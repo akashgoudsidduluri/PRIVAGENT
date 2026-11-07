@@ -15,6 +15,9 @@ export const ACTION_TYPES = [
   "select_tab",
   "new_tab",
   "close_tab",
+  "hover",
+  "select_date",
+  "slider_adjust",
 ] as const;
 
 export type ActionType = (typeof ACTION_TYPES)[number];
@@ -37,6 +40,9 @@ export const TYPE_ACTION_RISK_FLOOR: Record<ActionType, RiskClass> = {
   select_tab: "read",
   new_tab: "write",
   close_tab: "write",
+  hover: "read",
+  select_date: "write",
+  slider_adjust: "write",
 };
 
 export interface ElementTarget {
@@ -111,6 +117,23 @@ export interface CloseTabAction extends ActionBase {
   params: { tabId: number };
 }
 
+export interface HoverAction extends ActionBase {
+  type: "hover";
+  target: ElementTarget;
+}
+
+export interface SelectDateAction extends ActionBase {
+  type: "select_date";
+  target?: ElementTarget;
+  params: { date: string };
+}
+
+export interface SliderAdjustAction extends ActionBase {
+  type: "slider_adjust";
+  target: ElementTarget;
+  params?: { value?: number; percent?: number; direction?: "left" | "right" };
+}
+
 export type BrowserAction =
   | NavigateAction
   | ClickAction
@@ -122,7 +145,10 @@ export type BrowserAction =
   | ObserveAction
   | SelectTabAction
   | NewTabAction
-  | CloseTabAction;
+  | CloseTabAction
+  | HoverAction
+  | SelectDateAction
+  | SliderAdjustAction;
 
 export interface InteractiveElement {
   targetId: string;
@@ -153,6 +179,9 @@ export interface BrowserObservation {
   dpr: number;
   screenshot?: string;
   tabs?: TabInfo[];
+  articleContent?: string;
+  tableRows?: string[];
+  overlayText?: string;
 }
 
 export interface ActionResult {
@@ -194,6 +223,7 @@ export interface PermissionRequest {
 export interface AgentError {
   code:
     | "STALE_TARGET"
+    | "NO_EFFECT"
     | "TIMEOUT"
     | "NAVIGATION_FAILED"
     | "PRIVACY_VIOLATION"
@@ -346,6 +376,17 @@ export function validateAction(
       if (!params || !isSafeHttpUrl(String(params.url ?? ""))) {
         return { ok: false, error: "new_tab requires a safe http(s) url" };
       }
+      break;
+    case "hover":
+      if (!hasTarget) return { ok: false, error: "hover requires a target" };
+      break;
+    case "select_date":
+      if (!params || typeof params.date !== "string" || !params.date.trim()) {
+        return { ok: false, error: "select_date requires params.date" };
+      }
+      break;
+    case "slider_adjust":
+      if (!hasTarget) return { ok: false, error: "slider_adjust requires a target" };
       break;
     case "wait":
     case "observe":

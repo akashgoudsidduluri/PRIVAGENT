@@ -21,6 +21,9 @@ describe("contracts", () => {
       "select_tab",
       "new_tab",
       "close_tab",
+      "hover",
+      "select_date",
+      "slider_adjust",
     ]);
   });
 

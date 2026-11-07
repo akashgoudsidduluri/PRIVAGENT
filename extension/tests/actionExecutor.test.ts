@@ -8,6 +8,7 @@ import {
   isDrivableTabUrl,
   isPageSettled,
   observe,
+  typeApplied,
 } from "../src/actionExecutor";
 import type { BrowserAction } from "../src/contracts";
 
@@ -46,6 +47,26 @@ describe("action executor URL guards", () => {
     expect(isConsoleUrl("https://localhost:5173/")).toBe(true);
     expect(isConsoleUrl("https://example.com/")).toBe(false);
     expect(isConsoleUrl("not a url")).toBe(false);
+  });
+});
+
+describe("type read-back comparison", () => {
+  it("accepts the requested value when the field was cleared", () => {
+    expect(typeApplied("2026-12-24", "2026-12-24", true)).toBe(true);
+  });
+
+  it("rejects a field that discarded the keystrokes", () => {
+    expect(typeApplied("2026-12-24", "", true)).toBe(false);
+    expect(typeApplied("hello", undefined, true)).toBe(false);
+  });
+
+  it("accepts appended text without clearing", () => {
+    expect(typeApplied("world", "hello world", false)).toBe(true);
+    expect(typeApplied("world", "hello", false)).toBe(false);
+  });
+
+  it("ignores incidental whitespace differences", () => {
+    expect(typeApplied("hello world", "hello   world\n", true)).toBe(true);
   });
 });
 

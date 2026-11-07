@@ -10,10 +10,10 @@ NAVIGATOR is a privacy-first AI browser agent developed for **Smart India Hackat
 | Subsystem | Implementation | Status & Evidence |
 |-----------|----------------|-------------------|
 | **Landing Page & Agent Workspace** | Vite + vanilla TypeScript + hand CSS | ✓ `npm test` — 25/25 checks pass (10 structure, 8 console, 7 sanitization) |
-| **Chrome MV3 Extension** | Relay worker + in-page script + action executor | ✓ Vitest 35/35, `tsc --noEmit` clean, production build |
-| **Backend Orchestration** | FastAPI hub + bounded agent loop | ✓ `pytest` 81/81, including 29 security-hardening tests |
+| **Chrome MV3 Extension** | Relay worker + in-page script + action executor | ✓ Vitest 79/79 (7 files), `tsc --noEmit` clean, production build |
+| **Backend Orchestration** | FastAPI hub + bounded agent loop | ✓ `pytest` 144/144 |
 | **Shared Contracts** | TypeScript source mirrored as Pydantic models | ✓ Contract parity test (`test_contracts.py`) |
-| **Browser Action Control** | Navigate, click, type, press, scroll, zoom, wait, tabs | ✓ All 11 action types (`ACTION_TYPES`) |
+| **Browser Action Control** | Navigate, click, type, press, scroll, zoom, wait, tabs, hover, date, slider | ✓ All 14 action types (`ACTION_TYPES`) |
 | **Spatial Perception** | Bounding boxes (`bounds: {x,y,w,h}`), DPR grounding | ✓ `test_coordinates.py` and Test C |
 | **Privacy Redaction** | Strips credentials, cards, SSNs, tokens, URL secrets locally | ✓ Fail-closed tests (`test_privacy_failclosed.py`, `test_security_hardening.py`) |
 | **Prompt Injection Defense** | Page text isolated as untrusted data; schema-validated plans | ✓ `test_planner_injection.py` |
@@ -66,6 +66,23 @@ The backend binds to loopback and only accepts browser origins from `localhost`/
 - **Cancellation is real.** `POST /api/task/{id}/cancel` marks the loop for stop, wakes a pending confirmation, aborts any in-flight extension action slot, and no further actions execute. A cancel racing the task-create request is replayed once the task id exists.
 - **Retry safety.** Only idempotent actions (`observe`, `scroll`, `wait`, `zoom`, `select_tab`) are retried after a timeout; a click/type/press/navigate timeout is reported instead of risking a duplicate side effect.
 - **No committed secrets.** API keys come from `backend/.env` (gitignored) or the environment.
+
+### Privacy boundary (explicit user-input exception)
+
+NAVIGATOR does **not** claim zero-PII egress. The boundary is deliberate:
+
+| Data path | Handling |
+|---|---|
+| User task instruction | Sent to the configured provider **verbatim** (explicit user-input exception). The agent must act on values the user supplied. |
+| Page observations (title, URL, element names/values, article text, table rows, overlay/tooltip text) | Sanitized locally before egress: URL secrets stripped, PII patterns masked, length-capped (`overlayText` ≤ 1200 chars). |
+| Stored memory (preferences, conversation history, session/working memory, model notes) | Recursively sanitized before every prompt; long values bounded. |
+| Screenshots | Local-only by default; opt-in and suppressed when a sensitive field is present. |
+
+So: PII that the user types into the task box may reach the provider; PII that exists only on a page, in a tooltip, in a table, or in stored memory does not. Page/memory/history blocks are fenced as untrusted, and fence-shaped delimiters inside them are entity-escaped before prompt assembly.
+
+### Multi-browser routing (known limitation)
+
+Each action and observation is sent to the **newest live** `/ws/extension` socket. Sockets carry no browser or tab identity, so when several browsers or profiles connect to the same backend, the most recently connected instance receives the task. Within that browser, actions target the intended tab through the active-tab/`tabId` workflow. For deterministic runs, connect exactly one browser, or make the intended extension socket the newest (toggle its service worker). Per-task socket pinning would require a protocol change and is not part of this milestone.
 
 ---
 
@@ -152,14 +169,14 @@ observation-cache saving is measured in-process.
 # 1. Frontend structure, console, and sanitization tests (25 checks)
 npm test
 
-# 2. Extension Vitest suite (35 tests) + typecheck + build
+# 2. Extension Vitest suite (79 tests, 7 files) + typecheck + build
 cd extension
 npm test
 npx tsc --noEmit
 npm run build
 cd ..
 
-# 3. Backend Pytest suite (81 tests)
+# 3. Backend Pytest suite (144 tests)
 cd backend
 venv\Scripts\python.exe -m pytest tests -q
 cd ..
@@ -206,7 +223,7 @@ sih-26171-landing/
 │   │   ├── hub.py                   # Task registry and socket routing
 │   │   ├── contracts.py             # Mirrored Pydantic schemas
 │   │   └── providers/               # Gemini, Groq, and mock planners
-│   ├── tests/                       # 81 tests (contracts, privacy, loop, A–H, security, latency)
+│   ├── tests/                       # 144 tests (contracts, privacy, loop, A–H, security, latency)
 │   └── scripts/
 │       ├── check_gemini.py          # Live provider smoke test
 │       └── benchmark_eval.py        # Benchmark metrics runner
@@ -220,7 +237,7 @@ sih-26171-landing/
 │   │   ├── background.ts            # Serialized action queue + WS relay
 │   │   └── relay.ts                 # Pure WebSocket framing
 │   ├── lib/content.ts               # Programmatically injected in-page agent
-│   └── tests/                       # 35 Vitest unit tests
+│   └── tests/                       # 79 Vitest unit tests (7 files)
 ├── .claude/
 │   ├── agents/                      # 8 specialist agents
 │   └── skills/                      # 9 project skills

@@ -16,7 +16,7 @@ from . import config
 from .contracts import PrivacyViolation
 from .hub import Hub, hub as real_hub, TaskRecord
 from .planner import plan_from_observation
-from .privacy import classify_and_redact, redact_text_urls, redact_url
+from .privacy import classify_and_redact, redact_text_urls, redact_url, sanitize_text
 from .providers.errors import ProviderUnavailable
 
 MAX_STEPS = config.MAX_STEPS
@@ -329,7 +329,9 @@ async def _run_loop(
         if new_notes:
             # Bound model-written memory: a hostile page must not be able to
             # inflate every subsequent prompt (cost/latency) without limit.
-            working_memory["notes"] = str(new_notes)[:MAX_NOTES_CHARS]
+            # Notes are re-sent on every step, so they need the same free-text
+            # scrub as the page body: URL tokens *and* PII patterns.
+            working_memory["notes"] = sanitize_text(str(new_notes), MAX_NOTES_CHARS)
 
         steps = raw_plan.get("steps", [])
         if not steps:

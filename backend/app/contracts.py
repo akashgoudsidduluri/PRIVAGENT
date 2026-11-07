@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 ACTION_TYPES = [
     "navigate", "click", "type", "press", "scroll", "zoom",
     "wait", "observe", "select_tab", "new_tab", "close_tab",
+    "hover", "select_date", "slider_adjust",
 ]
 RISK_CLASSES = ["read", "write", "sensitive"]
 TASK_STATES = [
@@ -20,9 +21,9 @@ TASK_STATES = [
     "completed", "failed", "cancelled",
 ]
 ERROR_CODES = [
-    "STALE_TARGET", "TIMEOUT", "NAVIGATION_FAILED", "PRIVACY_VIOLATION",
-    "PLAN_INVALID", "BUDGET_EXCEEDED", "CANCELLED", "EXTENSION_DISCONNECTED",
-    "UNKNOWN",
+    "STALE_TARGET", "NO_EFFECT", "TIMEOUT", "NAVIGATION_FAILED",
+    "PRIVACY_VIOLATION", "PLAN_INVALID", "BUDGET_EXCEEDED", "CANCELLED",
+    "EXTENSION_DISCONNECTED", "UNKNOWN",
 ]
 
 RiskClass = Literal["read", "write", "sensitive"]
@@ -42,6 +43,8 @@ class ActionParams(BaseModel):
     container_id: Optional[str] = Field(default=None, alias="containerId")
     tab_id: Optional[int] = Field(default=None, alias="tabId")
     factor: Optional[float] = None
+    date: Optional[str] = None
+    percent: Optional[float] = None
 
     model_config = {"populate_by_name": True}
 
@@ -84,6 +87,9 @@ class BrowserObservation(BaseModel):
     dpr: float = 1.0
     screenshot: Optional[str] = None
     tabs: Optional[list[dict[str, Any]]] = None
+    article_content: Optional[str] = Field(default=None, alias="articleContent")
+    table_rows: Optional[list[str]] = Field(default=None, alias="tableRows")
+    overlay_text: Optional[str] = Field(default=None, alias="overlayText")
 
     model_config = {"populate_by_name": True}
 

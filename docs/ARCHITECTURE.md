@@ -59,6 +59,9 @@ NAVIGATOR is a privacy-first AI browser agent designed for the Smart India Hacka
   - `wait`: Pause for DOM changes or content stability.
   - `observe`: Inspect live interactive elements, scroll offsets, DPR, and viewport.
   - `new_tab`, `select_tab`, `close_tab`: Tab management and multi-tab workflows.
+  - `hover`: Move the pointer over a target, wait for an overlay, and return bounded visible overlay/tooltip text with the observation.
+  - `select_date`: Write an ISO date into a native `input[type=date]` or choose a verified calendar-picker cell.
+  - `slider_adjust`: Set a range/ARIA slider by percentage or direction and read the resulting value back locally.
 - **Validation**: every action is checked for its required target/params, risk floor, and a `timeoutMs` clamped to 100–60,000 ms. The planner additionally caps a plan at 3 steps.
 - **Retry safety**: only idempotent actions (`observe`, `scroll`, `wait`, `zoom`, `select_tab`) retry after a TIMEOUT. The backend waits ~10 s longer than the extension's own action deadline, so a late click is not resent as a duplicate.
 
@@ -71,19 +74,21 @@ NAVIGATOR is a privacy-first AI browser agent designed for the Smart India Hacka
 - **Screenshot Policy**: Screenshots stay local by default (`ALLOW_SCREENSHOTS=false`). Remote vision is opt-in and is suppressed whenever a sensitive field is present; the provider additionally enforces raster MIME types and a 4 MB cap.
 
 ### C. Local Privacy Layer & Prompt Injection Defense
-- **Local-First Sanitization**: `backend/app/privacy.py` executes on the local host before any payload is dispatched to remote AI models.
-- **Zero-Exposure Credential Policy**:
+- **Explicit Privacy Boundary**: NAVIGATOR is not a zero-PII-egress system. The **user's task instruction is forwarded to the remote planner verbatim** by design (explicit user-input exception), because the agent must act on values the user supplied. Everything else that is provider-bound is sanitized locally first: page observations, article text, table cells, overlay/tooltip text, stored preferences, conversation history, session memory, and model-written notes.
+- **Local-First Sanitization**: `backend/app/privacy.py` executes on the local host before page-derived or stored payloads are dispatched to remote AI models. `sanitize_text` applies URL-token redaction and the shared PII patterns, then truncates; `sanitize_memory` applies it recursively to string leaves.
+- **Zero-Exposure Credential Policy (page paths)**:
   - Input fields of type `password` or `hidden` have values stripped (`None`).
   - Fields containing tokens like `pwd`, `secret`, `token`, `api key`, `credit card`, `ssn` are wiped.
-  - Regex detection for credit cards, SSNs, emails, and API keys masks matching strings in titles, names, and values.
+  - Regex detection for credit cards, SSNs, emails, API keys, phone numbers, and `key=value` credentials masks matching strings in titles, names, values, article prose, table rows, and overlay text.
   - URLs are stripped of userinfo and have sensitive query/fragment values masked.
+  - Overlay/tooltip text is sanitized and capped at 1200 characters (`MAX_OVERLAY_LEN`).
 - **Fail-Closed Guarantee**: Any error during redaction immediately triggers `PrivacyViolation` and stops task execution. No partial or unvalidated payloads are transmitted.
-- **Prompt Injection Defense**: Untrusted page content is isolated within `<page-context>`, `<working-memory>`, and `<history>` wrappers marked untrusted. Planner instructions frame page content as inert data, and hard schema validation discards model hallucinations or unapproved actions.
+- **Prompt Injection Defense**: Untrusted page content is isolated within `<page-context>`, `<working-memory>`, `<conversation-history>`, `<session-memory>`, and `<history>` wrappers marked untrusted. `build_prompt` entity-escapes fence-shaped delimiters found inside untrusted data so page text cannot close its own block. The system frame treats page/tooltip text as inert data. Prompt isolation is best-effort; enforcement is deterministic: schema validation admits only whitelisted action types, risk floors are re-checked, and sensitive actions halt at the human confirmation gate.
 
 ### D. Action Risk Classification & User Confirmation
 - **Risk Classes**:
-  - `read` (automatic): `scroll`, `zoom`, `wait`, `observe`, `select_tab`.
-  - `write` (monitored): `navigate`, `click`, `type`, `press`, `new_tab`, `close_tab`.
+  - `read` (automatic): `scroll`, `zoom`, `wait`, `observe`, `select_tab`, `hover`.
+  - `write` (monitored): `navigate`, `click`, `type`, `press`, `new_tab`, `close_tab`, `select_date`, `slider_adjust`.
   - `sensitive` (confirmation required): Purchases, payments, irreversible form submissions, account changes.
 - **Human-in-the-Loop Gate**: The agent halts and sets `awaiting_confirmation` when the action is `sensitive`, the URL is a credential/payment surface (whole path segments such as `/login`, `/sign-in`, `/checkout`, `/billing`), or a WhatsApp QR login is required. Cancelling the task wakes the gate with a rejection so no approval can land afterwards.
 
@@ -91,6 +96,7 @@ NAVIGATOR is a privacy-first AI browser agent designed for the Smart India Hacka
 - **HTTP origin guard**: browser requests with a non-loopback, non-extension `Origin` are rejected with 403 before routing. CORS allows only `localhost`/`127.0.0.1` and `chrome-extension://`/`moz-extension://`.
 - **WebSocket guard**: `/ws/client` and `/ws/extension` close with policy code 1008 when the `Origin` is not allowlisted.
 - **Cancellation propagation**: `POST /api/task/{id}/cancel` sets a loop-level marker, wakes a pending confirmation, aborts any in-flight action result slot, and the loop checks the marker before planning, after confirmation, and after each execution. Terminal tasks are never rewritten. The UI replays a cancel that races task creation once the task id exists.
+- **Multi-browser routing (known limitation)**: There is no browser-identity handshake on `/ws/extension`. `Hub.send_action` sends each action and observation request to the newest live socket, falling back to older sockets only when a send fails. If several browsers or profiles are connected to one backend, the most recently connected instance receives the task, and a new connection mid-task can redirect later actions. Within the acting browser, tab targeting works normally (`select_tab`, active-tab observation). Deterministic runs require exactly one connected browser, or a freshly toggled extension socket. Per-task socket pinning is a future protocol change.
 
 ### F. Bounded Agent Loop & Latency
 - **Observation reuse**: a successful action's post-action observation is validated with Pydantic and reused for the next plan, removing one observe round trip per step. It is still re-run through `classify_and_redact()` every iteration, and is discarded after a failed action, a malformed payload, `select_tab`, or `close_tab`.
@@ -135,9 +141,9 @@ Executed via `backend/scripts/benchmark_eval.py` against the deterministic mock 
 | Suite | Command | Current result |
 |-------|---------|----------------|
 | Frontend | `npm test` | 25 checks (10 structure, 8 console, 7 sanitization) |
-| Extension | `cd extension && npm test` | 35 Vitest tests, 5 files |
+| Extension | `cd extension && npm test` | 79 Vitest tests, 7 files |
 | Extension types | `cd extension && npx tsc --noEmit` | clean |
-| Backend | `cd backend && venv\Scripts\python.exe -m pytest tests -q` | 81 tests |
+| Backend | `cd backend && venv\Scripts\python.exe -m pytest tests -q` | 144 tests |
 | Benchmark | `backend\venv\Scripts\python.exe backend/scripts/benchmark_eval.py` | 8/8 |
 
 Provider selection (`NAVIGATOR_PROVIDER`, else auto-detected from keys, else `mock`):

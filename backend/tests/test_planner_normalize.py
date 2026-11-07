@@ -239,3 +239,46 @@ def test_role_only_target_resolves_when_the_page_has_one_match():
     plan = _validate_plan(raw, payload=payload)
     assert plan.steps[0].action.target["name"] == "Search"
 
+
+def test_valid_new_actions_pass_plan_validation():
+    raw = {
+        "goal": "interact with controls",
+        "steps": [
+            {
+                "why": "hover over menu",
+                "action": {
+                    "type": "hover",
+                    "risk": "read",
+                    "verify": "menu shown",
+                    "timeoutMs": 5000,
+                    "target": {"name": "Departments"},
+                },
+            },
+            {
+                "why": "select date",
+                "action": {
+                    "type": "select_date",
+                    "risk": "write",
+                    "verify": "date picked",
+                    "timeoutMs": 5000,
+                    "params": {"date": "2026-11-06"},
+                },
+            },
+            {
+                "why": "adjust price filter slider",
+                "action": {
+                    "type": "slider_adjust",
+                    "risk": "write",
+                    "verify": "slider changed",
+                    "timeoutMs": 5000,
+                    "target": {"name": "Price Slider"},
+                    "params": {"percent": 30, "direction": "left"},
+                },
+            },
+        ],
+    }
+    plan = _validate_plan(raw)
+    assert len(plan.steps) == 3
+    assert plan.steps[0].action.type == "hover"
+    assert plan.steps[1].action.type == "select_date"
+    assert plan.steps[2].action.type == "slider_adjust"

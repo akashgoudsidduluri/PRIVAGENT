@@ -24,13 +24,21 @@ interface AgentElement {
 
 interface AgentApi {
   list: () => Promise<AgentElement[]>;
+  getArticleContent: () => Promise<string>;
+  getTableRows: () => Promise<string[]>;
+  getOverlayText: () => Promise<string>;
   click: (targetId: string, name?: string) => Promise<{ ok: boolean; error?: string }>;
   clickCoords: (x: number, y: number) => Promise<{ ok: boolean; targetId?: string; error?: string }>;
   getCoords: (targetId: string, name?: string) => Promise<{ x: number; y: number; width: number; height: number } | null>;
   clickPoint: (targetId: string, name?: string) => Promise<{ x: number; y: number; width: number; height: number } | null>;
+  hitTest: (targetId: string, name?: string, x?: number, y?: number) => Promise<{ ok: boolean; error?: string }>;
   type: (targetId: string, text: string, clear: boolean, name?: string) => Promise<{ ok: boolean; error?: string }>;
+  readValue: (targetId: string, name?: string) => Promise<{ ok: boolean; value?: string; error?: string }>;
   submit: (targetId: string, name?: string) => Promise<{ ok: boolean; error?: string }>;
   scroll: (d: "up" | "down" | "top" | "bottom", containerId?: string) => Promise<{ ok: boolean; scrollY: number }>;
+  hover: (targetId: string, name?: string) => Promise<{ ok: boolean; error?: string }>;
+  selectDate: (dateStr: string, targetId?: string, name?: string) => Promise<{ ok: boolean; error?: string; value?: string }>;
+  sliderAdjust: (targetId: string, name?: string, percent?: number, direction?: "left" | "right") => Promise<{ ok: boolean; error?: string; value?: number; code?: "STALE_TARGET" | "NO_EFFECT" }>;
 }
 
 async function withAgent(tabId: number): Promise<AgentApi> {
@@ -62,6 +70,39 @@ async function withAgent(tabId: number): Promise<AgentApi> {
       });
       return (r?.result as AgentElement[]) ?? [];
     },
+    getArticleContent: async () => {
+      try {
+        const [r] = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: () => (window as unknown as { __navigatorAgent?: { getArticleContent?: () => string } }).__navigatorAgent?.getArticleContent?.() ?? "",
+        });
+        return (r?.result as string) ?? "";
+      } catch {
+        return "";
+      }
+    },
+    getTableRows: async () => {
+      try {
+        const [r] = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: () => (window as unknown as { __navigatorAgent?: { getTableRows?: () => string[] } }).__navigatorAgent?.getTableRows?.() ?? [],
+        });
+        return (r?.result as string[]) ?? [];
+      } catch {
+        return [];
+      }
+    },
+    getOverlayText: async () => {
+      try {
+        const [r] = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: () => (window as unknown as { __navigatorAgent?: { getOverlayText?: () => string } }).__navigatorAgent?.getOverlayText?.() ?? "",
+        });
+        return (r?.result as string) ?? "";
+      } catch {
+        return "";
+      }
+    },
     getCoords: async (targetId: string, name?: string) => {
       const [r] = await chrome.scripting.executeScript({
         target: { tabId },
@@ -79,6 +120,19 @@ async function withAgent(tabId: number): Promise<AgentApi> {
         args: [targetId, name ?? ""],
       });
       return (r?.result as { x: number; y: number; width: number; height: number } | null) ?? null;
+    },
+    hitTest: async (targetId: string, name?: string, x?: number, y?: number) => {
+      try {
+        const [r] = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: (id: string, nm?: string, px?: number, py?: number) =>
+            (window as unknown as { __navigatorAgent?: { hitTest?: (i: string, n?: string, x?: number, y?: number) => { ok: boolean; error?: string } } }).__navigatorAgent?.hitTest?.(id, nm, px, py) ?? { ok: false, error: "no agent" },
+          args: [targetId, name ?? "", x, y],
+        });
+        return (r?.result as { ok: boolean; error?: string }) ?? { ok: false, error: "execution failed" };
+      } catch (e: any) {
+        return { ok: false, error: String(e?.message || e) };
+      }
     },
     click: async (targetId: string, name?: string) => {
       const [r] = await chrome.scripting.executeScript({
@@ -105,6 +159,19 @@ async function withAgent(tabId: number): Promise<AgentApi> {
       });
       return (r?.result as { ok: boolean; error?: string }) ?? { ok: false, error: "execution failed" };
     },
+    readValue: async (targetId: string, name?: string) => {
+      try {
+        const [r] = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: (id: string, nm?: string) =>
+            (window as unknown as { __navigatorAgent?: { readValue?: (i: string, n?: string) => { ok: boolean; value?: string; error?: string } } }).__navigatorAgent?.readValue?.(id, nm) ?? { ok: false, error: "no agent" },
+          args: [targetId, name ?? ""],
+        });
+        return (r?.result as { ok: boolean; value?: string; error?: string }) ?? { ok: false, error: "execution failed" };
+      } catch (e: any) {
+        return { ok: false, error: String(e?.message || e) };
+      }
+    },
     submit: async (targetId: string, name?: string) => {
       const [r] = await chrome.scripting.executeScript({
         target: { tabId },
@@ -121,6 +188,45 @@ async function withAgent(tabId: number): Promise<AgentApi> {
         args: [direction, containerId ?? ""],
       });
       return (r?.result as { ok: boolean; scrollY: number }) ?? { ok: false, scrollY: 0 };
+    },
+    hover: async (targetId: string, name?: string) => {
+      try {
+        const [r] = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: (id: string, nm?: string) =>
+            (window as unknown as { __navigatorAgent?: { hover?: (i: string, n?: string) => { ok: boolean; error?: string } } }).__navigatorAgent?.hover?.(id, nm) ?? { ok: false, error: "no agent" },
+          args: [targetId, name ?? ""],
+        });
+        return (r?.result as { ok: boolean; error?: string }) ?? { ok: false, error: "execution failed" };
+      } catch (e: any) {
+        return { ok: false, error: String(e?.message || e) };
+      }
+    },
+    selectDate: async (dateStr: string, targetId?: string, name?: string) => {
+      try {
+        const [r] = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: async (ds: string, id?: string, nm?: string) =>
+            (window as unknown as { __navigatorAgent?: { selectDate?: (d: string, i?: string, n?: string) => Promise<{ ok: boolean; error?: string; value?: string }> } }).__navigatorAgent?.selectDate?.(ds, id, nm) ?? { ok: false, error: "no agent" },
+          args: [dateStr, targetId ?? "", name ?? ""],
+        });
+        return (r?.result as { ok: boolean; error?: string; value?: string }) ?? { ok: false, error: "execution failed" };
+      } catch (e: any) {
+        return { ok: false, error: String(e?.message || e) };
+      }
+    },
+    sliderAdjust: async (targetId: string, name?: string, percent?: number, direction?: "left" | "right") => {
+      try {
+        const [r] = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: async (id: string, nm?: string, p?: number, d?: "left" | "right") =>
+            (window as unknown as { __navigatorAgent?: { sliderAdjust?: (i: string, n?: string, pc?: number, dir?: "left" | "right") => Promise<{ ok: boolean; error?: string; value?: number; code?: "STALE_TARGET" | "NO_EFFECT" }> } }).__navigatorAgent?.sliderAdjust?.(id, nm, p, d) ?? { ok: false, error: "no agent" },
+          args: [targetId, name ?? "", percent, direction],
+        });
+        return (r?.result as { ok: boolean; error?: string; value?: number; code?: "STALE_TARGET" | "NO_EFFECT" }) ?? { ok: false, error: "execution failed" };
+      } catch (e: any) {
+        return { ok: false, error: String(e?.message || e) };
+      }
     },
   };
 }
@@ -383,6 +489,9 @@ export async function executeAction(action: BrowserAction, taskId: string): Prom
       case "scroll": return await doScroll(action);
       case "zoom": return await doZoom(action);
       case "new_tab": return await doNewTab(action);
+      case "hover": return await doHover(action, taskId);
+      case "select_date": return await doSelectDate(action, taskId);
+      case "slider_adjust": return await doSliderAdjust(action, taskId);
       case "select_tab": {
         await chrome.tabs.update(action.params.tabId, { active: true });
         await waitForStable(action.params.tabId, action.timeoutMs);
@@ -425,6 +534,19 @@ export async function executeAction(action: BrowserAction, taskId: string): Prom
 
 function err(code: AgentError["code"], message: string, recoverable: boolean): ActionResult {
   return { ok: false, error: { code, message, recoverable } };
+}
+
+/**
+ * Compare a field's read-back value with the requested text. Whitespace is
+ * collapsed so a framework editor's incidental newlines do not look like a
+ * failed keystroke; a genuinely discarded value still fails.
+ */
+export function typeApplied(expected: string, actual: string | undefined, clear: boolean): boolean {
+  const normalize = (value: string) => value.replace(/\r\n/g, "\n").replace(/\s+/g, " ").trim();
+  const want = normalize(expected ?? "");
+  const got = normalize(actual ?? "");
+  if (!want) return got.length === 0;
+  return clear ? got === want : got.includes(want);
 }
 
 async function doNavigate(action: Extract<BrowserAction, { type: "navigate" }>): Promise<ActionResult> {
@@ -616,7 +738,12 @@ async function cdpType(
   }
 }
 
-async function cdpClick(tabId: number, x: number, y: number): Promise<boolean> {
+async function cdpClick(
+  tabId: number,
+  x: number,
+  y: number,
+  stillOnTarget?: () => Promise<boolean>,
+): Promise<boolean> {
   if (typeof chrome === "undefined" || !chrome.debugger) return false;
   await ensureTabActive(tabId);
   const target = { tabId };
@@ -635,6 +762,13 @@ async function cdpClick(tabId: number, x: number, y: number): Promise<boolean> {
       x: Math.round(x),
       y: Math.round(y),
     });
+    // A mouseover handler can remove or replace the control. Re-resolve the
+    // target after the move and refuse to press when the point no longer
+    // belongs to it, instead of activating whatever moved underneath.
+    if (stillOnTarget) {
+      const ok = await stillOnTarget();
+      if (!ok) return false;
+    }
     await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
       type: "mousePressed",
       x: Math.round(x),
@@ -666,6 +800,39 @@ async function cdpClick(tabId: number, x: number, y: number): Promise<boolean> {
     try {
       await chrome.debugger.detach(target);
     } catch {}
+  }
+}
+
+async function cdpMouseMove(tabId: number, x: number, y: number): Promise<boolean> {
+  if (typeof chrome === "undefined" || !chrome.debugger) return false;
+  await ensureTabActive(tabId);
+  const target = { tabId };
+  // Only detach what we attached: an existing session may belong to DevTools
+  // or another debugger, and tearing it down would disrupt the user.
+  let attachedHere = false;
+  try {
+    await chrome.debugger.attach(target, "1.3");
+    attachedHere = true;
+  } catch (e: any) {
+    if (!e?.message?.includes("already attached")) {
+      return false;
+    }
+  }
+  try {
+    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+      type: "mouseMoved",
+      x: Math.round(x),
+      y: Math.round(y),
+    });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (attachedHere) {
+      try {
+        await chrome.debugger.detach(target);
+      } catch {}
+    }
   }
 }
 
@@ -738,8 +905,18 @@ async function doClick(action: Extract<BrowserAction, { type: "click" }>, taskId
   const coords = await agent.clickPoint(targetId, targetName);
   let cdpSuccess = false;
   if (coords && coords.x > 0 && coords.y > 0) {
-    // 2. One trusted click via Chrome DevTools Protocol
-    cdpSuccess = await cdpClick(tabId, coords.x, coords.y);
+    const point = coords;
+    // 2. One trusted click via Chrome DevTools Protocol. The hit test runs
+    //    after mouseMoved, so a hover handler that removes the control
+    //    produces STALE_TARGET instead of a click on its replacement.
+    cdpSuccess = await cdpClick(tabId, point.x, point.y, async () => {
+      try {
+        const hit = await agent.hitTest(targetId, targetName, point.x, point.y);
+        return hit.ok;
+      } catch {
+        return false;
+      }
+    });
   }
 
   // 3. In-page click only if CDP was unavailable — never both.
@@ -785,6 +962,25 @@ async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: 
   const targetId = target?.targetId || action.target.targetId || "";
   const targetName = target?.name || action.target.name || "";
 
+  // Native date inputs reject synthetic insertText: the browser discards the
+  // keystrokes and leaves the value empty. Route to the dedicated primitive
+  // that writes through the native setter and fires input/change.
+  const targetInputType = cands.find(c => c.targetId === targetId)?.inputType
+    ?? (target as { inputType?: string } | null)?.inputType;
+  if (targetInputType === "date" && /^\d{4}-\d{2}-\d{2}$/.test(action.params.text)) {
+    const res = await agent.selectDate(action.params.text, targetId, targetName);
+    if (!res.ok) {
+      return err("NO_EFFECT", res.error ?? "date value was not applied", true);
+    }
+    await settleDom(tabId, 80, 200);
+    return {
+      ok: true,
+      targetId,
+      observation: await observe(tabId),
+      evidence: `selected date ${action.params.text}`,
+    };
+  }
+
   // 1. Type through Chrome's native input pipeline. A trusted click focuses
   //    the field and places the caret in the same session.
   const coords = await agent.getCoords(targetId, targetName);
@@ -808,6 +1004,18 @@ async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: 
   // Let a controlled input paint validation/autocomplete before this
   // observation is cached for the next planning step.
   await settleDom(tabId, 100, 300);
+
+  // Verify locally. The native and fallback paths both report what they
+  // attempted, not what the page kept; a read-only/date/time widget can
+  // discard the value. The field value never leaves the browser here.
+  const readBack = await agent.readValue(targetId, targetName);
+  if (!readBack.ok || !typeApplied(action.params.text, readBack.value, clear)) {
+    return err(
+      "NO_EFFECT",
+      `typed text was not applied to ${targetName || targetId}`,
+      true,
+    );
+  }
 
   let submitted = false;
   let obsTab = tabId;
@@ -920,6 +1128,159 @@ async function doNewTab(action: Extract<BrowserAction, { type: "new_tab" }>): Pr
   return { ok: true, observation: await observe(tab.id!), evidence: `opened ${action.params.url}` };
 }
 
+/**
+ * Count visible overlays a hover can plausibly reveal. Comparing the count
+ * before and after means success rests on an observed effect, not merely on
+ * a dispatched event. Returns null when the probe cannot run.
+ */
+async function hoverEffectFingerprint(tabId: number): Promise<number | null> {
+  try {
+    const [r] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const selector = [
+          "[role='tooltip']", "[role='menu']", "[role='dialog']", "[role='listbox']",
+          "[role='tree']", "[aria-expanded='true']", "details[open]", "dialog[open]",
+          "[data-state='open']", "[data-popper-placement]",
+          ".tooltip", ".dropdown-menu", ".submenu", ".popover", ".menu",
+        ].join(",");
+        const isHidden = (el: HTMLElement): boolean => {
+          let node: HTMLElement | null = el;
+          while (node) {
+            if (node.hasAttribute("hidden")) return true;
+            const style = getComputedStyle(node);
+            if (style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse") {
+              return true;
+            }
+            node = node.parentElement;
+          }
+          return false;
+        };
+        let count = 0;
+        document.querySelectorAll(selector).forEach(el => {
+          if (el instanceof HTMLElement && !isHidden(el)) count++;
+        });
+        return count;
+      },
+    });
+    return typeof r?.result === "number" ? r.result : null;
+  } catch {
+    return null;
+  }
+}
+
+async function doHover(action: Extract<BrowserAction, { type: "hover" }>, taskId: string): Promise<ActionResult> {
+  const tabId = await getOrCreateActiveTab();
+  await ensureTabActive(tabId);
+  const agent = await withAgent(tabId);
+  const cands = await agent.list();
+  const target = findTarget(action.target, cands, "click");
+  const targetId = target?.targetId || action.target.targetId || "";
+  const targetName = target?.name || action.target.name || "";
+
+  const beforeEffect = await hoverEffectFingerprint(tabId);
+  let cdpSuccess = false;
+  const coords = await agent.clickPoint(targetId, targetName);
+  if (coords && coords.x > 0 && coords.y > 0) {
+    cdpSuccess = await cdpMouseMove(tabId, coords.x, coords.y);
+  }
+  let usedFallback = false;
+  if (!cdpSuccess) {
+    usedFallback = true;
+    const res = await agent.hover(targetId, targetName);
+    if (!res.ok) {
+      return err("STALE_TARGET", res.error || `could not hover ${targetName || targetId}`, true);
+    }
+  }
+  await settleDom(tabId, 80, 400);
+  const afterEffect = await hoverEffectFingerprint(tabId);
+  const overlayText = await agent.getOverlayText();
+  const observation = await observe(tabId);
+  if (overlayText) observation.overlayText = overlayText;
+  void taskId;
+
+  // A visible overlay is the effect, whether this hover opened it or it was
+  // already open (the second hover in a row previously reported NO_EFFECT
+  // while the tooltip sat on screen with its text unread).
+  const countGrew = beforeEffect !== null && afterEffect !== null && afterEffect > beforeEffect;
+  const visibleOverlay = (afterEffect ?? 0) > 0 && Boolean(overlayText);
+  const effectObserved = afterEffect === null || countGrew || visibleOverlay;
+
+  if (!effectObserved) {
+    return {
+      ok: false,
+      observation,
+      error: {
+        code: "NO_EFFECT",
+        message: `hover produced no observable overlay change for ${targetName || targetId}`
+          + (usedFallback ? " (synthetic events cannot trigger CSS :hover)" : ""),
+        recoverable: true,
+      },
+    };
+  }
+
+  const effectNote = beforeEffect !== null && afterEffect !== null
+    ? `, overlays ${beforeEffect}→${afterEffect}`
+    : ", effect unverified";
+  const textNote = overlayText ? `, overlay text ${overlayText.length} chars` : "";
+  return {
+    ok: true,
+    observation,
+    evidence: `hovered ${targetName || targetId}${usedFallback ? " via synthetic events" : " via CDP"}${effectNote}${textNote}`,
+  };
+}
+
+async function doSelectDate(action: Extract<BrowserAction, { type: "select_date" }>, taskId: string): Promise<ActionResult> {
+  const tabId = await getOrCreateActiveTab();
+  await ensureTabActive(tabId);
+  const agent = await withAgent(tabId);
+  const cands = await agent.list();
+  const target = action.target ? findTarget(action.target, cands, "click") : undefined;
+  const targetId = target?.targetId || action.target?.targetId || "";
+  const targetName = target?.name || action.target?.name || "";
+
+  const beforeUrl = await currentUrl(tabId);
+  const res = await agent.selectDate(action.params.date, targetId, targetName);
+  if (!res.ok) {
+    return err("STALE_TARGET", res.error || `could not select date ${action.params.date}`, true);
+  }
+  const obsTab = await settleAfterAction(tabId, beforeUrl, action.timeoutMs);
+  void taskId;
+  return {
+    ok: true,
+    observation: await observe(obsTab),
+    evidence: `selected date ${res.value || action.params.date}`,
+  };
+}
+
+async function doSliderAdjust(action: Extract<BrowserAction, { type: "slider_adjust" }>, taskId: string): Promise<ActionResult> {
+  const tabId = await getOrCreateActiveTab();
+  await ensureTabActive(tabId);
+  const agent = await withAgent(tabId);
+  const cands = await agent.list();
+  const target = findTarget(action.target, cands, "click");
+  const targetId = target?.targetId || action.target.targetId || "";
+  const targetName = target?.name || action.target.name || "";
+
+  const res = await agent.sliderAdjust(targetId, targetName, action.params?.percent, action.params?.direction);
+  await settleDom(tabId, 100, 500);
+  void taskId;
+  return {
+    ok: res.ok,
+    observation: await observe(tabId),
+    evidence: res.ok
+      ? `adjusted slider ${targetName || targetId}${typeof res.value === "number" ? ` to ${res.value}` : ""}`
+      : "slider adjustment failed",
+    error: res.ok
+      ? undefined
+      : {
+        code: res.code ?? "STALE_TARGET",
+        message: res.error || "slider failed",
+        recoverable: true,
+      },
+  };
+}
+
 /** Wait until the navigation completes and the DOM is interactive and quiet. */
 async function waitForStable(tabId: number, timeoutMs: number, expectedUrl?: string): Promise<string> {
   const start = Date.now();
@@ -1016,6 +1377,8 @@ export async function observe(tabId: number): Promise<BrowserObservation> {
   }
 
   let list: AgentElement[] = [];
+  let articleContent = "";
+  let tableRows: string[] = [];
   let meta = { y: 0, w: 0, h: 0, dpr: 1 };
   try {
     const agent = await withAgent(tabId);
@@ -1031,6 +1394,9 @@ export async function observe(tabId: number): Promise<BrowserObservation> {
         if (list.length > 0) break;
       }
     }
+
+    articleContent = await agent.getArticleContent().catch(() => "");
+    tableRows = await agent.getTableRows().catch(() => []);
 
     const [m] = await chrome.scripting.executeScript({
       target: { tabId },
@@ -1076,6 +1442,8 @@ export async function observe(tabId: number): Promise<BrowserObservation> {
       value: undefined,
       bounds: e.bounds,
     })),
+    articleContent: articleContent || undefined,
+    tableRows: tableRows && tableRows.length > 0 ? tableRows : undefined,
     scroll: { y: meta.y, viewport: { w: meta.w, h: meta.h } },
     dpr: meta.dpr,
     screenshot,

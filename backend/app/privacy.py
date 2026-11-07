@@ -24,6 +24,10 @@ import re
 MAX_NAME_LEN = 120
 MAX_TITLE_LEN = 200
 MAX_URL_LEN = 2048
+MAX_ARTICLE_LEN = 3500
+MAX_TABLE_ROW_LEN = 300
+MAX_OVERLAY_LEN = 1200
+MAX_MEMORY_VALUE_LEN = 2000
 REDACTED = "[REDACTED]"
 
 SENSITIVE_INPUT_TYPES = {"password", "hidden"}
@@ -75,6 +79,23 @@ PATTERNS = {
     "slack_token": re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
     "private_key": re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     "email": re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"),
+    # Formatted phone numbers only (separators or a country prefix). Bare
+    # 10-digit runs are deliberately not matched: they collide with prices,
+    # order numbers and card fragments, which are handled by their own rules.
+    "phone": re.compile(
+        r"(?<![\d.])"
+        r"(?:\+\d{1,3}[\s.\-]?)?"
+        r"(?:\(\d{2,4}\)|\d{2,4})"
+        r"[\s.\-]?\d{3}[\s.\-]?\d{4}"
+        r"(?!\d)"
+    ),
+    # key=value credentials embedded in prose (password=hunter2). Skip values
+    # already masked by the URL layer so `access_token=[REDACTED]` keeps its
+    # key name instead of collapsing to a bare marker.
+    "credential": re.compile(
+        r"(?i)\b(?:password|passwd|pwd|secret|api[\s_-]?key|access[\s_-]?token"
+        r"|auth[\s_-]?token)\b\s*[:=]\s*(?!\[REDACTED\])[^\s,;\"'<>]{3,}"
+    ),
 }
 
 
@@ -172,6 +193,37 @@ def redact_text_urls(text: str) -> str:
     return URL_IN_TEXT_RE.sub(_one, text)
 
 
+def sanitize_text(text: str, max_len: int) -> str:
+    """Fail-closed scrub for free text bound for a remote provider.
+
+    Page bodies, table cells and model notes carry more than URLs: contact
+    addresses, card numbers, keys and credentials appear as prose. URL
+    scrubbing alone let all of that through, so free text goes through both
+    layers — query-token redaction first, then the shared PATTERNS — and is
+    truncated last.
+    """
+    if not text:
+        return text
+    return _redact_text(redact_text_urls(text), max_len)
+
+
+def sanitize_memory(value: Any, max_len: int = MAX_MEMORY_VALUE_LEN) -> Any:
+    """Recursively scrub provider-bound working memory.
+
+    Preferences, chat history and session memory are user-controlled and were
+    previously serialized with ``json.dumps`` untouched, so stored PII reached
+    the remote planner verbatim. Container structure is preserved; only string
+    leaves are scrubbed and bounded.
+    """
+    if isinstance(value, str):
+        return sanitize_text(value, max_len)
+    if isinstance(value, dict):
+        return {str(k): sanitize_memory(v, max_len) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [sanitize_memory(v, max_len) for v in value]
+    return value
+
+
 def _redact_element(el: InteractiveElement) -> InteractiveElement:
     """Pure per-element redactor. Raises through on bad input."""
     value: Optional[str] = el.value
@@ -203,6 +255,9 @@ class PrivacyFilteredPayload:
     elements_sent: int
     screenshot: Optional[str] = None
     tabs: list[dict[str, Any]] = field(default_factory=list)
+    article_content: Optional[str] = None
+    table_rows: list[str] = field(default_factory=list)
+    overlay_text: Optional[str] = None
 
     def to_context_block(self) -> str:
         """Render as an UNTRUSTED-DATA block for the planner prompt."""
@@ -215,6 +270,20 @@ class PrivacyFilteredPayload:
                 ttitle = t.get("title") or ""
                 is_act = " (active)" if tid == self.tab_id or t.get("active") else ""
                 lines.append(f"  - [Tab {tid}]{is_act} {turl} — {ttitle}")
+
+        if self.article_content:
+            lines.append("\nPAGE CONTENT / ARTICLE TEXT:")
+            lines.append(self.article_content[:3500])
+
+        if self.overlay_text:
+            lines.append("\nVISIBLE OVERLAY / TOOLTIP TEXT:")
+            lines.append(self.overlay_text[:MAX_OVERLAY_LEN])
+
+        if self.table_rows:
+            lines.append("\nTABLE / DATA ROWS:")
+            for r in self.table_rows[:25]:
+                lines.append(f"  {r}")
+
         def _pri(e: InteractiveElement) -> int:
             nm = (e.name or "").lower()
             if any(k in nm for k in ("search", "type a message", "send", "skip", "close", "submit", "groups", "group", "cancel search")):
@@ -243,7 +312,12 @@ class PrivacyFilteredPayload:
 def classify_and_redact(
     obs: BrowserObservation, *, instruction: str
 ) -> tuple[PrivacyFilteredPayload, PrivacyDecision]:
-    _ = instruction  # reserved: relevance scoring arrives with the planner
+    # Privacy boundary (explicit user-input exception): `instruction` is the
+    # user's own task text and is forwarded to the planner verbatim by design;
+    # the agent must operate on values the user supplied. Only page-derived
+    # data, memory, and history are sanitized here and in build_prompt. Never
+    # describe the instruction path as zero-PII egress.
+    _ = instruction
     try:
         redacted = [_redact_element(e) for e in obs.interactive]
         # Fail-closed privacy: if any element on page is sensitive (password/auth/card), omit screenshot
@@ -268,6 +342,16 @@ def classify_and_redact(
                 "title": _redact_text(t.get("title") or "", MAX_TITLE_LEN),
                 "active": bool(t.get("active")),
             })
+
+        raw_article = getattr(obs, "article_content", None)
+        safe_article = sanitize_text(raw_article, MAX_ARTICLE_LEN) if isinstance(raw_article, str) else None
+
+        raw_overlay = getattr(obs, "overlay_text", None)
+        safe_overlay = sanitize_text(raw_overlay, MAX_OVERLAY_LEN) if isinstance(raw_overlay, str) else None
+
+        raw_tables = getattr(obs, "table_rows", None) or []
+        safe_tables = [sanitize_text(t, MAX_TABLE_ROW_LEN) for t in raw_tables if isinstance(t, str)]
+
         payload = PrivacyFilteredPayload(
             tab_id=obs.tab_id,
             url=redact_url(obs.url),
@@ -279,6 +363,9 @@ def classify_and_redact(
             elements_sent=len(redacted),
             screenshot=safe_screenshot,
             tabs=scrubbed_tabs,
+            article_content=safe_article,
+            table_rows=safe_tables,
+            overlay_text=safe_overlay,
         )
         decision = PrivacyDecision(send=True, reason="redaction succeeded", violations=[])
         return payload, decision
