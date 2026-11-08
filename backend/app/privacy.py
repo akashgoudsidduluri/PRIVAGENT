@@ -89,6 +89,12 @@ PATTERNS = {
         r"[\s.\-]?\d{3}[\s.\-]?\d{4}"
         r"(?!\d)"
     ),
+    # International 5+5 layouts (e.g. +91 98765 43210). A country prefix is
+    # required so this cannot collide with bare prices or order numbers, which
+    # the phone rule above deliberately leaves alone.
+    "phone_intl": re.compile(
+        r"(?<![\d.])\+\d{1,3}[\s.\-]?\d{5}[\s.\-]?\d{5}(?!\d)"
+    ),
     # key=value credentials embedded in prose (password=hunter2). Skip values
     # already masked by the URL layer so `access_token=[REDACTED]` keeps its
     # key name instead of collapsing to a bare marker.

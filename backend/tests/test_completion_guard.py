@@ -94,6 +94,43 @@ def test_msg_loginrequired_is_a_login_surface():
     assert plan.steps[0].action.type == "wait"
 
 
+def test_self_reported_readonly_failure_is_not_marked_complete():
+    # A live run typed into a read-only field, then honestly explained in the
+    # final answer that the value could not be changed. The answer itself
+    # proves the task is incomplete, even though the action reported success.
+    plan = _validate_plan(
+        _completion(
+            "The Customer ID field is read-only and cannot be changed to CUST-999, "
+            "so the requested update cannot be performed."
+        ),
+        payload=_payload("https://crm.example/readonly"),
+        history=[{
+            "action": {"type": "type"},
+            "result_ok": True,
+            "evidence": "typed",
+        }],
+        instruction="set the Customer ID to CUST-999",
+    )
+    assert plan.blocked is True
+    assert plan.steps == []
+    assert "read-only" in (plan.answer or "")
+
+
+def test_successful_completion_is_not_flagged_incomplete():
+    plan = _validate_plan(
+        _completion("Priya Nair is in Bengaluru and her latest order total is 4860."),
+        payload=_payload("https://crm.example/records"),
+        history=[{
+            "action": {"type": "click", "target": {"name": "Search"}},
+            "result_ok": True,
+            "evidence": "clicked Search",
+        }],
+        instruction="find Priya Nair and report her city and latest order total",
+    )
+    assert plan.blocked is False
+    assert plan.steps == []
+
+
 def test_failed_type_with_open_chat_is_honest_failure():
     composer = _element("Type a message", role="textbox", tag="div")
     plan = _validate_plan(

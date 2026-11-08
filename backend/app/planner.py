@@ -521,6 +521,15 @@ _SUCCESS_WORD_RE = re.compile(r"\b(sent|delivered|successfully|success)\b", re.I
 _FAILURE_WORD_RE = re.compile(
     r"\b(not|never|unable|cannot|can't|couldn't|failed|blocked|incomplete)\b", re.IGNORECASE
 )
+# A final answer that itself reports an unperformed action (read-only field,
+# discarded value, failed save) must not be rendered as "Mission Completed".
+_SELF_REPORTED_BLOCKER_RE = re.compile(
+    r"(?:\b(?:cannot|can't|unable to|could not|couldn't|failed to)\b"
+    r"|\bread[- ]only\b"
+    r"|\bwas not (?:applied|saved|changed|submitted|performed)\b"
+    r"|\bno effect\b)",
+    re.IGNORECASE,
+)
 _HANDOFF_VERIFY = "waiting for user to complete CAPTCHA and log in"
 _HANDOFF_REASON = "Please solve the CAPTCHA / sign in manually in your browser, then click Continue."
 
@@ -827,6 +836,10 @@ def _guard_completion(
             )
     blocker = _detect_blocker(payload, history, instruction, plan.answer)
     if blocker is None:
+        if plan.answer and _SELF_REPORTED_BLOCKER_RE.search(plan.answer):
+            # Preserve the model's specific explanation, but mark the run
+            # incomplete so the loop never reports a false success.
+            return plan.model_copy(update={"blocked": True})
         return plan
     kind, reason = blocker
     if kind == "human" and not _handoff_recently(history):

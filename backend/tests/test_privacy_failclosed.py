@@ -149,6 +149,18 @@ def test_phone_formats_are_redacted():
     assert "today" in text
 
 
+def test_international_5_5_phone_numbers_are_redacted():
+    # Indian-style 5+5 layouts have an explicit country prefix, so they must be
+    # masked even though bare 10-digit runs (prices/order ids) stay untouched.
+    obs = make_obs()
+    obs.article_content = "Call +91 98765 43210; order NW-88213 costs 4860 today."
+    payload, _ = classify_and_redact(obs, instruction="call them")
+    text = payload.article_content or ""
+    assert "+91 98765 43210" not in text
+    assert "[REDACTED]" in text
+    assert "NW-88213" in text and "4860" in text and "today" in text
+
+
 class _ScriptedHub:
     """Minimal extension stand-in for the working-memory scrub test."""
 

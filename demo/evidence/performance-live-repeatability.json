@@ -1,0 +1,77 @@
+{
+  "environment": {
+    "browser": "Chrome/156.0.8078.80",
+    "node": "v24.22.2",
+    "provider": "groq",
+    "requestedProvider": "groq"
+  },
+  "instruction": "Open http://localhost:5180/ and find the customer Priya Nair. Tell me her city and the total of her most recent order. Then enter 'Called 2026-11-08' in the follow-up note field and click Save note.",
+  "trials": [
+    {
+      "trial": 1,
+      "taskId": "54676a61a105492ba74acfe83eb64e15",
+      "wallMs": 174944,
+      "taskState": "failed",
+      "stepsDone": 11,
+      "plannerMs": 19297,
+      "observeMs": 12,
+      "actMs": 12639,
+      "dashboardState": "failed",
+      "message": "Planner unavailable: Groq unavailable Gemini fallback also failed: PLAN_INVALID: Gemini returned non-JSON: Expecting property name enclosed in double quotes: line 3 column 101 (char 263)"
+    },
+    {
+      "trial": 2,
+      "taskId": "7da1cdbf9a9f4e61981867c1268b940f",
+      "wallMs": 240208,
+      "taskState": "running",
+      "stepsDone": 9,
+      "plannerMs": 4092,
+      "observeMs": 12,
+      "actMs": 9003,
+      "dashboardState": "running",
+      "message": "Step 9: type -> action exceeded 9000ms"
+    },
+    {
+      "trial": 3,
+      "taskId": "a6c805919c194575a213aa1b05838bab",
+      "wallMs": 240244,
+      "taskState": "running",
+      "stepsDone": 10,
+      "plannerMs": 8526,
+      "observeMs": 1393,
+      "actMs": 22185,
+      "dashboardState": "running",
+      "message": "Step 10: click -> clicking Search produced no visible change"
+    }
+  ],
+  "stats": {
+    "endToEndMs": {
+      "trials": 3,
+      "min": 174944,
+      "max": 240244,
+      "median": 240208,
+      "avg": 218465.3
+    },
+    "plannerMs": {
+      "trials": 3,
+      "min": 4092,
+      "max": 19297,
+      "median": 8526,
+      "avg": 10638.3
+    },
+    "observeMs": {
+      "trials": 3,
+      "min": 12,
+      "max": 1393,
+      "median": 12,
+      "avg": 472.3
+    },
+    "actMs": {
+      "trials": 3,
+      "min": 9003,
+      "max": 22185,
+      "median": 12639,
+      "avg": 14609
+    }
+  }
+}

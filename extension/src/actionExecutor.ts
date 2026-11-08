@@ -232,13 +232,47 @@ async function withAgent(tabId: number): Promise<AgentApi> {
 }
 
 const CONSOLE_PORTS = new Set(["5173", "4173"]);
+const DASHBOARD_MARKER = "data-navigator-dashboard";
 
-/** True for the NAVIGATOR console itself, which the agent must never drive. */
+function isLocalHost(url: string): boolean {
+  try {
+    const u = new URL(url);
+    return u.hostname === "localhost" || u.hostname === "127.0.0.1" || u.hostname === "[::1]";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Fast path for the conventional Vite ports. Port detection alone is not
+ * enough: Vite may auto-select any free port, so the authoritative check is
+ * the dashboard's own `data-navigator-dashboard` marker below.
+ */
 export function isConsoleUrl(url: string): boolean {
   try {
     const u = new URL(url);
-    return (u.hostname === "localhost" || u.hostname === "127.0.0.1" || u.hostname === "[::1]")
+    return isLocalHost(url)
       && CONSOLE_PORTS.has(u.port || (u.protocol === "https:" ? "443" : "80"));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Ask a page whether it is the NAVIGATOR dashboard. The marker is set by the
+ * dashboard's own HTML, so this works on any port/host and does not block
+ * unrelated localhost sites. Injection failures are treated as "not the
+ * dashboard" because privileged/blocked URLs are already excluded elsewhere.
+ */
+export async function isDashboardTab(tabId: number, url?: string): Promise<boolean> {
+  if (url !== undefined && isConsoleUrl(url)) return true;
+  try {
+    const [result] = await chrome.scripting?.executeScript({
+      target: { tabId },
+      func: (marker: string) => document.documentElement?.getAttribute(marker) === "1",
+      args: [DASHBOARD_MARKER],
+    }) ?? [];
+    return result?.result === true;
   } catch {
     return false;
   }
@@ -264,7 +298,7 @@ async function activeTab(): Promise<number | null> {
   const usable = (t: chrome.tabs.Tab) => t.id !== undefined && isDrivableTabUrl(t.url ?? "");
   // Prefer the tab the user is actually looking at.
   const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (active && usable(active)) {
+  if (active && usable(active) && !(await isDashboardTab(active.id!, active.url))) {
     return active.id!;
   }
   // Otherwise fall back to the most recently used permitted tab.
@@ -272,7 +306,10 @@ async function activeTab(): Promise<number | null> {
   const candidates = all
     .filter(usable)
     .sort((a, b) => (b.lastAccessed ?? 0) - (a.lastAccessed ?? 0));
-  return candidates[0]?.id ?? null;
+  for (const candidate of candidates) {
+    if (!(await isDashboardTab(candidate.id!, candidate.url))) return candidate.id!;
+  }
+  return null;
 }
 
 /**
@@ -493,6 +530,11 @@ export async function executeAction(action: BrowserAction, taskId: string): Prom
       case "select_date": return await doSelectDate(action, taskId);
       case "slider_adjust": return await doSliderAdjust(action, taskId);
       case "select_tab": {
+        const target = await chrome.tabs.get(action.params.tabId).catch(() => null);
+        if (target === null) return err("STALE_TARGET", "target tab no longer exists", true);
+        if (await isDashboardTab(action.params.tabId, target.url)) {
+          return err("PLAN_INVALID", "refusing to target the NAVIGATOR dashboard tab", false);
+        }
         await chrome.tabs.update(action.params.tabId, { active: true });
         await waitForStable(action.params.tabId, action.timeoutMs);
         return {
@@ -502,6 +544,10 @@ export async function executeAction(action: BrowserAction, taskId: string): Prom
         };
       }
       case "close_tab": {
+        const target = await chrome.tabs.get(action.params.tabId).catch(() => null);
+        if (target !== null && await isDashboardTab(action.params.tabId, target.url)) {
+          return err("PLAN_INVALID", "refusing to close the NAVIGATOR dashboard tab", false);
+        }
         await chrome.tabs.remove(action.params.tabId);
         const nextTabId = await getOrCreateActiveTab();
         return {
@@ -574,8 +620,9 @@ async function doNavigate(action: Extract<BrowserAction, { type: "navigate" }>):
   }
 
   const cur = existing !== null ? await chrome.tabs.get(existing).catch(() => null) : null;
+  const reusesDashboard = cur !== null && await isDashboardTab(existing!, cur.url);
   let targetTabId: number;
-  if (existing === null || (cur?.url && isConsoleUrl(cur.url))) {
+  if (existing === null || reusesDashboard || (cur?.url && isConsoleUrl(cur.url))) {
     // No usable tab (or only the dashboard): open the destination directly
     // instead of failing the mission before it starts.
     const newTab = await chrome.tabs.create({ url: p.url, active: true });
@@ -1414,14 +1461,20 @@ export async function observe(tabId: number): Promise<BrowserObservation> {
   let openTabs: TabInfo[] | undefined;
   try {
     const all = await chrome.tabs.query({});
-    openTabs = all
-      .filter(t => t.id !== undefined && isDrivableTabUrl(t.url ?? ""))
-      .map(t => ({
-        tabId: t.id!,
+    const visible: TabInfo[] = [];
+    for (const t of all) {
+      if (t.id === undefined || !isDrivableTabUrl(t.url ?? "")) continue;
+      // Only local tabs can be a dev-server dashboard; skip marker injection
+      // into unrelated remote pages during every observation.
+      if (isLocalHost(t.url ?? "") && await isDashboardTab(t.id, t.url)) continue;
+      visible.push({
+        tabId: t.id,
         url: t.url ?? "",
         title: t.title ?? "",
         active: Boolean(t.id === tabId || t.active),
-      }));
+      });
+    }
+    openTabs = visible;
   } catch {}
 
   return sanitizeObservation({

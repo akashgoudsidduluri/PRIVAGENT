@@ -97,6 +97,7 @@ NAVIGATOR is a privacy-first AI browser agent designed for the Smart India Hacka
 - **WebSocket guard**: `/ws/client` and `/ws/extension` close with policy code 1008 when the `Origin` is not allowlisted.
 - **Cancellation propagation**: `POST /api/task/{id}/cancel` sets a loop-level marker, wakes a pending confirmation, aborts any in-flight action result slot, and the loop checks the marker before planning, after confirmation, and after each execution. Terminal tasks are never rewritten. The UI replays a cancel that races task creation once the task id exists.
 - **Multi-browser routing (known limitation)**: There is no browser-identity handshake on `/ws/extension`. `Hub.send_action` sends each action and observation request to the newest live socket, falling back to older sockets only when a send fails. If several browsers or profiles are connected to one backend, the most recently connected instance receives the task, and a new connection mid-task can redirect later actions. Within the acting browser, tab targeting works normally (`select_tab`, active-tab observation). Deterministic runs require exactly one connected browser, or a freshly toggled extension socket. Per-task socket pinning is a future protocol change.
+- **Dashboard protection**: `index.html` and `agent.html` set `data-navigator-dashboard="1"`. Before selecting an active tab, reusing a tab for navigation, listing tabs, or executing `select_tab`/`close_tab`, the extension checks that marker in the page itself. The check is port-independent, so the dashboard stays protected when Vite auto-selects a port other than 5173/4173; unrelated localhost sites are not blocked. The conventional ports remain a fast-path hint only.
 
 ### F. Bounded Agent Loop & Latency
 - **Observation reuse**: a successful action's post-action observation is validated with Pydantic and reused for the next plan, removing one observe round trip per step. It is still re-run through `classify_and_redact()` every iteration, and is discarded after a failed action, a malformed payload, `select_tab`, or `close_tab`.
@@ -141,10 +142,12 @@ Executed via `backend/scripts/benchmark_eval.py` against the deterministic mock 
 | Suite | Command | Current result |
 |-------|---------|----------------|
 | Frontend | `npm test` | 25 checks (10 structure, 8 console, 7 sanitization) |
-| Extension | `cd extension && npm test` | 79 Vitest tests, 7 files |
+| Extension | `cd extension && npm test` | 83 Vitest tests, 7 files |
 | Extension types | `cd extension && npx tsc --noEmit` | clean |
-| Backend | `cd backend && venv\Scripts\python.exe -m pytest tests -q` | 144 tests |
-| Benchmark | `backend\venv\Scripts\python.exe backend/scripts/benchmark_eval.py` | 8/8 |
+| Backend | `cd backend && python -m pytest tests -q` | 151 tests |
+| Benchmark | `python backend/scripts/benchmark_eval.py` | 8/8 |
+
+Node.js `^22.22.2 || ^24.15.0 || >=26.0.0` is declared in both `package.json` files and verified on 24.22.2 LTS. Python dependencies install reproducibly from `backend/requirements.lock` with `pip install --require-hashes -r requirements.lock`.
 
 Provider selection (`NAVIGATOR_PROVIDER`, else auto-detected from keys, else `mock`):
 
@@ -153,4 +156,4 @@ Provider selection (`NAVIGATOR_PROVIDER`, else auto-detected from keys, else `mo
 - **Mock**: deterministic offline plans for tests and demos.
 - `GEMINI_MODEL` / `GROQ_MODEL` optionally override the primary model without editing code.
 
-API keys are read from `backend/.env` or the environment and are never logged or returned by an endpoint.
+A requested provider is not silently substituted. `config.resolve_provider()` produces `{requested, effective, fallback, reason}` and both the planner factory and `GET /api/health` consume it, so the advertised provider is always the one actually used. Health exposes `provider`, `requestedProvider`, `providerFallback`, and `providerFallbackReason`; explicit `mock` never falls back to a remote provider. API keys are read from `backend/.env` or the environment and are never logged or returned by an endpoint.

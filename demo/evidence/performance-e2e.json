@@ -1,0 +1,53 @@
+{
+  "environment": {
+    "browser": "Chrome/156.0.8078.80",
+    "node": "v24.22.2",
+    "provider": "groq",
+    "requestedProvider": "groq"
+  },
+  "instruction": "Open http://localhost:5180/ and find the customer Priya Nair. Tell me her city and the total of her most recent order. Then enter 'Called 2026-11-08' in the follow-up note field and click Save note.",
+  "trials": [
+    {
+      "trial": 1,
+      "taskId": "f7bda1b0c680457d85ca1e70e5133c1d",
+      "wallMs": 60587,
+      "taskState": "completed",
+      "stepsDone": 3,
+      "plannerMs": 51437,
+      "observeMs": 141,
+      "actMs": 421,
+      "dashboardState": "completed",
+      "message": "Priya Nair's city is Bengaluru, and the total of her most recent order is ₹4,860.00. The follow-up note 'Called 2026-11-08' has been entered and saved."
+    }
+  ],
+  "stats": {
+    "endToEndMs": {
+      "trials": 1,
+      "min": 60587,
+      "max": 60587,
+      "median": 60587,
+      "avg": 60587
+    },
+    "plannerMs": {
+      "trials": 1,
+      "min": 51437,
+      "max": 51437,
+      "median": 51437,
+      "avg": 51437
+    },
+    "observeMs": {
+      "trials": 1,
+      "min": 141,
+      "max": 141,
+      "median": 141,
+      "avg": 141
+    },
+    "actMs": {
+      "trials": 1,
+      "min": 421,
+      "max": 421,
+      "median": 421,
+      "avg": 421
+    }
+  }
+}

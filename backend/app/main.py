@@ -76,9 +76,13 @@ class TaskCreated(BaseModel):
 @app.get("/health")
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
+    selection = config.resolve_provider()
     return {
         "status": "ok",
-        "provider": config.PROVIDER,
+        "provider": selection["effective"],
+        "requestedProvider": selection["requested"],
+        "providerFallback": selection["fallback"],
+        "providerFallbackReason": selection["reason"],
         "extensionConnected": bool(hub.extension_sockets),
     }
 

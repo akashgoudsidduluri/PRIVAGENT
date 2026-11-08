@@ -1,0 +1,20 @@
+{
+  "taskId": "c3a872203f614d2db9bfd99262620b15",
+  "state": "failed",
+  "summary": "✗ Blocked / Failed · I was unable to set the Customer ID because the field is read‑only on the page, so it cannot be changed. Therefore the requested action cannot be completed.",
+  "steps": [
+    "🧭 [1] Step 1: navigate -> http://localhost:5180/readonly.html ↗",
+    "🖱️ [2] Step 2: click -> clicked Customer ID: CUST-1042",
+    "⚡ [2] I was unable to set the Customer ID because the field is read‑only on the page, so it cannot be changed. Therefore the requested action cannot be completed."
+  ],
+  "elapsedMs": 14763,
+  "taskState": "failed",
+  "message": "I was unable to set the Customer ID because the field is read‑only on the page, so it cannot be changed. Therefore the requested action cannot be completed.",
+  "stepsDone": 2,
+  "negativeFixture": {
+    "url": "http://localhost:5180/readonly.html",
+    "customerId": "CUST-1042",
+    "readOnly": true,
+    "status": ""
+  }
+}

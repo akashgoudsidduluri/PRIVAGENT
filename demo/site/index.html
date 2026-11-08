@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Northwind Demo CRM (Synthetic Data)</title>
+  <style>
+    :root { color-scheme: light; --ink:#172033; --muted:#5b6475; --line:#d9dee8; --accent:#1f5eff; --good:#0d7a4a; }
+    * { box-sizing: border-box; }
+    body { margin:0; font:15px/1.5 system-ui, Segoe UI, sans-serif; color:var(--ink); background:#f4f6fb; }
+    header { padding:22px 28px; background:#101a33; color:#fff; }
+    header h1 { margin:0; font-size:20px; }
+    header p { margin:4px 0 0; color:#b9c4dc; font-size:13px; }
+    main { max-width:1050px; margin:26px auto; padding:0 20px 60px; }
+    .card { background:#fff; border:1px solid var(--line); border-radius:12px; padding:20px; margin-bottom:18px; }
+    .toolbar { display:flex; flex-wrap:wrap; gap:12px; align-items:end; }
+    label { display:block; font-size:12px; font-weight:600; color:var(--muted); margin-bottom:4px; }
+    input, button { font:inherit; padding:9px 11px; border:1px solid #b8c1d4; border-radius:8px; background:#fff; }
+    button { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; cursor:pointer; }
+    button.secondary { background:#fff; color:var(--ink); border-color:#b8c1d4; }
+    table { width:100%; border-collapse:collapse; margin-top:16px; font-size:14px; }
+    th, td { text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+    th { font-size:12px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#e8f4ee; color:var(--good); font-size:12px; font-weight:600; }
+    .tip { position:relative; border-bottom:1px dotted #7b8497; cursor:help; }
+    .tip span { position:absolute; left:0; bottom:130%; width:230px; padding:8px 10px; border-radius:8px; background:#101a33; color:#fff; font-size:12px; line-height:1.4; opacity:0; pointer-events:none; transition:opacity .12s; z-index:5; }
+    .tip:hover span, .tip:focus span { opacity:1; }
+    .notice { margin-top:12px; font-size:13px; color:var(--muted); }
+    .saved { color:var(--good); font-weight:600; }
+    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:end; }
+    .row > div { flex:1 1 220px; }
+    .banner { padding:8px 12px; border-radius:8px; background:#fff4d6; border:1px solid #ecd28a; font-size:13px; margin-bottom:16px; }
+    .readonly-note { color:#9a3412; font-size:13px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Northwind Demo CRM</h1>
+    <p>Synthetic customer records for PrivAgent demonstration. All names, contacts, and payments are fictional.</p>
+  </header>
+  <main>
+    <div class="banner">Synthetic data only — no real customer information is present on this page.</div>
+
+    <section class="card">
+      <h2>Customer search</h2>
+      <form id="search-form" class="toolbar">
+        <div style="flex:2 1 280px">
+          <label for="q">Search customers</label>
+          <input id="q" name="q" type="search" placeholder="Try Priya Nair, Bengaluru, or an order number" autocomplete="off" />
+        </div>
+        <div>
+          <label for="since">Orders since</label>
+          <input id="since" name="since" type="date" />
+        </div>
+        <button type="submit">Search</button>
+        <button type="button" class="secondary" id="reset">Reset</button>
+      </form>
+      <div class="notice" id="count" aria-live="polite"></div>
+    </section>
+
+    <section class="card">
+      <h2>Records</h2>
+      <table id="customers">
+        <thead>
+          <tr><th>Customer</th><th>City</th><th>Contact</th><th>Latest order</th><th>Status</th></tr>
+        </thead>
+        <tbody>
+          <tr data-date="2026-11-06">
+            <td><strong>Priya Nair</strong><br /><span class="readonly-note">Account NW-1042</span></td>
+            <td>Bengaluru</td>
+            <td>priya.nair@example.com<br />+91 98765 43210<br />Card 4111 1111 1111 1111<br />SSN 123-45-6789</td>
+            <td>NW-88213<br />2026-11-06<br />₹4,860.00</td>
+            <td><span class="pill">Delivered</span></td>
+          </tr>
+          <tr data-date="2026-10-29">
+            <td><strong>Arun Mehta</strong><br /><span class="readonly-note">Account NW-1043</span></td>
+            <td>Pune</td>
+            <td>arun.mehta@example.com<br />+91 91234 56789<br />Card 5500 0000 0000 0004<br />SSN 987-65-4321</td>
+            <td>NW-88190<br />2026-10-29<br />₹1,275.50</td>
+            <td><span class="tip" tabindex="0">In transit<span>Handed to the courier on 2026-10-30. Expected in Pune within two business days.</span></span></td>
+          </tr>
+          <tr data-date="2026-09-18">
+            <td><strong>Meera Iyer</strong><br /><span class="readonly-note">Account NW-1044</span></td>
+            <td>Chennai</td>
+            <td>meera.iyer@example.com<br />+91 99887 76655<br />Card 4242 4242 4242 4242<br />SSN 555-12-3456</td>
+            <td>NW-88144<br />2026-09-18<br />₹8,940.00</td>
+            <td><span class="pill">Delivered</span></td>
+          </tr>
+          <tr data-date="2026-08-02">
+            <td><strong>Rahul Das</strong><br /><span class="readonly-note">Account NW-1045</span></td>
+            <td>Kolkata</td>
+            <td>rahul.das@example.com<br />+91 90000 11111<br />Card 4000 0566 5566 5556<br />SSN 321-54-9876</td>
+            <td>NW-88002<br />2026-08-02<br />₹2,310.00</td>
+            <td><span class="tip" tabindex="0">Returned<span>Returned by the customer on 2026-08-09; refund issued to the original payment method.</span></span></td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="notice" id="empty" hidden>No matching records.</div>
+    </section>
+
+    <section class="card">
+      <h2>Follow-up note</h2>
+      <div class="row">
+        <div>
+          <label for="note">Note for Priya Nair</label>
+          <input id="note" name="note" type="text" placeholder="Add a follow-up note" />
+        </div>
+        <button type="button" id="save">Save note</button>
+      </div>
+      <div class="notice" id="saved" aria-live="polite"></div>
+    </section>
+  </main>
+
+  <script>
+    const rows = [...document.querySelectorAll("#customers tbody tr")];
+    const q = document.getElementById("q");
+    const since = document.getElementById("since");
+    const count = document.getElementById("count");
+    const empty = document.getElementById("empty");
+
+    function applyFilters() {
+      const terms = q.value.toLowerCase().split(/\s+/).filter(t => t.length > 2);
+      const after = since.value ? new Date(since.value + "T00:00:00") : null;
+      let shown = 0;
+      for (const row of rows) {
+        const text = row.textContent.toLowerCase();
+        const date = new Date(row.dataset.date + "T00:00:00");
+        const matchText = terms.length === 0 || terms.some(t => text.includes(t));
+        const matchDate = !after || date >= after;
+        const visible = matchText && matchDate;
+        row.hidden = !visible;
+        if (visible) shown++;
+      }
+      count.textContent = `${shown} of ${rows.length} records shown.`;
+      empty.hidden = shown !== 0;
+    }
+
+    document.getElementById("search-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      applyFilters();
+    });
+    q.addEventListener("input", applyFilters);
+    since.addEventListener("change", applyFilters);
+    document.getElementById("reset").addEventListener("click", () => {
+      q.value = "";
+      since.value = "";
+      applyFilters();
+      document.getElementById("saved").textContent = "";
+    });
+    document.getElementById("save").addEventListener("click", () => {
+      const note = document.getElementById("note");
+      document.getElementById("saved").textContent = note.value.trim()
+        ? `Saved note: ${note.value.trim()}`
+        : "Enter a note before saving.";
+    });
+    applyFilters();
+  </script>
+</body>
+</html>

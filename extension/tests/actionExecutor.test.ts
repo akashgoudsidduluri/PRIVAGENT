@@ -5,6 +5,7 @@ import {
   getOrCreateActiveTab,
   isBlockedUrl,
   isConsoleUrl,
+  isDashboardTab,
   isDrivableTabUrl,
   isPageSettled,
   observe,
@@ -166,6 +167,77 @@ describe("drivable tab URLs", () => {
 
   it("keeps about:blank invalid as a navigation target", () => {
     expect(isBlockedUrl("about:blank")).toBe(true);
+  });
+});
+
+describe("dashboard identity marker", () => {
+  it("recognizes the dashboard on conventional and auto-assigned ports", async () => {
+    for (const port of [5173, 4173, 5190]) {
+      const executeScript = vi.fn(async () => [{ result: true }]);
+      vi.stubGlobal("chrome", { scripting: { executeScript } });
+      await expect(isDashboardTab(1, `http://localhost:${port}/agent.html`)).resolves.toBe(true);
+      if (port !== 5173 && port !== 4173) {
+        expect(executeScript).toHaveBeenCalledOnce();
+      }
+    }
+  });
+
+  it("does not treat an unrelated local page as the dashboard", async () => {
+    vi.stubGlobal("chrome", {
+      scripting: { executeScript: vi.fn(async () => [{ result: false }]) },
+    });
+    await expect(isDashboardTab(2, "http://localhost:5190/shop")).resolves.toBe(false);
+    await expect(isDashboardTab(3, "https://example.com/")).resolves.toBe(false);
+  });
+
+  it("skips a marked dashboard when choosing the active tab", async () => {
+    const tabs = [
+      { id: 1, url: "http://localhost:5190/agent.html", lastAccessed: 200 },
+      { id: 2, url: "https://example.com/", lastAccessed: 100 },
+    ];
+    const create = vi.fn(async () => ({ id: 99, url: "about:blank" }));
+    vi.stubGlobal("chrome", {
+      tabs: {
+        query: vi.fn(async (q: chrome.tabs.QueryInfo) => (q.active ? [tabs[0]] : tabs)),
+        create,
+      },
+      scripting: {
+        executeScript: vi.fn(async ({ target }: { target: { tabId: number } }) => [
+          { result: target.tabId === 1 },
+        ]),
+      },
+    });
+
+    await expect(getOrCreateActiveTab()).resolves.toBe(2);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("rejects select_tab and close_tab targeting the dashboard", async () => {
+    const update = vi.fn();
+    const remove = vi.fn();
+    vi.stubGlobal("chrome", {
+      tabs: {
+        get: vi.fn(async (id: number) => ({ id, url: "http://localhost:5190/agent.html" })),
+        update,
+        remove,
+      },
+      scripting: { executeScript: vi.fn(async () => [{ result: true }]) },
+    });
+
+    for (const type of ["select_tab", "close_tab"] as const) {
+      const action = {
+        type,
+        params: { tabId: 1 },
+        risk: type === "close_tab" ? "write" : "read",
+        verify: "tab is active",
+        timeoutMs: 1000,
+      } as BrowserAction;
+      const result = await executeAction(action, "task-1");
+      expect(result.ok).toBe(false);
+      expect(result.error?.code).toBe("PLAN_INVALID");
+    }
+    expect(update).not.toHaveBeenCalled();
+    expect(remove).not.toHaveBeenCalled();
   });
 });
 

@@ -873,21 +873,19 @@ def _live_observation_factory(record: TaskRecord) -> _LiveObservation:
 
 
 def _provider_for_config():
-    """Pick a planner provider. Explicit mock wins even with keys present."""
+    """Pick the planner provider reported by ``config.resolve_provider()``.
+
+    Explicit mock wins even with keys present. A remote provider without its
+    key falls back exactly as health reports it, so the planner used here and
+    the provider advertised by ``/api/health`` can never disagree.
+    """
     from . import config
     from .providers.mock import MockProvider
-    if config.PROVIDER == "mock":
-        return MockProvider()
-    if config.PROVIDER == "groq" and config.GROQ_API_KEY:
+    effective = config.resolve_provider()["effective"]
+    if effective == "groq":
         from .providers.groq import GroqProvider
         return GroqProvider(api_key=config.GROQ_API_KEY)
-    if config.PROVIDER == "gemini" and config.GEMINI_API_KEY:
-        from .providers.gemini import GeminiProvider
-        return GeminiProvider(api_key=config.GEMINI_API_KEY)
-    if config.GROQ_API_KEY:
-        from .providers.groq import GroqProvider
-        return GroqProvider(api_key=config.GROQ_API_KEY)
-    if config.GEMINI_API_KEY:
+    if effective == "gemini":
         from .providers.gemini import GeminiProvider
         return GeminiProvider(api_key=config.GEMINI_API_KEY)
     return MockProvider()

@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from app import agentLoop, privacy
+from app import agentLoop, config, privacy
 from app.agentLoop import (
     _auto_complete_after_send,
     _is_auth_url,
@@ -410,6 +410,48 @@ def test_explicit_mock_provider_wins_over_api_keys(monkeypatch):
     monkeypatch.setattr(agentLoop.config, "GROQ_API_KEY", "present-but-ignored", raising=False)
     monkeypatch.setattr(agentLoop.config, "GEMINI_API_KEY", "present-but-ignored", raising=False)
     assert isinstance(agentLoop._provider_for_config(), MockProvider)
+
+
+def test_requested_provider_falls_back_to_available_key(monkeypatch):
+    monkeypatch.setattr(config, "PROVIDER", "groq", raising=False)
+    monkeypatch.setattr(config, "GROQ_API_KEY", "", raising=False)
+    monkeypatch.setattr(config, "GEMINI_API_KEY", "present-but-secret", raising=False)
+    selection = config.resolve_provider()
+    assert selection["requested"] == "groq"
+    assert selection["effective"] == "gemini"
+    assert selection["fallback"] is True
+    assert "present-but-secret" not in str(selection)
+
+
+def test_requested_remote_provider_without_keys_reports_mock(monkeypatch):
+    monkeypatch.setattr(config, "PROVIDER", "groq", raising=False)
+    monkeypatch.setattr(config, "GROQ_API_KEY", "", raising=False)
+    monkeypatch.setattr(config, "GEMINI_API_KEY", "", raising=False)
+    selection = config.resolve_provider()
+    assert selection["effective"] == "mock"
+    assert selection["fallback"] is True
+    assert "groq" in str(selection["reason"])
+
+
+def test_health_reports_effective_provider_and_fallback(monkeypatch):
+    monkeypatch.setattr(config, "PROVIDER", "groq", raising=False)
+    monkeypatch.setattr(config, "GROQ_API_KEY", "", raising=False)
+    monkeypatch.setattr(config, "GEMINI_API_KEY", "", raising=False)
+    body = TestClient(app).get("/api/health").json()
+    assert body["provider"] == "mock"
+    assert body["requestedProvider"] == "groq"
+    assert body["providerFallback"] is True
+    assert body["providerFallbackReason"]
+
+
+def test_health_reports_explicit_mock_without_fallback(monkeypatch):
+    monkeypatch.setattr(config, "PROVIDER", "mock", raising=False)
+    monkeypatch.setattr(config, "GROQ_API_KEY", "present-but-ignored", raising=False)
+    body = TestClient(app).get("/api/health").json()
+    assert body["provider"] == "mock"
+    assert body["requestedProvider"] == "mock"
+    assert body["providerFallback"] is False
+    assert "present-but-ignored" not in str(body)
 
 
 def test_timeout_is_not_retried_for_non_idempotent_actions():

@@ -1,0 +1,31 @@
+{
+  "kind": "micro-benchmark",
+  "note": "Cold startup is a fresh Python process importing app.main; sanitization and mock planner are in-process loops.",
+  "environment": {
+    "python": "3.13.7",
+    "platform": "win32",
+    "sanitizeIterations": 300,
+    "providerIterations": 300
+  },
+  "startupImportMs": {
+    "trials": 5,
+    "min": 647.568,
+    "max": 964.297,
+    "median": 945.726,
+    "avg": 834.555
+  },
+  "sanitizationMs": {
+    "trials": 300,
+    "min": 0.284,
+    "max": 1.022,
+    "median": 0.386,
+    "avg": 0.411
+  },
+  "mockProviderPlanMs": {
+    "trials": 300,
+    "min": 0.002,
+    "max": 0.03,
+    "median": 0.003,
+    "avg": 0.003
+  }
+}

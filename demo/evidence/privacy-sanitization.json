@@ -1,0 +1,67 @@
+{
+  "kind": "privacy-pipeline-replay",
+  "note": "Synthetic fixture values replayed through the real backend classify_and_redact(); not a live capture.",
+  "sourceFixture": "demo/site/index.html",
+  "decision": {
+    "send": true,
+    "reason": "redaction succeeded",
+    "violations": []
+  },
+  "elements": {
+    "original": 3,
+    "sent": 3,
+    "screenshotWithheld": true
+  },
+  "before": {
+    "url": "https://crm.example/records?email=priya.nair@example.com&access_token=sk_live_9f8e7d6c5b4a3210&tab=orders",
+    "title": "Northwind CRM - priya.nair@example.com - 4111 1111 1111 1111",
+    "elementValues": [
+      "Priya Nair",
+      "4111 1111 1111 1111",
+      "S3cret!pass"
+    ],
+    "tabs": [
+      {
+        "tabId": 7,
+        "url": "https://crm.example/records?sessionid=abc123secret&user=priya.nair@example.com",
+        "title": "Northwind CRM - +91 98765 43210",
+        "active": true
+      }
+    ]
+  },
+  "after": {
+    "url": "https://crm.example/records?email=[REDACTED]&access_token=[REDACTED]&tab=orders",
+    "title": "Northwind CRM - [REDACTED] - [REDACTED]",
+    "elementValues": [
+      "Priya Nair",
+      null,
+      null
+    ],
+    "tabs": [
+      {
+        "tabId": 7,
+        "url": "https://crm.example/records?sessionid=[REDACTED]&user=[REDACTED]",
+        "title": "Northwind CRM - [REDACTED]",
+        "active": true
+      }
+    ],
+    "articleContent": "Customer Priya Nair ([REDACTED], [REDACTED]) paid with card [REDACTED] and SSN [REDACTED]. API key [REDACTED] must never leave the browser. [REDACTED] is also present in this synthetic note. Latest order total is 4860.",
+    "tableRows": [
+      "Priya Nair | Bengaluru | [REDACTED] | [REDACTED] | Card [REDACTED] | SSN [REDACTED]",
+      "Order NW-88213 | 2026-11-06 | 4860.00"
+    ],
+    "overlayText": "Signed in as [REDACTED]. Session token: [REDACTED]"
+  },
+  "residualLeakChecks": {
+    "email": false,
+    "phone": false,
+    "card": false,
+    "ssn": false,
+    "api_key": false,
+    "password_value": false,
+    "session_token": false,
+    "url_token": false,
+    "credential_prose": false
+  },
+  "allSensitiveValuesRedacted": true
+}
