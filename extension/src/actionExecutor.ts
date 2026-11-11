@@ -20,6 +20,7 @@ interface AgentElement {
   enabled: boolean;
   visible: boolean;
   bounds?: { x: number; y: number; width: number; height: number };
+  href?: string;
 }
 
 interface AgentApi {
@@ -28,12 +29,13 @@ interface AgentApi {
   clickCoords: (x: number, y: number) => Promise<{ ok: boolean; targetId?: string; error?: string }>;
   getCoords: (targetId: string, name?: string) => Promise<{ x: number; y: number; width: number; height: number } | null>;
   clickPoint: (targetId: string, name?: string) => Promise<{ x: number; y: number; width: number; height: number } | null>;
-  type: (targetId: string, text: string, clear: boolean, name?: string) => Promise<{ ok: boolean; error?: string }>;
+  type: (targetId: string, text: string, clear?: boolean, name?: string) => Promise<{ ok: boolean; error?: string }>;
   submit: (targetId: string, name?: string) => Promise<{ ok: boolean; error?: string }>;
   scroll: (d: "up" | "down" | "top" | "bottom", containerId?: string) => Promise<{ ok: boolean; scrollY: number }>;
+  extractText: (maxLen?: number) => Promise<string>;
 }
 
-async function withAgent(tabId: number): Promise<AgentApi> {
+export async function withAgent(tabId: number): Promise<AgentApi> {
   // Reuse the content script when it is already injected. Re-injecting the
   // whole bundle on every list/click/observe added a measurable round trip to
   // each step; a cheap presence probe is enough, and `list()` re-registers
@@ -67,7 +69,7 @@ async function withAgent(tabId: number): Promise<AgentApi> {
         target: { tabId },
         func: (id: string, nm?: string) =>
           (window as unknown as { __navigatorAgent?: { getCoords: (i: string, n?: string) => { x: number; y: number; width: number; height: number } | null } }).__navigatorAgent?.getCoords(id, nm) ?? null,
-        args: [targetId, name ?? ""],
+        args: [targetId ?? "", name ?? ""],
       });
       return (r?.result as { x: number; y: number; width: number; height: number } | null) ?? null;
     },
@@ -76,7 +78,7 @@ async function withAgent(tabId: number): Promise<AgentApi> {
         target: { tabId },
         func: (id: string, nm?: string) =>
           (window as unknown as { __navigatorAgent?: { getClickPoint: (i: string, n?: string) => { x: number; y: number; width: number; height: number } | null } }).__navigatorAgent?.getClickPoint(id, nm) ?? null,
-        args: [targetId, name ?? ""],
+        args: [targetId ?? "", name ?? ""],
       });
       return (r?.result as { x: number; y: number; width: number; height: number } | null) ?? null;
     },
@@ -84,11 +86,14 @@ async function withAgent(tabId: number): Promise<AgentApi> {
       const [r] = await chrome.scripting.executeScript({
         target: { tabId },
         func: (id: string, nm?: string) => (window as unknown as { __navigatorAgent?: { click: (i: string, n?: string) => { ok: boolean; error?: string } } }).__navigatorAgent?.click(id, nm) ?? { ok: false, error: "no agent" },
-        args: [targetId, name ?? ""],
+        args: [targetId ?? "", name ?? ""],
       });
       return (r?.result as { ok: boolean; error?: string }) ?? { ok: false, error: "execution failed" };
     },
     clickCoords: async (x: number, y: number) => {
+      if (typeof x !== "number" || typeof y !== "number" || !Number.isFinite(x) || !Number.isFinite(y)) {
+        return { ok: false, error: "invalid coordinates" };
+      }
       const [r] = await chrome.scripting.executeScript({
         target: { tabId },
         func: (cx: number, cy: number) => (window as unknown as { __navigatorAgent?: { clickCoords: (px: number, py: number) => { ok: boolean; targetId?: string; error?: string } } }).__navigatorAgent?.clickCoords(cx, cy) ?? { ok: false, error: "no agent" },
@@ -96,12 +101,12 @@ async function withAgent(tabId: number): Promise<AgentApi> {
       });
       return (r?.result as { ok: boolean; targetId?: string; error?: string }) ?? { ok: false, error: "execution failed" };
     },
-    type: async (targetId: string, text: string, clear: boolean, name?: string) => {
+    type: async (targetId: string, text: string, clear?: boolean, name?: string) => {
       const [r] = await chrome.scripting.executeScript({
         target: { tabId },
         func: (id: string, val: string, cl: boolean, nm?: string) =>
           (window as unknown as { __navigatorAgent?: { type: (i: string, v: string, c: boolean, n?: string) => { ok: boolean; error?: string } } }).__navigatorAgent?.type(id, val, cl, nm) ?? { ok: false, error: "no agent" },
-        args: [targetId, text, clear, name ?? ""],
+        args: [targetId ?? "", text ?? "", Boolean(clear ?? true), name ?? ""],
       });
       return (r?.result as { ok: boolean; error?: string }) ?? { ok: false, error: "execution failed" };
     },
@@ -110,7 +115,7 @@ async function withAgent(tabId: number): Promise<AgentApi> {
         target: { tabId },
         func: (id: string, nm?: string) =>
           (window as unknown as { __navigatorAgent?: { submit: (i: string, n?: string) => { ok: boolean; error?: string } } }).__navigatorAgent?.submit(id, nm) ?? { ok: false, error: "no agent" },
-        args: [targetId, name ?? ""],
+        args: [targetId ?? "", name ?? ""],
       });
       return (r?.result as { ok: boolean; error?: string }) ?? { ok: false, error: "execution failed" };
     },
@@ -118,9 +123,19 @@ async function withAgent(tabId: number): Promise<AgentApi> {
       const [r] = await chrome.scripting.executeScript({
         target: { tabId },
         func: (dir: string, cid?: string) => (window as unknown as { __navigatorAgent?: { scroll: (d: any, c?: string) => { ok: boolean; scrollY: number } } }).__navigatorAgent?.scroll(dir as any, cid) ?? { ok: false, scrollY: 0 },
-        args: [direction, containerId ?? ""],
+        args: [direction ?? "down", containerId ?? ""],
       });
       return (r?.result as { ok: boolean; scrollY: number }) ?? { ok: false, scrollY: 0 };
+    },
+    extractText: async (maxLen = 3000) => {
+      const limit = typeof maxLen === "number" && Number.isFinite(maxLen) ? Math.max(100, maxLen) : 3000;
+      const [r] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: (lim: number) =>
+          (window as unknown as { __navigatorAgent?: { extractText?: (m?: number) => string } }).__navigatorAgent?.extractText?.(lim) ?? "",
+        args: [limit],
+      });
+      return (r?.result as string) ?? "";
     },
   };
 }
@@ -156,13 +171,21 @@ export function isDrivableTabUrl(url: string): boolean {
 
 async function activeTab(): Promise<number | null> {
   const usable = (t: chrome.tabs.Tab) => t.id !== undefined && isDrivableTabUrl(t.url ?? "");
-  // Prefer the tab the user is actually looking at.
-  const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (active && usable(active)) {
-    return active.id!;
-  }
+  // Prefer the tab in the last focused window, then any active tab
+  try {
+    const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    if (active && usable(active)) {
+      return active.id!;
+    }
+  } catch {}
+  try {
+    const [active] = await chrome.tabs.query({ active: true });
+    if (active && usable(active)) {
+      return active.id!;
+    }
+  } catch {}
   // Otherwise fall back to the most recently used permitted tab.
-  const all = await chrome.tabs.query({});
+  const all = await chrome.tabs.query({}).catch(() => [] as chrome.tabs.Tab[]);
   const candidates = all
     .filter(usable)
     .sort((a, b) => (b.lastAccessed ?? 0) - (a.lastAccessed ?? 0));
@@ -179,14 +202,226 @@ async function activeTab(): Promise<number | null> {
 export async function getOrCreateActiveTab(defaultUrl = "about:blank"): Promise<number> {
   const existing = await activeTab();
   if (existing !== null) return existing;
-  const created = await chrome.tabs.create({ url: defaultUrl, active: true });
-  if (created.id === undefined) {
+  let tabId: number | undefined;
+  try {
+    const created = await chrome.tabs.create({ url: defaultUrl, active: true });
+    tabId = created.id;
+  } catch {
+    try {
+      const win = await chrome.windows.create({ url: defaultUrl, focused: true });
+      tabId = win?.tabs?.[0]?.id;
+    } catch {}
+  }
+  if (tabId === undefined) {
+    const win = await chrome.windows.create({ url: defaultUrl, focused: true });
+    tabId = win?.tabs?.[0]?.id;
+  }
+  if (tabId === undefined) {
     throw new Error("could not create a browser tab");
   }
   if (defaultUrl !== "about:blank") {
-    await waitForStable(created.id, 5000, defaultUrl);
+    await waitForStable(tabId, 5000, defaultUrl);
   }
-  return created.id;
+  return tabId;
+}
+
+export interface ExtensionSession {
+  sessionId: string;
+  primaryTabId: number;
+  activeTabId?: number;
+  childTabIds: Set<number>;
+  origin: "new_task" | "existing_user_tab" | "reused_session";
+  createdAt: number;
+  lastActivityAt: number;
+}
+
+export const extensionSessions = new Map<string, ExtensionSession>();
+
+export function clearExtensionSessions(): void {
+  extensionSessions.clear();
+}
+
+if (typeof chrome !== "undefined" && chrome?.tabs?.onRemoved?.addListener) {
+  try {
+    chrome.tabs.onRemoved.addListener((tabId) => {
+      for (const sess of extensionSessions.values()) {
+        if (sess.childTabIds.has(tabId)) {
+          sess.childTabIds.delete(tabId);
+        }
+      }
+    });
+  } catch {}
+}
+
+export async function initSession(params: {
+  sessionId: string;
+  useExistingTab?: boolean;
+  tabHint?: string;
+  tabId?: number;
+}): Promise<ActionResult & { primaryTabId?: number }> {
+  const { sessionId, useExistingTab, tabHint, tabId } = params;
+
+  if (extensionSessions.has(sessionId)) {
+    const existing = extensionSessions.get(sessionId)!;
+    existing.lastActivityAt = Date.now();
+    return {
+      ok: true,
+      evidence: `session ${sessionId} resumed with primaryTabId ${existing.primaryTabId}`,
+      primaryTabId: existing.primaryTabId,
+    };
+  }
+
+  let resolvedTabId: number | undefined;
+
+  if (useExistingTab) {
+    const all = await chrome.tabs.query({}).catch(() => [] as chrome.tabs.Tab[]);
+    const drivable = all.filter(t => t.id !== undefined && isDrivableTabUrl(t.url ?? ""));
+
+    if (tabId !== undefined) {
+      const match = drivable.find(t => t.id === tabId);
+      if (!match) {
+        return {
+          ok: false,
+          error: { code: "TAB_UNAVAILABLE", message: `Specified tab ${tabId} not found or not drivable`, recoverable: false },
+        };
+      }
+      resolvedTabId = tabId;
+    } else if (tabHint) {
+      const hintLower = tabHint.toLowerCase().trim();
+      const matchingTabs = drivable.filter(t => {
+        const u = (t.url ?? "").toLowerCase();
+        const title = (t.title ?? "").toLowerCase();
+        return u.includes(hintLower) || title.includes(hintLower);
+      });
+      if (matchingTabs.length === 0) {
+        return {
+          ok: false,
+          error: { code: "TAB_UNAVAILABLE", message: `No active tab matches hint "${tabHint}"`, recoverable: false },
+        };
+      }
+      if (matchingTabs.length > 1) {
+        return {
+          ok: false,
+          error: { code: "AMBIGUOUS_TAB", message: `Multiple tabs match hint "${tabHint}" (${matchingTabs.length} found)`, recoverable: false },
+        };
+      }
+      resolvedTabId = matchingTabs[0].id!;
+    } else {
+      const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => [] as chrome.tabs.Tab[]);
+      if (active && active.id !== undefined && isDrivableTabUrl(active.url ?? "")) {
+        resolvedTabId = active.id;
+      } else {
+        const activeTabs = drivable.filter(t => t.active);
+        if (activeTabs.length === 1) {
+          resolvedTabId = activeTabs[0].id!;
+        } else {
+          return {
+            ok: false,
+            error: { code: "AMBIGUOUS_TAB", message: "Cannot uniquely identify active user tab. Specify a tab hint.", recoverable: false },
+          };
+        }
+      }
+    }
+  } else {
+    try {
+      const created = await chrome.tabs.create({ url: "about:blank", active: true });
+      resolvedTabId = created.id;
+    } catch {
+      try {
+        const win = await chrome.windows.create({ url: "about:blank", focused: true });
+        resolvedTabId = win?.tabs?.[0]?.id;
+      } catch {}
+    }
+  }
+
+  if (resolvedTabId === undefined) {
+    return {
+      ok: false,
+      error: { code: "TAB_UNAVAILABLE", message: "Failed to allocate or find a browser tab for session", recoverable: false },
+    };
+  }
+
+  const session: ExtensionSession = {
+    sessionId,
+    primaryTabId: resolvedTabId,
+    childTabIds: new Set<number>(),
+    origin: useExistingTab ? "existing_user_tab" : "new_task",
+    createdAt: Date.now(),
+    lastActivityAt: Date.now(),
+  };
+  extensionSessions.set(sessionId, session);
+
+  return {
+    ok: true,
+    evidence: `session ${sessionId} initialized with primaryTabId ${resolvedTabId}`,
+    primaryTabId: resolvedTabId,
+  };
+}
+
+export async function resolveSessionTab(
+  action: BrowserAction,
+): Promise<{ tabId: number } | ActionResult> {
+  const sessionId = action.sessionId;
+  const explicitTabId = action.tabId;
+
+  if (sessionId) {
+    const session = extensionSessions.get(sessionId);
+    if (!session) {
+      return {
+        ok: false,
+        error: { code: "TAB_UNAUTHORIZED", message: `Session ${sessionId} is unknown or expired`, recoverable: false },
+      };
+    }
+
+    session.lastActivityAt = Date.now();
+    let targetId = explicitTabId;
+    if (targetId === undefined) {
+      if (session.activeTabId !== undefined && (session.activeTabId === session.primaryTabId || session.childTabIds.has(session.activeTabId))) {
+        targetId = session.activeTabId;
+      } else {
+        targetId = session.primaryTabId;
+      }
+    }
+
+    if (targetId !== session.primaryTabId && !session.childTabIds.has(targetId)) {
+      return {
+        ok: false,
+        error: {
+          code: "TAB_UNAUTHORIZED",
+          message: `Tab ${targetId} is not pinned or authorized for session ${sessionId}`,
+          recoverable: false,
+        },
+      };
+    }
+
+    const tab = await chrome.tabs.get(targetId).catch(() => null);
+    if (!tab || !isDrivableTabUrl(tab.url ?? "")) {
+      return {
+        ok: false,
+        error: {
+          code: "TAB_UNAVAILABLE",
+          message: `Pinned tab ${targetId} is closed or unavailable`,
+          recoverable: false,
+        },
+      };
+    }
+
+    return { tabId: targetId };
+  }
+
+  if (explicitTabId !== undefined) {
+    const tab = await chrome.tabs.get(explicitTabId).catch(() => null);
+    if (!tab || !isDrivableTabUrl(tab.url ?? "")) {
+      return {
+        ok: false,
+        error: { code: "TAB_UNAVAILABLE", message: `Tab ${explicitTabId} not available`, recoverable: false },
+      };
+    }
+    return { tabId: explicitTabId };
+  }
+
+  const defaultTab = await getOrCreateActiveTab();
+  return { tabId: defaultTab };
 }
 
 
@@ -264,8 +499,10 @@ async function pageStatus(tabId: number): Promise<PageSettlement | null> {
  * promise; callers then fall back to waitForStable().
  */
 async function settleDom(tabId: number, quietMs = 120, maxMs = 700): Promise<void> {
-  const quiet = Math.max(30, quietMs);
-  const cap = Math.max(quiet, maxMs);
+  const qVal = typeof quietMs === "number" && Number.isFinite(quietMs) ? quietMs : 120;
+  const mVal = typeof maxMs === "number" && Number.isFinite(maxMs) ? maxMs : 700;
+  const quiet = Math.max(30, qVal);
+  const cap = Math.max(quiet, mVal);
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
@@ -312,33 +549,67 @@ async function settleDom(tabId: number, quietMs = 120, maxMs = 700): Promise<voi
   }
 }
 
+async function detectNewTab(tabId: number, tabIdsBefore: Set<number>, windowId?: number): Promise<chrome.tabs.Tab | null> {
+  const currentTabs = await chrome.tabs.query({}).catch(() => [] as chrome.tabs.Tab[]);
+  const newTabs = currentTabs.filter(t => t.id !== undefined && !tabIdsBefore.has(t.id) && isDrivableTabUrl(t.url ?? ""));
+  if (newTabs.length === 0) return null;
+
+  // 1. Direct parent/opener match: tab explicitly designated as opened by tabId
+  const openerMatch = newTabs.find(t => t.openerTabId === tabId);
+  if (openerMatch) return openerMatch;
+
+  // 2. Same window match
+  if (windowId !== undefined) {
+    const windowMatch = newTabs.find(t => t.windowId === windowId);
+    if (windowMatch) return windowMatch;
+  }
+
+  // 3. Fallback to newest drivable tab
+  return newTabs[newTabs.length - 1] ?? null;
+}
+
 /**
- * Post-action settle used by click/type-submit/press. Watches for a URL change,
- * a loading tab, or a newly activated tab (target=_blank), otherwise waits for
- * DOM quiescence. Returns the tab whose observation the next step should use.
- * It never activates an element, so single-click/single-submit is unchanged.
+ * Post-action settle used by click/type-submit/press. Watches for a new tab,
+ * a URL change, a loading tab, or a newly activated tab (target=_blank),
+ * otherwise waits for DOM quiescence. Returns the tab whose observation
+ * the next step should use.
  */
-async function settleAfterAction(tabId: number, beforeUrl: string, timeoutMs: number): Promise<number> {
+async function settleAfterAction(
+  tabId: number,
+  beforeUrl: string,
+  timeoutMs: number,
+  tabIdsBefore?: Set<number>
+): Promise<number> {
+  // 1. Check if a newly created tab appeared (target=_blank, window.open, etc.)
+  if (tabIdsBefore && tabIdsBefore.size > 0) {
+    const originTab = await chrome.tabs.get(tabId).catch(() => null);
+    const windowId = originTab?.windowId;
+    let newTab: chrome.tabs.Tab | null = null;
+    for (let i = 0; i < 10; i++) {
+      newTab = await detectNewTab(tabId, tabIdsBefore, windowId);
+      if (newTab && newTab.id !== undefined) break;
+      await sleep(40);
+    }
+    if (newTab && newTab.id !== undefined) {
+      const destinationTabId = newTab.id;
+      await chrome.tabs.update(destinationTabId, { active: true }).catch(() => {});
+      await waitForStable(destinationTabId, timeoutMs);
+      return destinationTabId;
+    }
+  }
+
+  // 2. Current tab settled / navigated in-place
   const cap = Math.max(150, Math.min(timeoutMs, 1200));
   await settleDom(tabId, 120, cap);
 
-  // A click may have opened a new tab and made it active. Observe that tab,
-  // not the old one, so the returned observation matches the next action's
-  // active tab (and stays safe to cache).
-  const active = await activeTab();
-  if (active !== null && active !== tabId) {
-    await waitForStable(active, timeoutMs);
-    return active;
-  }
-
   // A navigation can start just after the click's DOM churn settles.
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 10; i++) {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (tab?.status === "loading" || (tab?.url && tab.url !== beforeUrl)) {
       await waitForStable(tabId, timeoutMs);
       return tabId;
     }
-    await sleep(30);
+    await sleep(40);
   }
   return tabId;
 }
@@ -370,51 +641,97 @@ export function isBlockedUrl(url: string): boolean {
 }
 
 export async function executeAction(action: BrowserAction, taskId: string): Promise<ActionResult> {
+  const raw = action as any;
+  if (raw?.type === "init_session") {
+    return await initSession(raw);
+  }
+  if (raw?.type === "close_session") {
+    const sId = raw?.sessionId;
+    if (sId && extensionSessions.has(sId)) {
+      extensionSessions.delete(sId);
+    }
+    return { ok: true, evidence: `session ${sId} closed` };
+  }
+
   const v = validateAction(action);
   if (!v.ok) {
     return { ok: false, error: { code: "PLAN_INVALID", message: `invalid action: ${v.error}`, recoverable: false } };
   }
   try {
+    if (action.type === "new_tab") {
+      return await doNewTab(action);
+    }
+    if (action.type === "select_tab") {
+      if (action.sessionId) {
+        const session = extensionSessions.get(action.sessionId);
+        if (session) {
+          if (action.params.tabId !== session.primaryTabId && !session.childTabIds.has(action.params.tabId)) {
+            return err("TAB_UNAUTHORIZED", `Tab ${action.params.tabId} is not in session ${action.sessionId}`, false);
+          }
+          session.activeTabId = action.params.tabId;
+        }
+      }
+      await chrome.tabs.update(action.params.tabId, { active: true });
+      await waitForStable(action.params.tabId, action.timeoutMs);
+      return {
+        ok: true,
+        observation: await observe(action.params.tabId),
+        evidence: `tab ${action.params.tabId} active`,
+      };
+    }
+    if (action.type === "close_tab") {
+      const session = action.sessionId ? extensionSessions.get(action.sessionId) : undefined;
+      if (session) {
+        if (action.params.tabId !== session.primaryTabId && !session.childTabIds.has(action.params.tabId)) {
+          return err("TAB_UNAUTHORIZED", `Tab ${action.params.tabId} is not in session ${action.sessionId}`, false);
+        }
+        // Closing the primary tab would leave the session without a home tab;
+        // the planner must close a child tab (or end the task) instead.
+        if (action.params.tabId === session.primaryTabId) {
+          return err("PLAN_INVALID", "cannot close the primary tab of an active session", false);
+        }
+        session.childTabIds.delete(action.params.tabId);
+        if (session.activeTabId === action.params.tabId) {
+          session.activeTabId = session.primaryTabId;
+        }
+      }
+      await chrome.tabs.remove(action.params.tabId);
+      let nextTabId: number;
+      if (session) {
+        nextTabId = session.primaryTabId;
+      } else {
+        nextTabId = await getOrCreateActiveTab();
+      }
+      return {
+        ok: true,
+        observation: await observe(nextTabId),
+        evidence: `tab ${action.params.tabId} closed`,
+      };
+    }
+
+    const resolved = await resolveSessionTab(action);
+    if ("ok" in resolved && !resolved.ok) {
+      return resolved;
+    }
+    const tabId = (resolved as { tabId: number }).tabId;
+
     switch (action.type) {
-      case "navigate": return await doNavigate(action);
-      case "click": return await doClick(action, taskId);
-      case "type": return await doType(action, taskId);
-      case "press": return await doPress(action);
-      case "scroll": return await doScroll(action);
-      case "zoom": return await doZoom(action);
-      case "new_tab": return await doNewTab(action);
-      case "select_tab": {
-        await chrome.tabs.update(action.params.tabId, { active: true });
-        await waitForStable(action.params.tabId, action.timeoutMs);
-        return {
-          ok: true,
-          observation: await observe(action.params.tabId),
-          evidence: `tab ${action.params.tabId} active`,
-        };
-      }
-      case "close_tab": {
-        await chrome.tabs.remove(action.params.tabId);
-        const nextTabId = await getOrCreateActiveTab();
-        return {
-          ok: true,
-          observation: await observe(nextTabId),
-          evidence: `tab ${action.params.tabId} closed`,
-        };
-      }
+      case "navigate": return await doNavigate(action, tabId);
+      case "click": return await doClick(action, taskId, tabId);
+      case "type": return await doType(action, taskId, tabId);
+      case "press": return await doPress(action, tabId);
+      case "scroll": return await doScroll(action, tabId);
+      case "zoom": return await doZoom(action, tabId);
       case "wait": {
-        const tabId = await activeTab();
-        if (tabId !== null) await ensureTabActive(tabId);
+        await ensureTabActive(tabId);
         await new Promise(r => setTimeout(r, Math.min(action.timeoutMs, 10_000)));
         return {
           ok: true,
-          observation: tabId !== null ? await observe(tabId) : undefined,
+          observation: await observe(tabId),
           evidence: "waited for page/app to settle"
         };
       }
       case "observe": {
-        // Observation is the loop's entry point; a missing tab must not abort
-        // the mission before the first plan.
-        const tabId = await getOrCreateActiveTab();
         return { ok: true, observation: await observe(tabId) };
       }
     }
@@ -427,16 +744,13 @@ function err(code: AgentError["code"], message: string, recoverable: boolean): A
   return { ok: false, error: { code, message, recoverable } };
 }
 
-async function doNavigate(action: Extract<BrowserAction, { type: "navigate" }>): Promise<ActionResult> {
+async function doNavigate(action: Extract<BrowserAction, { type: "navigate" }>, tabId: number): Promise<ActionResult> {
   const p = action.params;
-  const existing = await activeTab();
+  const existing = tabId;
 
   // Browser-history navigation needs a tab that exists; there is nowhere to
   // go back to otherwise, so this stays a recoverable error.
   if (p.direction === "back" || p.direction === "forward" || p.direction === "reload") {
-    if (existing === null) {
-      return err("NAVIGATION_FAILED", "no tab to navigate", true);
-    }
     if (p.direction === "back") { await chrome.tabs.goBack(existing); }
     else if (p.direction === "forward") { await chrome.tabs.goForward(existing); }
     else { await chrome.tabs.reload(existing); }
@@ -451,22 +765,9 @@ async function doNavigate(action: Extract<BrowserAction, { type: "navigate" }>):
     return err("NAVIGATION_FAILED", `blocked scheme: ${p.url}`, false);
   }
 
-  const cur = existing !== null ? await chrome.tabs.get(existing).catch(() => null) : null;
-  let targetTabId: number;
-  if (existing === null || (cur?.url && isConsoleUrl(cur.url))) {
-    // No usable tab (or only the dashboard): open the destination directly
-    // instead of failing the mission before it starts.
-    const newTab = await chrome.tabs.create({ url: p.url, active: true });
-    if (newTab.id === undefined) {
-      return err("NAVIGATION_FAILED", "could not create a browser tab", false);
-    }
-    targetTabId = newTab.id;
-  } else {
-    targetTabId = existing;
-    await chrome.tabs.update(existing, { url: p.url });
-  }
-  const url = await waitForStable(targetTabId, action.timeoutMs, p.url);
-  return { ok: true, observation: await observe(targetTabId), evidence: url };
+  await chrome.tabs.update(existing, { url: p.url });
+  const url = await waitForStable(existing, action.timeoutMs, p.url);
+  return { ok: true, observation: await observe(existing), evidence: url };
 }
 
 async function ensureTabActive(tabId: number): Promise<void> {
@@ -701,13 +1002,82 @@ async function cdpPressKey(tabId: number, key: string): Promise<boolean> {
   }
 }
 
-async function doClick(action: Extract<BrowserAction, { type: "click" }>, taskId: string): Promise<ActionResult> {
-  const tabId = await getOrCreateActiveTab();
+/**
+ * Detect visible modal/dialog overlays and dismiss them if an unambiguous
+ * safe close control (e.g. '✕', aria-label="Close", button.close, button._2doB4z) is present.
+ */
+export async function dismissObstructiveModalIfPresent(tabId: number): Promise<boolean> {
+  if (typeof chrome === "undefined" || !chrome.scripting) return false;
+  try {
+    const [r] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const modal = document.querySelector('[role="dialog"], [aria-modal="true"], .modal, ._2KpZ6l, [class*="dialog" i], [class*="modal" i], [class*="overlay" i], [class*="popup" i]') as HTMLElement | null;
+        if (!modal) return false;
+
+        const rect = modal.getBoundingClientRect();
+        if (rect.width < 50 || rect.height < 50) return false;
+        const style = window.getComputedStyle(modal);
+        if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+
+        const closeSelectors = [
+          'button._2doB4z',
+          'button._2KpZ6l._2doB4z',
+          'button[aria-label*="close" i]',
+          'button.close',
+          '[data-testid*="close"]',
+          '[aria-label="Close" i]',
+          '[aria-label*="dismiss" i]',
+          'button[class*="close" i]',
+        ];
+        let closeBtn: HTMLElement | null = modal.querySelector(closeSelectors.join(', '));
+        if (!closeBtn) {
+          const allBtns = modal.querySelectorAll('button, span[role="button"], div[role="button"]');
+          for (const btn of Array.from(allBtns)) {
+            const txt = (btn.textContent || "").trim();
+            if (txt === "✕" || txt === "×" || txt === "X") {
+              closeBtn = btn as HTMLElement;
+              break;
+            }
+          }
+        }
+        if (closeBtn) {
+          closeBtn.click();
+          return true;
+        }
+        return false;
+      },
+    });
+    return Boolean(r?.result);
+  } catch {
+    return false;
+  }
+}
+
+async function doClick(action: Extract<BrowserAction, { type: "click" }>, taskId: string, tabId: number): Promise<ActionResult> {
   await ensureTabActive(tabId);
   const before = await currentUrl(tabId);
+  const tabsBefore = await chrome.tabs.query({}).catch(() => [] as chrome.tabs.Tab[]);
+  const tabIdsBefore = new Set(tabsBefore.map(t => t.id).filter((id): id is number => typeof id === "number"));
   const agent = await withAgent(tabId);
-  const cands = await agent.list();
-  const target = findTarget(action.target, cands, "click");
+  let cands = await agent.list();
+  let target = findTarget(action.target, cands, "click");
+
+  if (!target && !action.target.name?.toLowerCase().includes("close")) {
+    const dismissed = await dismissObstructiveModalIfPresent(tabId);
+    if (dismissed) {
+      await settleDom(tabId, 150, 400);
+      cands = await agent.list();
+      target = findTarget(action.target, cands, "click");
+    }
+  }
+
+  // Re-list candidates after a brief settle before declaring target stale (dynamic elements / lazy render)
+  if (!target) {
+    await sleep(250);
+    cands = await agent.list();
+    target = findTarget(action.target, cands, "click");
+  }
 
   if (!target && action.target.coords) {
     // Exactly one click: trusted CDP input, with a single in-page fallback.
@@ -719,19 +1089,40 @@ async function doClick(action: Extract<BrowserAction, { type: "click" }>, taskId
     if (!res.ok) {
       return err("STALE_TARGET", res.error ?? "coordinate click failed", true);
     }
-    const obsTab = await settleAfterAction(tabId, before, action.timeoutMs);
+    const obsTab = await settleAfterAction(tabId, before, action.timeoutMs, tabIdsBefore);
+    if (action.sessionId && obsTab !== tabId) {
+      extensionSessions.get(action.sessionId)?.childTabIds.add(obsTab);
+    }
     const after = await currentUrl(obsTab);
     void taskId;
+    const isNewTab = obsTab !== tabId;
+    const navDetected = isNewTab || after !== before;
+    const expectsNav = /navigat|load\s*page|open\s*(tab|page)/i.test(action.verify || "");
+    if (expectsNav && !navDetected) {
+      return err("NAVIGATION_FAILED", `coordinate click (${p.x}, ${p.y}) accepted, but expected navigation did not occur (URL remained ${before})`, true);
+    }
+    let evidence = `clicked coords (${p.x}, ${p.y})`;
+    if (isNewTab) {
+      evidence = `opened new tab ${obsTab}: navigated ${before} → ${after} (observed destination content)`;
+    } else if (navDetected) {
+      evidence = `navigated ${before} → ${after} (observed destination content)`;
+    } else {
+      evidence = `clicked coords (${p.x}, ${p.y}) (click accepted; no navigation detected; url: ${after})`;
+    }
     return {
       ok: true,
       targetId: res.targetId,
       observation: await observe(obsTab),
-      evidence: after !== before ? `navigated ${before} → ${after}` : `clicked coords (${p.x}, ${p.y})`,
+      evidence,
     };
   }
 
-  const targetId = target?.targetId || action.target.targetId || "";
-  const targetName = target?.name || action.target.name || "";
+  if (!target) {
+    return err("STALE_TARGET", `no matching element for ${JSON.stringify(action.target)}`, true);
+  }
+
+  const targetId = target.targetId;
+  const targetName = target.name || action.target.name || "";
 
   // 1. Activation point: a chat row's true centre when the planner matched an
   //    inner label, so list selection handlers fire reliably.
@@ -749,14 +1140,53 @@ async function doClick(action: Extract<BrowserAction, { type: "click" }>, taskId
       return err("STALE_TARGET", res.error ?? `no matching element for ${JSON.stringify(action.target)}`, true);
     }
   }
-  const obsTab = await settleAfterAction(tabId, before, action.timeoutMs);
-  const after = await currentUrl(obsTab);
+  let obsTab = await settleAfterAction(tabId, before, action.timeoutMs, tabIdsBefore);
+  if (action.sessionId && obsTab !== tabId) {
+    extensionSessions.get(action.sessionId)?.childTabIds.add(obsTab);
+  }
+  let after = await currentUrl(obsTab);
   void taskId;
+  let isNewTab = obsTab !== tabId;
+  let navDetected = isNewTab || after !== before;
+
+  // Fallback for link clicks where browser popup blocker suppresses synthetic target="_blank":
+  if (!navDetected && target.href && /^https?:\/\//.test(target.href)) {
+    try {
+      const created = await chrome.tabs.create({ url: target.href, active: true, openerTabId: tabId });
+      if (created.id !== undefined) {
+        await waitForStable(created.id, action.timeoutMs);
+        obsTab = created.id;
+        after = await currentUrl(obsTab);
+        isNewTab = true;
+        navDetected = true;
+        if (action.sessionId) {
+          const sess = extensionSessions.get(action.sessionId);
+          if (sess) {
+            sess.childTabIds.add(obsTab);
+            sess.activeTabId = obsTab;
+          }
+        }
+      }
+    } catch {}
+  }
+
+  const expectsNav = /navigat|load\s*page|open\s*(tab|page)/i.test(action.verify || "");
+  if (expectsNav && !navDetected) {
+    return err("NAVIGATION_FAILED", `click accepted on ${targetName || targetId}, but expected navigation did not occur (URL remained ${before})`, true);
+  }
+  let evidence = `clicked ${targetName || targetId}`;
+  if (isNewTab) {
+    evidence = `opened new tab ${obsTab}: navigated ${before} → ${after} (observed destination content)`;
+  } else if (navDetected) {
+    evidence = `navigated ${before} → ${after} (observed destination content)`;
+  } else {
+    evidence = `clicked ${targetName || targetId} (click accepted; no navigation detected; url: ${after})`;
+  }
   return {
     ok: true,
     targetId: targetId,
     observation: await observe(obsTab),
-    evidence: after !== before ? `navigated ${before} → ${after}` : `clicked ${targetName || targetId}`,
+    evidence,
   };
 }
 
@@ -775,15 +1205,41 @@ function findSubmitControl(cands: AgentElement[]): AgentElement | undefined {
   });
 }
 
-async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: string): Promise<ActionResult> {
-  const tabId = await getOrCreateActiveTab();
+async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: string, tabId: number): Promise<ActionResult> {
   await ensureTabActive(tabId);
   const before = await currentUrl(tabId);
+  const tabsBefore = await chrome.tabs.query({}).catch(() => [] as chrome.tabs.Tab[]);
+  const tabIdsBefore = new Set(tabsBefore.map(t => t.id).filter((id): id is number => typeof id === "number"));
   const agent = await withAgent(tabId);
-  const cands = await agent.list();
-  const target = findTarget(action.target, cands, "type");
-  const targetId = target?.targetId || action.target.targetId || "";
-  const targetName = target?.name || action.target.name || "";
+  let cands = await agent.list();
+  let target = findTarget(action.target, cands, "type");
+  if (!target) {
+    const dismissed = await dismissObstructiveModalIfPresent(tabId);
+    if (dismissed) {
+      await settleDom(tabId, 150, 400);
+      cands = await agent.list();
+      target = findTarget(action.target, cands, "type");
+    }
+  }
+  // Re-list candidates after a brief settle before declaring target stale
+  if (!target) {
+    await sleep(250);
+    cands = await agent.list();
+    target = findTarget(action.target, cands, "type");
+  }
+  if (!target) {
+    return err("STALE_TARGET", `no matching element for ${JSON.stringify(action.target)}`, true);
+  }
+  const targetId = target.targetId;
+  const targetName = target.name || action.target.name || "";
+
+  // If a modal popped up after listing, dismiss it so input field is reachable
+  if (!action.target.name?.toLowerCase().includes("close")) {
+    const dismissed = await dismissObstructiveModalIfPresent(tabId);
+    if (dismissed) {
+      await settleDom(tabId, 150, 300);
+    }
+  }
 
   // 1. Type through Chrome's native input pipeline. A trusted click focuses
   //    the field and places the caret in the same session.
@@ -831,13 +1287,27 @@ async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: 
       submitted = await cdpPressKey(tabId, "Enter");
     }
     // Settle after submission attempt
-    obsTab = await settleAfterAction(tabId, before, Math.min(action.timeoutMs, 2000));
+    obsTab = await settleAfterAction(tabId, before, Math.min(action.timeoutMs, 2000), tabIdsBefore);
+    if (action.sessionId && obsTab !== tabId) {
+      const sess = extensionSessions.get(action.sessionId);
+      if (sess) {
+        sess.childTabIds.add(obsTab);
+        sess.activeTabId = obsTab;
+      }
+    }
     // In-page fallback: if page hasn't navigated, trigger form submission directly
     const interimUrl = await currentUrl(obsTab);
     if (interimUrl === before) {
       const fallback = await agent.submit(targetId, targetName);
       if (fallback.ok) {
-        obsTab = await settleAfterAction(tabId, before, action.timeoutMs);
+        obsTab = await settleAfterAction(tabId, before, action.timeoutMs, tabIdsBefore);
+        if (action.sessionId && obsTab !== tabId) {
+          const sess = extensionSessions.get(action.sessionId);
+          if (sess) {
+            sess.childTabIds.add(obsTab);
+            sess.activeTabId = obsTab;
+          }
+        }
       }
     }
   }
@@ -853,10 +1323,11 @@ async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: 
   };
 }
 
-async function doPress(action: Extract<BrowserAction, { type: "press" }>): Promise<ActionResult> {
-  const tabId = await getOrCreateActiveTab();
+async function doPress(action: Extract<BrowserAction, { type: "press" }>, tabId: number): Promise<ActionResult> {
   await ensureTabActive(tabId);
   const before = await currentUrl(tabId);
+  const tabsBefore = await chrome.tabs.query({}).catch(() => [] as chrome.tabs.Tab[]);
+  const tabIdsBefore = new Set(tabsBefore.map(t => t.id).filter((id): id is number => typeof id === "number"));
   const key = action.params.key;
 
   if (key === "Enter") {
@@ -876,15 +1347,21 @@ async function doPress(action: Extract<BrowserAction, { type: "press" }>): Promi
         target.dispatchEvent(new KeyboardEvent("keypress", opts));
         target.dispatchEvent(new KeyboardEvent("keyup", opts));
       },
-      args: [key],
+      args: [key ?? ""],
     });
   }
-  const obsTab = await settleAfterAction(tabId, before, action.timeoutMs);
+  const obsTab = await settleAfterAction(tabId, before, action.timeoutMs, tabIdsBefore);
+  if (action.sessionId && obsTab !== tabId) {
+    const sess = extensionSessions.get(action.sessionId);
+    if (sess) {
+      sess.childTabIds.add(obsTab);
+      sess.activeTabId = obsTab;
+    }
+  }
   return { ok: true, observation: await observe(obsTab), evidence: `pressed ${key}` };
 }
 
-async function doScroll(action: Extract<BrowserAction, { type: "scroll" }>): Promise<ActionResult> {
-  const tabId = await getOrCreateActiveTab();
+async function doScroll(action: Extract<BrowserAction, { type: "scroll" }>, tabId: number): Promise<ActionResult> {
   await ensureTabActive(tabId);
   const agent = await withAgent(tabId);
   const res = await agent.scroll(action.params.direction, action.params.containerId);
@@ -899,8 +1376,7 @@ async function doScroll(action: Extract<BrowserAction, { type: "scroll" }>): Pro
   };
 }
 
-async function doZoom(action: Extract<BrowserAction, { type: "zoom" }>): Promise<ActionResult> {
-  const tabId = await getOrCreateActiveTab();
+async function doZoom(action: Extract<BrowserAction, { type: "zoom" }>, tabId: number): Promise<ActionResult> {
   const p = action.params;
   const current = await chrome.tabs.getZoom(tabId);
   let newZoom = current;
@@ -916,8 +1392,17 @@ async function doZoom(action: Extract<BrowserAction, { type: "zoom" }>): Promise
 async function doNewTab(action: Extract<BrowserAction, { type: "new_tab" }>): Promise<ActionResult> {
   if (isBlockedUrl(action.params.url)) return err("NAVIGATION_FAILED", `blocked scheme: ${action.params.url}`, false);
   const tab = await chrome.tabs.create({ url: action.params.url, active: true });
+  if (action.sessionId && tab.id !== undefined) {
+    const sess = extensionSessions.get(action.sessionId);
+    if (sess) {
+      sess.childTabIds.add(tab.id);
+      sess.activeTabId = tab.id;
+    }
+  }
   await waitForStable(tab.id!, action.timeoutMs, action.params.url);
-  return { ok: true, observation: await observe(tab.id!), evidence: `opened ${action.params.url}` };
+  // The backend registers child tabs by parsing this evidence ("opened new
+  // tab <id>") — keep the phrasing in sync with agentLoop's detector.
+  return { ok: true, observation: await observe(tab.id!), evidence: `opened new tab ${tab.id} at ${action.params.url}` };
 }
 
 /** Wait until the navigation completes and the DOM is interactive and quiet. */
@@ -937,16 +1422,20 @@ async function waitForStable(tabId: number, timeoutMs: number, expectedUrl?: str
     await sleep(50);
   }
 
-  // 2. Wait for the network load to complete.
+  // 2. Wait for the network load to complete or DOM to become interactive.
   while (Date.now() - start < budget) {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (tab?.status === "complete" && tab.url) break;
+    if (Date.now() - start >= 400) {
+      const status = await pageStatus(tabId);
+      if (status && status.ready && status.interactiveCount >= 3) break;
+    }
     await sleep(50);
   }
 
   // 3. Hydration: fast poll, exit as soon as the DOM is interactive and
   // stable. Low-element pages no longer pay a fixed 3.5s penalty.
-  const hydrateDeadline = Math.min(Date.now() + 3500, start + budget);
+  const hydrateDeadline = Math.min(Date.now() + 2000, start + budget);
   let previousInteractive = -1;
   let stableSamples = 0;
   while (Date.now() < hydrateDeadline) {
@@ -1005,7 +1494,7 @@ function emptyObservation(tabId: number, url: string, title: string): BrowserObs
   });
 }
 
-export async function observe(tabId: number): Promise<BrowserObservation> {
+export async function observe(tabId: number, sessionId?: string): Promise<BrowserObservation> {
   await ensureTabActive(tabId);
   const tab = await chrome.tabs.get(tabId);
   const url = tab.url ?? "";
@@ -1017,6 +1506,7 @@ export async function observe(tabId: number): Promise<BrowserObservation> {
 
   let list: AgentElement[] = [];
   let meta = { y: 0, w: 0, h: 0, dpr: 1 };
+  let pageText: string | undefined;
   try {
     const agent = await withAgent(tabId);
     list = await agent.list();
@@ -1037,6 +1527,13 @@ export async function observe(tabId: number): Promise<BrowserObservation> {
       func: () => ({ y: scrollY, w: innerWidth, h: innerHeight, dpr: devicePixelRatio }),
     });
     meta = m?.result ?? meta;
+
+    try {
+      const txt = await agent.extractText(4000);
+      if (txt && txt.trim().length > 0) {
+        pageText = txt.trim();
+      }
+    } catch {}
   } catch {
     // Injection refused (host permission, PDF viewer, tab mid-commit): degrade
     // to metadata so the loop can recover instead of aborting the mission.
@@ -1048,14 +1545,29 @@ export async function observe(tabId: number): Promise<BrowserObservation> {
   let openTabs: TabInfo[] | undefined;
   try {
     const all = await chrome.tabs.query({});
-    openTabs = all
-      .filter(t => t.id !== undefined && isDrivableTabUrl(t.url ?? ""))
-      .map(t => ({
-        tabId: t.id!,
-        url: t.url ?? "",
-        title: t.title ?? "",
-        active: Boolean(t.id === tabId || t.active),
-      }));
+    let allowedTabIds: Set<number> | null = null;
+    if (sessionId && extensionSessions.has(sessionId)) {
+      const sess = extensionSessions.get(sessionId)!;
+      allowedTabIds = new Set([sess.primaryTabId, ...sess.childTabIds]);
+    } else {
+      for (const sess of extensionSessions.values()) {
+        if (sess.primaryTabId === tabId || sess.childTabIds.has(tabId)) {
+          allowedTabIds = new Set([sess.primaryTabId, ...sess.childTabIds]);
+          break;
+        }
+      }
+    }
+
+    const filtered = allowedTabIds
+      ? all.filter(t => t.id !== undefined && allowedTabIds!.has(t.id) && isDrivableTabUrl(t.url ?? ""))
+      : all.filter(t => t.id === tabId);
+
+    openTabs = filtered.map(t => ({
+      tabId: t.id!,
+      url: t.url ?? "",
+      title: t.title ?? "",
+      active: Boolean(t.id === tabId),
+    }));
   } catch {}
 
   return sanitizeObservation({
@@ -1063,12 +1575,14 @@ export async function observe(tabId: number): Promise<BrowserObservation> {
     url,
     title,
     tabs: openTabs,
+    pageText,
     interactive: list.map(e => ({
       targetId: e.targetId,
       role: e.role,
       name: e.name,
       tag: e.tag || "el",
       inputType: e.inputType,
+      href: e.href,
       visible: e.visible,
       enabled: e.enabled,
       // Values are never read at observation time; the privacy layer is only

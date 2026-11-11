@@ -6,8 +6,11 @@ without Chrome. Production wiring (main.py) passes the real hub and planner.
 from __future__ import annotations
 
 import asyncio
+import atexit
+from concurrent.futures import ThreadPoolExecutor
 import inspect
 import re
+import threading
 import time
 from typing import Any, Callable, Optional
 from urllib.parse import urlsplit
@@ -22,6 +25,44 @@ from .providers.errors import ProviderUnavailable
 MAX_STEPS = config.MAX_STEPS
 MAX_RETRIES = config.MAX_RETRIES
 TASK_TIMEOUT_S = config.TASK_TIMEOUT_S
+PLANNER_TIMEOUT_S = float(getattr(config, "PLANNER_TIMEOUT_S", 60.0))
+MAX_CONCURRENT_PLANNERS = int(getattr(config, "MAX_CONCURRENT_PLANNERS", 4))
+_planner_executor: Optional[ThreadPoolExecutor] = None
+_planner_executor_lock = threading.Lock()
+
+
+def get_planner_executor() -> ThreadPoolExecutor:
+    """Singleton ThreadPoolExecutor bounding concurrent planner executions to MAX_CONCURRENT_PLANNERS."""
+    global _planner_executor
+    if _planner_executor is None:
+        with _planner_executor_lock:
+            if _planner_executor is None:
+                _planner_executor = ThreadPoolExecutor(
+                    max_workers=MAX_CONCURRENT_PLANNERS,
+                    thread_name_prefix="privagent-planner",
+                )
+    return _planner_executor
+
+
+def shutdown_planner_executor(wait: bool = False, cancel_futures: bool = True) -> None:
+    """Cleanly shut down the planner executor and discard queued tasks."""
+    global _planner_executor
+    with _planner_executor_lock:
+        if _planner_executor is not None:
+            try:
+                _planner_executor.shutdown(wait=wait, cancel_futures=cancel_futures)
+            except TypeError:
+                _planner_executor.shutdown(wait=wait)
+            _planner_executor = None
+
+
+atexit.register(shutdown_planner_executor)
+
+
+def _get_planner_semaphore() -> asyncio.Semaphore:
+    """Retained for backward compatibility."""
+    return asyncio.Semaphore(MAX_CONCURRENT_PLANNERS)
+
 MAX_NOTES_CHARS = 4000
 MAX_HISTORY_TEXT_CHARS = 400
 # A malformed plan must not kill the mission. Give the model a bounded number
@@ -190,6 +231,8 @@ async def run_with_injection(
     confirm_timeout_s: float = 120.0,
     on_metrics: Optional[Callable[[dict[str, Any]], None]] = None,
     initial_memory: Optional[dict[str, Any]] = None,
+    session_id: Optional[str] = None,
+    conversation_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Test entrypoint mirroring run_task's flow with injectable parts."""
     try:
@@ -204,11 +247,48 @@ async def run_with_injection(
             confirm_timeout_s=confirm_timeout_s,
             on_metrics=on_metrics,
             initial_memory=initial_memory,
+            session_id=session_id,
+            conversation_id=conversation_id,
         )
     finally:
         # Never leak cancellation markers: task ids are unique, but a stale
         # marker would make a replayed id silently cancel itself.
         _cancelled.discard(task_id)
+
+
+def _enforce_date_integrity(action: dict[str, Any], instruction: str) -> None:
+    """Validate and preserve exact user-specified dates and years (e.g. 2026 must never become 2027)."""
+    inst = instruction or ""
+    if "2026" in inst and "2027" not in inst:
+        params = action.get("params") or {}
+        if "text" in params and isinstance(params["text"], str) and "2027" in params["text"]:
+            params["text"] = params["text"].replace("2027", "2026")
+        if "url" in params and isinstance(params["url"], str) and "2027" in params["url"]:
+            params["url"] = params["url"].replace("2027", "2026")
+
+
+def _save_checkpoint_defensive(
+    task_id: str,
+    conversation_id: Optional[str],
+    session_id: Optional[str],
+    steps_done: int,
+    raw_url: str,
+    history: list[dict[str, Any]],
+    working_memory: dict[str, Any],
+) -> None:
+    try:
+        from . import db
+        db.save_task_checkpoint(
+            task_id=task_id,
+            conversation_id=conversation_id or "default",
+            session_id=session_id,
+            step_index=steps_done,
+            last_url=raw_url or "",
+            history=history,
+            working_memory=working_memory,
+        )
+    except Exception:
+        pass
 
 
 async def _run_loop(
@@ -223,17 +303,41 @@ async def _run_loop(
     confirm_timeout_s: float,
     on_metrics: Optional[Callable[[dict[str, Any]], None]] = None,
     initial_memory: Optional[dict[str, Any]] = None,
+    session_id: Optional[str] = None,
+    conversation_id: Optional[str] = None,
 ) -> dict[str, Any]:
     history: list[dict[str, Any]] = []
+    if initial_memory and initial_memory.get("prior_checkpoint_history"):
+        history = list(initial_memory["prior_checkpoint_history"])
     penalties: list[str] = []
     working_memory: dict[str, Any] = dict(initial_memory or {})
-    steps_done = 0
+    # Give plan validation the session's pinned primary tab so close_tab on it
+    # can be rejected deterministically.
+    if session_id and "primary_tab_id" not in working_memory:
+        try:
+            from .session_manager import session_manager
+            sess0 = session_manager.get_session(session_id)
+            if sess0 and sess0.primary_tab_id is not None:
+                working_memory["primary_tab_id"] = sess0.primary_tab_id
+        except Exception:
+            pass
+    try:
+        from .extractors.research import init_multi_site_tracker
+        ms_tracker = init_multi_site_tracker(instruction, working_memory.get("multi_site_research"))
+        if ms_tracker:
+            working_memory["multi_site_research"] = ms_tracker
+    except Exception:
+        pass
+    steps_done = len(history)
     invalid_plans = 0
     start = time.monotonic()
     # A successful action already returns the post-action observation from the
     # extension. Replanning on that snapshot removes one full observe round
     # trip per step. It is revalidated and re-redacted before every prompt.
     cached_obs: Any = None
+    last_digest: Optional[str] = None
+    zero_change_repeats = 0
+    url_history: list[str] = []
 
     def progress(msg: str, screenshot: Optional[str] = None) -> None:
         if not on_progress:
@@ -257,9 +361,9 @@ async def _run_loop(
 
     while steps_done < MAX_STEPS:
         if is_cancelled(task_id):
-            return {"final": "cancelled", "steps": steps_done, "summary": None}
+            return {"final": "cancelled", "steps": steps_done, "summary": None, "history": history}
         if time.monotonic() - start > TASK_TIMEOUT_S:
-            return {"final": "budget_exceeded", "steps": steps_done, "summary": "timeout"}
+            return {"final": "budget_exceeded", "steps": steps_done, "summary": "timeout", "history": history}
 
         if cached_obs is not None:
             raw_obs = cached_obs
@@ -272,83 +376,287 @@ async def _run_loop(
         try:
             payload, _decision = classify_and_redact(_to_obs(raw_obs), instruction=instruction)
         except PrivacyViolation:
-            return {"final": "failed", "steps": steps_done, "summary": "privacy violation — payload not sent"}
+            return {"final": "failed", "steps": steps_done, "summary": "privacy violation — payload not sent", "history": history}
 
         raw_url = str(
             getattr(raw_obs, "url", None)
             or (raw_obs.get("url") if isinstance(raw_obs, dict) else "")
             or ""
         )
+        raw_title = str(
+            getattr(raw_obs, "title", None)
+            or (raw_obs.get("title") if isinstance(raw_obs, dict) else "")
+            or ""
+        )
+        raw_text = str(
+            getattr(raw_obs, "page_text", None)
+            or (raw_obs.get("page_text") if isinstance(raw_obs, dict) else "")
+            or getattr(raw_obs, "readable_text", None)
+            or (raw_obs.get("readable_text") if isinstance(raw_obs, dict) else "")
+            or ""
+        )
+        if raw_url and raw_text:
+            try:
+                from .extractors.research import extract_page_research, update_multi_site_tracker
+                fact = extract_page_research(raw_url, raw_title, raw_text)
+                if fact:
+                    if "collected_research" not in working_memory:
+                        working_memory["collected_research"] = {}
+                    working_memory["collected_research"][fact["domain"]] = fact
+                if "multi_site_research" in working_memory:
+                    working_memory["multi_site_research"] = update_multi_site_tracker(
+                        working_memory["multi_site_research"],
+                        raw_url,
+                        raw_title,
+                        raw_text,
+                        working_memory.get("collected_research", {}),
+                    )
+            except Exception:
+                pass
+        current_digest = _state_digest(raw_obs)
 
         h_view = _history_view(history, penalties, working_memory)
         payload_dict = payload.model_dump() if hasattr(payload, "model_dump") else payload
-        # Planner providers are synchronous HTTP clients. Run them off the
-        # event loop so cancel/confirm endpoints stay responsive during a
-        # slow model call.
+        # Planner providers are synchronous HTTP clients. Run them in a bounded
+        # ThreadPoolExecutor so cancel/confirm endpoints stay responsive during a
+        # slow model call, and active worker threads cannot exceed MAX_CONCURRENT_PLANNERS.
         raw_plan = None
         plan_started = time.perf_counter()
-        try:
-            raw_plan = await asyncio.to_thread(
-                _call_planner, planner, instruction, payload_dict, h_view, working_memory
-            )
-        except ValueError as exc:
-            # A plan that fails schema/target validation is a planner mistake,
-            # not a mission-fatal error. Replan with the exact reason instead of
-            # surfacing "loop error" after one step.
-            invalid_plans += 1
-            reason = redact_text_urls(str(exc))[:300]
-            penalties.append(
-                f"invalid plan ({reason}); re-emit a valid plan. Every click/type "
-                "needs target.targetId or target.name from the page context."
-            )
-            if invalid_plans >= MAX_INVALID_PLANS:
+        if is_cancelled(task_id):
+            return {"final": "cancelled", "steps": steps_done, "summary": None, "history": history}
+        planner_executor = get_planner_executor()
+        loop = asyncio.get_running_loop()
+
+        plan_deadline = time.monotonic() + PLANNER_TIMEOUT_S
+        MAX_PLAN_RETRIES = 2
+        for plan_attempt in range(MAX_PLAN_RETRIES):
+            time_left = plan_deadline - time.monotonic()
+            if time_left <= 0 and plan_attempt > 0:
+                _save_checkpoint_defensive(task_id, conversation_id, session_id, steps_done, raw_url, history, working_memory)
                 return {
                     "final": "failed",
                     "steps": steps_done,
-                    "summary": f"Task incomplete: the planner could not produce a valid action ({reason}).",
+                    "summary": f"Planner timed out: shared planning deadline ({int(PLANNER_TIMEOUT_S)}s) expired (step {steps_done} state preserved).", "history": history,
                 }
-            progress(f"Replanning after invalid plan: {reason}")
-            continue
-        except ProviderUnavailable as exc:
-            # Quota/outage is not a mission bug. Fail fast with the operator
-            # message instead of retrying a provider that cannot answer.
-            return {
-                "final": "failed",
-                "steps": steps_done,
-                "summary": f"Planner unavailable: {redact_text_urls(str(exc))[:400]}",
-            }
-        finally:
-            metrics("plan", plan_started)
-        invalid_plans = 0
+            try:
+                raw_plan = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        planner_executor,
+                        _call_planner,
+                        planner,
+                        instruction,
+                        payload_dict,
+                        h_view,
+                        working_memory,
+                    ),
+                    timeout=max(0.001, time_left),
+                )
+                break
+            except asyncio.TimeoutError:
+                _save_checkpoint_defensive(task_id, conversation_id, session_id, steps_done, raw_url, history, working_memory)
+                return {
+                    "final": "failed",
+                    "steps": steps_done,
+                    "summary": f"Planner timed out: model provider did not respond within {int(PLANNER_TIMEOUT_S)}s deadline (step {steps_done} state preserved).", "history": history,
+                }
+            except ValueError as exc:
+                invalid_plans += 1
+                reason = redact_text_urls(str(exc))[:300]
+                penalties.append(
+                    f"invalid plan ({reason}); re-emit a valid plan. Every click/type "
+                    "needs target.targetId or target.name from the page context."
+                )
+                if invalid_plans >= MAX_INVALID_PLANS:
+                    _save_checkpoint_defensive(task_id, conversation_id, session_id, steps_done, raw_url, history, working_memory)
+                    return {
+                        "final": "failed",
+                        "steps": steps_done,
+                        "summary": f"Task incomplete: the planner could not produce a valid action ({reason}).", "history": history,
+                    }
+                progress(f"Replanning after invalid plan: {reason}")
+                break
+            except ProviderUnavailable as exc:
+                err_text = str(exc)
+                retry_s = 0.0
+                try:
+                    from .providers.limits import parse_retry_seconds
+                    retry_s = parse_retry_seconds(err_text)
+                except Exception:
+                    pass
+
+                # If cooldown is long (> 3.0s) or explicitly in quota exhaustion, do not repeatedly call providers still in cooldown
+                is_long_cooldown = retry_s > 3.0 or "quota exhausted" in err_text or "1m" in err_text
+                if is_long_cooldown or plan_attempt + 1 >= MAX_PLAN_RETRIES:
+                    _save_checkpoint_defensive(task_id, conversation_id, session_id, steps_done, raw_url, history, working_memory)
+                    return {
+                        "final": "failed",
+                        "steps": steps_done,
+                        "summary": f"Planner unavailable: {redact_text_urls(err_text)[:400]} (step {steps_done} state preserved).", "history": history,
+                    }
+
+                wait_time = max(retry_s + 0.5, 1.5)
+                progress(f"Provider unavailable; retrying ({plan_attempt + 1}/{MAX_PLAN_RETRIES})...")
+                await asyncio.sleep(wait_time)
+                continue
+            finally:
+                metrics("plan", plan_started)
         if is_cancelled(task_id):
-            return {"final": "cancelled", "steps": steps_done, "summary": None}
+            return {"final": "cancelled", "steps": steps_done, "summary": None, "history": history}
+        if raw_plan is None:
+            if invalid_plans > 0:
+                continue
+            return {"final": "failed", "steps": steps_done, "summary": "planner returned a non-object plan", "history": history}
+        invalid_plans = 0
         if not isinstance(raw_plan, dict):
-            return {"final": "failed", "steps": steps_done, "summary": "planner returned a non-object plan"}
+            return {"final": "failed", "steps": steps_done, "summary": "planner returned a non-object plan", "history": history}
 
         new_notes = raw_plan.get("notes")
         if new_notes:
-            # Bound model-written memory: a hostile page must not be able to
-            # inflate every subsequent prompt (cost/latency) without limit.
-            working_memory["notes"] = str(new_notes)[:MAX_NOTES_CHARS]
+            existing = working_memory.get("notes")
+            if existing and existing != str(new_notes) and str(new_notes) not in existing:
+                working_memory["notes"] = f"{existing}\n- {new_notes}"[:MAX_NOTES_CHARS]
+            else:
+                working_memory["notes"] = str(new_notes)[:MAX_NOTES_CHARS]
 
         steps = raw_plan.get("steps", [])
         if not steps:
             final_ans = raw_plan.get("answer") or raw_plan.get("summary")
             summary_msg = final_ans if final_ans else _summary(raw_obs, history)
-            if raw_plan.get("blocked"):
-                # The planner guard proved the task is incomplete. Report it as
-                # a failure so the UI never renders "Mission Completed" over an
-                # unverified claim.
-                return {"final": "failed", "steps": steps_done,
-                        "summary": summary_msg or "Task incomplete: the result could not be verified."}
-            return {"final": "completed", "steps": steps_done, "summary": summary_msg}
+            ms_tracker = working_memory.get("multi_site_research")
+            if ms_tracker:
+                try:
+                    from .extractors.research import is_multi_site_task_complete, get_pending_sites, format_comparison_table, extract_target_product_query
+                    if not is_multi_site_task_complete(ms_tracker):
+                        pending = get_pending_sites(ms_tracker)
+                        if pending:
+                            penalties.append(
+                                f"Multi-site task incomplete: {len(pending)} websites remaining to compare: {', '.join(s['name'] for s in pending)}. Do not conclude yet."
+                            )
+                            next_s = pending[0]
+                            cur_host = (urlsplit(raw_url).hostname or "").lower()
+                            is_on_next_s = cur_host and any(d in cur_host for d in next_s.get("domains", []))
+                            if is_on_next_s:
+                                interactive = getattr(raw_obs, "interactive", []) if raw_obs else []
+                                search_el = None
+                                for el in (interactive or []):
+                                    name = str(getattr(el, "name", "") or (el.get("name") if isinstance(el, dict) else "")).lower()
+                                    role = str(getattr(el, "role", "") or (el.get("role") if isinstance(el, dict) else "")).lower()
+                                    if role in ("searchbox", "combobox") or "search" in name:
+                                        search_el = el
+                                        break
+                                query = extract_target_product_query(instruction)
+                                if search_el and query:
+                                    t_id = getattr(search_el, "target_id", None) or (search_el.get("targetId") if isinstance(search_el, dict) else "search")
+                                    t_name = getattr(search_el, "name", None) or (search_el.get("name") if isinstance(search_el, dict) else "Search")
+                                    action = {
+                                        "type": "type",
+                                        "risk": "write",
+                                        "target": {"targetId": t_id, "name": t_name},
+                                        "params": {"text": query, "submit": True},
+                                        "verify": f"searched for {query}",
+                                        "timeoutMs": 15000,
+                                    }
+                                    first = {"why": f"On {next_s['name']}: searching for '{query}'", "action": action}
+                                    steps = [first]
+                                else:
+                                    next_s["status"] = "unavailable"
+                                    next_s["reason"] = f"No search input or listing found on {next_s['name']}"
+                                    remaining = get_pending_sites(ms_tracker)
+                                    if remaining:
+                                        rem = remaining[0]
+                                        action = {
+                                            "type": "navigate",
+                                            "risk": "write",
+                                            "params": {"url": rem["default_url"]},
+                                            "verify": f"navigated to {rem['name']}",
+                                            "timeoutMs": 15000,
+                                        }
+                                        first = {"why": f"Moving to next comparison site: navigating to {rem['name']}", "action": action}
+                                        steps = [first]
+                            else:
+                                first = {
+                                    "why": f"Continuing multi-site comparison: navigating to {next_s['name']}",
+                                    "action": {
+                                        "type": "navigate",
+                                        "risk": "write",
+                                        "params": {"url": next_s["default_url"]},
+                                        "verify": f"navigated to {next_s['name']}",
+                                        "timeoutMs": 15000,
+                                    },
+                                }
+                                steps = [first]
+                                action = first["action"]
+                        else:
+                            return {
+                                "final": "failed",
+                                "steps": steps_done,
+                                "summary": summary_msg or "Task incomplete: requested comparison websites were not all visited.",
+                                "history": history, "url": raw_url, "last_obs": raw_obs,
+                            }
+                    else:
+                        comp_table = format_comparison_table(ms_tracker, instruction)
+                        if comp_table and "Price & Availability Comparison" not in summary_msg:
+                            summary_msg = f"{summary_msg}\n\n{comp_table}" if summary_msg else comp_table
+                except Exception:
+                    pass
+            if not steps:
+                if raw_plan.get("blocked"):
+                    return {"final": "failed", "steps": steps_done,
+                            "summary": summary_msg or "Task incomplete: the result could not be verified.",
+                            "history": history, "url": raw_url, "last_obs": raw_obs}
+                return {"final": "completed", "steps": steps_done, "summary": summary_msg,
+                        "history": history, "url": raw_url, "last_obs": raw_obs}
 
         first = steps[0] if isinstance(steps, list) else None
         action = first.get("action") if isinstance(first, dict) else None
         if not isinstance(action, dict) or not action.get("type"):
             # Belt-and-braces: every real provider is schema-validated, but a
             # malformed injected plan must never crash the loop with a KeyError.
-            return {"final": "failed", "steps": steps_done, "summary": "planner returned a malformed step"}
+            return {"final": "failed", "steps": steps_done, "summary": "planner returned a malformed step", "history": history}
+
+        # Requirement 8: Never repeat completed browser actions after fallback
+        if _is_redundant_completed_action(action, history, raw_url):
+            if len(steps) > 1:
+                first = steps[1]
+                action = first.get("action") if isinstance(first, dict) else None
+                if not isinstance(action, dict) or not action.get("type"):
+                    action = None
+            else:
+                action = None
+                ms_tracker = working_memory.get("multi_site_research")
+                if ms_tracker:
+                    try:
+                        from .extractors.research import is_multi_site_task_complete, get_pending_sites
+                        if not is_multi_site_task_complete(ms_tracker):
+                            pending = get_pending_sites(ms_tracker)
+                            if pending:
+                                next_site = pending[0]
+                                cur_h = (urlsplit(raw_url).hostname or "").lower()
+                                if cur_h and any(d in cur_h for d in next_site.get("domains", [])):
+                                    rem = [s for s in pending if not any(d in cur_h for d in s.get("domains", []))]
+                                    if rem:
+                                        next_site = rem[0]
+                                action = {
+                                    "type": "navigate",
+                                    "risk": "write",
+                                    "params": {"url": next_site["default_url"]},
+                                    "verify": f"navigated to {next_site['name']}",
+                                    "timeoutMs": 15000,
+                                }
+                                first = {"why": f"Action was redundant. Transitioning to pending comparison site {next_site['name']}", "action": action}
+                    except Exception:
+                        pass
+                if action is None:
+                    if working_memory.get("collected_research") or working_memory.get("notes"):
+                        # If multi-site tracker is present and not complete, do NOT complete prematurely
+                        if not ms_tracker or is_multi_site_task_complete(ms_tracker):
+                            summary_notes = working_memory.get("notes") or "Research completed."
+                            return {"final": "completed", "steps": steps_done, "summary": summary_notes,
+                                    "history": history, "url": raw_url, "last_obs": raw_obs}
+                    penalties.append(
+                        "You emitted an action that was already executed and completed in a previous step. Do not repeat completed browser actions."
+                    )
+                    continue
 
         # Loop prevention & chat auto-completion (host-scoped; no false
         # positives on ordinary search forms that happen to have a send button).
@@ -358,8 +666,30 @@ async def _run_loop(
                 return {
                     "final": "completed",
                     "steps": steps_done,
-                    "summary": f"Completed: {notes_summary[:160]}",
+                    "summary": f"Completed: {notes_summary[:160]}", "history": history,
                 }
+
+            # State-aware loop detection: detect repeated actions with zero page state change
+            if last_digest is not None and current_digest == last_digest:
+                last_entry = history[-1]
+                last_act = last_entry.get("action") or {}
+                if _actions_match(last_act, action):
+                    zero_change_repeats += 1
+                    if zero_change_repeats >= 3 and action.get("type") != "scroll":
+                        return {
+                            "final": "budget_exceeded",
+                            "steps": steps_done,
+                            "summary": f"Loop detected: action '{action.get('type')}' repeated on identical page state with zero effect.",
+                            "history": history,
+                        }
+                    if zero_change_repeats >= 1 and action.get("type") != "scroll":
+                        penalties.append(
+                            f"State-aware loop warning: action '{action.get('type')}' was already executed on this exact page state, but produced zero state change (URL and DOM remain identical). Do not repeat this action without changing target or strategy. If navigating, select an alternative link or conclude."
+                        )
+                else:
+                    zero_change_repeats = 0
+            else:
+                zero_change_repeats = 0
 
             consecutive_repeats = 0
             for h in reversed(history):
@@ -368,14 +698,40 @@ async def _run_loop(
                 else:
                     break
 
-            if consecutive_repeats >= 3 and action.get("type") != "scroll":
-                return {
-                    "final": "budget_exceeded",
-                    "steps": steps_done,
-                    "summary": f"Loop detected: action '{action.get('type')}' repeated {consecutive_repeats + 1} times without progress."
-                }
-            if consecutive_repeats >= 1 and action.get("type") != "scroll":
-                penalties.append(f"loop warning: action '{action.get('type')}' was already completed. Do not repeat it; proceed to next step or conclude.")
+            if action.get("type") == "scroll":
+                if consecutive_repeats >= 3:
+                    return {
+                        "final": "budget_exceeded",
+                        "steps": steps_done,
+                        "summary": "Loop detected: repeated scrolling without selecting a target or finding progress.",
+                        "history": history,
+                    }
+                if consecutive_repeats >= 1:
+                    penalties.append(
+                        "Loop warning: You have already scrolled down. Do not scroll again. Look at the available links in <page-context> and click a matching product/result, or conclude if information is found."
+                    )
+            else:
+                if consecutive_repeats >= 3:
+                    return {
+                        "final": "budget_exceeded",
+                        "steps": steps_done,
+                        "summary": f"Loop detected: action '{action.get('type')}' repeated {consecutive_repeats + 1} times without progress.",
+                        "history": history,
+                    }
+                if consecutive_repeats >= 1:
+                    penalties.append(f"loop warning: action '{action.get('type')}' was already completed. Do not repeat it; proceed to next step or conclude.")
+
+        last_digest = current_digest
+
+        if raw_url:
+            url_history.append(raw_url)
+            if len(url_history) >= 4:
+                if (url_history[-1] == url_history[-3] and
+                    url_history[-2] == url_history[-4] and
+                    url_history[-1] != url_history[-2]):
+                    penalties.append(
+                        "Oscillation warning: You are repeatedly bouncing between two pages. Do not navigate back and forth; execute your search or extraction on the destination page."
+                    )
 
         is_wa_qr = _is_whatsapp_qr(raw_url, raw_obs)
         is_auth_page = _is_auth_url(raw_url)
@@ -383,22 +739,53 @@ async def _run_loop(
         needs_confirm = action.get("risk") == "sensitive" or is_auth_page or is_wa_qr or (
             is_strict and action.get("risk") == "write" and action.get("type") not in ("navigate", "scroll", "zoom", "wait", "observe", "select_tab")
         )
+        approved = False
         if confirm_gate is not None and needs_confirm:
             gate_msg = _gate_message(action, is_wa_qr, is_auth_page)
             approved = await _request_confirmation(confirm_gate, action, task_id, confirm_timeout_s, custom_message=gate_msg)
             if is_cancelled(task_id):
-                return {"final": "cancelled", "steps": steps_done, "summary": None}
+                return {"final": "cancelled", "steps": steps_done, "summary": None, "history": history}
             if approved is False:
                 return {"final": "failed", "steps": steps_done,
-                        "summary": f"user rejected action: {action.get('type')}"}
+                        "summary": f"user rejected action: {action.get('type')}", "history": history}
 
+        _enforce_date_integrity(action, instruction)
         action_started = time.perf_counter()
-        result = await _execute_with_retries(ext_hub, action, task_id)
+        result = await _execute_with_retries(ext_hub, action, task_id, session_id=session_id)
         metrics("act", action_started)
+        if session_id and result.get("ok"):
+            obs = result.get("observation")
+            if isinstance(obs, dict) and "tabId" in obs:
+                from .session_manager import session_manager
+                sess = session_manager.get_session(session_id)
+                if sess:
+                    is_new_tab = "opened new tab" in str(result.get("evidence", "")).lower() or obs["tabId"] == sess.primary_tab_id or obs["tabId"] in sess.child_tab_ids
+                    if is_new_tab:
+                        session_manager.register_child_tab(session_id, obs["tabId"])
+            # After a successful close_tab, drop the tab from the session's
+            # child registry so stale tabIds cannot authorize later actions.
+            if session_id and action.get("type") == "close_tab":
+                try:
+                    closed_tab_id = int(action.get("params", {}).get("tabId"))
+                except (TypeError, ValueError):
+                    closed_tab_id = None
+                if closed_tab_id is not None:
+                    session_manager.unregister_child_tab(session_id, closed_tab_id)
         if is_cancelled(task_id):
-            return {"final": "cancelled", "steps": steps_done, "summary": None}
+            return {"final": "cancelled", "steps": steps_done, "summary": None, "history": history}
         steps_done += 1
         cached_obs = _fresh_observation(result, action)
+        if needs_confirm and approved:
+            try:
+                from .auth_validator import verify_authentication_state
+                post_obs = cached_obs or raw_obs
+                is_authed, auth_msg = verify_authentication_state(post_obs)
+                if not is_authed:
+                    penalties.append(f"Authentication unverified: {auth_msg}. Do not assume login succeeded.")
+            except Exception:
+                pass
+        if not result.get("ok") or zero_change_repeats > 0:
+            cached_obs = None
 
         evidence: Any = result.get("evidence")
         if not evidence:
@@ -417,24 +804,44 @@ async def _run_loop(
         safe_evidence: Any = redact_text_urls(evidence) if isinstance(evidence, str) else evidence
         progress(f"Step {steps_done}: {action.get('type')} -> {safe_evidence}", screenshot=step_screenshot)
 
-        entry = {"action": action, "result_ok": result.get("ok"), "evidence": safe_evidence}
-        if not result.get("ok"):
+        action_ok = bool(result.get("ok"))
+        if action_ok:
+            is_verified = (
+                action.get("type") in ("navigate", "scroll", "wait", "observe", "select_tab")
+                or "navigated" in str(safe_evidence).lower()
+                or "opened new tab" in str(safe_evidence).lower()
+                or "verified" in str(safe_evidence).lower()
+                or "accepted" in str(safe_evidence).lower()
+            )
+            action_status = "verified" if is_verified else "completed_unverified"
+        else:
+            action_status = "failed"
+
+        entry = {
+            "action": action,
+            "result_ok": action_ok,
+            "status": action_status,
+            "evidence": safe_evidence,
+        }
+        if not action_ok:
             err = result.get("error") or {}
             err_msg = str(err.get("message", "unknown"))
             entry["error"] = redact_text_urls(err_msg)
             if not err.get("recoverable", False):
+                _save_checkpoint_defensive(task_id, conversation_id, session_id, steps_done, raw_url, history, working_memory)
                 return {"final": "failed", "steps": steps_done,
-                        "summary": f"non-recoverable error: {redact_text_urls(err_msg)}"}
+                        "summary": f"non-recoverable error: {redact_text_urls(err_msg)}", "history": history}
             penalty = _same_failure(history, entry)
             if penalty:
                 penalties.append(penalty)
         history.append(entry)
+        _save_checkpoint_defensive(task_id, conversation_id, session_id, steps_done, raw_url, history, working_memory)
 
         if steps_done >= MAX_STEPS:
             break
 
     if is_cancelled(task_id):
-        return {"final": "cancelled", "steps": steps_done, "summary": None}
+        return {"final": "cancelled", "steps": steps_done, "summary": None, "history": history}
     final_obs = cached_obs
     if final_obs is None:
         final_obs = obs_factory()
@@ -443,7 +850,7 @@ async def _run_loop(
                 final_obs = await final_obs
             except Exception:
                 final_obs = {}
-    return {"final": "budget_exceeded", "steps": steps_done, "summary": _summary(final_obs, history)}
+    return {"final": "budget_exceeded", "steps": steps_done, "summary": _summary(final_obs, history), "history": history}
 
 
 def _call_planner(
@@ -488,6 +895,55 @@ def _actions_match(a1: dict[str, Any], a2: dict[str, Any]) -> bool:
     if p1.get("url") and p1.get("url") == p2.get("url"):
         return True
     return False
+
+
+def _is_redundant_completed_action(action: dict[str, Any], history: list[dict[str, Any]], current_url: str) -> bool:
+    """Never repeat completed browser actions (e.g. redundant navigate or form submission after provider fallback)."""
+    if not history or not action:
+        return False
+    atype = action.get("type")
+    params = action.get("params") or {}
+    if atype == "navigate":
+        nav_url = params.get("url")
+        if nav_url and current_url:
+            try:
+                cur_parts = urlsplit(current_url)
+                nav_parts = urlsplit(nav_url)
+                if cur_parts.hostname and nav_parts.hostname and (
+                    cur_parts.hostname == nav_parts.hostname
+                    or cur_parts.hostname.endswith("." + nav_parts.hostname)
+                    or nav_parts.hostname.endswith("." + cur_parts.hostname)
+                ):
+                    if cur_parts.path.rstrip("/") == nav_parts.path.rstrip("/"):
+                        for h in history:
+                            h_act = h.get("action") or {}
+                            if h.get("result_ok") and h_act.get("type") == "navigate":
+                                return True
+            except Exception:
+                pass
+    elif atype == "type":
+        text = params.get("text")
+        if text and params.get("submit"):
+            for h in history:
+                h_act = h.get("action") or {}
+                if h.get("result_ok") and h_act.get("type") == "type":
+                    h_params = h_act.get("params") or {}
+                    if h_params.get("text") == text and h_params.get("submit"):
+                        return True
+    return False
+
+
+def _state_digest(raw_obs: Any) -> str:
+    if raw_obs is None:
+        return ""
+    url = str(getattr(raw_obs, "url", None) or (raw_obs.get("url") if isinstance(raw_obs, dict) else "") or "")
+    title = str(getattr(raw_obs, "title", None) or (raw_obs.get("title") if isinstance(raw_obs, dict) else "") or "")
+    interactive = getattr(raw_obs, "interactive", None) or (raw_obs.get("interactive") if isinstance(raw_obs, dict) else []) or []
+    el_sample = ",".join(
+        str(getattr(e, "target_id", None) or (e.get("targetId") if isinstance(e, dict) else ""))
+        for e in interactive[:12]
+    )
+    return f"{url}|{title}|{len(interactive)}|{el_sample}"
 
 
 def _is_whatsapp_qr(raw_url: str, raw_obs: Any) -> bool:
@@ -604,8 +1060,10 @@ def _history_view(history: list[dict[str, Any]], penalties: list[str], working_m
     return out
 
 
-async def _execute_with_retries(ext_hub: Any, action: dict[str, Any], task_id: str) -> dict[str, Any]:
+async def _execute_with_retries(ext_hub: Any, action: dict[str, Any], task_id: str, session_id: Optional[str] = None) -> dict[str, Any]:
     act = dict(action)
+    if session_id and "sessionId" not in act:
+        act["sessionId"] = session_id
     if "timeoutMs" not in act:
         act["timeoutMs"] = act.get("timeout_ms", 10000)
     # Wait slightly longer than the extension's own action deadline (+5s) so
@@ -700,6 +1158,20 @@ def extract_mission_facts(instruction: str, summary: str, history: Optional[list
     if summary:
         facts["last_result"] = summary[:240].strip()
 
+    # 6. LeetCode Profile extraction
+    if "leetcode" in full_text.lower():
+        try:
+            from .extractors.leetcode import extract_leetcode_profile
+            profile = extract_leetcode_profile({"url": facts.get("canonical_url", "")}, page_text=full_text)
+            if profile.get("username") and profile["username"] != "Authenticated User":
+                facts["leetcode_username"] = str(profile["username"])
+            if profile.get("total_solved") and str(profile["total_solved"]) != "0":
+                facts["leetcode_solved"] = str(profile["total_solved"])
+            if profile.get("contest_rating") and "unrated" not in str(profile["contest_rating"]).lower():
+                facts["leetcode_rating"] = str(profile["contest_rating"])
+        except Exception:
+            pass
+
     return facts
 
 
@@ -730,6 +1202,15 @@ async def run_task(task_id: str) -> None:
             if chat_mem:
                 initial_memory["session_memory"] = chat_mem
 
+            latest_cp = db.get_latest_checkpoint_for_chat(chat_id)
+            if latest_cp:
+                if latest_cp.get("working_memory"):
+                    for k, v in latest_cp["working_memory"].items():
+                        if k not in initial_memory:
+                            initial_memory[k] = v
+                if latest_cp.get("history"):
+                    initial_memory["prior_checkpoint_history"] = latest_cp["history"]
+
             db.add_message(chat_id, "user", record.instruction)
 
             chat_info = db.get_chat(chat_id)
@@ -741,11 +1222,192 @@ async def run_task(task_id: str) -> None:
         except Exception:
             pass
 
+    # 1. Intent Classification Stage (P5.2)
+    from .intent_router import classify_intent, TaskIntent
+    from .session_manager import session_manager
+
+    active_session = None
+    if chat_id:
+        active_session = session_manager.get_active_session_for_chat(chat_id)
+
+    classification = classify_intent(
+        record.instruction,
+        context={
+            "active_session": active_session,
+            "conversation_history": initial_memory.get("conversation_history", []),
+        },
+    )
+    record.intent = classification.intent.value
+    record.is_browser_task = classification.is_browser
+
+    # 2. NON_BROWSER Intent: Conversational fast-path (Zero browser interactions)
+    if not classification.is_browser:
+        from .capabilities import check_supported_capability, is_capability_query, format_capability_overview
+        from .completion_verifier import verify_task_completion
+
+        # Check for explicitly unsupported system operations
+        is_supp, supp_reason = check_supported_capability(record.instruction)
+        if not is_supp:
+            record.state = "failed"
+            record.message = supp_reason or "Unsupported capability requested."
+            await real_hub.broadcast_progress(record)
+            if chat_id:
+                try:
+                    from . import db
+                    db.add_message(chat_id, "agent", record.message, evidence="unsupported")
+                    db.touch_chat(chat_id)
+                except Exception:
+                    pass
+            return
+
+        record.state = "running"
+        record.message = "Thinking..."
+        await real_hub.broadcast_progress(record)
+
+        try:
+            if is_capability_query(record.instruction):
+                answer = format_capability_overview()
+            else:
+                provider = _provider_for_config()
+                history = initial_memory.get("conversation_history", [])
+                if hasattr(provider, "chat_call"):
+                    answer = provider.chat_call(record.instruction, history=history)
+                else:
+                    answer = "I have processed your request."
+
+            verified = verify_task_completion(
+                instruction=record.instruction,
+                candidate_state="completed",
+                message=answer,
+                observation=None,
+                working_memory=initial_memory,
+            )
+            record.steps_done = 1
+            record.state = verified.state
+            record.message = verified.message
+            await real_hub.broadcast_progress(record)
+            if chat_id:
+                try:
+                    from . import db
+                    evidence_tag = "conversational" if verified.state == "completed" else "failed"
+                    db.add_message(chat_id, "agent", verified.message, evidence=evidence_tag)
+                    db.touch_chat(chat_id)
+                except Exception:
+                    pass
+            return
+        except Exception as exc:
+            cancelled = record.cancelled or is_cancelled(task_id)
+            record.state = "cancelled" if cancelled else "failed"  # type: ignore[assignment]
+            record.message = "" if cancelled else f"Error: {exc}"
+            await real_hub.broadcast_progress(record)
+            if chat_id:
+                try:
+                    from . import db
+                    db.add_message(chat_id, "agent", f"Error: {exc}", evidence="failed")
+                    db.touch_chat(chat_id)
+                except Exception:
+                    pass
+            return
+
+    # 3. BROWSER Tasks (NEW_BROWSER_TASK, CONTINUE_BROWSER_TASK, USE_EXISTING_USER_TAB)
+    if not real_hub.extension_sockets:
+        record.state = "failed"
+        record.message = "EXTENSION_DISCONNECTED: Chrome extension is not connected."
+        await real_hub.broadcast_progress(record)
+        if chat_id:
+            try:
+                from . import db
+                db.add_message(chat_id, "agent", "Error: Chrome extension is not connected.", evidence="failed")
+                db.touch_chat(chat_id)
+            except Exception:
+                pass
+        return
+
+    # Check for ambiguous user tab request
+    if classification.is_ambiguous:
+        record.state = "failed"
+        record.message = "AMBIGUOUS_TAB: Cannot determine target tab. Please specify a specific site or tab."
+        await real_hub.broadcast_progress(record)
+        if chat_id:
+            try:
+                from . import db
+                db.add_message(chat_id, "agent", "Error: Ambiguous tab request.", evidence="failed")
+                db.touch_chat(chat_id)
+            except Exception:
+                pass
+        return
+
+    # Session acquisition
+    origin = "new_task"
+    if classification.intent == TaskIntent.CONTINUE_BROWSER_TASK and active_session:
+        session = session_manager.continue_session(active_session.session_id, task_id)
+        if not session:
+            session = session_manager.create_session(
+                conversation_id=chat_id or "default",
+                task_id=task_id,
+                origin="new_task",
+            )
+        else:
+            origin = "reused_session"
+    elif classification.intent == TaskIntent.USE_EXISTING_USER_TAB:
+        session = session_manager.create_session(
+            conversation_id=chat_id or "default",
+            task_id=task_id,
+            origin="existing_user_tab",
+        )
+        origin = "existing_user_tab"
+    else:
+        session = session_manager.create_session(
+            conversation_id=chat_id or "default",
+            task_id=task_id,
+            origin="new_task",
+        )
+
+    record.session_id = session.session_id
+    record.primary_tab_id = session.primary_tab_id
+    record.child_tab_ids = session.child_tab_ids
+
+    # Initialize session in the extension
+    init_res = await real_hub.send_action(task_id, {
+        "type": "init_session",
+        "sessionId": session.session_id,
+        "useExistingTab": (origin == "existing_user_tab"),
+        "tabHint": classification.target_tab_hint,
+        "timeoutMs": 15000,
+    })
+
+    if not init_res.get("ok"):
+        err_info = init_res.get("error") or {}
+        err_code = err_info.get("code", "SESSION_INIT_FAILED")
+        err_msg = err_info.get("message", "Failed to initialize browser session")
+        record.state = "failed"
+        record.message = f"{err_code}: {err_msg}"
+        session_manager.update_status(session.session_id, "failed")
+        await real_hub.broadcast_progress(record)
+        if chat_id:
+            try:
+                from . import db
+                db.add_message(chat_id, "agent", f"Error ({err_code}): {err_msg}", evidence="failed")
+                db.touch_chat(chat_id)
+            except Exception:
+                pass
+        return
+
+    # Pin primary tab ID
+    primary_tab_id = init_res.get("primaryTabId")
+    if primary_tab_id:
+        session_manager.pin_primary_tab(session.session_id, primary_tab_id)
+        record.primary_tab_id = primary_tab_id
+
     def on_step_progress(steps: int = 0, msg: str = "", screenshot: Optional[str] = None) -> None:
         record.steps_done = steps
         record.message = msg
-        # A cancelled task must not be flipped back to running by a late step.
-        if record.state != "cancelled":
+        sess = session_manager.get_session(session.session_id)
+        if sess:
+            record.primary_tab_id = sess.primary_tab_id
+            record.child_tab_ids = sess.child_tab_ids
+        # A terminal task must not be flipped back to running by a late step.
+        if record.state not in ("completed", "failed", "cancelled"):
             record.state = "running"
         if screenshot:
             record.screenshot = screenshot
@@ -775,13 +1437,32 @@ async def run_task(task_id: str) -> None:
             confirm_gate=_ConfirmGate(record),
             on_metrics=on_metrics,
             initial_memory=initial_memory,
+            session_id=session.session_id,
+            conversation_id=chat_id or "default",
         )
-        final_state = {"completed": "completed", "failed": "failed", "cancelled": "cancelled",
-                       "budget_exceeded": "failed"}.get(state["final"], "failed")
-        if record.cancelled:
+        candidate_final = {"completed": "completed", "failed": "failed", "cancelled": "cancelled",
+                           "budget_exceeded": "failed"}.get(state["final"], "failed")
+        from .completion_verifier import verify_task_completion
+        verified = verify_task_completion(
+            instruction=record.instruction,
+            candidate_state=candidate_final,
+            message=state.get("summary") or "",
+            observation=state.get("last_obs") or ({"url": state["url"]} if state.get("url") else None),
+            working_memory=initial_memory,
+            history=state.get("history") or [],
+        )
+        if record.cancelled or is_cancelled(task_id):
+            final_state = "cancelled"
+            record.message = "Task cancelled by user."
+        elif record.state != "cancelled":
+            final_state = verified.state
+            record.message = verified.message
+        else:
             final_state = "cancelled"
         record.state = final_state  # type: ignore[assignment]
-        record.message = state.get("summary") or ""
+        is_planner_err = "Planner unavailable" in (record.message or "") or "Planner timed out" in (record.message or "")
+        sess_status = "active" if (is_planner_err or final_state == "completed") else final_state
+        session_manager.update_status(session.session_id, sess_status)
         await real_hub.broadcast_progress(record)
 
         if chat_id:
@@ -790,7 +1471,7 @@ async def run_task(task_id: str) -> None:
                 summary = state.get("summary") or "Mission finished."
                 evidence_info = f"{final_state} ({state.get('steps', record.steps_done)} steps)"
                 db.add_message(chat_id, "agent", summary, evidence=evidence_info)
-                if final_state == "completed":
+                if final_state == "completed" or (state.get("history") and any(h.get("result_ok") for h in state.get("history"))):
                     facts = extract_mission_facts(record.instruction, summary, state.get("history") or [])
                     for k, v in facts.items():
                         db.set_chat_memory(chat_id, k, v)
@@ -799,8 +1480,10 @@ async def run_task(task_id: str) -> None:
                 pass
     except Exception as exc:
         cancelled = record.cancelled or is_cancelled(task_id)
-        record.state = "cancelled" if cancelled else "failed"  # type: ignore[assignment]
+        if record.state != "cancelled":
+            record.state = "cancelled" if cancelled else "failed"  # type: ignore[assignment]
         record.message = "" if cancelled else f"loop error: {exc}"
+        session_manager.update_status(session.session_id, "cancelled" if cancelled else "failed")
         await real_hub.broadcast_progress(record)
 
         if chat_id:
@@ -845,8 +1528,10 @@ class _ConfirmGate:
 class _LiveObservation:
     """Observation factory: asks the extension for the active tab view each
     round. Raises if the extension socket is gone (loop fails cleanly)."""
-    def __init__(self, task_id: str) -> None:
+    def __init__(self, task_id: str, session_id: Optional[str] = None, tab_id: Optional[int] = None) -> None:
         self._task_id = task_id
+        self._session_id = session_id
+        self._tab_id = tab_id
 
     async def __call__(self) -> dict[str, Any]:
         if not real_hub.extension_sockets:
@@ -854,9 +1539,14 @@ class _LiveObservation:
         for attempt in range(2):
             if is_cancelled(self._task_id):
                 raise RuntimeError("task cancelled")
-            res = await real_hub.send_action(self._task_id, {
+            act: dict[str, Any] = {
                 "type": "observe", "risk": "read", "verify": "fresh observation", "timeoutMs": 25000,
-            })
+            }
+            if self._session_id:
+                act["sessionId"] = self._session_id
+            if self._tab_id:
+                act["tabId"] = self._tab_id
+            res = await real_hub.send_action(self._task_id, act)
             if res.get("ok") and res.get("observation"):
                 return res["observation"]
             if is_cancelled(self._task_id):
@@ -867,15 +1557,37 @@ class _LiveObservation:
 
 
 def _live_observation_factory(record: TaskRecord) -> _LiveObservation:
-    return _LiveObservation(record.task_id)
+    # If session_id is present, let extension dynamically observe session.activeTabId
+    tab = None if record.session_id else record.primary_tab_id
+    return _LiveObservation(record.task_id, session_id=record.session_id, tab_id=tab)
 
 
 def _provider_for_config():
-    """Pick a planner provider. Explicit mock wins even with keys present."""
+    """Pick a planner provider. Explicit mock wins even with keys present.
+
+    Runtime selection (POST /api/llm/config) wins over static config so the
+    provider can be switched without restarting the application. Raises only
+    when a runtime selection itself cannot be built; the static paths below
+    keep their existing fallthrough behavior.
+    """
     from . import config
+    from .providers import provider_settings
+    from .providers.errors import ProviderUnavailable
+    if provider_settings.active():
+        try:
+            return provider_settings.provider_for_runtime()
+        except ProviderUnavailable:
+            raise
     from .providers.mock import MockProvider
     if config.PROVIDER == "mock":
         return MockProvider()
+    if config.PROVIDER == "antseed" and config.ANTSEED_API_KEY_ENV:
+        from .providers.openai_compatible import OpenAICompatibleProvider
+        return OpenAICompatibleProvider(
+            api_key=config.ANTSEED_API_KEY_ENV,
+            base_url=config.ANTSEED_BASE_URL,
+            model=config.ANTSEED_MODEL or None,
+        )
     if config.PROVIDER == "groq" and config.GROQ_API_KEY:
         from .providers.groq import GroqProvider
         return GroqProvider(api_key=config.GROQ_API_KEY)

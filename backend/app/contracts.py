@@ -22,6 +22,7 @@ TASK_STATES = [
 ERROR_CODES = [
     "STALE_TARGET", "TIMEOUT", "NAVIGATION_FAILED", "PRIVACY_VIOLATION",
     "PLAN_INVALID", "BUDGET_EXCEEDED", "CANCELLED", "EXTENSION_DISCONNECTED",
+    "TAB_UNAVAILABLE", "TAB_UNAUTHORIZED", "AMBIGUOUS_TAB",
     "UNKNOWN",
 ]
 
@@ -55,6 +56,8 @@ class BrowserAction(BaseModel):
     risk: RiskClass
     verify: str
     timeout_ms: int = Field(alias="timeoutMs")
+    session_id: Optional[str] = Field(default=None, alias="sessionId")
+    tab_id: Optional[int] = Field(default=None, alias="tabId")
     target: Optional[ElementTarget] = None
     params: Optional[ActionParams] = None
 
@@ -67,6 +70,7 @@ class InteractiveElement(BaseModel):
     name: str
     tag: str
     input_type: Optional[str] = Field(default=None, alias="inputType")
+    href: Optional[str] = None
     value: Optional[str] = None
     visible: bool
     enabled: bool
@@ -84,6 +88,7 @@ class BrowserObservation(BaseModel):
     dpr: float = 1.0
     screenshot: Optional[str] = None
     tabs: Optional[list[dict[str, Any]]] = None
+    page_text: Optional[str] = Field(default=None, alias="pageText")
 
     model_config = {"populate_by_name": True}
 

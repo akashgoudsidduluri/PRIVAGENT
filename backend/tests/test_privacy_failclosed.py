@@ -74,3 +74,20 @@ def test_payload_counts_provenance():
     payload, _ = classify_and_redact(obs, instruction="look around")
     assert payload.elements_sent == 2
     assert payload.elements_original == 2
+
+
+def test_page_text_redaction_and_context_block():
+    obs = make_obs({"a": {"type": "text", "value": "1"}})
+    obs.page_text = "Call us at 4111-2222-3333-4444 or email admin@example.com for secret api key sk-1234567890abcdef1234. Visit https://example.com/login?token=secret123"
+    payload, _ = classify_and_redact(obs, instruction="read info")
+    assert payload.page_text is not None
+    # Credit card, email, api key, and token in URL must all be redacted
+    assert "4111-2222-3333-4444" not in payload.page_text
+    assert "admin@example.com" not in payload.page_text
+    assert "sk-1234567890abcdef1234" not in payload.page_text
+    assert "token=secret123" not in payload.page_text
+    assert "[REDACTED]" in payload.page_text
+    ctx = payload.to_context_block()
+    assert "<page-text>" in ctx
+    assert "</page-text>" in ctx
+    assert "[REDACTED]" in ctx

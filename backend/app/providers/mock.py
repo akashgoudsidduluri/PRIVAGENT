@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from app.privacy import PrivacyFilteredPayload
+from ..privacy import PrivacyFilteredPayload
 
 
 class MockProvider:
@@ -44,6 +44,26 @@ class MockProvider:
                 "why": "nothing useful on page; go to google",
             })
         return {"goal": instruction, "steps": steps}
+
+    def chat_call(self, prompt: str, history: Optional[list[dict[str, Any]]] = None) -> str:
+        lower = (prompt or "").strip().lower()
+        if any(w in lower for w in ("hi", "hello", "hey", "greetings", "howdy")):
+            return "Hello! I am PrivAgent, your privacy-preserving AI assistant. How can I help you today?"
+        if "transformer" in lower:
+            return "Transformers are deep learning architectures based on self-attention mechanisms that process input sequences in parallel rather than sequentially."
+        if "bfs" in lower or "c++" in lower:
+            return "Here is a C++ BFS implementation:\n\n```cpp\n#include <iostream>\n#include <vector>\n#include <queue>\n\nvoid bfs(int start, const std::vector<std::vector<int>>& adj) {\n    std::vector<bool> visited(adj.size(), false);\n    std::queue<int> q;\n    q.push(start);\n    visited[start] = true;\n    while (!q.empty()) {\n        int u = q.front(); q.pop();\n        std::cout << u << \" \";\n        for (int v : adj[u]) {\n            if (!visited[v]) {\n                visited[v] = true;\n                q.push(v);\n            }\n        }\n    }\n}\n```"
+        if "browser automation" in lower:
+            return "Browser automation refers to programmatically controlling a web browser to automate web tasks, form fills, testing, and navigation without manual human interaction."
+        if "google search" in lower:
+            return "Google Search works by crawling web pages via automated spiders (Googlebot), indexing text and metadata in a massive database, and ranking pages against user queries using algorithms like PageRank and AI relevance models."
+        if "calculate" in lower or "compute" in lower or "%" in lower or "*" in lower or "solve" in lower:
+            if "25%" in lower and "800" in lower:
+                return "25% of 800 is 200."
+            if "125" in lower and "8" in lower:
+                return "125 * 8 is 1000."
+            return f"Calculated answer for: {prompt}"
+        return f"Here is the requested information regarding: {prompt}"
 
 
 class InjectionProbeProvider(MockProvider):

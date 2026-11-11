@@ -61,7 +61,16 @@ async function withDeadline(promise: Promise<ActionResult>, ms: number): Promise
 }
 
 async function handleMessage(taskId: string, raw: unknown): Promise<void> {
-  const action = raw as { timeoutMs?: number } | null;
+  const action = raw as { type?: string; timeoutMs?: number } | null;
+  if (action?.type === "reload_extension") {
+    relay.send({ type: "RESULT", taskId, payload: { ok: true, evidence: "reloading extension" } });
+    setTimeout(() => {
+      try {
+        chrome.runtime?.reload?.();
+      } catch {}
+    }, 50);
+    return;
+  }
   const actionMs = typeof action?.timeoutMs === "number" && action.timeoutMs > 0
     ? Math.min(action.timeoutMs, 60_000)
     : 10_000;

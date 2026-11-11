@@ -52,4 +52,37 @@ describe("target resolution", () => {
     const t = findTarget({ targetId: "unknown", name: "realme 15 pro" }, longCandidates);
     expect(t?.targetId).toBe("p2");
   });
+
+  it("does not fall back to synthetic nav-el-* when wantedName fails to match", () => {
+    const list: Candidate[] = [
+      { targetId: "nav-el-5", role: "button", name: "Different Item", cssSelector: "#btn", enabled: true, visible: true },
+    ];
+    // Specified name doesn't match, so it must not bind to nav-el-5
+    const t = findTarget({ targetId: "nav-el-5", name: "Wanted Product" }, list);
+    expect(t).toBeNull();
+  });
+
+  it("accepts synthetic nav-el-* when no wantedName is specified", () => {
+    const list: Candidate[] = [
+      { targetId: "nav-el-5", role: "button", name: "Different Item", cssSelector: "#btn", enabled: true, visible: true },
+    ];
+    const t = findTarget({ targetId: "nav-el-5" }, list);
+    expect(t?.targetId).toBe("nav-el-5");
+  });
+
+  it("matches target with token overlap when descriptive words vary", () => {
+    const list: Candidate[] = [
+      { targetId: "el1", role: "link", name: "Realme 15 Pro (Emerald Green, 256GB)", cssSelector: "#el1", enabled: true, visible: true },
+    ];
+    const t = findTarget({ targetId: "nav-el-12", name: "Realme 15 Pro 5G Emerald Green 8GB 256GB Phone" }, list);
+    expect(t?.targetId).toBe("el1");
+  });
+
+  it("accepts synthetic nav-el-* when element shares token affinity with wantedName", () => {
+    const list: Candidate[] = [
+      { targetId: "nav-el-7", role: "link", name: "Realme 15 Pro Smartphone", cssSelector: "#p7", enabled: true, visible: true },
+    ];
+    const t = findTarget({ targetId: "nav-el-7", name: "Realme 15 Pro Edition" }, list);
+    expect(t?.targetId).toBe("nav-el-7");
+  });
 });

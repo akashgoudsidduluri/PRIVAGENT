@@ -8,6 +8,7 @@ export interface Candidate {
   enabled: boolean;
   visible: boolean;
   bounds?: { x: number; y: number; width: number; height: number };
+  href?: string;
 }
 
 const norm = (s: string | undefined) => (s ?? "").trim().toLowerCase();
@@ -65,14 +66,42 @@ export function findTarget(
         return wantedTokens.every(tok => cn.includes(tok));
       });
       if (tokenMatch) return tokenMatch;
+
+      // 2e. Token overlap matching: candidate name contains majority (>= 60%) of wanted tokens
+      // or candidate's tokens are all contained within wantedName
+      let bestCandidate: Candidate | null = null;
+      let highestScore = 0;
+      for (const c of candidates) {
+        if (!usable(c, interaction)) continue;
+        const cn = norm(c.name);
+        const cTokens = cn.split(/\s+/).filter(w => w.length > 1);
+        if (cTokens.length === 0) continue;
+        const matched = wantedTokens.filter(tok => cn.includes(tok)).length;
+        const score = matched / wantedTokens.length;
+        const candSubset = cTokens.length >= 2 && cTokens.every(tok => wantedTokens.some(wt => wt.includes(tok)));
+        if ((score >= 0.6 && score > highestScore) || candSubset) {
+          highestScore = score;
+          bestCandidate = c;
+        }
+      }
+      if (bestCandidate) return bestCandidate;
     }
   }
 
-  // 3. Fallback to synthetic targetId (nav-el-*) if name didn't match
+  // 3. Fallback to synthetic targetId (nav-el-*)
   if (tid) {
     const byId = candidates.find(c => cleanId(c.targetId) === tid || c.targetId === target.targetId);
     if (byId && usable(byId, interaction)) {
-      return byId;
+      if (!wantedName) {
+        return byId;
+      }
+      const cn = norm(byId.name);
+      const wantedTokens = wantedName.split(/\s+/).filter(w => w.length > 1);
+      const sharesToken = wantedTokens.some(tok => cn.includes(tok));
+      const sharesRole = target.role ? byId.role === target.role : true;
+      if (sharesToken || (cn.length === 0 && sharesRole) || (!tid.startsWith("nav-el-"))) {
+        return byId;
+      }
     }
   }
 

@@ -991,3 +991,121 @@
 }
 
 
+
+/* LLM Provider Settings dialog */
+.llm-settings-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  padding: 16px;
+}
+
+.llm-settings-overlay[hidden] {
+  display: none;
+}
+
+.llm-settings {
+  width: min(440px, 100%);
+  background: var(--bg-2, #0a1230);
+  border: 1px solid var(--line, rgba(70, 215, 255, 0.15));
+  border-radius: 12px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
+}
+
+.llm-settings__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--line, rgba(70, 215, 255, 0.15));
+}
+
+.llm-settings__header h3 {
+  margin: 0;
+  font-family: var(--font-display, monospace);
+  font-size: 13px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.llm-settings__body {
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.llm-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.llm-field > span {
+  font-family: var(--font-display, monospace);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  opacity: 0.75;
+}
+
+.llm-field input,
+.llm-field select {
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--line, rgba(70, 215, 255, 0.15));
+  border-radius: 8px;
+  color: inherit;
+  padding: 8px 10px;
+  font-size: 13px;
+  font-family: inherit;
+}
+
+.llm-field input:focus-visible,
+.llm-field select:focus-visible {
+  outline: 2px solid var(--accent, #46d7ff);
+  outline-offset: 1px;
+}
+
+.llm-model-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.llm-model-row select,
+.llm-model-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.llm-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.llm-status {
+  font-size: 11px;
+  opacity: 0.8;
+}
+
+.llm-note {
+  margin: 0;
+  font-size: 11px;
+  opacity: 0.6;
+  line-height: 1.5;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .llm-settings-overlay,
+  .llm-settings {
+    backdrop-filter: none;
+    transition: none;
+  }
+}

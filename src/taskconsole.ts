@@ -63,7 +63,11 @@ function renderTaskState(taskState: string, message: string): void {
 }
 
 function addStep(message: string): void {
-  if (!stepsEl) return;
+  if (!stepsEl || !message) return;
+  const lastLi = stepsEl.querySelector("li:last-child");
+  if (lastLi && lastLi.textContent?.trim().includes(message.trim())) {
+    return;
+  }
   const li = document.createElement("li");
   li.innerHTML = `<span style="opacity: 0.9; margin-right: 4px;">${actionIcon(message)}</span> ${formatSummary(message)}`;
   stepsEl.appendChild(li);
@@ -101,8 +105,17 @@ input?.addEventListener("input", () => {
   if (startBtn) startBtn.disabled = !input.value.trim();
 });
 
+input?.addEventListener("keydown", (e: KeyboardEvent) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    if (startBtn && !startBtn.disabled && input.value.trim()) {
+      startBtn.click();
+    }
+  }
+});
+
 startBtn?.addEventListener("click", async () => {
-  if (!input || !startBtn || !input.value.trim()) return;
+  if (!input || !startBtn || startBtn.disabled || !input.value.trim()) return;
   startBtn.disabled = true;
   closeConfirm(false);
   currentTaskId = null;
@@ -171,12 +184,46 @@ cancelBtn?.addEventListener("click", async () => {
 
 function connectEvents(): void {
   const ws = new WebSocket(`ws://localhost:8000/ws/client`);
+  ws.onopen = async () => {
+    if (currentTaskId) {
+      try {
+        const res = await fetch(`${API}/api/task/${currentTaskId}`);
+        if (res.ok) {
+          const t = (await res.json()) as { taskState: string; message: string };
+          if (["completed", "failed", "cancelled"].includes(t.taskState)) {
+            renderTaskState(t.taskState, t.message);
+            if (startBtn) startBtn.disabled = !input?.value.trim();
+            if (cancelBtn) cancelBtn.hidden = true;
+          }
+        }
+      } catch { /* offline */ }
+    }
+  };
   ws.onmessage = ev => {
     try {
-      const env = JSON.parse(ev.data) as { type: string; taskId: string; payload: { taskState: string; stepsDone: number; message: string } };
+      const env = JSON.parse(ev.data) as {
+        type: string;
+        taskId: string;
+        payload: {
+          taskState: string;
+          stepsDone: number;
+          message: string;
+          intent?: string;
+          isBrowserTask?: boolean;
+          sessionId?: string | null;
+        };
+      };
       if (env.type !== "PROGRESS" || env.taskId !== currentTaskId) return;
       const p = env.payload;
+      const modeStr = p.intent === "NON_BROWSER" || p.isBrowserTask === false
+        ? " [Conversational]"
+        : (p.sessionId ? ` [Browser Session ${p.sessionId.slice(0, 8)}]` : "");
+      // Raw state drives logic (terminal checks, summary branches); the
+      // suffix must never contaminate state comparisons — it is display-only.
       renderTaskState(p.taskState, p.message);
+      if (stateEl && modeStr) {
+        setState(`${p.taskState}${modeStr}`);
+      }
       addStep(`[${p.stepsDone}] ${p.message}`);
       if (p.taskState === "awaiting_confirmation") {
         fetch(`${API}/api/task/${env.taskId}`)

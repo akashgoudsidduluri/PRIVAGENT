@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 import sys
+import uuid
 from typing import Any, Optional
 
 if sys.platform == "win32":
@@ -80,7 +81,99 @@ async def health() -> dict[str, Any]:
         "status": "ok",
         "provider": config.PROVIDER,
         "extensionConnected": bool(hub.extension_sockets),
+        "maxSteps": config.MAX_STEPS,
+        "allowScreenshots": config.ALLOW_SCREENSHOTS,
     }
+
+
+@app.post("/api/extension/reload")
+async def reload_extension() -> dict[str, Any]:
+    if not hub.extension_sockets:
+        raise HTTPException(status_code=503, detail="extension not connected")
+    return await hub.send_action("reload", {"type": "reload_extension"}, timeout_s=5.0)
+
+
+# ---------------------------------------------------------------------------
+# LLM provider selection (/api/llm/*) — state lives in provider_settings.
+# The API key is write-only from the API surface: no endpoint returns it.
+# ---------------------------------------------------------------------------
+
+
+class LLMConfigInput(BaseModel):
+    provider: Optional[str] = None
+    baseUrl: Optional[str] = None
+    apiKey: Optional[str] = None
+    model: Optional[str] = None
+    reset: bool = False
+
+
+@app.get("/api/llm/config")
+async def get_llm_config() -> dict[str, Any]:
+    from .providers import provider_settings
+    return provider_settings.public_state()
+
+
+@app.post("/api/llm/config")
+async def set_llm_config(body: LLMConfigInput) -> dict[str, Any]:
+    from .providers import provider_settings
+    try:
+        return provider_settings.configure(
+            provider=body.provider,
+            base_url=body.baseUrl,
+            api_key=body.apiKey,
+            model=body.model,
+            reset=body.reset,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/llm/models")
+async def discover_llm_models() -> dict[str, Any]:
+    """Discover models from the configured OpenAI-compatible gateway.
+
+    Never falls back silently: on failure we return the reason so the UI can
+    offer manual model entry honestly, plus the static seed list either way.
+    """
+    from .providers import provider_settings
+    from .providers.openai_compatible import seeded_models
+    seeded = seeded_models()
+    try:
+        provider = provider_settings.provider_for_runtime()
+    except Exception as exc:
+        return {"discovered": False, "reason": str(exc), "seeded": seeded, "models": list(seeded)}
+    list_models = getattr(provider, "list_models", None)
+    if list_models is None:
+        return {
+            "discovered": False,
+            "reason": f"Provider '{provider.name() if hasattr(provider, 'name') else type(provider).__name__}' does not support model discovery.",
+            "seeded": seeded,
+            "models": list(seeded),
+        }
+    try:
+        models = list_models()
+    except Exception as exc:
+        return {
+            "discovered": False,
+            "reason": str(exc),
+            "seeded": seeded,
+            "models": list(seeded),
+        }
+    merged: list[str] = []
+    seen: set[str] = set()
+    for m in list(models) + seeded:
+        if m not in seen:
+            seen.add(m)
+            merged.append(m)
+    return {"discovered": True, "models": merged, "seeded": seeded, "reason": None}
+
+
+@app.post("/api/test/execute_action")
+async def test_execute_action(body: dict[str, Any]) -> dict[str, Any]:
+    if not hub.extension_sockets:
+        raise HTTPException(status_code=503, detail="extension not connected")
+    tid = body.get("taskId") or f"test-{uuid.uuid4().hex[:8]}"
+    return await hub.send_action(tid, body.get("action", {}), timeout_s=body.get("timeout_s", 15.0))
 
 
 @app.get("/api/chats")
@@ -115,6 +208,7 @@ async def post_chat_message(chat_id: str, body: ChatMessageInput) -> dict[str, A
         raise HTTPException(status_code=404, detail="chat not found")
     task = hub.new_task(body.text, chat_id=chat_id)
     task.state = "planning"
+    _spawn(hub.broadcast_progress(task))
     _spawn(_run_task_later(task.task_id))
     return {
         "taskId": task.task_id,
@@ -159,6 +253,7 @@ async def create_task(body: TaskInput) -> TaskCreated:
         chat_id = chat["id"]
     task = hub.new_task(body.instruction, chat_id=chat_id)
     task.state = "planning"
+    _spawn(hub.broadcast_progress(task))
     _spawn(_run_task_later(task.task_id))
     return TaskCreated(taskId=task.task_id, chatId=chat_id)
 
@@ -182,7 +277,8 @@ async def _run_task_later(task_id: str) -> None:
             # a failure.
             from .agentLoop import is_cancelled
             cancelled = task.cancelled or is_cancelled(task_id)
-            task.state = "cancelled" if cancelled else "failed"
+            if task.state != "cancelled":
+                task.state = "cancelled" if cancelled else "failed"
             task.message = "" if cancelled else f"backend error: {exc}"
             await hub.broadcast_progress(task)
 
@@ -201,6 +297,11 @@ async def get_task(task_id: str) -> dict[str, Any]:
         "plannerMs": task.planner_ms,
         "observeMs": task.observe_ms,
         "actMs": task.act_ms,
+        "intent": task.intent,
+        "sessionId": task.session_id,
+        "primaryTabId": task.primary_tab_id,
+        "childTabIds": task.child_tab_ids,
+        "isBrowserTask": task.intent != "NON_BROWSER" if task.intent else True,
     }
 
 
@@ -223,6 +324,9 @@ async def cancel_task(task_id: str) -> dict[str, str]:
     task.confirm_decision = False
     task.confirm_event.set()
     hub.abort_task_actions(task_id)
+    if getattr(task, "session_id", None):
+        from .session_manager import session_manager
+        session_manager.update_status(task.session_id, "cancelled")
     await hub.broadcast_progress(task)
     return {"taskState": "cancelled"}
 
@@ -240,9 +344,39 @@ async def confirm_task(task_id: str, body: ConfirmInput) -> dict[str, str]:
 
 def _require(task_id: str):
     task = hub.tasks.get(task_id)
-    if task is None:
-        raise HTTPException(404, "task not found")
-    return task
+    if task is not None:
+        return task
+    # Restore from SQLite task_checkpoints if task was saved but pruned from memory
+    try:
+        from . import db
+        from .hub import TaskRecord
+        cp = db.get_task_checkpoint(task_id)
+        if cp:
+            sess_id = cp.get("session_id")
+            primary_tab = None
+            child_tabs = []
+            if sess_id:
+                sess_data = db.get_browser_session(sess_id)
+                if sess_data:
+                    primary_tab = sess_data.get("primary_tab_id")
+                    child_tabs = sess_data.get("child_tab_ids", [])
+            state = "completed" if cp.get("step_index", 0) > 0 and not cp.get("error") else "failed"
+            restored = TaskRecord(
+                task_id=task_id,
+                instruction=cp.get("working_memory", {}).get("instruction") or "Task",
+                chat_id=cp.get("conversation_id"),
+                state=state,
+                steps_done=cp.get("step_index", 0),
+                message=cp.get("working_memory", {}).get("notes") or f"State preserved at step {cp.get('step_index', 0)}",
+                session_id=sess_id,
+                primary_tab_id=primary_tab,
+                child_tab_ids=child_tabs,
+            )
+            hub.tasks[task_id] = restored
+            return restored
+    except Exception:
+        pass
+    raise HTTPException(404, "task not found")
 
 
 @app.websocket("/ws/extension")

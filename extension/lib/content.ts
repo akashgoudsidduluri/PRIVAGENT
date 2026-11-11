@@ -15,6 +15,7 @@ interface AgentElement {
   enabled: boolean;
   visible: boolean;
   bounds: { x: number; y: number; width: number; height: number };
+  href?: string;
 }
 
 interface NavigatorAgent {
@@ -26,6 +27,7 @@ interface NavigatorAgent {
   type: (targetId: string, text: string, clear: boolean, name?: string) => { ok: boolean; error?: string };
   submit: (targetId: string, name?: string) => { ok: boolean; error?: string };
   scroll: (direction: "up" | "down" | "top" | "bottom", containerId?: string) => { ok: boolean; scrollY: number };
+  extractText: (maxLen?: number) => string;
 }
 
 declare global {
@@ -88,7 +90,11 @@ function candidates(): AgentElement[] {
     'button[aria-label*="close" i]',
     'button[aria-label*="skip" i]',
     'button.close',
+    'button._2doB4z',
+    'button._2KpZ6l._2doB4z',
     '[data-testid*="close"]',
+    '[aria-label="Close" i]',
+    '[aria-label*="dismiss" i]',
     '#onetrust-accept-btn-handler',
     'button[id*="cookie"]',
     'button[id*="accept"]',
@@ -109,18 +115,24 @@ function candidates(): AgentElement[] {
     const rawId = el.id ? el.id.trim() : "";
     const targetId = rawId || `nav-el-${i}`;
 
-    el.setAttribute("data-navigator-id", targetId);
-    registry.set(targetId, el);
-    if (rawId) {
-      registry.set(`nav-el-${i}`, el);
-    }
+    const textTrimmed = (el.textContent || "").trim();
+    const isCloseGlyph = textTrimmed === "✕" || textTrimmed === "×" || textTrimmed === "X" || textTrimmed.toLowerCase() === "close";
+    const isInModalOrDialog = Boolean(el.closest('[role="dialog"], [aria-modal="true"], .modal, ._2KpZ6l, [class*="dialog" i], [class*="modal" i], [class*="overlay" i], [class*="popup" i]'));
+    const isExplicitClose = el.matches('button._2doB4z, button._2KpZ6l._2doB4z, button.close, [data-testid*="close"], [aria-label*="close" i], [aria-label*="dismiss" i]');
+    const isOverlayClose = (isCloseGlyph && isInModalOrDialog) || isExplicitClose || el.matches('.ytp-ad-overlay-close-button');
 
     const isAdSkip = el.matches('.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button, [id^="skip-button"]');
-    const isOverlayClose = el.matches('.ytp-ad-overlay-close-button, button[aria-label*="close" i], button.close, [data-testid*="close"]');
     const isVoiceBtn = el.matches('[data-icon="ptt"], [aria-label*="voice" i], [aria-label*="audio" i], [aria-label*="record" i]');
     const isSendBtn = !isVoiceBtn && el.matches('[data-testid="compose-btn-send"], [data-icon="send"], span[data-icon="send"], button[aria-label="Send" i], button[aria-label*="Send message" i]');
     const isComposer = el.matches('footer [contenteditable="true"], [data-tab="10"], [data-testid="conversation-compose-box-input"], footer [role="textbox"]');
     const isCancelVoice = el.matches('[data-icon="cancel"], [data-testid="btn-cancel"], [data-icon="delete-clip"], button[aria-label*="cancel" i]');
+
+    // Exclude repetitive header/footer navigation category clutter unless it's a search input, submit or modal close
+    const isNavOrFooter = Boolean(el.closest('footer, #navFooter, #nav-subnav, #nav-belt, .s-navigation-left-panel, [role="navigation"]'));
+    const isSpecialControl = isAdSkip || isOverlayClose || el.tagName.toLowerCase() === "input" || el.tagName.toLowerCase() === "textarea" || (el.getAttribute("role") === "searchbox");
+    if (isNavOrFooter && !isSpecialControl) {
+      return;
+    }
 
     const isWa = window.location.hostname.includes("whatsapp.com");
     const isWaGroupFilter = isWa && el.matches('button, [role="button"]') && el.textContent?.trim() === "Groups";
@@ -133,6 +145,9 @@ function candidates(): AgentElement[] {
       waChatTitle = titleEl?.getAttribute("title") || titleEl?.textContent?.trim() || "";
     }
 
+    const anchor = (el.tagName.toLowerCase() === "a" ? el : el.closest("a[href]")) as HTMLAnchorElement | null;
+    const href = anchor?.href || undefined;
+
     let name = (
       (isAdSkip ? "Skip Ad " : "") +
       (isOverlayClose && !el.textContent?.trim() ? "Close " : "") +
@@ -144,10 +159,10 @@ function candidates(): AgentElement[] {
       el.textContent ||
       input.value ||
       "")
-    ).replace(/\s+/g, " ").trim().slice(0, 120);
+    ).replace(/\s+/g, " ").trim().slice(0, 140);
 
     if (isAdSkip && !name) name = "Skip Ad";
-    if (isOverlayClose && !name) name = "Close";
+    if (isOverlayClose && (!name || isCloseGlyph)) name = "Close";
     if (isVoiceBtn) name = "Voice message";
     if (isCancelVoice) name = "Cancel Recording";
     if (isSendBtn) name = "Send";
@@ -156,6 +171,33 @@ function candidates(): AgentElement[] {
     if (isWaCancelSearch) name = "Cancel search";
     if (isWaSearch && !name) name = "Search or start new chat";
     if (isWaChatRow && waChatTitle) name = waChatTitle;
+
+    // Discard generic ad badges and empty link elements
+    const nameLower = name.toLowerCase();
+    if (nameLower === "sponsored" || nameLower === "ad" || nameLower === "feedback" || nameLower === "conditions of use") {
+      return;
+    }
+    if (el.tagName.toLowerCase() === "a" && !name && !el.querySelector('img')) {
+      return;
+    }
+
+    // Group product card title and price together for e-commerce
+    if (href && (href.includes("/dp/") || href.includes("/gp/product/") || href.includes("/p/"))) {
+      const card = el.closest('[data-component-type="s-search-result"], .s-result-item, [data-id], ._1AtVbE, ._75nlfW, [data-asin]');
+      if (card) {
+        const priceEl = card.querySelector('.a-price .a-offscreen, ._30jeq3, .Nx9bqj, .priceToPay, [data-feature-name="corePrice"]');
+        const priceText = priceEl?.textContent?.trim() || "";
+        if (priceText && !name.includes(priceText)) {
+          name = `${name} - ${priceText}`;
+        }
+      }
+    }
+
+    el.setAttribute("data-navigator-id", targetId);
+    registry.set(targetId, el);
+    if (rawId) {
+      registry.set(`nav-el-${i}`, el);
+    }
 
     const role = isAdSkip ? "ad-skip" :
                  isOverlayClose ? "close-button" :
@@ -174,6 +216,7 @@ function candidates(): AgentElement[] {
       cssSelector,
       enabled: !(input as HTMLButtonElement).disabled && !el.hasAttribute("aria-disabled"),
       visible: true,
+      href,
       bounds: {
         x: Math.round(r.left),
         y: Math.round(r.top),
@@ -460,8 +503,8 @@ window.__navigatorAgent = {
         }
       }
 
-      if (el && !(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el.isContentEditable)) {
-        const inner = el.querySelector("input, textarea, [contenteditable='true'], [contenteditable]") as HTMLElement | null;
+      if (el && !(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement || el.isContentEditable)) {
+        const inner = el.querySelector("input, textarea, select, [contenteditable='true'], [contenteditable]") as HTMLElement | null;
         if (inner) el = inner;
       }
       if (!el) {
@@ -523,6 +566,28 @@ window.__navigatorAgent = {
           el.dispatchEvent(new InputEvent("input", {
             bubbles: true, cancelable: true, inputType: "insertText", data: text,
           }));
+        }
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+      } else if (el instanceof HTMLSelectElement) {
+        // Native <select> filters: typing into a select does nothing — the
+        // operation that matters is selecting the matching option so the
+        // site's change handler fires. Match by value or visible label.
+        const wanted = text.trim().toLowerCase();
+        let matched = Array.from(el.options).find(o => o.value.trim().toLowerCase() === wanted)
+          ?? Array.from(el.options).find(o => (o.textContent || "").trim().toLowerCase() === wanted)
+          ?? Array.from(el.options).find(o => (o.textContent || "").trim().toLowerCase().includes(wanted) && wanted.length > 2);
+        if (!matched) {
+          return { ok: false, error: `no option matching "${text.slice(0, 60)}" in select` };
+        }
+        el.focus();
+        const proto = HTMLSelectElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+        try {
+          if (setter) setter.call(el, matched.value);
+          else el.value = matched.value;
+        } catch {
+          el.value = matched.value;
         }
         el.dispatchEvent(new Event("input", { bubbles: true }));
         el.dispatchEvent(new Event("change", { bubbles: true }));
@@ -602,4 +667,80 @@ window.__navigatorAgent = {
       scrollY: Math.round(container ? container.scrollTop : (window.scrollY || document.scrollingElement?.scrollTop || 0)),
     };
   },
+  extractText: (maxLen = 4000) => {
+    return extractReadableText(maxLen);
+  },
 };
+
+function extractReadableText(maxLen = 4000): string {
+  try {
+    const root =
+      document.querySelector(
+        'main, [role="main"], article, #content, #mw-content-text, #centerCol, #dp, body'
+      ) || document.body;
+    if (!root) return "";
+
+    const ignoreTags = new Set(["SCRIPT", "STYLE", "NAV", "FOOTER", "HEADER", "SVG", "NOSCRIPT", "IFRAME", "OBJECT"]);
+    const lines: string[] = [];
+    let currentLength = 0;
+
+    const elements = root.querySelectorAll(
+      'h1, h2, h3, h4, p, table, [data-feature-name], .a-price, .a-price-whole, #corePriceDisplay_desktop_feature_div, #corePrice_desktop, #apex_desktop, .priceToPay, [data-feature-name="corePrice"], [data-feature-name="title"], #productTitle, #twister, #productDescription, #feature-bullets, #techSpecs-table, #productDetails_techSpec_section_1, #productDetails_db_sections, ' +
+      '._30jeq3, .Nx9bqj, ._16Jk6d, ._21A06W, ._1mX5Pr, ._3k-BhJ, ._2160x1, ._35KyD6, ._4rR01T, .KzDlHZ, .B_NuCI, ' +
+      '[role="listitem"], .pIav2d, .JVOxCe, .yR1fYc, .U3gHgb, [jsname="I3kE2b"], .YMlIz, [data-hotel-id], .D90Uje, .b0G24d, .qA0Zcf, .W8L26d, ' +
+      '[class*="text-label-"], [class*="text-sd-"], [class*="ranking"], [class*="rating"], [data-difficulty], [data-cypress="UserAvatar"], [class*="badge"], [class*="stat"]'
+    );
+
+    if (elements.length === 0) {
+      const text = (root as HTMLElement).innerText || "";
+      return text.slice(0, maxLen).trim();
+    }
+
+    const seenText = new Set<string>();
+
+    for (const el of Array.from(elements)) {
+      if (currentLength >= maxLen) break;
+      if (ignoreTags.has(el.tagName)) continue;
+
+      const htmlEl = el as HTMLElement;
+      if (htmlEl.offsetParent === null && htmlEl.tagName !== "BODY") {
+        continue;
+      }
+
+      if (el.closest('nav, footer, header, [role="navigation"], #cookie-banner, .cookie-notice, #nav-main')) {
+        continue;
+      }
+
+      let blockText = "";
+      if (el.tagName === "TABLE") {
+        const rows = Array.from(el.querySelectorAll("tr"))
+          .map(r =>
+            Array.from(r.querySelectorAll("th, td"))
+              .map(c => (c.textContent || "").trim())
+              .filter(Boolean)
+              .join(" | ")
+          )
+          .filter(Boolean);
+        blockText = rows.join("\n");
+      } else {
+        blockText = (htmlEl.innerText || htmlEl.textContent || "").trim();
+      }
+
+      blockText = blockText.replace(/[ \t]+/g, " ").trim();
+      if (!blockText || blockText.length < 5) continue;
+      if (seenText.has(blockText)) continue;
+      seenText.add(blockText);
+
+      if (/^H[1-4]$/.test(el.tagName)) {
+        blockText = `### ${blockText}`;
+      }
+
+      lines.push(blockText);
+      currentLength += blockText.length + 1;
+    }
+
+    return lines.join("\n\n").slice(0, maxLen).trim();
+  } catch {
+    return "";
+  }
+}
