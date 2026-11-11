@@ -47,8 +47,9 @@ def _is_sensitive_name(name: Optional[str]) -> bool:
 # Query-string keys whose values must never leave the host.
 SENSITIVE_QUERY_KEYS = re.compile(
     r"^(?:"
-    r"access_?token|id_?token|refresh_?token|token|api_?key|key|secret|"
-    r"password|passwd|pwd|auth|authorization|session|sessionid|sid|"
+    r"(?:access|id|refresh|session|auth|user|csrf|xsrf|verification)_?token|"
+    r"token|api_?(?:key|secret)|key|secret|client_?secret|"
+    r"password|passwd|pwd|auth|authorization|session|session_?id|sid|"
     r"sig|signature|code|otp|email|user|username|login|"
     r"card|cc|pan|cvv|cvc|ssn|pin"
     r")$",
@@ -75,6 +76,9 @@ PATTERNS = {
     "slack_token": re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
     "private_key": re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     "email": re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"),
+    "sensitive_kv": re.compile(
+        r"(?i)\b((?:session|auth|access|refresh|id|user|csrf|xsrf)_?token|client_?secret|api_?key|password|passwd|secret)\s*(?:[:=]|\bis\b)\s*([a-zA-Z0-9_\-\.]{8,})"
+    ),
 }
 
 
@@ -88,8 +92,11 @@ def _has_sensitive_value(val: str) -> bool:
 def _redact_text(value: str, max_len: int) -> str:
     """Mask known secret patterns in free text, then truncate."""
     out = value
-    for pattern in PATTERNS.values():
-        out = pattern.sub(REDACTED, out)
+    for name, pattern in PATTERNS.items():
+        if name == "sensitive_kv":
+            out = pattern.sub(r"\1: " + REDACTED, out)
+        else:
+            out = pattern.sub(REDACTED, out)
     return out[:max_len]
 
 
@@ -184,10 +191,13 @@ def _redact_element(el: InteractiveElement) -> InteractiveElement:
             value = None
         else:
             value = _redact_text(value, MAX_NAME_LEN)
-    return el.model_copy(update={
+    update_dict: dict[str, Any] = {
         "value": value,
         "name": _redact_text(el.name or "", MAX_NAME_LEN),
-    })
+    }
+    if el.href:
+        update_dict["href"] = redact_url(el.href)
+    return el.model_copy(update=update_dict)
 
 
 @dataclass
@@ -203,6 +213,8 @@ class PrivacyFilteredPayload:
     elements_sent: int
     screenshot: Optional[str] = None
     tabs: list[dict[str, Any]] = field(default_factory=list)
+    page_text: Optional[str] = None
+    query_terms: set[str] = field(default_factory=set)
 
     def to_context_block(self) -> str:
         """Render as an UNTRUSTED-DATA block for the planner prompt."""
@@ -217,33 +229,85 @@ class PrivacyFilteredPayload:
                 lines.append(f"  - [Tab {tid}]{is_act} {turl} — {ttitle}")
         def _pri(e: InteractiveElement) -> int:
             nm = (e.name or "").lower()
-            if any(k in nm for k in ("search", "type a message", "send", "skip", "close", "submit", "groups", "group", "cancel search")):
-                return 0
-            if e.role in ("listitem", "row") and e.name:
-                return 1
-            if e.role == "link" and e.name and len(e.name) > 10:
-                return 1
-            if e.role in ("textbox", "input", "button", "ad-skip"):
-                return 2
-            if e.name:
-                return 3
-            return 4
+            href = (e.href or "").lower()
 
+            # 1. Obstructive modal close, popup dismiss, ad skip, or direct query match
+            if e.role in ("close-button", "ad-skip") or any(k in nm for k in ("close", "skip ad", "cancel search")):
+                return 0
+            if self.query_terms and any(t in nm for t in self.query_terms):
+                return 0
+
+            # 2. Key navigation and inputs (search, composer, send, filter)
+            if any(k in nm for k in ("search", "type a message", "send", "submit", "groups", "group")):
+                return 1
+
+            # 3. Dedicated product/article/doc links and price-bearing elements
+            is_product_link = any(seg in href for seg in ("/dp/", "/gp/", "/p/", "/item/", "/product/", "/wiki/", "/docs/"))
+            has_price = any(sym in nm for sym in ("₹", "$", "€", "£", "rs."))
+            if is_product_link or has_price:
+                return 1
+
+            # 4. Structured list items and rows
+            if e.role in ("listitem", "row") and e.name:
+                return 2
+
+            # 5. Descriptive links
+            if e.role == "link" and e.name and len(e.name) > 10:
+                return 2
+
+            # 6. Interactive inputs & buttons
+            if e.role in ("textbox", "input", "button"):
+                return 3
+
+            if e.name:
+                return 4
+            return 5
+
+        max_elements = int(getattr(config, "MAX_INTERACTIVE_ELEMENTS", 40))
         sorted_els = sorted(self.interactive, key=_pri)
-        for el in sorted_els[:65]:
+        seen_hrefs: set[str] = set()
+        deduped_els: list[InteractiveElement] = []
+        for el in sorted_els:
+            h = (el.href or "").split("?")[0].rstrip("/").lower()
+            if h and any(seg in h for seg in ("/dp/", "/gp/product/", "/p/")):
+                if h in seen_hrefs:
+                    continue
+                seen_hrefs.add(h)
+            deduped_els.append(el)
+            if len(deduped_els) >= max_elements:
+                break
+
+        for el in deduped_els:
             bits = [f"id={el.target_id}", el.role, f'name="{el.name}"', "disabled" if not el.enabled else ""]
-            if el.bounds:
-                bits.append(f'bounds=[{int(el.bounds.get("x", 0))},{int(el.bounds.get("y", 0))},{int(el.bounds.get("width", 0))}x{int(el.bounds.get("height", 0))}]')
+            if el.href:
+                clean_href = el.href[:120] + "..." if len(el.href) > 120 else el.href
+                bits.append(f'href="{clean_href}"')
             if el.value is not None:
                 bits.append(f'value="{el.value}"')
             lines.append("- " + " ".join(b for b in bits if b))
+        if self.page_text:
+            cleaned_text = re.sub(r"[ \t]+", " ", self.page_text)
+            cleaned_text = re.sub(r"\n\s*\n+", "\n", cleaned_text).strip()
+            if cleaned_text:
+                lines.append("\n<page-text>")
+                lines.append(cleaned_text[:2000])
+                lines.append("</page-text>")
         return "\n".join(lines)
 
 
 def classify_and_redact(
     obs: BrowserObservation, *, instruction: str
 ) -> tuple[PrivacyFilteredPayload, PrivacyDecision]:
-    _ = instruction  # reserved: relevance scoring arrives with the planner
+    _stopwords = {
+        "and", "the", "for", "check", "its", "find", "open", "show", "get", "with",
+        "from", "on", "in", "to", "a", "an", "is", "of", "at", "by", "website",
+        "page", "site", "please", "can", "you", "now", "it", "or", "what", "how",
+    }
+    query_terms = {
+        w.lower()
+        for w in re.findall(r"\b[a-zA-Z0-9_\-\.]{2,}\b", instruction or "")
+        if w.lower() not in _stopwords
+    }
     try:
         redacted = [_redact_element(e) for e in obs.interactive]
         # Fail-closed privacy: if any element on page is sensitive (password/auth/card), omit screenshot
@@ -268,6 +332,11 @@ def classify_and_redact(
                 "title": _redact_text(t.get("title") or "", MAX_TITLE_LEN),
                 "active": bool(t.get("active")),
             })
+        safe_page_text = None
+        raw_text = getattr(obs, "page_text", None) or (obs.get("pageText") if isinstance(obs, dict) else None)
+        if raw_text:
+            max_chars = int(getattr(config, "MAX_PAGE_TEXT_CHARS", 2500))
+            safe_page_text = _redact_text(redact_text_urls(str(raw_text)), max_chars)
         payload = PrivacyFilteredPayload(
             tab_id=obs.tab_id,
             url=redact_url(obs.url),
@@ -279,6 +348,8 @@ def classify_and_redact(
             elements_sent=len(redacted),
             screenshot=safe_screenshot,
             tabs=scrubbed_tabs,
+            page_text=safe_page_text,
+            query_terms=query_terms,
         )
         decision = PrivacyDecision(send=True, reason="redaction succeeded", violations=[])
         return payload, decision

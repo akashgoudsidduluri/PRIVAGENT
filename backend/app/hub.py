@@ -36,6 +36,12 @@ class TaskRecord:
     observe_ms: Optional[int] = None
     act_ms: Optional[int] = None
     created_at: float = field(default_factory=time.monotonic)
+    # P5.2 Task Intent & Browser Session Management
+    intent: Optional[str] = None
+    session_id: Optional[str] = None
+    primary_tab_id: Optional[int] = None
+    child_tab_ids: list[int] = field(default_factory=list)
+    terminal_emitted: bool = False
 
 
 class ActionResultSlot:
@@ -143,6 +149,11 @@ class Hub:
             self._action_results.pop(action_id, None)
 
     async def broadcast_progress(self, task: TaskRecord) -> None:
+        if task.state in TERMINAL_STATES:
+            if task.terminal_emitted:
+                return
+            task.terminal_emitted = True
+
         payload = {
             "type": "PROGRESS",
             "taskId": task.task_id,
@@ -157,6 +168,11 @@ class Hub:
                 "plannerMs": task.planner_ms,
                 "observeMs": task.observe_ms,
                 "actMs": task.act_ms,
+                "intent": task.intent,
+                "sessionId": task.session_id,
+                "primaryTabId": task.primary_tab_id,
+                "childTabIds": task.child_tab_ids,
+                "isBrowserTask": task.intent != "NON_BROWSER" if task.intent else True,
             },
         }
         for ws in list(self.client_sockets):

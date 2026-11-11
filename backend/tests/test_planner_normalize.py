@@ -45,6 +45,41 @@ def test_press_with_string_target_becomes_click():
     assert act["target"] == {"targetId": "nav-el-3"}
 
 
+def test_system_prompt_carries_pagination_and_filter_guidance():
+    """Complex-search readiness: the planner prompt must teach pagination and
+    filter/dropdown operation so multi-page search flows are planned."""
+    from app.planner import SYSTEM_FRAME
+
+    for needle in (
+        "PAGINATION",
+        "Load more",
+        "FILTERS & DROPDOWNS",
+        "combobox",
+    ):
+        assert needle in SYSTEM_FRAME, f"SYSTEM_FRAME missing '{needle}'"
+
+
+def test_click_on_pagination_target_is_valid():
+    plan = _validate_plan(_plan({
+        "type": "click", "risk": "write",
+        "target": {"name": "Next"},
+        "verify": "next results page loaded",
+        "timeoutMs": 8000,
+    }))
+    assert plan.steps[0].action.type == "click"
+
+
+def test_type_with_option_label_for_select_filter_is_valid():
+    plan = _validate_plan(_plan({
+        "type": "type", "risk": "write",
+        "target": {"name": "Sort by"},
+        "params": {"text": "Price -- Low to High", "clear": True, "submit": False},
+        "verify": "sorted by price",
+        "timeoutMs": 5000,
+    }))
+    assert plan.steps[0].action.type == "type"
+
+
 def test_press_rewrite_raises_risk_to_write_floor():
     norm = _normalize_raw_plan(_plan({"type": "press", "risk": "read", "target": {"targetId": "t1"}}))
     assert norm["steps"][0]["action"]["risk"] == "write"

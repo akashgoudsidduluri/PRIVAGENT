@@ -26,6 +26,10 @@
       </a>
       <span class="agent-pill">Autonomous Mode</span>
       <span class="agent-pill agent-pill--vault">Local Vault Active</span>
+      <button id="btnLlmSettings" class="btn btn--sm btn--ghost" title="LLM Provider Settings" aria-haspopup="dialog">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        <span id="llmSettingsLabel">Provider</span>
+      </button>
     </div>
     <div class="agent-header__right">
       <div class="agent-ws-indicator" id="wsIndicator">
@@ -215,13 +219,59 @@
             <span class="telemetry-lbl">Step Budget</span>
           </div>
           <div class="telemetry-item">
-            <span class="telemetry-val">Off</span>
+            <span class="telemetry-val" id="telRemoteVision">Off</span>
             <span class="telemetry-lbl">Remote Vision (opt-in)</span>
           </div>
         </div>
       </div>
     </aside>
   </main>
+
+  <!-- LLM Provider Settings Dialog -->
+  <div class="llm-settings-overlay" id="llmSettingsOverlay" hidden>
+    <div class="llm-settings" role="dialog" aria-modal="true" aria-labelledby="llmSettingsTitle">
+      <div class="llm-settings__header">
+        <h3 id="llmSettingsTitle">LLM Provider Settings</h3>
+        <button id="btnLlmClose" class="btn btn--sm btn--ghost" aria-label="Close">✕</button>
+      </div>
+      <div class="llm-settings__body">
+        <label class="llm-field">
+          <span>Provider</span>
+          <select id="llmProviderSelect">
+            <option value="groq">Groq</option>
+            <option value="gemini">Gemini</option>
+            <option value="antseed">Antseed (Third-Party)</option>
+            <option value="mock">Mock (testing)</option>
+          </select>
+        </label>
+        <div id="antseedFields">
+          <label class="llm-field">
+            <span>Base URL</span>
+            <input id="llmBaseUrl" type="text" placeholder="http://localhost:8377/v1" spellcheck="false" />
+          </label>
+          <label class="llm-field">
+            <span>API Key</span>
+            <input id="llmApiKey" type="password" placeholder="Enter your gateway API key" autocomplete="off" />
+          </label>
+          <label class="llm-field">
+            <span>Model ID</span>
+            <div class="llm-model-row">
+              <select id="llmModelSelect"></select>
+              <input id="llmModelCustom" type="text" placeholder="or type a custom model id" spellcheck="false" hidden />
+              <button id="btnLlmModelMode" class="btn btn--sm btn--ghost" title="Switch between list and custom entry" type="button">Aa</button>
+            </div>
+          </label>
+          <button id="btnLlmDiscover" class="btn btn--sm btn--ghost" type="button">Discover models</button>
+          <span id="llmDiscoverStatus" class="llm-status"></span>
+        </div>
+        <div class="llm-actions">
+          <button id="btnLlmSave" class="btn btn--primary btn--sm" type="button">Apply</button>
+          <span id="llmSaveStatus" class="llm-status"></span>
+        </div>
+        <p class="llm-note">The API key is stored only in the backend process (never sent back to this page or written to task history). Model changes apply to the next mission without a restart.</p>
+      </div>
+    </div>
+  </div>
 
   <script type="module" src="/src/agentApp.ts"></script>
 </body>

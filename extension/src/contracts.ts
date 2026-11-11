@@ -43,6 +43,8 @@ export interface ElementTarget {
   targetId: string;
   /** Semantic anchor — accessible name the observer reported. */
   name?: string;
+  /** ARIA role hint (planner may pass it; used only as a tiebreaker). */
+  role?: string;
   /** Fallback CSS selector from the observer registry. */
   cssSelector?: string;
   /** Screenshot-grounded coordinates in CSS pixels (last resort). */
@@ -54,6 +56,8 @@ interface ActionBase {
   /** Verification criteria — checked against a fresh observation. */
   verify: string;
   timeoutMs: number;
+  sessionId?: string;
+  tabId?: number;
 }
 
 export interface NavigateAction extends ActionBase {
@@ -130,6 +134,7 @@ export interface InteractiveElement {
   name: string;
   tag: string;
   inputType?: string;
+  href?: string;
   /** Sensitive fields (password/token) report undefined — never a value. */
   value?: string;
   visible: boolean;
@@ -153,6 +158,7 @@ export interface BrowserObservation {
   dpr: number;
   screenshot?: string;
   tabs?: TabInfo[];
+  pageText?: string;
 }
 
 export interface ActionResult {
@@ -201,6 +207,9 @@ export interface AgentError {
     | "BUDGET_EXCEEDED"
     | "CANCELLED"
     | "EXTENSION_DISCONNECTED"
+    | "TAB_UNAVAILABLE"
+    | "TAB_UNAUTHORIZED"
+    | "AMBIGUOUS_TAB"
     | "UNKNOWN";
   message: string;
   recoverable: boolean;

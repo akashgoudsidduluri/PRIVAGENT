@@ -263,3 +263,27 @@ def test_loop_hands_off_once_then_reports_failure():
     assert "incomplete" in (state["summary"] or "").lower()
     # Exactly one sensitive wait: never a burst of sign-in clicks.
     assert hub.executed == ["wait"]
+
+
+def test_extraction_claim_rejected_when_still_on_search_results():
+    """Completion claiming article/specs extraction while still on search results is rejected."""
+    plan = _validate_plan(
+        _completion("Extracted neural network definition: A neural network is a..."),
+        payload=_payload("https://en.wikipedia.org/w/index.php?search=neural+network"),
+        history=[],
+        instruction="search Wikipedia for neural networks and extract the first 2 paragraphs",
+    )
+    assert plan.blocked is True
+    assert "cannot claim extraction from search results" in plan.answer
+
+
+def test_extraction_claim_accepted_on_article_page():
+    """Completion claiming article extraction on an actual article page is accepted."""
+    plan = _validate_plan(
+        _completion("Extracted neural network definition: A neural network is a..."),
+        payload=_payload("https://en.wikipedia.org/wiki/Neural_network"),
+        history=[{"action": {"type": "click"}, "result_ok": True, "evidence": "navigated to article"}],
+        instruction="search Wikipedia for neural networks and extract the first 2 paragraphs",
+    )
+    assert plan.blocked is False
+    assert "Extracted" in plan.answer

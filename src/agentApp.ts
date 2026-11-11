@@ -15,6 +15,7 @@ const missionInput = document.getElementById("missionInput") as HTMLTextAreaElem
 const btnStartMission = document.getElementById("btnStartMission") as HTMLButtonElement | null;
 const btnCancelMission = document.getElementById("btnCancelMission") as HTMLButtonElement | null;
 const btnNewSession = document.getElementById("btnNewSession") as HTMLButtonElement | null;
+const missionSubtext = document.getElementById("missionSubtext") as HTMLElement | null;
 const stateBadge = document.getElementById("missionStateBadge") as HTMLElement | null;
 const stepsList = document.getElementById("agentStepsList") as HTMLOListElement | null;
 const stepsCount = document.getElementById("feedStepsCount") as HTMLElement | null;
@@ -34,6 +35,7 @@ const inspectorUrl = document.getElementById("inspectorUrl") as HTMLAnchorElemen
 const inspectorTitle = document.getElementById("inspectorTitle") as HTMLElement | null;
 const inspectorEvidence = document.getElementById("inspectorEvidence") as HTMLElement | null;
 const telStepsDone = document.getElementById("telStepsDone") as HTMLElement | null;
+const telRemoteVision = document.getElementById("telRemoteVision") as HTMLElement | null;
 const telPlannerLatency = document.getElementById("telPlannerLatency") as HTMLElement | null;
 const obstacleBadge = document.getElementById("obstacleBadge") as HTMLElement | null;
 const inspectorScreenshot = document.getElementById("inspectorScreenshot") as HTMLImageElement | null;
@@ -46,8 +48,12 @@ const wsText = document.getElementById("wsText") as HTMLElement | null;
 // Session & Task State
 let activeChatId: string | null = null;
 let currentTaskId: string | null = null;
+let renderedTerminalTaskId: string | null = null;
 let stepCounter = 0;
 let cancelRequested = false;
+let isWorking = false;
+let lastProgressTime = 0;
+let pollInterval: number | null = null;
 
 interface ChatSummary {
   id: string;
@@ -97,6 +103,32 @@ function setTaskState(state: string): void {
   }
 }
 
+// Telemetry pills reflect backend reality instead of hardcoded markup.
+// Fetched once per page load from /api/health; failures keep sensible text.
+let stepBudget: number | null = null;
+
+function renderStepBudget(): void {
+  const done = stepCounter;
+  if (telStepsDone) {
+    telStepsDone.textContent = stepBudget ? `${done} / ${stepBudget}` : `${done}`;
+  }
+}
+
+async function loadTelemetryConfig(): Promise<void> {
+  try {
+    const res = await fetch(`${API}/api/health`);
+    if (!res.ok) return;
+    const h = (await res.json()) as { maxSteps?: number; allowScreenshots?: boolean };
+    if (typeof h.maxSteps === "number" && h.maxSteps > 0) stepBudget = h.maxSteps;
+    if (telRemoteVision) {
+      telRemoteVision.textContent = h.allowScreenshots ? "On (opted in)" : "Off";
+    }
+    renderStepBudget();
+  } catch {
+    /* offline: keep existing markup values */
+  }
+}
+
 function updateVisualFrame(screenshot: string | null | undefined, message: string, taskState: string): void {
   const m = message.toLowerCase();
   const hasObstacle = /\b(skip\s*ad|advertisement|cookie\s*banner|close\s*popup|modal\s*overlay|dismiss\s*dialog)\b/.test(m);
@@ -136,17 +168,21 @@ function actionIcon(msg: string): string {
 
 function formatResultHtml(rawMessage: string): string {
   const urlMatch = rawMessage.match(/https?:\/\/[^\s"'<>)]+/);
-  const priceMatch = rawMessage.match(/(?:₹|Rs\.?|INR|\$)\s?[\d,]+(?:\.\d+)?/i);
+  // Show a single price badge only when the summary contains exactly one
+  // distinct price. In multi-product research summaries the first price is
+  // just one of several — surfacing it as "the price" would mislead.
+  const allPrices = rawMessage.match(/(?:₹|Rs\.?|INR|\$)\s*\d[\d,]*(?:\.\d+)?/gi) ?? [];
+  const normalized = new Set(allPrices.map(p => p.replace(/\s+/g, "")));
   const directUrl = urlMatch ? safeHttpUrl(urlMatch[0]) : null;
-  const price = priceMatch ? priceMatch[0] : "";
+  const price = normalized.size === 1 && allPrices.length > 0 ? (allPrices[0] ?? "").trim() : "";
 
   let showcaseHtml = "";
-  if (directUrl || price) {
+  if (directUrl || (price && /\d/.test(price))) {
     showcaseHtml = `
       <div class="product-showcase">
         <h4 class="product-showcase__title">Mission Summary</h4>
         <div class="product-showcase__meta">
-          ${price ? `<span class="price-tag">${escapeHtml(price)}</span>` : ""}
+          ${price && /\d/.test(price) ? `<span class="price-tag">${escapeHtml(price)}</span>` : ""}
           ${directUrl ? `<a href="${escapeHtml(directUrl)}" target="_blank" rel="noopener noreferrer" class="product-link-btn">Open ${escapeHtml(linkLabel(directUrl))} ↗</a>` : ""}
         </div>
       </div>
@@ -177,7 +213,7 @@ function addUserMessageItem(message: string): void {
 function updateStepsCount(count: number): void {
   stepCounter = Math.max(0, count);
   if (stepsCount) stepsCount.textContent = `${stepCounter} step${stepCounter === 1 ? "" : "s"} executed`;
-  if (telStepsDone) telStepsDone.textContent = `${stepCounter} / 25`;
+  renderStepBudget();
 }
 
 function addStepItem(message: string, stepNum?: number): void {
@@ -196,6 +232,16 @@ function addStepItem(message: string, stepNum?: number): void {
   const stepPrefixRegex = /^\[\d+\]\s*/;
   if (stepPrefixRegex.test(displayMessage)) {
     displayMessage = displayMessage.replace(stepPrefixRegex, "");
+  }
+
+  // Deduplicate against the immediate previous step
+  const existingSteps = stepsList.querySelectorAll("li.agent-step-item");
+  if (existingSteps.length > 0) {
+    const lastEl = existingSteps[existingSteps.length - 1];
+    const lastText = (lastEl.querySelector(".agent-step-item__text")?.textContent || "").trim();
+    if (lastText === displayMessage) {
+      return;
+    }
   }
 
   const li = document.createElement("li");
@@ -230,9 +276,27 @@ const WORKING_MISSION_HTML = `
   </span>
 `.trim();
 
+function showStalledNotice(): void {
+  if (missionSubtext && isWorking) {
+    missionSubtext.innerHTML = `
+      <span style="color: #fbbf24; font-weight: 500;">
+        ⏳ Progress is taking longer than usual (planner waiting for model response). You may wait or click Cancel.
+      </span>
+    `;
+  }
+}
+
+function clearStalledNotice(): void {
+  if (missionSubtext) {
+    missionSubtext.textContent = "Automated browsing with fail-closed privacy.";
+  }
+}
+
 function setButtonWorking(working: boolean): void {
+  isWorking = working;
   if (!btnStartMission) return;
   if (working) {
+    lastProgressTime = Date.now();
     btnStartMission.disabled = true;
     btnStartMission.classList.add("btn--working");
     btnStartMission.innerHTML = WORKING_MISSION_HTML;
@@ -240,12 +304,28 @@ function setButtonWorking(working: boolean): void {
     btnStartMission.classList.remove("btn--working");
     btnStartMission.innerHTML = START_MISSION_HTML;
     btnStartMission.disabled = !missionInput?.value.trim();
+    clearStalledNotice();
   }
 }
 
 function addCompletionStepItem(taskState: string, message: string): void {
   if (!stepsList) return;
   const isOk = taskState === "completed";
+
+  // If a result card is already in the steps list, update it in place rather than creating duplicate
+  const existingResult = stepsList.querySelector(".agent-step-item--result, .agent-step-item--failed");
+  if (existingResult) {
+    existingResult.className = isOk ? "agent-step-item agent-step-item--result" : "agent-step-item agent-step-item--failed";
+    existingResult.innerHTML = `
+      <span class="agent-step-item__icon">${isOk ? "✓" : "✗"}</span>
+      <span class="agent-step-item__text">
+        <strong>${isOk ? "Mission Result" : "Task Incomplete"}</strong>:
+        ${linkify(message || (isOk ? "Mission completed." : "Task stopped."))}
+      </span>
+    `;
+    return;
+  }
+
   const li = document.createElement("li");
   li.className = isOk ? "agent-step-item agent-step-item--result" : "agent-step-item agent-step-item--failed";
   li.innerHTML = `
@@ -259,11 +339,103 @@ function addCompletionStepItem(taskState: string, message: string): void {
   li.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
+async function syncActiveTask(taskId: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${API}/api/task/${taskId}`);
+    if (!res.ok) {
+      if (res.status === 404 && currentTaskId === taskId) {
+        stopFallbackPolling();
+        renderCompletion("failed", "Task session not found on server.");
+        return true;
+      }
+      return false;
+    }
+    const t = (await res.json()) as {
+      taskState: string;
+      message: string;
+      screenshot?: string | null;
+      intent?: string;
+      isBrowserTask?: boolean;
+      sessionId?: string | null;
+      primaryTabId?: number | null;
+      childTabIds?: number[] | null;
+    };
+    if (currentTaskId !== taskId) return false;
+    lastProgressTime = Date.now();
+    clearStalledNotice();
+
+    if (missionSubtext && !missionSubtext.innerHTML.includes("Progress is taking longer")) {
+      if (t.isBrowserTask === false || t.intent === "NON_BROWSER") {
+        missionSubtext.innerHTML = `<span style="color: #a78bfa; font-weight: 500;">💬 Mode: Conversational (Zero Browser Actions)</span>`;
+      } else if (t.sessionId) {
+        const tabInfo = t.primaryTabId ? ` · Tab #${t.primaryTabId}` : "";
+        const childInfo = t.childTabIds && t.childTabIds.length > 0 ? ` (+${t.childTabIds.length} child tabs)` : "";
+        missionSubtext.innerHTML = `<span style="color: #38bdf8; font-weight: 500;">🌐 Session: ${t.sessionId.slice(0, 8)}${tabInfo}${childInfo}</span>`;
+      }
+    }
+
+    if (t.taskState && t.taskState !== "planning") {
+      setTaskState(t.taskState);
+    }
+    if (t.screenshot) {
+      updateVisualFrame(t.screenshot, t.message || "", t.taskState);
+    }
+    if (["completed", "failed", "cancelled"].includes(t.taskState)) {
+      renderCompletion(t.taskState, t.message || "");
+      loadChatList();
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function startFallbackPolling(taskId: string): void {
+  stopFallbackPolling();
+  lastProgressTime = Date.now();
+  pollInterval = window.setInterval(async () => {
+    if (!isWorking || currentTaskId !== taskId) {
+      stopFallbackPolling();
+      return;
+    }
+    const terminal = await syncActiveTask(taskId);
+    if (terminal) {
+      stopFallbackPolling();
+    } else if (Date.now() - lastProgressTime > 45000) {
+      showStalledNotice();
+    }
+  }, 4000);
+}
+
+function stopFallbackPolling(): void {
+  if (pollInterval !== null) {
+    clearInterval(pollInterval);
+    pollInterval = null;
+  }
+}
+
 function renderCompletion(taskState: string, message: string, appendToTimeline = true): void {
+  stopFallbackPolling();
+  clearStalledNotice();
   setTaskState(taskState);
   setButtonWorking(false);
   if (btnCancelMission) btnCancelMission.hidden = true;
   if (humanGate) humanGate.hidden = true;
+
+  if (currentTaskId && renderedTerminalTaskId === currentTaskId) {
+    if (resultContent && !resultCard?.hidden) {
+      if (taskState === "completed") {
+        resultContent.innerHTML = formatResultHtml(message || "The autonomous task completed successfully.");
+      } else {
+        resultContent.innerHTML = `<div class="result-raw-text">${linkify(message || "Task stopped before completing all steps.")}</div>`;
+      }
+    }
+    return;
+  }
+  if (currentTaskId) {
+    renderedTerminalTaskId = currentTaskId;
+  }
 
   if (appendToTimeline) {
     addCompletionStepItem(taskState, message);
@@ -375,7 +547,7 @@ async function selectChat(chatId: string): Promise<void> {
   if (stepsList) stepsList.innerHTML = "";
   if (resultCard) resultCard.hidden = true;
   if (stepsCount) stepsCount.textContent = "0 steps executed";
-  if (telStepsDone) telStepsDone.textContent = "0 / 25";
+  renderStepBudget();
   setTaskState("ready");
 
   if (missionInput) {
@@ -388,6 +560,11 @@ async function selectChat(chatId: string): Promise<void> {
     const res = await fetch(`${API}/api/chat/${chatId}`);
     if (!res.ok) return;
     const detail = (await res.json()) as ChatDetail;
+    // /api/chat/{id} returns a FLAT shape (chat fields + messages + memory),
+    // not {chat: {...}, messages}. Read status defensively from either form.
+    const chatStatus = (detail as unknown as { status?: string }).status
+      ?? detail.chat?.status
+      ?? "";
 
     if (!detail.messages || detail.messages.length === 0) {
       if (stepsList) {
@@ -397,12 +574,27 @@ async function selectChat(chatId: string): Promise<void> {
     }
 
     let lastAgentMsg: string | null = null;
+    let finalTaskState = chatStatus === "failed" || chatStatus === "cancelled" ? chatStatus : "completed";
+
     detail.messages.forEach(msg => {
       if (msg.role === "user") {
         addUserMessageItem(msg.content);
       } else if (msg.role === "agent") {
         lastAgentMsg = msg.content;
-        addCompletionStepItem("completed", msg.content);
+        const ev = (msg.evidence || "").toLowerCase();
+        const content = (msg.content || "").toLowerCase();
+        let msgState = "completed";
+        if (ev.includes("failed") || ev.includes("unsupported") || content.startsWith("error:") || content.includes("planner unavailable")) {
+          msgState = "failed";
+          finalTaskState = "failed";
+        } else if (ev.includes("blocked") || content.includes("blocked")) {
+          msgState = "blocked";
+          finalTaskState = "failed";
+        } else if (ev.includes("partially") || content.includes("partially completed")) {
+          msgState = "failed";
+          finalTaskState = "failed";
+        }
+        addCompletionStepItem(msgState, msg.content);
         if (msg.evidence) {
           const urlMatch = msg.evidence.match(/https?:\/\/[^\s"'<>)]+/);
           const safeUrl = urlMatch ? safeHttpUrl(urlMatch[0]) : null;
@@ -416,7 +608,8 @@ async function selectChat(chatId: string): Promise<void> {
     });
 
     if (lastAgentMsg) {
-      renderCompletion("completed", lastAgentMsg, false);
+      renderCompletion(finalTaskState, lastAgentMsg, false);
+      setTaskState(finalTaskState);
     }
   } catch (err) {
     addStepItem(`⚠️ Failed to load chat history: ${err}`);
@@ -437,8 +630,11 @@ async function deleteChat(chatId: string): Promise<void> {
 }
 
 function createNewChat(): void {
+  stopFallbackPolling();
+  clearStalledNotice();
   activeChatId = null;
   currentTaskId = null;
+  renderedTerminalTaskId = null;
   cancelRequested = false;
   stepCounter = 0;
   hideHumanGate();
@@ -455,7 +651,7 @@ function createNewChat(): void {
   }
   if (resultCard) resultCard.hidden = true;
   if (stepsCount) stepsCount.textContent = "0 steps executed";
-  if (telStepsDone) telStepsDone.textContent = "0 / 25";
+  renderStepBudget();
   if (telPlannerLatency) telPlannerLatency.textContent = "—";
 
   if (inspectorScreenshot) {
@@ -502,7 +698,16 @@ btnNewSession?.addEventListener("click", () => {
 });
 
 missionInput?.addEventListener("input", () => {
-  if (btnStartMission) btnStartMission.disabled = !missionInput.value.trim();
+  if (btnStartMission && !isWorking) btnStartMission.disabled = !missionInput.value.trim();
+});
+
+missionInput?.addEventListener("keydown", (e: KeyboardEvent) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    if (!isWorking && missionInput.value.trim() && btnStartMission && !btnStartMission.disabled) {
+      btnStartMission.click();
+    }
+  }
 });
 
 // Preset Chips
@@ -511,14 +716,14 @@ document.querySelectorAll(".preset-chip").forEach(chip => {
     const prompt = chip.getAttribute("data-prompt");
     if (prompt && missionInput) {
       missionInput.value = prompt;
-      if (btnStartMission) btnStartMission.disabled = false;
+      if (btnStartMission && !isWorking) btnStartMission.disabled = false;
       missionInput.focus();
     }
   });
 });
 
 btnStartMission?.addEventListener("click", async () => {
-  if (!missionInput || !btnStartMission || !missionInput.value.trim()) return;
+  if (isWorking || !missionInput || !btnStartMission || !missionInput.value.trim()) return;
   const instruction = missionInput.value.trim();
 
   setButtonWorking(true);
@@ -526,6 +731,7 @@ btnStartMission?.addEventListener("click", async () => {
   if (resultCard) resultCard.hidden = true;
   hideHumanGate();
   currentTaskId = null;
+  renderedTerminalTaskId = null;
   cancelRequested = false;
 
   // Append user instruction bubble immediately
@@ -571,8 +777,9 @@ btnStartMission?.addEventListener("click", async () => {
       return;
     }
 
-    // Fetch initial task state if available
+    // Start background sync / polling for active task
     if (currentTaskId) {
+      startFallbackPolling(currentTaskId);
       const stRes = await fetch(`${API}/api/task/${currentTaskId}`).catch(() => null);
       if (stRes && stRes.ok) {
         const t = (await stRes.json()) as { taskState: string; message: string; screenshot?: string | null };
@@ -583,12 +790,15 @@ btnStartMission?.addEventListener("click", async () => {
           updateVisualFrame(t.screenshot, t.message || "", t.taskState);
         }
         if (["completed", "failed", "cancelled"].includes(t.taskState)) {
+          stopFallbackPolling();
           renderCompletion(t.taskState, t.message || "");
           loadChatList();
         }
       }
     }
   } catch (err) {
+    stopFallbackPolling();
+    clearStalledNotice();
     setTaskState("failed");
     addStepItem(`⚠️ Backend connection failed: ${err}`);
     setButtonWorking(false);
@@ -600,6 +810,8 @@ btnStartMission?.addEventListener("click", async () => {
 btnCancelMission?.addEventListener("click", async () => {
   const id = currentTaskId;
   cancelRequested = true;
+  stopFallbackPolling();
+  clearStalledNotice();
   if (btnCancelMission) btnCancelMission.hidden = true;
   hideHumanGate();
   if (id) {
@@ -642,6 +854,9 @@ function connectWebSocket(): void {
 
   ws.onopen = () => {
     setConnectionStatus(true, "Online");
+    if (currentTaskId && isWorking) {
+      syncActiveTask(currentTaskId);
+    }
   };
 
   ws.onmessage = ev => {
@@ -658,11 +873,36 @@ function connectWebSocket(): void {
           plannerMs?: number | null;
           observeMs?: number | null;
           actMs?: number | null;
+          intent?: string;
+          isBrowserTask?: boolean;
+          sessionId?: string | null;
+          primaryTabId?: number | null;
+          childTabIds?: number[] | null;
         };
       };
       if (env.type !== "PROGRESS") return;
       if (env.taskId !== currentTaskId && env.payload?.chatId !== activeChatId) return;
       const p = env.payload;
+
+      lastProgressTime = Date.now();
+      clearStalledNotice();
+
+      if (missionSubtext && !missionSubtext.innerHTML.includes("Progress is taking longer")) {
+        if (p.isBrowserTask === false || p.intent === "NON_BROWSER") {
+          missionSubtext.innerHTML = `<span style="color: #a78bfa; font-weight: 500;">💬 Mode: Conversational (Zero Browser Actions)</span>`;
+        } else if (p.sessionId) {
+          const tabInfo = p.primaryTabId ? ` · Tab #${p.primaryTabId}` : "";
+          const childInfo = p.childTabIds && p.childTabIds.length > 0 ? ` (+${p.childTabIds.length} child tabs)` : "";
+          missionSubtext.innerHTML = `<span style="color: #38bdf8; font-weight: 500;">🌐 Session: ${p.sessionId.slice(0, 8)}${tabInfo}${childInfo}</span>`;
+        }
+      }
+
+      if (["completed", "failed", "cancelled"].includes(p.taskState)) {
+        stopFallbackPolling();
+        renderCompletion(p.taskState, p.message);
+        loadChatList();
+        return;
+      }
 
       setTaskState(p.taskState);
       addStepItem(p.message, p.stepsDone);
@@ -678,11 +918,6 @@ function connectWebSocket(): void {
             const msg = t.pending_confirmation?.message ?? "Authentication / Sign-in required";
             showHumanGate(msg);
           });
-      }
-
-      if (["completed", "failed", "cancelled"].includes(p.taskState)) {
-        renderCompletion(p.taskState, p.message);
-        loadChatList();
       }
     } catch {
       // non-JSON frame
@@ -702,3 +937,181 @@ function connectWebSocket(): void {
 // Initial Load
 connectWebSocket();
 loadChatList();
+initLlmSettings();
+
+// ---------------------------------------------------------------------------
+// LLM provider settings — runtime provider/model selection via /api/llm/*.
+// The API key is password-typed, sent only to the backend, and never echoed
+// back: the config response carries keyConfigured (boolean) only.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_SEEDED_MODELS = ["glm-5.3-flash", "deepseek-v4-flash"];
+
+function $(id: string): HTMLElement | null {
+  return document.getElementById(id);
+}
+
+interface LlmConfig {
+  provider: string;
+  baseUrl: string;
+  keyConfigured: boolean;
+  model: string | null;
+}
+
+async function initLlmSettings(): Promise<void> {
+  const overlay = $("llmSettingsOverlay");
+  const openBtn = $("btnLlmSettings");
+  const closeBtn = $("btnLlmClose");
+  if (!overlay || !openBtn || !closeBtn) return;
+
+  openBtn.addEventListener("click", () => { overlay.hidden = false; void refreshLlmSettings(); });
+  closeBtn.addEventListener("click", () => { overlay.hidden = true; });
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.hidden = true; });
+
+  const providerSelect = $("llmProviderSelect") as HTMLSelectElement | null;
+  providerSelect?.addEventListener("change", () => {
+    const show = providerSelect.value === "antseed";
+    const fields = $("antseedFields");
+    if (fields) fields.hidden = !show;
+  });
+  wireModelModeToggle();
+  $("btnLlmDiscover")?.addEventListener("click", () => { void discoverLlmModels(); });
+  $("btnLlmSave")?.addEventListener("click", () => { void saveLlmSettings(); });
+
+  await refreshLlmSettings();
+}
+
+async function refreshLlmSettings(): Promise<void> {
+  try {
+    const res = await fetch(`${API}/api/llm/config`);
+    if (!res.ok) return;
+    const cfg = (await res.json()) as LlmConfig;
+    const providerSelect = $("llmProviderSelect") as HTMLSelectElement | null;
+    if (providerSelect) {
+      providerSelect.value = cfg.provider;
+      const fields = $("antseedFields");
+      if (fields) fields.hidden = cfg.provider !== "antseed";
+    }
+    const base = $("llmBaseUrl") as HTMLInputElement | null;
+    if (base) base.value = cfg.baseUrl;
+    const key = $("llmApiKey") as HTMLInputElement | null;
+    if (key) {
+      key.value = ""; // never render the credential
+      key.placeholder = cfg.keyConfigured ? "A key is configured (enter to replace)" : "Enter your gateway API key";
+    }
+    const modelSel = $("llmModelSelect") as HTMLSelectElement | null;
+    if (modelSel) {
+      if (!modelSel.options.length) {
+        DEFAULT_SEEDED_MODELS.forEach(m => modelSel.add(new Option(m, m)));
+      }
+      if (cfg.model) {
+        let found = false;
+        for (const opt of Array.from(modelSel.options)) {
+          if (opt.value === cfg.model) { modelSel.value = cfg.model; found = true; break; }
+        }
+        if (!found) {
+          modelSel.add(new Option(cfg.model, cfg.model));
+          modelSel.value = cfg.model;
+        }
+        const custom = $("llmModelCustom") as HTMLInputElement | null;
+        if (custom) custom.value = cfg.model;
+      }
+    }
+    const label = $("llmSettingsLabel");
+    if (label) {
+      label.textContent = cfg.model ? `${cfg.provider} · ${cfg.model}` : cfg.provider;
+    }
+  } catch {
+    /* backend offline: panel still opens with defaults */
+  }
+}
+
+function wireModelModeToggle(): void {
+  const btn = $("btnLlmModelMode");
+  const sel = $("llmModelSelect") as HTMLSelectElement | null;
+  const custom = $("llmModelCustom") as HTMLInputElement | null;
+  if (!btn || !sel || !custom) return;
+  let customMode = false;
+  btn.addEventListener("click", () => {
+    customMode = !customMode;
+    sel.hidden = customMode;
+    custom.hidden = !customMode;
+    if (customMode) custom.value = sel.value;
+  });
+}
+
+async function discoverLlmModels(): Promise<void> {
+  const status = $("llmDiscoverStatus");
+  const modelSel = $("llmModelSelect") as HTMLSelectElement | null;
+  if (status) status.textContent = "Discovering…";
+  const saved = await saveLlmSettings({ silentStatus: true });
+  if (!saved) {
+    if (status) status.textContent = "Could not save settings; fix the form and retry.";
+    return;
+  }
+  try {
+    const res = await fetch(`${API}/api/llm/models`);
+    if (!res.ok) {
+      if (status) status.textContent = `Discovery failed (HTTP ${res.status}). Manual entry still available.`;
+      return;
+    }
+    const data = (await res.json()) as { discovered?: boolean; models?: string[]; reason?: string | null };
+    const models = data.models ?? [];
+    if (data.discovered && modelSel) {
+      const keep = modelSel.value;
+      modelSel.options.length = 0;
+      models.forEach(m => modelSel.add(new Option(m, m)));
+      if (keep && models.includes(keep)) modelSel.value = keep;
+      if (status) status.textContent = `Discovered ${models.length} model${models.length === 1 ? "" : "s"}.`;
+    } else if (status) {
+      const reason = data.reason ? ` (${data.reason})` : "";
+      status.textContent = `Discovery unavailable${reason}. Seeded list loaded; manual entry still available.`;
+    }
+  } catch {
+    if (status) status.textContent = "Discovery request failed. Manual entry still available.";
+  }
+}
+
+async function saveLlmSettings(opts: { silentStatus?: boolean } = {}): Promise<boolean> {
+  const status = $("llmSaveStatus");
+  const provider = ($("llmProviderSelect") as HTMLSelectElement | null)?.value;
+  const baseEl = $("llmBaseUrl") as HTMLInputElement | null;
+  const keyEl = $("llmApiKey") as HTMLInputElement | null;
+  const sel = $("llmModelSelect") as HTMLSelectElement | null;
+  const custom = $("llmModelCustom") as HTMLInputElement | null;
+  if (!provider) return false;
+
+  const body: Record<string, unknown> = { provider };
+  if (provider === "antseed") {
+    const baseUrl = baseEl?.value.trim() || "http://localhost:8377/v1";
+    body.baseUrl = baseUrl;
+    const modelId = (custom && !custom.hidden && custom.value.trim())
+      ? custom.value.trim()
+      : (sel?.value.trim() ?? "");
+    if (modelId) body.model = modelId;
+    // Only send the key when the operator typed one; the stored key persists.
+    const apiKey = keyEl?.value ?? "";
+    if (apiKey.trim()) body.apiKey = apiKey.trim();
+  }
+  try {
+    const res = await fetch(`${API}/api/llm/config`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const detail = await res.json().catch(() => ({ detail: "" }));
+      const msg = typeof detail.detail === "string" ? `: ${detail.detail}` : "";
+      if (status && !opts.silentStatus) status.textContent = `Apply failed${msg}`;
+      return false;
+    }
+    await refreshLlmSettings();
+    if (status && !opts.silentStatus) status.textContent = "Applied.";
+    // Clear the password field post-save; backend holds it now.
+    if (keyEl) keyEl.value = "";
+    return true;
+  } catch {
+    if (status && !opts.silentStatus) status.textContent = "Could not reach the backend.";
+    return false;
+  }
+}

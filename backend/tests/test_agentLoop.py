@@ -245,3 +245,49 @@ def test_loop_reports_phase_metrics():
     assert "plan" in phases
     assert "act" in phases
     assert all(isinstance(m["ms"], int) and m["ms"] >= 0 for m in seen)
+
+
+def test_state_aware_loop_detection_identical_state():
+    hub = FakeHub({"click": [{"ok": True}]})
+    plans: list[dict] = []
+    calls = {"n": 0}
+
+    class Planner:
+        def __call__(self, i, p, h):
+            plans.append(h)
+            calls["n"] += 1
+            # Propose the exact same click action repeatedly
+            return {
+                "goal": "click item",
+                "steps": [{
+                    "why": "click product link",
+                    "action": {
+                        "type": "click",
+                        "risk": "write",
+                        "verify": "v",
+                        "timeoutMs": 1000,
+                        "target": {"targetId": "nav-el-1", "name": "Acer Laptop"},
+                    },
+                }],
+            }
+
+    # obs_factory always returns the exact same unchanged observation
+    state = asyncio.run(agentLoop.run_with_injection(
+        hub, planner=Planner(),
+        obs_factory=lambda: {
+            "tabId": 1, "url": "https://www.amazon.com/s?k=laptop", "title": "Search",
+            "interactive": [{"targetId": "nav-el-1", "role": "link", "name": "Acer Laptop", "tag": "a", "visible": True, "enabled": True}],
+            "scroll": {}, "dpr": 1,
+        },
+    ))
+    assert state["final"] == "budget_exceeded"
+    assert "Loop detected" in state["summary"]
+    assert "identical page state" in state["summary"]
+    # Verify that the state-aware loop warning was injected into planner penalties
+    has_warning = any(
+        "State-aware loop warning" in str(h.get("penalty", ""))
+        for call_hist in plans
+        for h in call_hist
+        if isinstance(h, dict)
+    )
+    assert has_warning
