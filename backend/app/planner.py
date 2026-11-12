@@ -50,6 +50,11 @@ Emit ONE JSON object:
 
 Allowed action types: {actions}.
 
+For a user-selected attachment, target a file input with upload_file and risk=sensitive;
+leave params empty. The backend supplies file bytes only after the human gate.
+For custom dropdowns use select_option with params.option; for dates use set_date
+with params.date in YYYY-MM-DD. Do not invent file content or filenames.
+
 CORE OPERATING PRINCIPLES:
 1. PERSISTENT WORKING MEMORY ("notes"):
    - When researching or extracting information (e.g. facts about black holes, article summaries, product specs, prices, links), ALWAYS save the key extracted facts into "notes".
@@ -1428,7 +1433,7 @@ def _validate_step(
     a = step.action
     if a.type not in ACTION_TYPES:
         raise ValueError(f"PLAN_INVALID: action type {a.type!r} outside whitelist")
-    if a.risk == "read" and a.type in {"type", "click", "navigate", "press", "new_tab", "close_tab"}:
+    if a.risk == "read" and a.type in {"type", "click", "navigate", "press", "new_tab", "close_tab", "select_option", "set_date", "upload_file"}:
         # floor breach: these change page/task state at minimum
         raise ValueError(f"PLAN_INVALID: action {a.type} cannot be risk=read")
     if not (MIN_TIMEOUT_MS <= a.timeout_ms <= MAX_TIMEOUT_MS):
@@ -1438,11 +1443,25 @@ def _validate_step(
         )
 
     p = a.params
-    if a.type in {"click", "type"}:
+    if a.type in {"click", "type", "select_option", "set_date", "upload_file"}:
         _require_target(a)
     if a.type == "type":
         if p is None or p.text is None:
             raise ValueError("PLAN_INVALID: type action requires params.text")
+    elif a.type == "select_option":
+        if p is None or not p.option or len(p.option) > 300:
+            raise ValueError("PLAN_INVALID: select_option requires params.option")
+    elif a.type == "set_date":
+        import datetime
+        try:
+            if p is None or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", p.date or ""):
+                raise ValueError("date must be ISO")
+            datetime.date.fromisoformat(p.date)
+        except (TypeError, ValueError):
+            raise ValueError("PLAN_INVALID: set_date requires YYYY-MM-DD") from None
+    elif a.type == "upload_file":
+        if a.risk != "sensitive" or (p is not None and (p.file_name or p.base64 or p.file_token)):
+            raise ValueError("PLAN_INVALID: upload_file needs a sensitive gate; file details are forbidden in plans")
     elif a.type == "navigate":
         if p is None or not (p.url or p.direction):
             raise ValueError("PLAN_INVALID: navigate needs params.url or params.direction")

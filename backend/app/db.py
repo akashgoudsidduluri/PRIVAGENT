@@ -79,6 +79,12 @@ def init_db(db_path: Optional[str] = None) -> None:
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS user_semantic_facts (
+                id TEXT PRIMARY KEY, category TEXT NOT NULL CHECK(category IN ('personal','retail','coding')),
+                fact_key TEXT NOT NULL, fact_value TEXT NOT NULL, created_at REAL NOT NULL,
+                expires_at REAL NOT NULL, UNIQUE(category, fact_key)
+            );
+
             CREATE TABLE IF NOT EXISTS browser_sessions (
                 session_id TEXT PRIMARY KEY,
                 task_id TEXT NOT NULL,
@@ -128,7 +134,30 @@ def init_db(db_path: Optional[str] = None) -> None:
                 updated_at REAL NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS monitoring_missions (
+                id TEXT PRIMARY KEY, conversation_id TEXT, title TEXT NOT NULL,
+                target_url TEXT NOT NULL, trigger_type TEXT NOT NULL DEFAULT 'interval',
+                schedule_cron TEXT, interval_seconds INTEGER NOT NULL CHECK(interval_seconds >= 60),
+                condition_type TEXT NOT NULL DEFAULT 'text_change', condition_params TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'paused', last_run_at REAL, next_run_at REAL,
+                last_state_hash TEXT, last_state_json TEXT, last_alert_hash TEXT, last_alert_at REAL,
+                created_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS monitoring_events (
+                id TEXT PRIMARY KEY, mission_id TEXT NOT NULL REFERENCES monitoring_missions(id) ON DELETE CASCADE,
+                task_id TEXT, detected_at REAL NOT NULL, title TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL, diff_data TEXT NOT NULL DEFAULT '{}',
+                notification_sent INTEGER NOT NULL DEFAULT 0, acknowledged INTEGER NOT NULL DEFAULT 0,
+                state_hash TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS mcp_audit (
+                id TEXT PRIMARY KEY, tool_name TEXT NOT NULL, input_hash TEXT NOT NULL,
+                latency_ms INTEGER NOT NULL, status TEXT NOT NULL, output_hash TEXT NOT NULL,
+                created_at REAL NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id);
+            CREATE INDEX IF NOT EXISTS idx_semantic_expiry ON user_semantic_facts(expires_at);
             CREATE INDEX IF NOT EXISTS idx_chats_updated_at ON chats(updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_sessions_conv ON browser_sessions(conversation_id, last_activity_at DESC);
             CREATE INDEX IF NOT EXISTS idx_checkpoints_conv ON task_checkpoints(conversation_id, updated_at DESC);
@@ -136,13 +165,37 @@ def init_db(db_path: Optional[str] = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_artifacts_conv ON artifacts(conversation_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_packages_conv ON research_packages(conversation_id, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_packages_task ON research_packages(task_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_monitor_due ON monitoring_missions(status, next_run_at);
+            CREATE INDEX IF NOT EXISTS idx_monitor_events ON monitoring_events(mission_id, detected_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_mcp_audit_created ON mcp_audit(created_at DESC);
             """
         )
+        # Earlier control-center previews created narrower tables. Add only
+        # missing columns so persisted missions and events survive upgrades.
+        migrations = {
+            "monitoring_missions": {
+                "conversation_id": "TEXT", "trigger_type": "TEXT NOT NULL DEFAULT 'interval'",
+                "schedule_cron": "TEXT", "condition_type": "TEXT NOT NULL DEFAULT 'text_change'",
+                "condition_params": "TEXT NOT NULL DEFAULT '{}'", "last_state_json": "TEXT",
+                "last_alert_hash": "TEXT", "last_alert_at": "REAL",
+            },
+            "monitoring_events": {
+                "task_id": "TEXT", "title": "TEXT NOT NULL DEFAULT ''",
+                "diff_data": "TEXT NOT NULL DEFAULT '{}'", "notification_sent": "INTEGER NOT NULL DEFAULT 0",
+                "state_hash": "TEXT NOT NULL DEFAULT ''",
+            },
+        }
+        for table, columns in migrations.items():
+            existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for name, spec in columns.items():
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {spec}")
 
 
 def create_chat(title: Optional[str] = None, db_path: Optional[str] = None) -> dict[str, Any]:
+    from .privacy import scrub_persistent
     chat_id = uuid.uuid4().hex
-    display_title = (title or "New Mission").strip()
+    display_title = scrub_persistent((title or "New Mission").strip())
     with get_connection(db_path) as conn:
         conn.execute(
             "INSERT INTO chats (id, title, status) VALUES (?, ?, 'active')",
@@ -184,10 +237,11 @@ def delete_chat(chat_id: str, db_path: Optional[str] = None) -> bool:
 
 
 def update_chat_title(chat_id: str, title: str, db_path: Optional[str] = None) -> None:
+    from .privacy import scrub_persistent
     with get_connection(db_path) as conn:
         conn.execute(
             "UPDATE chats SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (title.strip(), chat_id),
+            (scrub_persistent(title.strip()), chat_id),
         )
 
 
@@ -206,6 +260,9 @@ def add_message(
     evidence: Optional[str] = None,
     db_path: Optional[str] = None,
 ) -> dict[str, Any]:
+    from .privacy import scrub_persistent
+    content = scrub_persistent(content)
+    evidence = scrub_persistent(evidence)
     msg_id = uuid.uuid4().hex
     with get_connection(db_path) as conn:
         conn.execute(
@@ -244,6 +301,8 @@ def get_messages(chat_id: str, limit: int = 20, db_path: Optional[str] = None) -
 
 
 def set_chat_memory(chat_id: str, key: str, value: str, db_path: Optional[str] = None) -> None:
+    from .privacy import scrub_persistent
+    value = scrub_persistent(str(value), key)
     with get_connection(db_path) as conn:
         conn.execute(
             """
@@ -279,6 +338,9 @@ def get_user_preferences(db_path: Optional[str] = None) -> dict[str, str]:
 
 
 def set_user_preference(key: str, value: str, db_path: Optional[str] = None) -> None:
+    from .privacy import classify_sensitivity, Sensitivity
+    if classify_sensitivity(str(value), key) >= Sensitivity.RESTRICTED_PII:
+        raise ValueError("sensitive facts cannot be stored as preferences")
     with get_connection(db_path) as conn:
         conn.execute(
             """
@@ -385,9 +447,11 @@ def save_task_checkpoint(
     working_memory: dict[str, Any],
     db_path: Optional[str] = None,
 ) -> None:
+    from .privacy import scrub_persistent, redact_url
     now = time.time()
-    hist_json = json.dumps(_json_serializable(history))
-    wm_json = json.dumps(_json_serializable(working_memory))
+    hist_json = json.dumps(scrub_persistent(_json_serializable(history)))
+    wm_json = json.dumps(scrub_persistent(_json_serializable(working_memory)))
+    last_url = redact_url(last_url)
     with get_connection(db_path) as conn:
         conn.execute(
             """
@@ -455,18 +519,21 @@ def get_latest_checkpoint_for_chat(conversation_id: str, db_path: Optional[str] 
 
 def save_artifact(artifact: dict[str, Any], db_path: Optional[str] = None) -> dict[str, Any]:
     """Register or update an artifact deliverable in persistent SQLite storage."""
+    from .privacy import scrub_persistent, classify_sensitivity, Sensitivity
     art_id = artifact.get("artifact_id") or uuid.uuid4().hex
     task_id = artifact.get("task_id") or ""
     conversation_id = artifact.get("conversation_id") or ""
     filename = artifact.get("filename") or f"artifact_{art_id}"
     filepath = artifact.get("filepath") or ""
+    if any(classify_sensitivity(str(path)) >= Sensitivity.RESTRICTED_PII for path in (filename, filepath)):
+        raise ValueError("artifact paths cannot contain credentials or PII")
     file_format = (artifact.get("file_format") or "bin").lower().strip(".")
     mime_type = artifact.get("mime_type") or "application/octet-stream"
     file_size_bytes = int(artifact.get("file_size_bytes") or 0)
-    title = artifact.get("title") or filename
-    summary = artifact.get("summary") or ""
+    title = scrub_persistent(artifact.get("title") or filename)
+    summary = scrub_persistent(artifact.get("summary") or "")
     meta_dict = artifact.get("metadata") or {}
-    meta_json = json.dumps(_json_serializable(meta_dict))
+    meta_json = json.dumps(scrub_persistent(_json_serializable(meta_dict)))
     created_at = float(artifact.get("created_at") or time.time())
 
     with get_connection(db_path) as conn:
@@ -574,7 +641,9 @@ def save_research_package(
     pkg_id = package.get("package_id") or f"pkg_{task_id}"
     topic_obj = package.get("topic") or {}
     topic_title = topic_obj.get("title") if isinstance(topic_obj, dict) else getattr(topic_obj, "title", "Technical Research")
-    data_json = json.dumps(_json_serializable(package))
+    from .privacy import scrub_persistent
+    data_json = json.dumps(scrub_persistent(_json_serializable(package)))
+    topic_title = scrub_persistent(str(topic_title))
     now = time.time()
     created_at = float(package.get("created_at") or now)
 

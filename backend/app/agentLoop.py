@@ -126,10 +126,26 @@ _AUTH_PATH_TOKENS = {
 
 def request_cancel(task_id: str) -> None:
     _cancelled.add(task_id)
+    event = _pause_events.get(task_id)
+    if event:
+        event.set()
 
 
 def is_cancelled(task_id: str) -> bool:
     return task_id in _cancelled
+
+
+_pause_events: dict[str, asyncio.Event] = {}
+
+
+def request_pause(task_id: str) -> None:
+    _pause_events.setdefault(task_id, asyncio.Event()).clear()
+
+
+def request_resume(task_id: str) -> None:
+    event = _pause_events.pop(task_id, None)
+    if event:
+        event.set()
 
 
 def _noop_progress(record: TaskRecord | dict[str, Any], *_: Any) -> None:
@@ -260,6 +276,7 @@ async def run_with_injection(
         # Never leak cancellation markers: task ids are unique, but a stale
         # marker would make a replayed id silently cancel itself.
         _cancelled.discard(task_id)
+        _pause_events.pop(task_id, None)
 
 
 def _enforce_date_integrity(action: dict[str, Any], instruction: str) -> None:
@@ -675,16 +692,19 @@ async def _run_loop(
     zero_change_repeats = 0
     url_history: list[str] = []
 
-    def progress(msg: str, screenshot: Optional[str] = None) -> None:
+    def progress(msg: str, screenshot: Optional[str] = None, observation: Any = None) -> None:
         if not on_progress:
             return
         try:
-            on_progress(steps_done, msg, screenshot=screenshot)
+            on_progress(steps_done, msg, screenshot=screenshot, observation=observation)
         except TypeError:
             try:
-                on_progress(steps_done, msg)
+                on_progress(steps_done, msg, screenshot=screenshot)
             except TypeError:
-                on_progress()
+                try:
+                    on_progress(steps_done, msg)
+                except TypeError:
+                    on_progress()
 
     def metrics(phase: str, started: float) -> None:
         """Report one phase's wall time. Never lets telemetry break the loop."""
@@ -696,6 +716,11 @@ async def _run_loop(
             pass
 
     while steps_done < MAX_STEPS:
+        pause_event = _pause_events.get(task_id)
+        if pause_event is not None and not pause_event.is_set():
+            pause_started = time.monotonic()
+            await pause_event.wait()
+            start += time.monotonic() - pause_started
         if is_cancelled(task_id):
             return {"final": "cancelled", "steps": steps_done, "summary": None, "history": history}
         if time.monotonic() - start > TASK_TIMEOUT_S:
@@ -711,6 +736,7 @@ async def _run_loop(
             metrics("observe", observe_started)
         try:
             payload, _decision = classify_and_redact(_to_obs(raw_obs), instruction=instruction)
+            progress("", observation=raw_obs)
         except PrivacyViolation:
             return {"final": "failed", "steps": steps_done, "summary": "privacy violation — payload not sent", "history": history}
 
@@ -1230,6 +1256,26 @@ async def _run_loop(
                 if consecutive_repeats >= 1:
                     penalties.append(f"loop warning: action '{action.get('type')}' was already completed. Do not repeat it; proceed to next step or conclude.")
 
+        # Ground ambiguous planner labels against this *redacted* observation.
+        # A semantic match supplies a fresh target ID and a spatial fallback;
+        # no match leaves the executor to report STALE_TARGET honestly.
+        if action and action.get("type") in ("click", "type", "select_option", "set_date", "upload_file"):
+            target = action.get("target") or {}
+            if isinstance(target, dict):
+                from .observation import match_semantic_target
+                matched = match_semantic_target(
+                    payload.interactive, target_id=target.get("targetId") or "",
+                    name=target.get("name") or "", role=target.get("role") or "",
+                    expected_bounds=target.get("expectedBounds"))
+                if matched:
+                    target = dict(target)
+                    target["targetId"] = matched.target_id
+                    target.setdefault("name", matched.name)
+                    bounds = matched.semantic.interactability["bounds"]
+                    target.setdefault("coords", {"x": bounds["x"] + bounds["width"] / 2,
+                                                 "y": bounds["y"] + bounds["height"] / 2})
+                    action["target"] = target
+
         last_digest = current_digest
 
         if raw_url:
@@ -1258,9 +1304,27 @@ async def _run_loop(
                 return {"final": "failed", "steps": steps_done,
                         "summary": f"user rejected action: {action.get('type')}", "history": history}
 
+        pause_event = _pause_events.get(task_id)
+        if pause_event is not None and not pause_event.is_set():
+            pause_started = time.monotonic()
+            await pause_event.wait()
+            start += time.monotonic() - pause_started
+        if is_cancelled(task_id):
+            return {"final": "cancelled", "steps": steps_done, "summary": None, "history": history}
+
         _enforce_date_integrity(action, instruction)
         action_started = time.perf_counter()
-        result = await _execute_with_retries(ext_hub, action, task_id, session_id=session_id)
+        execution_action = action
+        if action.get("type") == "upload_file":
+            from .file_uploads import get as get_attachment
+            from .hub import hub
+            attachment = get_attachment(hub.tasks.get(task_id).file_token or "") if hub.tasks.get(task_id) else None
+            if not attachment:
+                return {"final": "failed", "steps": steps_done,
+                        "summary": "File upload blocked: select the exact attachment in the workspace first.", "history": history}
+            execution_action = dict(action)
+            execution_action["params"] = {"fileName": attachment[0], "base64": attachment[1]}
+        result = await _execute_with_retries(ext_hub, execution_action, task_id, session_id=session_id)
         metrics("act", action_started)
         if session_id and result.get("ok"):
             obs = result.get("observation")
@@ -1311,19 +1375,16 @@ async def _run_loop(
         )
         step_screenshot = fresh_shot or raw_screenshot
         safe_evidence: Any = redact_text_urls(evidence) if isinstance(evidence, str) else evidence
-        progress(f"Step {steps_done}: {action.get('type')} -> {safe_evidence}", screenshot=step_screenshot)
+        progress(f"Step {steps_done}: {action.get('type')} -> {safe_evidence}", screenshot=step_screenshot,
+                 observation=result.get("observation") or raw_obs)
 
         action_ok = bool(result.get("ok"))
         if action_ok:
-            is_verified = (
-                action.get("type") in ("navigate", "scroll", "wait", "observe", "select_tab")
-                or "navigated" in str(safe_evidence).lower()
-                or "opened new tab" in str(safe_evidence).lower()
-                or "verified" in str(safe_evidence).lower()
-                or "accepted" in str(safe_evidence).lower()
-            )
-            action_status = "verified" if is_verified else "completed_unverified"
+            from .completion_verifier import verify_action_receipt
+            receipt = verify_action_receipt(action, result, before=raw_obs, goal=instruction)
+            action_status = "verified" if receipt["verified"] else "completed_unverified"
         else:
+            receipt = None
             action_status = "failed"
 
         entry = {
@@ -1331,6 +1392,7 @@ async def _run_loop(
             "result_ok": action_ok,
             "status": action_status,
             "evidence": safe_evidence,
+            "verification": receipt,
         }
         if not action_ok:
             err = result.get("error") or {}
@@ -1716,6 +1778,13 @@ async def run_task(task_id: str) -> None:
         user_prefs = db.get_user_preferences()
         if user_prefs:
             initial_memory["user_preferences"] = user_prefs
+        from .memory import SemanticMemory
+        facts = SemanticMemory().recall()
+        if facts:
+            initial_memory["semantic_facts"] = [
+                {"category": f["category"], "key": f["fact_key"], "value": f["fact_value"]}
+                for f in facts
+            ]
     except Exception:
         pass
 
@@ -2243,7 +2312,12 @@ async def run_task(task_id: str) -> None:
         session_manager.pin_primary_tab(session.session_id, primary_tab_id)
         record.primary_tab_id = primary_tab_id
 
-    def on_step_progress(steps: int = 0, msg: str = "", screenshot: Optional[str] = None) -> None:
+    def on_step_progress(steps: int = 0, msg: str = "", screenshot: Optional[str] = None,
+                         observation: Any = None) -> None:
+        if observation is not None:
+            record.last_observation = observation
+        if not msg:
+            return
         record.steps_done = steps
         record.message = msg
         sess = session_manager.get_session(session.session_id)
@@ -2251,7 +2325,7 @@ async def run_task(task_id: str) -> None:
             record.primary_tab_id = sess.primary_tab_id
             record.child_tab_ids = sess.child_tab_ids
         # A terminal task must not be flipped back to running by a late step.
-        if record.state not in ("completed", "failed", "cancelled"):
+        if record.state not in ("completed", "failed", "cancelled", "paused"):
             record.state = "running"
         if screenshot:
             record.screenshot = screenshot
@@ -2295,6 +2369,7 @@ async def run_task(task_id: str) -> None:
             working_memory=state.get("working_memory") or initial_memory,
             history=state.get("history") or [],
         )
+        record.last_observation = state.get("last_obs")
         if record.cancelled or is_cancelled(task_id):
             final_state = "cancelled"
             record.message = "Task cancelled by user."

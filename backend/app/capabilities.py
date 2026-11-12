@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
 
+from .connectors import GmailConnector, OutlookConnector, GoogleCalendarConnector, GoogleDriveConnector, SlackConnector, GitHubConnector, LocalFileSystemAdapter
+
 
 class Capability(str, Enum):
     BROWSER_AUTOMATION = "BROWSER_AUTOMATION"
@@ -129,3 +131,75 @@ def format_capability_overview() -> str:
         "- **📊 Multi-Site Comparison**: Multi-retailer price comparisons (Amazon, Flipkart, Samsung) with full status tracking across visited and unavailable stores.\n"
         "- **💬 Conversational Assistance**: Code writing, mathematical calculations, and conceptual explanations."
     )
+
+
+@dataclass(frozen=True)
+class CapabilityRoute:
+    capability: str
+    adapter: str
+    method: str
+    operation: str
+    available: bool
+    url: str | None = None
+
+
+class BrowserAdapter:
+    def __init__(self, name: str, url: str):
+        self.name = name
+        self.url = url
+
+
+class CapabilityRegistry:
+    """Intent maps to an adapter without giving a planner credentials or tools."""
+
+    _OPERATIONS = {
+        "EmailCapability": {"search_threads": False, "summarize_messages": False, "draft_email": True, "manage_labels": True},
+        "CalendarCapability": {"list_events": False, "check_availability": False, "create_invite": True},
+        "DocumentCapability": {"search_documents": False, "extract_text": False, "upload_deliverable": True},
+        "TeamChatCapability": {"query_channels": False, "summarize_discussions": False, "post_notification": True},
+        "CodeRepoCapability": {"query_issues": False, "inspect_prs": False, "inspect_commit_diff": False},
+    }
+
+    def __init__(self, adapters: dict[str, list[Any]] | None = None, *, browser_available: bool = False):
+        self.browser_available = browser_available
+        from .mcp.policy import ApprovalPolicy
+        self._policy = ApprovalPolicy()
+        from .connectors.oauth import oauth_manager
+        from pathlib import Path
+        self.adapters = adapters or {
+            "EmailCapability": [oauth_manager.connector("gmail"), oauth_manager.connector("outlook"), BrowserAdapter("BrowserEmailAdapter", "https://mail.google.com")],
+            "CalendarCapability": [oauth_manager.connector("google_calendar"), BrowserAdapter("BrowserCalendarAdapter", "https://calendar.google.com")],
+            "DocumentCapability": [oauth_manager.connector("google_drive"), LocalFileSystemAdapter(Path(__file__).resolve().parents[1] / "data" / "artifacts"), BrowserAdapter("BrowserDriveAdapter", "https://drive.google.com")],
+            "TeamChatCapability": [oauth_manager.connector("slack"), BrowserAdapter("BrowserChatAdapter", "https://app.slack.com/client")],
+            "CodeRepoCapability": [oauth_manager.connector("github")],
+        }
+
+    def resolve(self, capability: str, operation: str) -> CapabilityRoute:
+        if capability not in self._OPERATIONS or operation not in self._OPERATIONS[capability]:
+            raise ValueError("unsupported capability operation")
+        for adapter in self.adapters.get(capability, []):
+            if getattr(adapter, "configured", False):
+                return CapabilityRoute(capability, type(adapter).__name__, "native", operation, True)
+        for adapter in self.adapters.get(capability, []):
+            if isinstance(adapter, BrowserAdapter) and self.browser_available:
+                return CapabilityRoute(capability, adapter.name, "browser", operation, True, adapter.url)
+        return CapabilityRoute(capability, "", "unavailable", operation, False)
+
+    def approve_native(self, capability: str, operation: str, params: dict[str, Any], task_id: str) -> str:
+        """Called only by a trusted user-confirmation handler."""
+        route = self.resolve(capability, operation)
+        if route.method != "native" or not self._OPERATIONS[capability][operation]:
+            raise ValueError("no mutable native route")
+        return self._policy.approve(f"{capability}.{operation}", params, task_id)
+
+    def execute_native(self, capability: str, operation: str, params: dict[str, Any], *,
+                       approval_token: str | None = None, task_id: str = "") -> Any:
+        route = self.resolve(capability, operation)
+        if route.method != "native":
+            raise RuntimeError("native connector not configured; use browser route or connect an account")
+        if self._OPERATIONS[capability][operation]:
+            self._policy.authorize(f"{capability}.{operation}", params, approval_token, task_id)
+        adapter = next(a for a in self.adapters[capability] if type(a).__name__ == route.adapter)
+        from .mcp.sanitizer import sanitize_tool_output
+        result = getattr(adapter, operation)(**params)
+        return sanitize_tool_output(result)

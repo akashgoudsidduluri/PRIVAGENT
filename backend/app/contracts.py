@@ -12,12 +12,12 @@ from pydantic import BaseModel, Field
 
 ACTION_TYPES = [
     "navigate", "click", "type", "press", "scroll", "zoom",
-    "wait", "observe", "select_tab", "new_tab", "close_tab",
+    "wait", "observe", "select_tab", "new_tab", "close_tab", "select_option", "set_date", "upload_file",
 ]
 RISK_CLASSES = ["read", "write", "sensitive"]
 TASK_STATES = [
     "planning", "awaiting_confirmation", "running", "awaiting_input",
-    "completed", "failed", "cancelled",
+    "completed", "failed", "cancelled", "paused",
 ]
 ERROR_CODES = [
     "STALE_TARGET", "TIMEOUT", "NAVIGATION_FAILED", "PRIVACY_VIOLATION",
@@ -43,6 +43,11 @@ class ActionParams(BaseModel):
     container_id: Optional[str] = Field(default=None, alias="containerId")
     tab_id: Optional[int] = Field(default=None, alias="tabId")
     factor: Optional[float] = None
+    option: Optional[str] = None
+    date: Optional[str] = None
+    file_name: Optional[str] = Field(default=None, alias="fileName")
+    file_token: Optional[str] = Field(default=None, alias="fileToken")
+    base64: Optional[str] = None
 
     model_config = {"populate_by_name": True}
 
@@ -64,8 +69,19 @@ class BrowserAction(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class SemanticElement(BaseModel):
+    element_id: str = Field(alias="elementId")
+    role: str
+    semantic_name: str = Field(alias="semanticName")
+    control_type: str = Field(alias="controlType")
+    interactability: dict[str, Any]
+    context_text: str = Field(default="", alias="contextText")
+    model_config = {"populate_by_name": True}
+
+
 class InteractiveElement(BaseModel):
     target_id: str = Field(alias="targetId")
+    semantic: Optional[SemanticElement] = None
     role: str
     name: str
     tag: str
@@ -102,6 +118,7 @@ class ActionResult(BaseModel):
     observation: Optional[BrowserObservation] = None
     error: Optional[dict[str, Any]] = None
     evidence: Optional[str] = None
+    verification: Optional[dict[str, Any]] = None
 
     model_config = {"populate_by_name": True}
 

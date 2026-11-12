@@ -8,6 +8,7 @@ from . import config
 class TaskInput(BaseModel):
     instruction: str = Field(min_length=1, max_length=config.MAX_INSTRUCTION_CHARS)
     chat_id: Optional[str] = Field(default=None, alias="chatId")
+    file_token: Optional[str] = Field(default=None, alias="fileToken")
     model_config = {"populate_by_name": True}
 
     @field_validator("instruction")
@@ -26,6 +27,7 @@ class ChatCreateInput(BaseModel):
 class ChatMessageInput(BaseModel):
     instruction: Optional[str] = None
     content: Optional[str] = None
+    file_token: Optional[str] = Field(default=None, alias="fileToken")
 
     @property
     def text(self) -> str:

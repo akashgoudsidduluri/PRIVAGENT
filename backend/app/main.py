@@ -17,10 +17,13 @@ if sys.platform == "win32":
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from . import config, db
+from . import file_uploads
 from .hub import hub
+from .monitoring_scheduler import monitoring_lifespan
 from .schemas import TaskInput, ConfirmInput, ChatCreateInput, ChatMessageInput
 
 logger = logging.getLogger("navigator.api")
@@ -38,13 +41,13 @@ _ALLOWED_ORIGIN_RE = re.compile(_ALLOWED_ORIGIN_PATTERN)
 
 TERMINAL_STATES = {"completed", "failed", "cancelled"}
 
-app = FastAPI(title="NAVIGATOR backend", version="0.1.0")
+app = FastAPI(title="NAVIGATOR backend", version="0.1.0", lifespan=monitoring_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[],
     allow_origin_regex=_ALLOWED_ORIGIN_PATTERN,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["content-type"],
     allow_credentials=False,
 )
@@ -73,6 +76,54 @@ class TaskCreated(BaseModel):
     task_id: str = Field(alias="taskId")
     chat_id: Optional[str] = Field(default=None, alias="chatId")
     model_config = {"populate_by_name": True}
+
+
+class AttachmentInput(BaseModel):
+    file_name: str = Field(alias="fileName")
+    base64: str
+
+
+@app.get("/api/connectors")
+async def connector_status() -> list[dict]:
+    from .connectors.oauth import oauth_manager
+    return oauth_manager.status()
+
+
+@app.post("/api/connectors/{provider}/start")
+async def start_connector(provider: str) -> dict[str, str]:
+    from .connectors.oauth import oauth_manager
+    try:
+        return {"authorizationUrl": oauth_manager.start(provider)}
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+
+
+@app.get("/api/connectors/{provider}/callback")
+async def connector_callback(provider: str, code: str = "", state: str = ""):
+    from .connectors.oauth import oauth_manager
+    try:
+        oauth_manager.complete(provider, code, state)
+    except (PermissionError, RuntimeError, KeyError, ValueError) as exc:
+        raise HTTPException(400, "OAuth authorization failed or expired") from None
+    return RedirectResponse("http://localhost:5173/agent.html#connectors", status_code=303)
+
+
+@app.delete("/api/connectors/{provider}")
+async def disconnect_connector(provider: str) -> dict[str, bool]:
+    from .connectors.oauth import oauth_manager
+    if provider not in {item["provider"] for item in oauth_manager.status()}:
+        raise HTTPException(404, "unknown connector")
+    oauth_manager.disconnect(provider)
+    return {"ok": True}
+
+
+@app.post("/api/attachments")
+async def create_attachment(body: AttachmentInput) -> dict[str, str]:
+    try:
+        token = file_uploads.put(body.file_name, body.base64)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    return {"fileToken": token, "fileName": body.file_name}
 
 
 @app.get("/health")
@@ -207,7 +258,10 @@ async def post_chat_message(chat_id: str, body: ChatMessageInput) -> dict[str, A
     chat = db.get_chat(chat_id)
     if not chat:
         raise HTTPException(status_code=404, detail="chat not found")
+    if body.file_token and not file_uploads.get(body.file_token):
+        raise HTTPException(status_code=422, detail="attachment expired")
     task = hub.new_task(body.text, chat_id=chat_id)
+    task.file_token = body.file_token
     task.state = "planning"
     _spawn(hub.broadcast_progress(task))
     _spawn(_run_task_later(task.task_id))
@@ -236,7 +290,10 @@ async def get_preferences() -> dict[str, str]:
 async def set_preferences(body: dict[str, Any]) -> dict[str, str]:
     for k, v in body.items():
         if k and v is not None:
-            db.set_user_preference(str(k), str(v))
+            try:
+                db.set_user_preference(str(k), str(v))
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from None
     return db.get_user_preferences()
 
 
@@ -252,7 +309,10 @@ async def create_task(body: TaskInput) -> TaskCreated:
     if not chat_id:
         chat = db.create_chat(title=body.instruction[:48].strip() or "New Mission")
         chat_id = chat["id"]
+    if body.file_token and not file_uploads.get(body.file_token):
+        raise HTTPException(status_code=422, detail="attachment expired")
     task = hub.new_task(body.instruction, chat_id=chat_id)
+    task.file_token = body.file_token
     task.state = "planning"
     _spawn(hub.broadcast_progress(task))
     _spawn(_run_task_later(task.task_id))
@@ -280,20 +340,21 @@ async def _run_task_later(task_id: str) -> None:
             cancelled = task.cancelled or is_cancelled(task_id)
             if task.state != "cancelled":
                 task.state = "cancelled" if cancelled else "failed"
-            task.message = "" if cancelled else f"backend error: {exc}"
+            task.message = "" if cancelled else "Backend task failed; inspect local diagnostics."
             await hub.broadcast_progress(task)
 
 
 @app.get("/api/task/{task_id}")
 async def get_task(task_id: str) -> dict[str, Any]:
     task = _require(task_id)
+    from .privacy import scrub_persistent
     return {
         "taskId": task.task_id,
-        "instruction": task.instruction,
+        "instruction": scrub_persistent(task.instruction),
         "taskState": task.state,
         "stepsDone": task.steps_done,
-        "message": task.message,
-        "pending_confirmation": task.pending_confirmation,
+        "message": scrub_persistent(task.message),
+        "pending_confirmation": scrub_persistent(task.pending_confirmation),
         "screenshot": task.screenshot,
         "plannerMs": task.planner_ms,
         "observeMs": task.observe_ms,
@@ -330,6 +391,32 @@ async def cancel_task(task_id: str) -> dict[str, str]:
         session_manager.update_status(task.session_id, "cancelled")
     await hub.broadcast_progress(task)
     return {"taskState": "cancelled"}
+
+
+@app.post("/api/task/{task_id}/pause")
+async def pause_task(task_id: str) -> dict[str, str]:
+    task = _require(task_id)
+    if task.state not in {"running", "planning"}:
+        raise HTTPException(409, f"task is {task.state}, cannot pause")
+    from .agentLoop import request_pause
+    request_pause(task_id)
+    task.state = "paused"
+    task.message = "Mission paused at the next action boundary."
+    await hub.broadcast_progress(task)
+    return {"taskState": "paused"}
+
+
+@app.post("/api/task/{task_id}/resume")
+async def resume_task(task_id: str) -> dict[str, str]:
+    task = _require(task_id)
+    if task.state != "paused":
+        raise HTTPException(409, f"task is {task.state}, cannot resume")
+    from .agentLoop import request_resume
+    request_resume(task_id)
+    task.state = "running"
+    task.message = "Mission resumed."
+    await hub.broadcast_progress(task)
+    return {"taskState": "running"}
 
 
 @app.post("/api/task/{task_id}/confirm")
@@ -526,3 +613,14 @@ async def ws_client(ws: WebSocket) -> None:
     finally:
         if ws in hub.client_sockets:
             hub.client_sockets.remove(ws)
+
+# Local control-center surfaces share the application's origin guard.
+from .control_center import router as control_center_router
+app.include_router(control_center_router)
+
+from .mcp.api import router as mcp_router
+app.include_router(mcp_router)
+from .capabilities_api import router as capabilities_router
+app.include_router(capabilities_router)
+from .memory.api import router as memory_router
+app.include_router(memory_router)
