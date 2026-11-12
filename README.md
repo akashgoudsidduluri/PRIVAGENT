@@ -148,6 +148,8 @@ observation-cache saving is measured in-process.
 
 ## Test & Benchmark Battery
 
+The 12-category live runner is at `backend/scripts/realworld_benchmark.py`. It needs an active local backend, connected Chrome extension, and configured test sites; it reports blocked scenarios rather than treating mock tests as live completions. See `docs/PHASE8_STATUS.md` for the command and current gate status.
+
 ```bash
 # 1. Frontend structure, console, and sanitization tests (25 checks)
 npm test
@@ -171,17 +173,9 @@ backend\venv\Scripts\python.exe backend/scripts/benchmark_eval.py
 backend\venv\Scripts\python.exe backend/scripts/check_gemini.py
 ```
 
-### Benchmark Metrics (Phase 11)
+### Benchmark Metrics
 
-Measured with the deterministic mock harness (`benchmark_eval.py`), so durations reflect in-process orchestration, not network latency:
-
-- **Task Completion Rate**: 100.0% (8/8)
-- **Correct Action Rate**: 100.0%
-- **Target-Selection Errors**: 0
-- **Recovery Success Rate**: 100.0% (1/1)
-- **Average Scenario Duration**: ~45–55 ms (in-process; varies by run)
-- **Privacy Policy Violations**: 0
-- **Unsupported Action Attempts**: 0
+`benchmark_eval.py` runs eight deterministic fixture smoke tests and reports only test passes and fixture duration. It does not establish live autonomy accuracy or zero privacy leakage. The 12-category runner in `backend/scripts/realworld_benchmark.py` computes evidence-backed task and action metrics from a connected runtime; its current live readiness status is documented in `docs/PHASE8_STATUS.md`.
 
 ---
 

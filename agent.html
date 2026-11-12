@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>NAVIGATOR — Agent Workspace · SIH 26171</title>
+  <title>PrivAgent — Control Center</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='10' fill='%23061032'/%3E%3Ccircle cx='12' cy='12' r='6.5' fill='none' stroke='%2346d7ff' stroke-width='1.8'/%3E%3Ccircle cx='12' cy='12' r='2.4' fill='%23a06bff'/%3E%3C/svg%3E" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -22,10 +22,10 @@
         <span class="nav__logo" aria-hidden="true">
           <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3.5 3 14 0 18M12 3c-3 3.5-3 14 0 18"/></svg>
         </span>
-        <span class="nav__wordmark">NAVIGATOR<sup>WORKSPACE</sup></span>
+        <span class="nav__wordmark">PRIVAGENT<sup>CONTROL CENTER</sup></span>
       </a>
-      <span class="agent-pill">Autonomous Mode</span>
-      <span class="agent-pill agent-pill--vault">Local Vault Active</span>
+      <span class="agent-pill">Human-governed autonomy</span>
+      <span class="agent-pill agent-pill--vault">Local-first runtime</span>
       <button id="btnLlmSettings" class="btn btn--sm btn--ghost" title="LLM Provider Settings" aria-haspopup="dialog">
         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
         <span id="llmSettingsLabel">Provider</span>
@@ -37,11 +37,13 @@
         <span class="status-text" id="wsText">Connecting...</span>
       </div>
       <button id="btnNewSession" class="btn btn--sm btn--ghost">New Mission</button>
-      <a href="/" class="btn btn--sm btn--ghost">Overview ←</a>
+      <a href="/" class="btn btn--sm btn--ghost">Public site ↗</a>
     </div>
   </header>
 
   <!-- Workspace Split Grid -->
+  <nav id="controlNav" class="control-nav" aria-label="Control center"></nav>
+  <div id="controlPage" class="control-page"></div>
   <main class="agent-workspace" id="agentWorkspace">
     <!-- Left: Collapsible Missions History Sidebar -->
     <aside class="agent-chat-sidebar" id="chatSidebar" aria-label="Mission History Sidebar">
@@ -70,6 +72,7 @@
 
     <!-- Center: Timeline & Chat Feed -->
     <section class="agent-timeline">
+<div class="workspace-heading"><span class="eyebrow">YOUR PRIVATE OPERATIONS LAYER</span><h1>Intent into <em>action.</em></h1><p>One mission. Every decision visible. You stay in control.</p></div>
       <!-- Input Panel -->
       <div class="agent-input-card">
         <label for="missionInput" class="agent-input-label">
@@ -77,6 +80,9 @@
           <span class="agent-state-badge" id="missionStateBadge">READY</span>
         </label>
         <textarea id="missionInput" class="agent-textarea" rows="2" placeholder="e.g. Buy me a yellow dress from amazon (proceed until checkout)"></textarea>
+        <label class="agent-attachment" for="missionAttachment">Attach a file for this mission (up to 5 MiB)
+          <input id="missionAttachment" type="file" accept=".pdf,.png,.jpg,.jpeg,.txt,.csv,.docx,.xlsx" />
+        </label>
 
         <!-- Quick Presets -->
         <div class="agent-presets">
@@ -154,7 +160,7 @@
       <div class="inspector-card">
         <div class="inspector-card__header">
           <h4>BROWSER INSPECTOR</h4>
-          <span class="live-dot">● LIVE</span>
+          <span class="live-dot">● EVIDENCE</span>
         </div>
         <div class="inspector-field">
           <label>ACTIVE TAB URL</label>
@@ -174,7 +180,7 @@
         <div class="inspector-viewport-wrap">
           <div class="inspector-viewport-header">
             <label>VISUAL PERCEPTION FRAME</label>
-            <span class="obstacle-badge obstacle-badge--clear" id="obstacleBadge">✓ Workflow Clear</span>
+            <span class="obstacle-badge obstacle-badge--clear" id="obstacleBadge">Awaiting evidence</span>
           </div>
           <div class="inspector-viewport" id="inspectorViewport">
             <img id="inspectorScreenshot" class="inspector-screenshot" alt="Visual Workflow Frame" hidden />
@@ -194,7 +200,7 @@
       <div class="inspector-card">
         <div class="inspector-card__header">
           <h4>PRIVACY SENTINEL</h4>
-          <span class="shield-badge">SHIELDED</span>
+          <span class="shield-badge">POLICY</span>
         </div>
         <ul class="sentinel-list">
           <li>
@@ -208,7 +214,7 @@
             <span class="sentinel-icon">⚡</span>
             <div>
               <strong>Local-First Perception</strong>
-              <p>DOM candidates and bounding boxes are analyzed locally. Full screenshots stay on this device unless an operator explicitly opts in with <code>ALLOW_SCREENSHOTS=true</code>.</p>
+              <p>DOM candidates and bounds are analyzed locally. Screenshot consent is controlled in Privacy Center; detected sensitive content still withholds the image.</p>
             </div>
           </li>
           <li>
@@ -288,5 +294,6 @@
   </div>
 
   <script type="module" src="/src/agentApp.ts"></script>
+<script type="module" src="/src/controlCenter.ts"></script>
 </body>
 </html>
