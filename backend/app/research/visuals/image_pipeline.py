@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import httpx
-from PIL import Image
+from PIL import Image  # type: ignore
 
 from ...website_resolver import is_safe_public_url, validate_redirect_chain
 

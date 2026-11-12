@@ -13,6 +13,7 @@ import re
 import threading
 import time
 from typing import Any, Callable, Optional
+import urllib.parse
 from urllib.parse import urlsplit
 from pathlib import Path
 

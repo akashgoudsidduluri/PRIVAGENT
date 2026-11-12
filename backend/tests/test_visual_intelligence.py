@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
-from PIL import Image
+from PIL import Image  # type: ignore
 
 from app.research.collector import extract_page_images
 from app.research.models import DataTable
@@ -306,7 +306,7 @@ def test_pdf_and_docx_render_with_authenticated_image_attribution(tmp_path):
     assert Path(docx_path).stat().st_size > 3000
 
     # Check DOCX text contains the attribution
-    import docx
+    import docx  # type: ignore
     doc = docx.Document(docx_path)
     full_text = "\n".join(p.text for p in doc.paragraphs)
     assert "Credit: National Renewable Energy Laboratory (NREL)" in full_text
