@@ -3,7 +3,7 @@
   "name": "NAVIGATOR — Privacy Browser Agent",
   "version": "1.0.0",
   "description": "On-device orchestration relay for the NAVIGATOR browser agent (SIH 26171).",
-  "permissions": ["tabs", "scripting", "debugger", "activeTab", "alarms"],
+  "permissions": ["tabs", "scripting", "debugger", "activeTab", "alarms", "webNavigation", "storage"],
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background.js", "type": "module" }
 }
