@@ -12,6 +12,24 @@ afterEach(() => {
 });
 
 describe("React-controlled input fallback typing", () => {
+  it("re-resolves a detached search input after rerender", () => {
+    document.body.innerHTML = '<input id="old" aria-label="Search products">';
+    const original = document.getElementById("old")!;
+    original.getBoundingClientRect = () => ({left:10,top:10,width:100,height:30,right:110,bottom:40,x:10,y:10,toJSON:()=>({})}) as DOMRect;
+    (window.__navigatorAgent as unknown as { list: () => unknown[] }).list();
+    original.remove();
+    document.body.innerHTML = '<input id="new" aria-label="Search products">';
+    const result = agent().type("old", "query", true, "Search products");
+    expect(result.ok).toBe(true);
+    expect((document.getElementById("new") as HTMLInputElement).value).toBe("query");
+  });
+
+  it("refuses two equally named replacement inputs", () => {
+    document.body.innerHTML = '<input id="old" aria-label="Search products">';
+    (window.__navigatorAgent as unknown as { list: () => unknown[] }).list();
+    document.body.innerHTML = '<input id="new1" aria-label="Search products"><input id="new2" aria-label="Search products">';
+    expect(agent().readValue("old", "Search products").ok).toBe(false);
+  });
   it("fires input/change and keeps controlled state in sync with the DOM value", () => {
     document.body.innerHTML = `
       <input id="react-search" type="text" name="q" aria-label="Search products">`;
