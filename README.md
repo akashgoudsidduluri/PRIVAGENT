@@ -227,3 +227,38 @@ sih-26171-landing/
 └── docs/
     └── ARCHITECTURE.md              # Technical architecture reference
 ```
+
+---
+
+## Autonomous Research & Document Generation Engine (Phase 4)
+
+PrivAgent features an end-to-end, privacy-hardened autonomous research and document synthesis engine capable of investigating complex subjects across credible web sources, harvesting multi-perspective evidence, validating data, and rendering publication-ready deliverables across multiple formats.
+
+### 1. Adaptive Research & General-Purpose Document Planning
+- **Topic-Agnostic Document Architecture**: The renderer does not rely on domain-specific hardcoded templates. Research on quantum computing, operating systems, solar economics, or consumer hardware uniformly generates structured outlines with executive summaries, technical findings, algorithmic/mathematical proofs, comparative tables, and verified references.
+- **Adaptive Document Sizing**: Intelligently scales document length, section depth, and visual placement based on user constraints (e.g. strict five-page executive briefs vs. dense multi-page technical dossiers).
+- **Mathematical & Algorithmic Formulations**: Synthesizes and formats LaTeX expressions and renders them into vector/raster images using Matplotlib/ReportLab.
+
+### 2. Secure Image Pipeline & Attribution
+- **Authentic Image Extraction**: High-substance imagery is parsed directly from researched websites, filtering out tracking pixels, 1x1 spacer GIFs, navigation icons, and marketing banners.
+- **Multi-Layer SSRF & Exploit Defense**:
+  - Image URLs are validated via `is_safe_public_url` against loopback, private RFC-1918 subnets, and cloud metadata endpoints.
+  - Redirect chains are bounded and re-checked at every hop.
+  - Payloads are screened against magic bytes (PNG, JPEG, WebP, GIF) and inspected with Pillow to eliminate decompression bomb vectors.
+- **Automated Caching & Embedding**: Remote visuals are safely downloaded, cached in local session storage, and embedded near their relevant textual subsections in both PDF (`ReportLab`) and DOCX (`python-docx`) deliverables.
+- **Honest Provenance & Attribution**: Images maintain strict provenance (`is_generated=False` for scraped assets vs. `is_generated=True` for system-generated charts/diagrams), displaying photographer/publisher credit and source domain attribution directly below each figure.
+
+### 3. Category-Independent Product Research
+- **Universal Product Model**: Extracts technical specifications across diverse product categories, including smartphones (e.g. Samsung Galaxy S25 5G, Apple iPhone, Google Pixel), laptops, and general consumer electronics.
+- **Multi-Retailer Comparison**: Aggregates pricing, retailer links, availability, and hardware specifications (SoC, camera array, RAM, storage, battery) across competing e-commerce platforms.
+- **EMI & Financing Intelligence**: Automatically extracts and compares No Cost EMI and Standard EMI terms, monthly instalment amounts, and tenures across retailers.
+- **Verified Comparison Claims**: Generates structured `DataTable` matrices highlighting the verified best price (`⭐ Best Price`) along with corroborated price and availability claims.
+
+### 4. Deliverable-Only Export & Continuation Workflow
+PrivAgent separates intent handling into distinct operational paths to eliminate unnecessary browsing:
+1. `NEW_RESEARCH`: Isolated research missions exploring fresh topics with full browser navigation.
+2. `EXPORT_EXISTING_PACKAGE`: Zero-browser deliverable compilation (`"export as PDF"`, `"Make the previous report five pages and add more images"`, `"convert to DOCX"`). Immediately reuses persisted knowledge packages, caches visuals, applies page constraints, and renders new deliverables without opening a browser.
+3. `REFINE_EXISTING_RESEARCH`: Extends active research with new conceptual subtopics while preserving all prior evidence, sources, and claims.
+4. `RESUME_EXISTING_MISSION`: Seamlessly picks up interrupted or stalled research missions.
+5. `NORMAL_CONVERSATION`: Answers conversational queries locally without browser overhead.
+

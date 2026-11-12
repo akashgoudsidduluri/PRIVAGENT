@@ -45,6 +45,8 @@ export interface ElementTarget {
   name?: string;
   /** ARIA role hint (planner may pass it; used only as a tiebreaker). */
   role?: string;
+  /** Explicit semantic marker. Only set when the action is intentionally a search. */
+  search?: boolean;
   /** Fallback CSS selector from the observer registry. */
   cssSelector?: string;
   /** Screenshot-grounded coordinates in CSS pixels (last resort). */
@@ -134,6 +136,8 @@ export interface InteractiveElement {
   name: string;
   tag: string;
   inputType?: string;
+  /** Explicit search semantic from the observer (not a DOM attribute change). */
+  search?: boolean;
   href?: string;
   /** Sensitive fields (password/token) report undefined — never a value. */
   value?: string;

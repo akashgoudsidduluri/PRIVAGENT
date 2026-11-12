@@ -95,7 +95,7 @@ CORE OPERATING PRINCIPLES:
      * Step 1: Navigate to the target site or search engine (e.g. Google, Wikipedia, Amazon).
      * Step 2: Once on search results, look at the items in <page-context>. Identify the most relevant article or product link and CLICK IT ({{"type": "click", "risk": "write", "target": {{"targetId": "..."}}}} or {{"target": {{"name": "..."}}}}). DO NOT scroll repeatedly when matching results are already visible in <page-context>!
      * Step 3: Once on the destination page, read the headings, paragraphs, and tables in <page-context> and <page-text>. Extract the requested facts, specifications, or answers into "notes".
-     * Step 4: Conclude immediately with steps: [] and provide the complete, sourced answer in "answer".
+     * Step 4: MULTI-SOURCE RESEARCH & CONCLUSION: If the user request asks to compare, cross-reference, or research from multiple credible sources, DO NOT conclude after only one paper or source! Proceed to examine the other independent sources. Only conclude with steps: [] once sufficient independent sources (at least 2 for multi-source prompts) have been examined and synthesized into "notes" and "answer". Never cite or count search-results pages as sources.
 5. APP LOADING & SPA HYDRATION:
    - If a page has just navigated and shows "Connecting...", loading spinners, or fewer than 3 elements, emit:
      {{"type": "wait", "risk": "read", "verify": "waiting for page/app to render", "timeoutMs": 3500}}
@@ -297,6 +297,48 @@ def build_prompt(instruction: str, payload: PrivacyFilteredPayload, history: lis
                 "DO NOT navigate back to websites marked COMPLETED.\n"
                 "</multi-site-comparison-status>\n"
             )
+        pkg_data = other_mem.pop("research_knowledge_package", None) if other_mem else None
+        if not pkg_data and working_memory:
+            pkg_data = working_memory.get("research_knowledge_package")
+        if (working_memory and working_memory.get("is_research")) or pkg_data:
+            sources = (pkg_data or {}).get("sources", {})
+            claims = (pkg_data or {}).get("claims", {})
+            accessible_count = len([s for s in sources.values() if s.get("reliability_score", 0) > 0])
+            corroborated_count = len([c for c in claims.values() if c.get("classification") == "independently_corroborated"])
+            conflicting_count = len([c for c in claims.values() if c.get("classification") == "conflicting"])
+            domains_list = list({s.get("domain", "") for s in sources.values() if s.get("domain")})
+            mem_blocks.append(
+                f"<research-status (trusted tracker)>\n"
+                f"Topic: {working_memory.get('research_topic') or instruction}\n"
+                f"Target Format: {working_memory.get('requested_format') or 'report'}\n"
+                f"Deliverable: {working_memory.get('deliverable_type') or 'report'}\n"
+                f"Accessible Sources Visited: {accessible_count} ({', '.join(domains_list) if domains_list else 'none yet'})\n"
+                f"Claims Harvested: {len(claims)} (Corroborated: {corroborated_count}, Conflicting: {conflicting_count})\n"
+                f"RESEARCH GUIDELINES:\n"
+                f"- Navigate to relevant search results and independent authoritative sources.\n"
+                f"- Harvest factual findings across multiple independent domains.\n"
+                f"- If sources conflict or report divergent numbers/dates, preserve both perspectives.\n"
+                f"- When sufficient evidence is collected, conclude with steps: [] and provide a synthesized comprehensive report.\n"
+                f"</research-status>\n"
+            )
+        if working_memory and working_memory.get("autonomous_discovery"):
+            disc = working_memory["autonomous_discovery"]
+            queries_str = ", ".join([f'"{q}"' for q in disc.get("search_queries", [])])
+            sources_str = ", ".join([s.get("domain", "") for s in disc.get("selected_sources", [])])
+            mem_blocks.append(
+                f"<autonomous-discovery (trusted engine)>\n"
+                f"Scenario: {disc.get('scenario')} ({'User specified website' if disc.get('scenario') == 'A' else 'Autonomous discovery'})\n"
+                f"Category: {disc.get('category', 'general')}\n"
+                f"Objective: {disc.get('objective', '')}\n"
+                f"Decomposed Queries: {queries_str}\n"
+                f"Selected Target Hubs: {sources_str}\n"
+                f"Discovery Directives:\n"
+                f"- Avoid advertisements, sponsored links, and SEO spam farms.\n"
+                f"- Prefer primary and verified sources.\n"
+                f"- When comparing, inspect multiple independent domains.\n"
+                f"- Never treat a discovered URL as authorization to purchase or submit orders.\n"
+                f"</autonomous-discovery>\n"
+            )
         if other_mem and any(other_mem.values()):
             mem_blocks.append(
                 f"<working-memory untrusted=\"true\">\n{json.dumps(other_mem, separators=(',', ':'))}\n</working-memory>\n"
@@ -351,6 +393,7 @@ def try_deterministic_plan(
     instruction: str,
     payload: PrivacyFilteredPayload,
     history: list[dict[str, Any]],
+    working_memory: Optional[dict[str, Any]] = None,
 ) -> Optional[TaskPlan]:
     """Provide zero-token deterministic plans for unambiguous browser operations."""
     inst = (instruction or "").strip()
@@ -478,28 +521,37 @@ def try_deterministic_plan(
                 ],
             )
 
-    # 6. Pure direct site opening: e.g. "Open Google", "open mail", "check my email", "open amazon", "go to https://example.com"
-    open_match = re.match(r"^(?:open|visit|go\s+to|navigate\s+to|check)(?:\s+my)?\s+([a-zA-Z0-9_\-\.\:\/]+)\s*$", inst, re.IGNORECASE)
+    # 6. Direct site opening / navigation (with WebsiteResolver and ambiguity safety)
+    open_match = re.match(
+        r"^(?:open|visit|go\s+to|navigate\s+to|check)(?:\s+my)?\s+([a-zA-Z0-9_\-\.\:\/]+(?:\s+[a-zA-Z0-9_\-\.]+)?)(?:\s+(?:and|,)\s+(.+))?$",
+        inst,
+        re.IGNORECASE,
+    )
     if open_match:
-        target_token = open_match.group(1).strip()
-        target_token_lower = target_token.lower().rstrip("/")
+        target_token = open_match.group(1).strip().rstrip(".?!")
+        subsequent_action = open_match.group(2).strip() if open_match.group(2) else None
 
-        target_url = None
-        target_name = target_token
-        if target_token_lower in _DIRECT_SITE_TARGETS:
-            target_url = _DIRECT_SITE_TARGETS[target_token_lower]
-            target_name = target_token.capitalize()
-        elif target_token_lower.startswith(("http://", "https://")):
-            target_url = target_token
-        elif "." in target_token_lower and not target_token_lower.endswith("."):
-            target_url = f"https://{target_token}"
+        from .website_resolver import website_resolver, format_ambiguity_clarification
+        resolved = website_resolver.resolve(target_token, context=working_memory)
+
+        if resolved.is_ambiguous:
+            clarification = format_ambiguity_clarification(resolved.target_name, resolved.ambiguity_candidates)
+            return TaskPlan(
+                goal=f"Clarification Required for Ambiguous Target '{target_token}'",
+                notes="Target destination is ambiguous across multiple official candidates.",
+                steps=[],
+                answer=clarification,
+            )
+
+        target_url = resolved.canonical_url
+        target_name = resolved.target_name
 
         if target_url:
             # If we are at the beginning or on blank page, deterministically navigate
             if curr_url in ("", "about:blank") or not history:
                 return TaskPlan(
-                    goal=f"Open {target_name}",
-                    notes=None,
+                    goal=f"Open {target_name}" + (f" and {subsequent_action}" if subsequent_action else ""),
+                    notes=f"Navigating directly to verified URL {target_url} for {target_name}.",
                     steps=[
                         PlannedStep(
                             why=f"Navigating directly to {target_url} as requested in instruction",
@@ -515,8 +567,8 @@ def try_deterministic_plan(
                     answer=None,
                 )
 
-            # If we already navigated there successfully and are currently on that site, complete!
-            if history and history[-1].get("result_ok"):
+            # If we already navigated there successfully and are currently on that site, complete if no subsequent action!
+            if not subsequent_action and history and history[-1].get("result_ok"):
                 try:
                     cur_host = (urlsplit(curr_url).hostname or "").lower()
                     tgt_host = (urlsplit(target_url).hostname or "").lower()
@@ -530,6 +582,36 @@ def try_deterministic_plan(
                 except Exception:
                     pass
 
+    # 7. Autonomous Website Discovery Initial Navigation (Scenario B: no website specified)
+    disc = (working_memory or {}).get("autonomous_discovery")
+    if disc and disc.get("scenario") == "B" and (curr_url in ("", "about:blank") or not history):
+        prim_url = disc.get("primary_navigation_url")
+        if prim_url:
+            cat = disc.get("category", "general")
+            queries = disc.get("search_queries", [])
+            q_str = queries[0] if queries else inst
+            return TaskPlan(
+                goal=f"Discover sources for {disc.get('objective', inst)[:60]}",
+                notes=(
+                    f"Autonomous Website Discovery: Category={cat}. "
+                    f"Decomposed Queries: {'; '.join(queries)}. "
+                    f"Candidate Sources: {', '.join([s.get('domain', '') for s in disc.get('selected_sources', [])])}."
+                ),
+                steps=[
+                    PlannedStep(
+                        why=f"Navigating to primary discovery hub {prim_url} to search for '{q_str}'",
+                        action=BrowserAction(
+                            type="navigate",
+                            risk="write",
+                            params={"url": prim_url},
+                            verify="navigated to discovery hub",
+                            timeout_ms=15000,
+                        ),
+                    )
+                ],
+                answer=None,
+            )
+
     return None
 
 
@@ -540,7 +622,7 @@ def plan_from_observation(*, instruction: str, payload: PrivacyFilteredPayload,
     # Requirement 6: Avoid unnecessary LLM calls for deterministic browser operations
     is_llm = hasattr(provider, "_api_key") or hasattr(provider, "FALLBACK_MODELS") or getattr(provider, "is_llm", False)
     if is_llm:
-        det = try_deterministic_plan(instruction, payload, hist)
+        det = try_deterministic_plan(instruction, payload, hist, working_memory=working_memory)
         if det is not None:
             if hasattr(provider, "last_provider"):
                 provider.last_provider = "deterministic"

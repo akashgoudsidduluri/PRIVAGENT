@@ -230,38 +230,70 @@ class PrivacyFilteredPayload:
         def _pri(e: InteractiveElement) -> int:
             nm = (e.name or "").lower()
             href = (e.href or "").lower()
+            role = (e.role or "").lower()
+            tag = (e.tag or "").lower()
+            input_type = (e.input_type or "").lower()
+            visible = bool(getattr(e, "visible", True))
+            search_classified = bool(getattr(e, "search", None))
 
-            # 1. Obstructive modal close, popup dismiss, ad skip, or direct query match
-            if e.role in ("close-button", "ad-skip") or any(k in nm for k in ("close", "skip ad", "cancel search")):
+            # 0. Obstructive modal close, popup dismiss, ad skip.
+            if role in ("close-button", "ad-skip") or any(k in nm for k in ("close", "skip ad", "cancel search")):
                 return 0
+
+            # 0. Primary search controls always outrank result/navigation noise.
+            #    Classification comes from the observer (aria-label/label/name/
+            #    id/type/form evidence) and is not just a name substring.
+            is_search_field = (
+                search_classified
+                or role == "searchbox"
+                or input_type == "search"
+                or (
+                    (role in ("textbox", "combobox", "input") or tag in ("input", "textarea"))
+                    and visible
+                    and (
+                        bool(re.search(r"\b(search|query|keywords?|find)\b", nm))
+                        or nm.strip() == "q"
+                    )
+                )
+            )
+            is_search_button = (
+                search_classified
+                and (role in ("button", "submit") or tag == "button")
+            )
+            if visible and (is_search_field or is_search_button):
+                return 0
+
+            # 1. Direct query match and ordinary text-entry controls. Only the
+            #    search field above is promoted to 0; a page cannot flood the
+            #    payload with every textbox at the top.
             if self.query_terms and any(t in nm for t in self.query_terms):
-                return 0
-
-            # 2. Key navigation and inputs (search, composer, send, filter)
-            if any(k in nm for k in ("search", "type a message", "send", "submit", "groups", "group")):
+                return 1
+            if visible and (
+                role in ("textbox", "combobox", "input")
+                or tag in ("textarea",)
+                or (tag == "input" and input_type not in ("hidden", "password"))
+            ):
                 return 1
 
-            # 3. Dedicated product/article/doc links and price-bearing elements
+            # 2. Buttons and other actionable controls stay visible.
+            if role in ("button", "submit", "menuitem", "tab", "checkbox", "radio", "switch") or tag in ("button", "select"):
+                return 2
+
+            # 3. Product/result links, prices, and structured result rows.
             is_product_link = any(seg in href for seg in ("/dp/", "/gp/", "/p/", "/item/", "/product/", "/wiki/", "/docs/"))
             has_price = any(sym in nm for sym in ("₹", "$", "€", "£", "rs."))
             if is_product_link or has_price:
-                return 1
-
-            # 4. Structured list items and rows
-            if e.role in ("listitem", "row") and e.name:
-                return 2
-
-            # 5. Descriptive links
-            if e.role == "link" and e.name and len(e.name) > 10:
-                return 2
-
-            # 6. Interactive inputs & buttons
-            if e.role in ("textbox", "input", "button"):
+                return 3
+            if role in ("listitem", "row") and e.name:
                 return 3
 
-            if e.name:
+            # 4. Descriptive links (still below every control and result).
+            if role == "link" and e.name and len(e.name) > 10:
                 return 4
-            return 5
+
+            if e.name:
+                return 5
+            return 6
 
         max_elements = int(getattr(config, "MAX_INTERACTIVE_ELEMENTS", 40))
         sorted_els = sorted(self.interactive, key=_pri)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 import re
 import sys
 import uuid
@@ -15,7 +16,7 @@ if sys.platform == "win32":
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from . import config, db
@@ -360,14 +361,39 @@ def _require(task_id: str):
                 if sess_data:
                     primary_tab = sess_data.get("primary_tab_id")
                     child_tabs = sess_data.get("child_tab_ids", [])
-            state = "completed" if cp.get("step_index", 0) > 0 and not cp.get("error") else "failed"
+            # A checkpoint alone only proves progress, not completion. Derive the
+            # restored state from the recorded final agent message instead of
+            # assuming "completed" whenever step_index > 0 (which used to report
+            # crashed/interrupted tasks as successful).
+            state = "failed"
+            message = (
+                f"Backend restarted before this task finished; "
+                f"progress preserved at step {cp.get('step_index', 0)}."
+            )
+            chat = None
+            if cp.get("conversation_id"):
+                try:
+                    chat = db.get_chat(cp["conversation_id"])
+                except Exception:
+                    chat = None
+            messages = (chat or {}).get("messages") or []
+            last_agent = next(
+                (m for m in reversed(messages) if m.get("role") == "agent"), None
+            )
+            if last_agent:
+                evidence = (last_agent.get("evidence") or "").lower()
+                if evidence.startswith("completed"):
+                    state = "completed"
+                    message = last_agent.get("content") or "Task completed."
+                elif last_agent.get("content"):
+                    message = last_agent["content"]
             restored = TaskRecord(
                 task_id=task_id,
                 instruction=cp.get("working_memory", {}).get("instruction") or "Task",
                 chat_id=cp.get("conversation_id"),
                 state=state,
                 steps_done=cp.get("step_index", 0),
-                message=cp.get("working_memory", {}).get("notes") or f"State preserved at step {cp.get('step_index', 0)}",
+                message=message,
                 session_id=sess_id,
                 primary_tab_id=primary_tab,
                 child_tab_ids=child_tabs,
@@ -377,6 +403,82 @@ def _require(task_id: str):
     except Exception:
         pass
     raise HTTPException(404, "task not found")
+
+
+# ---------------------------------------------------------------------------
+# Artifact Deliverables & Storage API
+# ---------------------------------------------------------------------------
+
+ARTIFACTS_DIR = (Path(__file__).resolve().parents[1] / "data" / "artifacts").resolve()
+ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@app.get("/api/tasks/{task_id}/artifacts")
+async def get_task_artifacts(task_id: str) -> list[dict[str, Any]]:
+    return db.list_task_artifacts(task_id)
+
+
+@app.get("/api/chats/{chat_id}/artifacts")
+async def get_chat_artifacts(chat_id: str) -> list[dict[str, Any]]:
+    return db.list_conversation_artifacts(chat_id)
+
+
+@app.get("/api/artifacts/{artifact_id}")
+async def get_artifact_metadata(artifact_id: str) -> dict[str, Any]:
+    art = db.get_artifact(artifact_id)
+    if not art:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    return art
+
+
+@app.get("/api/artifacts/{artifact_id}/download")
+async def download_artifact(artifact_id: str) -> FileResponse:
+    art = db.get_artifact(artifact_id)
+    if not art:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    file_path = Path(art.get("filepath", "")).resolve()
+
+    # Path traversal validation: file must reside strictly inside ARTIFACTS_DIR
+    try:
+        file_path.relative_to(ARTIFACTS_DIR)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Access denied: path traversal attempt")
+
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Artifact file not found on disk")
+
+    return FileResponse(
+        path=str(file_path),
+        filename=art["filename"],
+        media_type=art["mime_type"],
+        headers={"Content-Disposition": f'attachment; filename="{art["filename"]}"'},
+    )
+
+
+@app.get("/api/artifacts/{artifact_id}/preview")
+async def preview_artifact(artifact_id: str) -> FileResponse:
+    art = db.get_artifact(artifact_id)
+    if not art:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    file_path = Path(art.get("filepath", "")).resolve()
+
+    # Path traversal validation: file must reside strictly inside ARTIFACTS_DIR
+    try:
+        file_path.relative_to(ARTIFACTS_DIR)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Access denied: path traversal attempt")
+
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Artifact file not found on disk")
+
+    return FileResponse(
+        path=str(file_path),
+        filename=art["filename"],
+        media_type=art["mime_type"],
+        headers={"Content-Disposition": f'inline; filename="{art["filename"]}"'},
+    )
 
 
 @app.websocket("/ws/extension")

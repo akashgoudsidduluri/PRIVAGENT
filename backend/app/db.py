@@ -102,10 +102,40 @@ def init_db(db_path: Optional[str] = None) -> None:
                 updated_at REAL NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS artifacts (
+                artifact_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                filepath TEXT NOT NULL,
+                file_format TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                file_size_bytes INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                summary TEXT,
+                metadata TEXT NOT NULL,
+                created_at REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS research_packages (
+                package_id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                topic_title TEXT NOT NULL,
+                status TEXT NOT NULL,
+                data_json TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id);
             CREATE INDEX IF NOT EXISTS idx_chats_updated_at ON chats(updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_sessions_conv ON browser_sessions(conversation_id, last_activity_at DESC);
             CREATE INDEX IF NOT EXISTS idx_checkpoints_conv ON task_checkpoints(conversation_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_artifacts_conv ON artifacts(conversation_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_packages_conv ON research_packages(conversation_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_packages_task ON research_packages(task_id, updated_at DESC);
             """
         )
 
@@ -332,6 +362,19 @@ def get_latest_active_session_for_chat(conversation_id: str, db_path: Optional[s
         return d
 
 
+def _json_serializable(obj: Any) -> Any:
+    """Recursively convert Pydantic models, dataclasses, sets, and custom types to serializable primitives."""
+    if hasattr(obj, "model_dump"):
+        return _json_serializable(obj.model_dump())
+    if hasattr(obj, "to_dict"):
+        return _json_serializable(obj.to_dict())
+    if isinstance(obj, dict):
+        return {str(k): _json_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_json_serializable(x) for x in obj]
+    return obj
+
+
 def save_task_checkpoint(
     task_id: str,
     conversation_id: str,
@@ -343,8 +386,8 @@ def save_task_checkpoint(
     db_path: Optional[str] = None,
 ) -> None:
     now = time.time()
-    hist_json = json.dumps(history)
-    wm_json = json.dumps(working_memory)
+    hist_json = json.dumps(_json_serializable(history))
+    wm_json = json.dumps(_json_serializable(working_memory))
     with get_connection(db_path) as conn:
         conn.execute(
             """
@@ -404,5 +447,206 @@ def get_latest_checkpoint_for_chat(conversation_id: str, db_path: Optional[str] 
         except Exception:
             d["working_memory"] = {}
         return d
+
+
+# ---------------------------------------------------------------------------
+# Artifact Metadata Registry and Storage
+# ---------------------------------------------------------------------------
+
+def save_artifact(artifact: dict[str, Any], db_path: Optional[str] = None) -> dict[str, Any]:
+    """Register or update an artifact deliverable in persistent SQLite storage."""
+    art_id = artifact.get("artifact_id") or uuid.uuid4().hex
+    task_id = artifact.get("task_id") or ""
+    conversation_id = artifact.get("conversation_id") or ""
+    filename = artifact.get("filename") or f"artifact_{art_id}"
+    filepath = artifact.get("filepath") or ""
+    file_format = (artifact.get("file_format") or "bin").lower().strip(".")
+    mime_type = artifact.get("mime_type") or "application/octet-stream"
+    file_size_bytes = int(artifact.get("file_size_bytes") or 0)
+    title = artifact.get("title") or filename
+    summary = artifact.get("summary") or ""
+    meta_dict = artifact.get("metadata") or {}
+    meta_json = json.dumps(_json_serializable(meta_dict))
+    created_at = float(artifact.get("created_at") or time.time())
+
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO artifacts (
+                artifact_id, task_id, conversation_id, filename, filepath,
+                file_format, mime_type, file_size_bytes, title, summary,
+                metadata, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(artifact_id) DO UPDATE SET
+                task_id = excluded.task_id,
+                conversation_id = excluded.conversation_id,
+                filename = excluded.filename,
+                filepath = excluded.filepath,
+                file_format = excluded.file_format,
+                mime_type = excluded.mime_type,
+                file_size_bytes = excluded.file_size_bytes,
+                title = excluded.title,
+                summary = excluded.summary,
+                metadata = excluded.metadata
+            """,
+            (
+                art_id, task_id, conversation_id, filename, filepath,
+                file_format, mime_type, file_size_bytes, title, summary,
+                meta_json, created_at,
+            ),
+        )
+        conn.commit()
+
+    return get_artifact(art_id, db_path=db_path) or artifact
+
+
+def get_artifact(artifact_id: str, db_path: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """Retrieve an artifact by its unique ID."""
+    with get_connection(db_path) as conn:
+        row = conn.execute("SELECT * FROM artifacts WHERE artifact_id = ?", (artifact_id,)).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        try:
+            d["metadata"] = json.loads(d.get("metadata") or "{}")
+        except Exception:
+            d["metadata"] = {}
+        return d
+
+
+def list_task_artifacts(task_id: str, db_path: Optional[str] = None) -> list[dict[str, Any]]:
+    """Retrieve all artifacts generated for a specific task."""
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM artifacts WHERE task_id = ? ORDER BY created_at DESC",
+            (task_id,),
+        ).fetchall()
+        results = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["metadata"] = json.loads(d.get("metadata") or "{}")
+            except Exception:
+                d["metadata"] = {}
+            results.append(d)
+        return results
+
+
+def list_conversation_artifacts(conversation_id: str, db_path: Optional[str] = None) -> list[dict[str, Any]]:
+    """Retrieve all artifacts associated with a conversation."""
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM artifacts WHERE conversation_id = ? ORDER BY created_at DESC",
+            (conversation_id,),
+        ).fetchall()
+        results = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["metadata"] = json.loads(d.get("metadata") or "{}")
+            except Exception:
+                d["metadata"] = {}
+            results.append(d)
+        return results
+
+
+def delete_artifact(artifact_id: str, db_path: Optional[str] = None) -> bool:
+    """Delete an artifact record from the database."""
+    with get_connection(db_path) as conn:
+        cur = conn.execute("DELETE FROM artifacts WHERE artifact_id = ?", (artifact_id,))
+        conn.commit()
+        return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Research Knowledge Package Persistence and Management
+# ---------------------------------------------------------------------------
+
+def save_research_package(
+    package: dict[str, Any],
+    conversation_id: str,
+    task_id: str,
+    status: str = "completed",
+    db_path: Optional[str] = None,
+) -> dict[str, Any]:
+    """Persist or update a ResearchKnowledgePackage in SQLite."""
+    pkg_id = package.get("package_id") or f"pkg_{task_id}"
+    topic_obj = package.get("topic") or {}
+    topic_title = topic_obj.get("title") if isinstance(topic_obj, dict) else getattr(topic_obj, "title", "Technical Research")
+    data_json = json.dumps(_json_serializable(package))
+    now = time.time()
+    created_at = float(package.get("created_at") or now)
+
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO research_packages (
+                package_id, conversation_id, task_id, topic_title,
+                status, data_json, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(package_id) DO UPDATE SET
+                conversation_id = excluded.conversation_id,
+                task_id = excluded.task_id,
+                topic_title = excluded.topic_title,
+                status = excluded.status,
+                data_json = excluded.data_json,
+                updated_at = excluded.updated_at
+            """,
+            (pkg_id, conversation_id, task_id, str(topic_title), status, data_json, created_at, now),
+        )
+        conn.commit()
+    return get_research_package(pkg_id, db_path=db_path) or package
+
+
+def get_research_package(package_id: str, db_path: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """Retrieve a research package by its unique package_id."""
+    with get_connection(db_path) as conn:
+        row = conn.execute("SELECT * FROM research_packages WHERE package_id = ?", (package_id,)).fetchone()
+        if not row:
+            return None
+        res = dict(row)
+        try:
+            res["data"] = json.loads(res["data_json"])
+        except Exception:
+            res["data"] = {}
+        return res
+
+
+def get_latest_package_for_chat(conversation_id: str, db_path: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """Retrieve the most recent research package for a conversation."""
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM research_packages WHERE conversation_id = ? ORDER BY updated_at DESC LIMIT 1",
+            (conversation_id,),
+        ).fetchone()
+        if not row:
+            return None
+        res = dict(row)
+        try:
+            res["data"] = json.loads(res["data_json"])
+        except Exception:
+            res["data"] = {}
+        return res
+
+
+def list_packages_for_chat(conversation_id: str, db_path: Optional[str] = None) -> list[dict[str, Any]]:
+    """List all research packages stored for a conversation in reverse chronological order."""
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM research_packages WHERE conversation_id = ? ORDER BY updated_at DESC",
+            (conversation_id,),
+        ).fetchall()
+        results = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["data"] = json.loads(d["data_json"])
+            except Exception:
+                d["data"] = {}
+            results.append(d)
+        return results
+
 
 

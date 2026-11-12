@@ -6,7 +6,7 @@ import type {
   TabInfo,
 } from "./contracts";
 import { validateAction } from "./contracts";
-import { findTarget } from "./targeting";
+import { classifySearchTarget, findTarget, type Candidate } from "./targeting";
 import { sanitizeObservation } from "./observer";
 
 /** Injected content-script API shape (see lib/content.ts). */
@@ -16,11 +16,31 @@ interface AgentElement {
   name: string;
   tag: string;
   inputType?: string;
+  search?: boolean;
   cssSelector: string;
   enabled: boolean;
   visible: boolean;
   bounds?: { x: number; y: number; width: number; height: number };
   href?: string;
+}
+
+interface ValueProbe {
+  ok: boolean;
+  value?: string;
+  tag?: string;
+  inputType?: string;
+  editable?: boolean;
+  error?: string;
+}
+
+interface PageStateProbe {
+  url: string;
+  title: string;
+  readyState: string;
+  textLength: number;
+  textHash: number;
+  interactiveCount: number;
+  resultCount: number;
 }
 
 interface AgentApi {
@@ -29,8 +49,10 @@ interface AgentApi {
   clickCoords: (x: number, y: number) => Promise<{ ok: boolean; targetId?: string; error?: string }>;
   getCoords: (targetId: string, name?: string) => Promise<{ x: number; y: number; width: number; height: number } | null>;
   clickPoint: (targetId: string, name?: string) => Promise<{ x: number; y: number; width: number; height: number } | null>;
-  type: (targetId: string, text: string, clear?: boolean, name?: string) => Promise<{ ok: boolean; error?: string }>;
+  type: (targetId: string, text: string, clear?: boolean, name?: string) => Promise<{ ok: boolean; error?: string; value?: string }>;
   submit: (targetId: string, name?: string) => Promise<{ ok: boolean; error?: string }>;
+  readValue: (targetId: string, name?: string) => Promise<ValueProbe>;
+  pageState: () => Promise<PageStateProbe>;
   scroll: (d: "up" | "down" | "top" | "bottom", containerId?: string) => Promise<{ ok: boolean; scrollY: number }>;
   extractText: (maxLen?: number) => Promise<string>;
 }
@@ -42,30 +64,30 @@ export async function withAgent(tabId: number): Promise<AgentApi> {
   // element ids after any SPA re-render.
   let injected = false;
   try {
-    const [probe] = await chrome.scripting.executeScript({
+    const [probe] = await execScript({
       target: { tabId },
       func: () => Boolean((window as unknown as { __navigatorAgent?: unknown }).__navigatorAgent),
-    });
+    }, 1_500);
     injected = Boolean(probe?.result);
   } catch {
     injected = false;
   }
   if (!injected) {
-    await chrome.scripting.executeScript({
+    await execScript({
       target: { tabId },
       files: ["content.js"],
-    });
+    }, 3_000);
   }
   return {
     list: async () => {
-      const [r] = await chrome.scripting.executeScript({
+      const [r] = await execScript({
         target: { tabId },
         func: () => (window as unknown as { __navigatorAgent?: { list: () => AgentElement[] } }).__navigatorAgent?.list() ?? [],
       });
       return (r?.result as AgentElement[]) ?? [];
     },
     getCoords: async (targetId: string, name?: string) => {
-      const [r] = await chrome.scripting.executeScript({
+      const [r] = await execScript({
         target: { tabId },
         func: (id: string, nm?: string) =>
           (window as unknown as { __navigatorAgent?: { getCoords: (i: string, n?: string) => { x: number; y: number; width: number; height: number } | null } }).__navigatorAgent?.getCoords(id, nm) ?? null,
@@ -74,7 +96,7 @@ export async function withAgent(tabId: number): Promise<AgentApi> {
       return (r?.result as { x: number; y: number; width: number; height: number } | null) ?? null;
     },
     clickPoint: async (targetId: string, name?: string) => {
-      const [r] = await chrome.scripting.executeScript({
+      const [r] = await execScript({
         target: { tabId },
         func: (id: string, nm?: string) =>
           (window as unknown as { __navigatorAgent?: { getClickPoint: (i: string, n?: string) => { x: number; y: number; width: number; height: number } | null } }).__navigatorAgent?.getClickPoint(id, nm) ?? null,
@@ -83,7 +105,7 @@ export async function withAgent(tabId: number): Promise<AgentApi> {
       return (r?.result as { x: number; y: number; width: number; height: number } | null) ?? null;
     },
     click: async (targetId: string, name?: string) => {
-      const [r] = await chrome.scripting.executeScript({
+      const [r] = await execScript({
         target: { tabId },
         func: (id: string, nm?: string) => (window as unknown as { __navigatorAgent?: { click: (i: string, n?: string) => { ok: boolean; error?: string } } }).__navigatorAgent?.click(id, nm) ?? { ok: false, error: "no agent" },
         args: [targetId ?? "", name ?? ""],
@@ -94,7 +116,7 @@ export async function withAgent(tabId: number): Promise<AgentApi> {
       if (typeof x !== "number" || typeof y !== "number" || !Number.isFinite(x) || !Number.isFinite(y)) {
         return { ok: false, error: "invalid coordinates" };
       }
-      const [r] = await chrome.scripting.executeScript({
+      const [r] = await execScript({
         target: { tabId },
         func: (cx: number, cy: number) => (window as unknown as { __navigatorAgent?: { clickCoords: (px: number, py: number) => { ok: boolean; targetId?: string; error?: string } } }).__navigatorAgent?.clickCoords(cx, cy) ?? { ok: false, error: "no agent" },
         args: [x, y],
@@ -102,16 +124,16 @@ export async function withAgent(tabId: number): Promise<AgentApi> {
       return (r?.result as { ok: boolean; targetId?: string; error?: string }) ?? { ok: false, error: "execution failed" };
     },
     type: async (targetId: string, text: string, clear?: boolean, name?: string) => {
-      const [r] = await chrome.scripting.executeScript({
+      const [r] = await execScript({
         target: { tabId },
         func: (id: string, val: string, cl: boolean, nm?: string) =>
-          (window as unknown as { __navigatorAgent?: { type: (i: string, v: string, c: boolean, n?: string) => { ok: boolean; error?: string } } }).__navigatorAgent?.type(id, val, cl, nm) ?? { ok: false, error: "no agent" },
+          (window as unknown as { __navigatorAgent?: { type: (i: string, v: string, c: boolean, n?: string) => { ok: boolean; error?: string; value?: string } } }).__navigatorAgent?.type(id, val, cl, nm) ?? { ok: false, error: "no agent" },
         args: [targetId ?? "", text ?? "", Boolean(clear ?? true), name ?? ""],
       });
-      return (r?.result as { ok: boolean; error?: string }) ?? { ok: false, error: "execution failed" };
+      return (r?.result as { ok: boolean; error?: string; value?: string }) ?? { ok: false, error: "execution failed" };
     },
     submit: async (targetId: string, name?: string) => {
-      const [r] = await chrome.scripting.executeScript({
+      const [r] = await execScript({
         target: { tabId },
         func: (id: string, nm?: string) =>
           (window as unknown as { __navigatorAgent?: { submit: (i: string, n?: string) => { ok: boolean; error?: string } } }).__navigatorAgent?.submit(id, nm) ?? { ok: false, error: "no agent" },
@@ -119,8 +141,28 @@ export async function withAgent(tabId: number): Promise<AgentApi> {
       });
       return (r?.result as { ok: boolean; error?: string }) ?? { ok: false, error: "execution failed" };
     },
+    readValue: async (targetId: string, name?: string) => {
+      const [r] = await execScript({
+        target: { tabId },
+        func: (id: string, nm?: string) =>
+          (window as unknown as { __navigatorAgent?: { readValue: (i: string, n?: string) => ValueProbe } }).__navigatorAgent?.readValue(id, nm) ?? { ok: false, error: "no agent" },
+        args: [targetId ?? "", name ?? ""],
+      });
+      return (r?.result as ValueProbe) ?? { ok: false, error: "execution failed" };
+    },
+    pageState: async () => {
+      const [r] = await execScript({
+        target: { tabId },
+        func: () =>
+          (window as unknown as { __navigatorAgent?: { pageState: () => PageStateProbe } }).__navigatorAgent?.pageState() ?? null,
+      });
+      return (r?.result as PageStateProbe) ?? {
+        url: "", title: "", readyState: "", textLength: 0, textHash: 0,
+        interactiveCount: 0, resultCount: 0,
+      };
+    },
     scroll: async (direction: "up" | "down" | "top" | "bottom", containerId?: string) => {
-      const [r] = await chrome.scripting.executeScript({
+      const [r] = await execScript({
         target: { tabId },
         func: (dir: string, cid?: string) => (window as unknown as { __navigatorAgent?: { scroll: (d: any, c?: string) => { ok: boolean; scrollY: number } } }).__navigatorAgent?.scroll(dir as any, cid) ?? { ok: false, scrollY: 0 },
         args: [direction ?? "down", containerId ?? ""],
@@ -129,7 +171,7 @@ export async function withAgent(tabId: number): Promise<AgentApi> {
     },
     extractText: async (maxLen = 3000) => {
       const limit = typeof maxLen === "number" && Number.isFinite(maxLen) ? Math.max(100, maxLen) : 3000;
-      const [r] = await chrome.scripting.executeScript({
+      const [r] = await execScript({
         target: { tabId },
         func: (lim: number) =>
           (window as unknown as { __navigatorAgent?: { extractText?: (m?: number) => string } }).__navigatorAgent?.extractText?.(lim) ?? "",
@@ -474,7 +516,7 @@ function samePageUrl(a: string, b: string): boolean {
 
 async function pageStatus(tabId: number): Promise<PageSettlement | null> {
   try {
-    const [res] = await chrome.scripting.executeScript({
+    const [res] = await execScript({
       target: { tabId },
       func: () => {
         const text = document.body?.innerText || "";
@@ -486,7 +528,7 @@ async function pageStatus(tabId: number): Promise<PageSettlement | null> {
           isConnecting: text.includes("Connecting to WhatsApp") || text.includes("Loading your chats"),
         };
       },
-    });
+    }, 1_500);
     return (res?.result as PageSettlement) ?? null;
   } catch {
     return null;
@@ -504,7 +546,7 @@ async function settleDom(tabId: number, quietMs = 120, maxMs = 700): Promise<voi
   const quiet = Math.max(30, qVal);
   const cap = Math.max(quiet, mVal);
   try {
-    await chrome.scripting.executeScript({
+    await execScript({
       target: { tabId },
       func: async (q: number, capMs: number) => {
         await new Promise<void>(resolve => {
@@ -543,7 +585,7 @@ async function settleDom(tabId: number, quietMs = 120, maxMs = 700): Promise<voi
         });
       },
       args: [quiet, cap],
-    });
+    }, cap + 400);
   } catch {
     // Navigation replaced the document mid-wait.
   }
@@ -845,75 +887,278 @@ function isMacPlatform(): boolean {
   }
 }
 
+// Chrome can leave a debugger promise pending after a navigation or when
+// another client owns the target. An unbounded await there stalls the whole
+// action until the relay's deadline fires, losing a successful interaction.
+const DEBUGGER_ATTACH_MS = 2_000;
+const DEBUGGER_COMMAND_MS = 3_000;
+const DEBUGGER_DETACH_MS = 1_200;
+
+async function withDebuggerDeadline<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  try {
+    return await Promise.race([promise, deadline]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+async function debugSend(
+  target: { tabId: number },
+  method: string,
+  params?: Record<string, unknown>,
+): Promise<unknown> {
+  return await withDebuggerDeadline(
+    chrome.debugger.sendCommand(target, method, params),
+    DEBUGGER_COMMAND_MS,
+    `debugger ${method}`,
+  );
+}
+
+/**
+ * Bound page injections. When a tab starts navigating mid-injection Chrome may
+ * never settle the returned promise, which would wedge the action until the
+ * relay deadline. A rejected injection is always handled by the caller as an
+ * unavailable page, so a hard timeout is safe here.
+ */
+async function execScript(injection: any, ms = 5_000): Promise<any[]> {
+  return await withDebuggerDeadline(
+    chrome.scripting["executeScript"](injection) as Promise<any[]>,
+    ms,
+    "executeScript",
+  );
+}
+
+async function debugDetach(target: { tabId: number }): Promise<void> {
+  try {
+    await withDebuggerDeadline(
+      chrome.debugger.detach(target),
+      DEBUGGER_DETACH_MS,
+      "debugger detach",
+    );
+  } catch {
+    // Detach is best-effort: a tab that navigated mid-action may already have
+    // dropped the session, and a stuck detach must not hide a real result.
+  }
+}
+
+interface DebuggerAttachResult {
+  ok: boolean;
+  /** True when this call owns the session and must detach it afterwards. */
+  owned: boolean;
+  error?: string;
+}
+
+async function debugAttach(target: { tabId: number }): Promise<DebuggerAttachResult> {
+  try {
+    await withDebuggerDeadline(
+      chrome.debugger.attach(target, "1.3"),
+      DEBUGGER_ATTACH_MS,
+      "debugger attach",
+    );
+    return { ok: true, owned: true };
+  } catch (e: any) {
+    const message = String(e?.message ?? e);
+    if (message.includes("already attached")) {
+      // Someone else owns the session; use it but never detach their client.
+      return { ok: true, owned: false };
+    }
+    // A timed-out attach may still complete later; report ownership so the
+    // caller can release it. A hard failure never attached.
+    return { ok: false, owned: message.includes("timed out"), error: message };
+  }
+}
+
 async function dispatchKeySequence(
   target: { tabId: number },
   sequence: Array<Record<string, unknown>>,
 ): Promise<void> {
   for (const event of sequence) {
-    await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", event);
+    await debugSend(target, "Input.dispatchKeyEvent", event);
   }
 }
 
+/** Compare the DOM value read back after typing with what we asked for. */
+export function typedValueMatches(actual: string | undefined, expected: string, clear: boolean): boolean {
+  const value = actual ?? "";
+  if (clear) {
+    return value === expected || value.trim() === expected.trim();
+  }
+  return value === expected || value.endsWith(expected) || value.includes(expected);
+}
+
+interface FocusPoint {
+  x: number;
+  y: number;
+}
+
+interface CdpTypeOptions {
+  targetId?: string;
+  targetName?: string;
+  /** Resolve a search/send button while the same debugger session is attached. */
+  submit?: () => Promise<FocusPoint | null>;
+  /** Re-resolve the input rectangle after an SPA rerender. */
+  refocus?: () => Promise<FocusPoint | null>;
+  /** Snapshot search state after typing, immediately before submission. */
+  beforeSubmit?: () => Promise<PageStateProbe | null>;
+}
+
+interface CdpTypeResult {
+  typed: boolean;
+  verified: boolean;
+  actualValue?: string;
+  submitted: boolean;
+  submitMethod?: "button" | "enter";
+  /** Why the native path could not verify, for honest fallback evidence. */
+  error?: string;
+}
+
+async function cdpMouseClick(target: { tabId: number }, coords: FocusPoint): Promise<void> {
+  const x = Math.round(coords.x);
+  const y = Math.round(coords.y);
+  await debugSend(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+  await debugSend(target, "Input.dispatchMouseEvent", {
+    type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1, pointerType: "mouse",
+  });
+  await debugSend(target, "Input.dispatchMouseEvent", {
+    type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1, pointerType: "mouse",
+  });
+}
+
+function valueProbeExpression(targetId?: string, targetName?: string): string {
+  const tid = JSON.stringify(targetId || "");
+  const name = JSON.stringify((targetName || "").trim().toLowerCase());
+  return `(() => {
+    const read = (e) => e ? (e.isContentEditable ? (e.textContent || "") : ('value' in e ? String(e.value) : (e.textContent || ""))) : "";
+    const tid = ${tid};
+    const nm = ${name};
+    let el = null;
+    try {
+      if (tid) {
+        el = document.querySelector('[data-navigator-id="' + CSS.escape(tid) + '"]')
+          || document.getElementById(tid)
+          || document.querySelector('[name="' + CSS.escape(tid) + '"]');
+      }
+    } catch (e) {}
+    if (!el && nm) {
+      const all = Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"], [role="searchbox"], [role="textbox"]'));
+      el = all.find((e) => {
+        const label = String(e.getAttribute('aria-label') || e.getAttribute('title') || e.getAttribute('placeholder') || '').trim().toLowerCase();
+        return label === nm || (label.length > 2 && label.includes(nm));
+      }) || null;
+    }
+    const active = document.activeElement;
+    const editable = !!active && (active.isContentEditable || active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.tagName === 'SELECT');
+    return {
+      targetFound: !!el,
+      targetValue: read(el),
+      activeValue: read(active),
+      activeEditable: editable,
+      activeTag: active ? active.tagName : '',
+    };
+  })()`;
+}
+
+async function cdpEvaluate(target: { tabId: number }, expression: string): Promise<any> {
+  const result = await debugSend(target, "Runtime.evaluate", {
+    expression,
+    returnByValue: true,
+    awaitPromise: false,
+  }) as any;
+  return result?.result?.value;
+}
+
 /**
- * Type into the focused element through Chrome's native input pipeline.
+ * Type (and optionally submit) through one Chrome DevTools Protocol session.
  *
- * This is the primary path for modern SPAs (React-controlled inputs,
- * Flipkart's container `<div>`, WhatsApp Web's Lexical contenteditable).
- * `Input.insertText` goes through the same editing command a real keystroke
- * uses, so it fires `beforeinput`/`input` and updates the framework's state —
- * unlike assigning `HTMLInputElement.prototype.value`, which those apps
- * reject or overwrite on their next render.
- *
- * Returns false when the native path is unavailable, so the caller can fall
- * back to the in-page implementation.
+ * The old flow attached, typed, detached, then attached again for Enter. That
+ * detach/reattach boundary is where SPAs can drop focus or replace the input,
+ * so Enter lands on <body>. Keeping one session means the verified editable is
+ * still focused when submission happens. The debugger is always detached in
+ * `finally`, including error paths. No React `_valueTracker` poking is done:
+ * `Input.insertText` is the native editing command React already understands.
  */
 async function cdpType(
   tabId: number,
-  coords: { x: number; y: number } | null,
+  coords: FocusPoint | null,
   text: string,
   clear: boolean,
-): Promise<boolean> {
-  if (typeof chrome === "undefined" || !chrome.debugger) return false;
+  options: CdpTypeOptions = {},
+): Promise<CdpTypeResult> {
+  const failed: CdpTypeResult = { typed: false, verified: false, submitted: false };
+  if (typeof chrome === "undefined" || !chrome.debugger) return failed;
   // Without coordinates we cannot focus the field with trusted input, and
   // insertText would land in whatever happens to be focused instead.
-  if (!coords || coords.x <= 0 || coords.y <= 0) return false;
+  if (!coords || coords.x <= 0 || coords.y <= 0) return failed;
 
   await ensureTabActive(tabId);
   const target = { tabId };
+  // Track any attach we initiated so a timed-out attach is still detached.
+  let attachAttempted = false;
   try {
-    await chrome.debugger.attach(target, "1.3");
-  } catch (e: any) {
-    if (!e?.message?.includes("already attached")) {
-      return false;
+    const attach = await debugAttach(target);
+    attachAttempted = attach.owned;
+    if (!attach.ok) {
+      return { ...failed, error: attach.error ?? "debugger attach failed" };
     }
-  }
 
-  try {
-    const x = Math.round(coords.x);
-    const y = Math.round(coords.y);
     // A trusted click both focuses the field and places the caret, which is
     // what allows insertText to target the right editable.
-    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
-    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
-      type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1, pointerType: "mouse",
-    });
-    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
-      type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1, pointerType: "mouse",
-    });
+    await cdpMouseClick(target, coords);
 
     if (clear) {
       await dispatchKeySequence(target, cdpKeySequence("selectAll", isMacPlatform()));
       await dispatchKeySequence(target, cdpKeySequence("backspace"));
     }
 
-    await chrome.debugger.sendCommand(target, "Input.insertText", { text });
-    return true;
-  } catch {
-    return false;
+    await debugSend(target, "Input.insertText", { text });
+
+    // Let React/controlled inputs flush their state, then verify the actual
+    // DOM value (not just that a command was sent).
+    await new Promise(r => setTimeout(r, 60));
+    const probe = await cdpEvaluate(target, valueProbeExpression(options.targetId, options.targetName));
+    const actualValue: string = probe?.targetFound ? probe.targetValue : probe.activeValue;
+    const verified = typedValueMatches(actualValue, text, clear);
+    let submitted = false;
+    let submitMethod: "button" | "enter" | undefined;
+
+    if (options.submit && verified) {
+      await new Promise(r => setTimeout(r, 80));
+      // Capture post-typing state inside the session so autocomplete changes
+      // are not mistaken for a successful submission.
+      if (options.beforeSubmit) {
+        try { await options.beforeSubmit(); } catch {}
+      }
+      // Autocomplete often rerenders. If the editable lost focus, re-resolve
+      // its rectangle and click it again inside this same session.
+      if (!probe?.activeEditable && options.refocus) {
+        const refreshed = await options.refocus();
+        if (refreshed && refreshed.x > 0 && refreshed.y > 0) {
+          await cdpMouseClick(target, refreshed);
+        }
+      }
+      const submitPoint = await options.submit();
+      if (submitPoint && submitPoint.x > 0 && submitPoint.y > 0) {
+        await cdpMouseClick(target, submitPoint);
+        submitted = true;
+        submitMethod = "button";
+      } else {
+        await dispatchKeySequence(target, cdpKeySequence("enter"));
+        submitted = true;
+        submitMethod = "enter";
+      }
+    }
+
+    return { typed: true, verified, actualValue, submitted, submitMethod };
+  } catch (e) {
+    return { ...failed, error: String(e instanceof Error ? e.message : e) };
   } finally {
-    try {
-      await chrome.debugger.detach(target);
-    } catch {}
+    if (attachAttempted) {
+      await debugDetach(target);
+    }
   }
 }
 
@@ -921,22 +1166,17 @@ async function cdpClick(tabId: number, x: number, y: number): Promise<boolean> {
   if (typeof chrome === "undefined" || !chrome.debugger) return false;
   await ensureTabActive(tabId);
   const target = { tabId };
-  try {
-    await chrome.debugger.attach(target, "1.3");
-  } catch (e: any) {
-    if (!e?.message?.includes("already attached")) {
-      return false;
-    }
-  }
+  const attach = await debugAttach(target);
+  if (!attach.ok) return false;
 
   let pressed = false;
   try {
-    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+    await debugSend(target, "Input.dispatchMouseEvent", {
       type: "mouseMoved",
       x: Math.round(x),
       y: Math.round(y),
     });
-    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+    await debugSend(target, "Input.dispatchMouseEvent", {
       type: "mousePressed",
       x: Math.round(x),
       y: Math.round(y),
@@ -950,7 +1190,7 @@ async function cdpClick(tabId: number, x: number, y: number): Promise<boolean> {
     // second in-page click.
     pressed = true;
     await new Promise(r => setTimeout(r, 20));
-    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+    await debugSend(target, "Input.dispatchMouseEvent", {
       type: "mouseReleased",
       x: Math.round(x),
       y: Math.round(y),
@@ -964,9 +1204,7 @@ async function cdpClick(tabId: number, x: number, y: number): Promise<boolean> {
   } catch {
     return pressed;
   } finally {
-    try {
-      await chrome.debugger.detach(target);
-    } catch {}
+    if (attach.owned) await debugDetach(target);
   }
 }
 
@@ -974,31 +1212,24 @@ async function cdpPressKey(tabId: number, key: string): Promise<boolean> {
   if (typeof chrome === "undefined" || !chrome.debugger) return false;
   await ensureTabActive(tabId);
   const target = { tabId };
-  try {
-    await chrome.debugger.attach(target, "1.3");
-  } catch (e: any) {
-    if (!e?.message?.includes("already attached")) {
-      return false;
-    }
-  }
+  const attach = await debugAttach(target);
+  if (!attach.ok) return false;
 
   let down = false;
   try {
     if (key !== "Enter") return false;
     const [keyDown, keyUp] = cdpKeySequence("enter");
-    await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", keyDown);
+    await debugSend(target, "Input.dispatchKeyEvent", keyDown);
     // keyDown may already submit the form; treat a failed keyUp as a
     // successful attempt so no second Enter is dispatched.
     down = true;
     await new Promise(r => setTimeout(r, 15));
-    await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", keyUp);
+    await debugSend(target, "Input.dispatchKeyEvent", keyUp);
     return true;
   } catch {
     return down;
   } finally {
-    try {
-      await chrome.debugger.detach(target);
-    } catch {}
+    if (attach.owned) await debugDetach(target);
   }
 }
 
@@ -1009,7 +1240,7 @@ async function cdpPressKey(tabId: number, key: string): Promise<boolean> {
 export async function dismissObstructiveModalIfPresent(tabId: number): Promise<boolean> {
   if (typeof chrome === "undefined" || !chrome.scripting) return false;
   try {
-    const [r] = await chrome.scripting.executeScript({
+    const [r] = await execScript({
       target: { tabId },
       func: () => {
         const modal = document.querySelector('[role="dialog"], [aria-modal="true"], .modal, ._2KpZ6l, [class*="dialog" i], [class*="modal" i], [class*="overlay" i], [class*="popup" i]') as HTMLElement | null;
@@ -1060,15 +1291,18 @@ async function doClick(action: Extract<BrowserAction, { type: "click" }>, taskId
   const tabsBefore = await chrome.tabs.query({}).catch(() => [] as chrome.tabs.Tab[]);
   const tabIdsBefore = new Set(tabsBefore.map(t => t.id).filter((id): id is number => typeof id === "number"));
   const agent = await withAgent(tabId);
+  const searchIntent = classifySearchTarget(action.target);
+  const resolveClick = (list: Candidate[]) =>
+    findTarget(action.target, list, "click", { searchIntent });
   let cands = await agent.list();
-  let target = findTarget(action.target, cands, "click");
+  let target = resolveClick(cands);
 
   if (!target && !action.target.name?.toLowerCase().includes("close")) {
     const dismissed = await dismissObstructiveModalIfPresent(tabId);
     if (dismissed) {
       await settleDom(tabId, 150, 400);
       cands = await agent.list();
-      target = findTarget(action.target, cands, "click");
+      target = resolveClick(cands);
     }
   }
 
@@ -1076,7 +1310,7 @@ async function doClick(action: Extract<BrowserAction, { type: "click" }>, taskId
   if (!target) {
     await sleep(250);
     cands = await agent.list();
-    target = findTarget(action.target, cands, "click");
+    target = resolveClick(cands);
   }
 
   if (!target && action.target.coords) {
@@ -1193,6 +1427,13 @@ async function doClick(action: Extract<BrowserAction, { type: "click" }>, taskId
 function findSubmitControl(cands: AgentElement[]): AgentElement | undefined {
   return cands.find(c => {
     if (!c.enabled || !c.visible) return false;
+    const buttonLike = c.tag === "button"
+      || c.role === "button"
+      || c.role === "submit"
+      || c.inputType === "submit"
+      || c.inputType === "image";
+    // Never mistake the search textbox itself for the submit control.
+    if (!buttonLike) return false;
     const n = c.name.toLowerCase();
     if (n.includes("voice") || n.includes("ptt") || n.includes("microphone") || n.includes("record")) return false;
     return n === "send"
@@ -1201,8 +1442,58 @@ function findSubmitControl(cands: AgentElement[]): AgentElement | undefined {
       || n === "search"
       || n.startsWith("search ")
       || n.includes("search for")
-      || (c.role === "button" && (n.includes("submit") || n.includes("search") || (c.tag === "button" && c.inputType === "submit")));
+      || n.includes("submit")
+      || c.inputType === "submit";
   });
+}
+
+/** Did a search submission change navigation or the application's page state? */
+export function searchTransitionChanged(
+  before: PageStateProbe | null,
+  after: PageStateProbe | null,
+): boolean {
+  if (!before || !after) return false;
+  if (before.url !== after.url || before.title !== after.title) return true;
+  if (before.resultCount !== after.resultCount) return true;
+  return before.textHash !== after.textHash || before.textLength !== after.textLength;
+}
+
+/**
+ * Give a search submit time to take effect. Real navigations land immediately,
+ * but SPAs (Flipkart) may route several seconds after the form event. Poll URL
+ * and page state instead of failing on the first quiet sample.
+ */
+async function waitForSearchOutcome(
+  tabId: number,
+  beforeUrl: string,
+  baseline: PageStateProbe | null,
+  budgetMs: number,
+  probe: () => Promise<PageStateProbe | null>,
+): Promise<{ url: string; state: PageStateProbe | null }> {
+  const deadline = Date.now() + Math.max(800, budgetMs);
+  let state = baseline;
+  let nextProbeAt = Date.now();
+  while (Date.now() < deadline) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    const url = tab?.url ?? "";
+    if (url && url !== beforeUrl) return { url, state };
+    if (tab?.status === "loading") {
+      const settledUrl = await waitForStable(tabId, Math.min(budgetMs, 4_000));
+      return { url: settledUrl || url, state };
+    }
+    if (Date.now() >= nextProbeAt) {
+      nextProbeAt = Date.now() + 750;
+      const next = await probe();
+      if (next) {
+        state = next;
+        if (searchTransitionChanged(baseline, next)) {
+          return { url: url || await currentUrl(tabId), state: next };
+        }
+      }
+    }
+    await sleep(150);
+  }
+  return { url: await currentUrl(tabId).catch(() => beforeUrl), state };
 }
 
 async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: string, tabId: number): Promise<ActionResult> {
@@ -1211,27 +1502,34 @@ async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: 
   const tabsBefore = await chrome.tabs.query({}).catch(() => [] as chrome.tabs.Tab[]);
   const tabIdsBefore = new Set(tabsBefore.map(t => t.id).filter((id): id is number => typeof id === "number"));
   const agent = await withAgent(tabId);
+  let searchIntent = classifySearchTarget(action.target);
+  const resolveType = (list: Candidate[]) =>
+    findTarget(action.target, list, "type", { searchIntent });
   let cands = await agent.list();
-  let target = findTarget(action.target, cands, "type");
+  let target = resolveType(cands);
   if (!target) {
     const dismissed = await dismissObstructiveModalIfPresent(tabId);
     if (dismissed) {
       await settleDom(tabId, 150, 400);
       cands = await agent.list();
-      target = findTarget(action.target, cands, "type");
+      target = resolveType(cands);
     }
   }
   // Re-list candidates after a brief settle before declaring target stale
   if (!target) {
     await sleep(250);
     cands = await agent.list();
-    target = findTarget(action.target, cands, "type");
+    target = resolveType(cands);
   }
   if (!target) {
-    return err("STALE_TARGET", `no matching element for ${JSON.stringify(action.target)}`, true);
+    return err("STALE_TARGET", `no safely identifiable element for ${JSON.stringify(action.target)}`, true);
   }
   const targetId = target.targetId;
   const targetName = target.name || action.target.name || "";
+  const typedText = action.params.text;
+  const clear = action.params.clear ?? true;
+  const submitRequested = Boolean(action.params.submit);
+  searchIntent = searchIntent || classifySearchTarget(action.target, target);
 
   // If a modal popped up after listing, dismiss it so input field is reachable
   if (!action.target.name?.toLowerCase().includes("close")) {
@@ -1241,85 +1539,174 @@ async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: 
     }
   }
 
-  // 1. Type through Chrome's native input pipeline. A trusted click focuses
-  //    the field and places the caret in the same session.
-  const coords = await agent.getCoords(targetId, targetName);
-  const clear = action.params.clear ?? true;
-  const nativeTyped = await cdpType(tabId, coords, action.params.text, clear);
-
-  // 2. In-page fallback only when the native path is unavailable. It is
-  //    wrapped because a framework-owned node can throw from inside the
-  //    injected script (the old "execution failed" path).
-  if (!nativeTyped) {
-    let res: { ok: boolean; error?: string };
-    try {
-      res = await agent.type(targetId, action.params.text, clear, targetName);
-    } catch (e) {
-      const detail = String(e instanceof Error ? e.message : e).slice(0, 120);
-      return err("STALE_TARGET", `type failed: ${detail}`, true);
-    }
-    if (!res.ok) return err("STALE_TARGET", res.error ?? "type failed", true);
-  }
-
-  // Let a controlled input paint validation/autocomplete before this
-  // observation is cached for the next planning step.
-  await settleDom(tabId, 100, 300);
-
-  let submitted = false;
-  let obsTab = tabId;
-  if (action.params.submit) {
-    // Poll for the Send button instead of sleeping a fixed 150ms: exit as soon
-    // as React/DOM exposes it, capped so a missing control still falls back.
+  const findSubmitPoint = async (): Promise<FocusPoint | null> => {
+    // Poll for the Send/Search button instead of sleeping a fixed 150ms: exit
+    // as soon as React/DOM exposes it, capped so a missing control still falls
+    // back to Enter.
     const renderDeadline = Date.now() + 400;
     let sendBtn = findSubmitControl(await agent.list());
     while (!sendBtn && Date.now() < renderDeadline) {
       await sleep(40);
       sendBtn = findSubmitControl(await agent.list());
     }
-    if (sendBtn) {
-      const sendCoords = await agent.getCoords(sendBtn.targetId, sendBtn.name);
-      if (sendCoords && sendCoords.x > 0 && sendCoords.y > 0) {
-        submitted = await cdpClick(tabId, sendCoords.x, sendCoords.y);
+    if (!sendBtn) return null;
+    const sendCoords = await agent.getCoords(sendBtn.targetId, sendBtn.name);
+    return sendCoords && sendCoords.x > 0 && sendCoords.y > 0
+      ? { x: sendCoords.x, y: sendCoords.y }
+      : null;
+  };
+
+  const refocus = async (): Promise<FocusPoint | null> => {
+    const fresh = await agent.getCoords(targetId, targetName);
+    return fresh && fresh.x > 0 && fresh.y > 0 ? { x: fresh.x, y: fresh.y } : null;
+  };
+
+  let baselineState: PageStateProbe | null = null;
+  const captureBaseline = async (): Promise<PageStateProbe | null> => {
+    try {
+      baselineState = await agent.pageState();
+      return baselineState;
+    } catch {
+      return null;
+    }
+  };
+
+  // 1. Type through Chrome's native input pipeline. When submit is requested,
+  //    the same debugger session verifies the value, waits for autocomplete,
+  //    re-focuses if the SPA rerendered, and submits — no detach/reattach gap.
+  let typingMode = "native";
+  let verified = false;
+  let submitted = false;
+  let nativeSubmitMethod: "button" | "enter" | undefined;
+  let nativeError: string | undefined;
+
+  if (target.tag !== "select") {
+    const coords = await agent.getCoords(targetId, targetName);
+    const native = await cdpType(tabId, coords, typedText, clear, {
+      targetId,
+      targetName,
+      submit: submitRequested ? findSubmitPoint : undefined,
+      refocus: submitRequested ? refocus : undefined,
+      beforeSubmit: submitRequested ? captureBaseline : undefined,
+    });
+    verified = Boolean(native.typed && native.verified);
+    submitted = native.submitted;
+    nativeSubmitMethod = native.submitMethod;
+    nativeError = native.error;
+  }
+
+  // 2. In-page fallback only when the native path is unavailable or could not
+  //    verify the actual DOM value. It is not described as trusted input.
+  if (!verified) {
+    let res: { ok: boolean; error?: string; value?: string };
+    try {
+      res = await agent.type(targetId, typedText, clear, targetName);
+    } catch (e) {
+      const detail = String(e instanceof Error ? e.message : e).slice(0, 120);
+      return err("STALE_TARGET", `type failed: ${detail}`, true);
+    }
+    if (!res.ok) return err("STALE_TARGET", res.error ?? "type failed", true);
+    typingMode = target.tag === "select" ? "in-page select" : "in-page fallback";
+
+    if (target.tag !== "select") {
+      const probe = await agent.readValue(targetId, targetName);
+      const actual = res.value ?? probe.value;
+      if (!probe.ok && res.value === undefined) {
+        return err("STALE_TARGET", "typed value could not be read back from the page", true);
+      }
+      if (!typedValueMatches(actual, typedText, clear)) {
+        return err(
+          "STALE_TARGET",
+          `typed value not confirmed in the DOM (expected ${JSON.stringify(typedText.slice(0, 60))}, got ${JSON.stringify(String(actual ?? "").slice(0, 60))})`,
+          true,
+        );
       }
     }
-    // No button (or CDP unavailable): press Enter exactly once.
+
+    // Native submission was unavailable; try one CDP submit, then the
+    // in-page form/Enter fallback.
+    if (submitRequested) {
+      await captureBaseline();
+      const point = await findSubmitPoint();
+      if (point) submitted = await cdpClick(tabId, point.x, point.y);
+      if (!submitted) submitted = await cdpPressKey(tabId, "Enter");
+      if (!submitted) {
+        const fallback = await agent.submit(targetId, targetName);
+        submitted = fallback.ok;
+      }
+    }
+  }
+
+  // Let a controlled input paint validation/autocomplete before this
+  // observation is cached for the next planning step.
+  await settleDom(tabId, 100, 300);
+
+  let obsTab = tabId;
+  if (submitRequested) {
     if (!submitted) {
-      submitted = await cdpPressKey(tabId, "Enter");
-    }
-    // Settle after submission attempt
-    obsTab = await settleAfterAction(tabId, before, Math.min(action.timeoutMs, 2000), tabIdsBefore);
-    if (action.sessionId && obsTab !== tabId) {
-      const sess = extensionSessions.get(action.sessionId);
-      if (sess) {
-        sess.childTabIds.add(obsTab);
-        sess.activeTabId = obsTab;
-      }
-    }
-    // In-page fallback: if page hasn't navigated, trigger form submission directly
-    const interimUrl = await currentUrl(obsTab);
-    if (interimUrl === before) {
+      // CDP was entirely unavailable: one in-page submit is the honest fallback.
+      await captureBaseline();
       const fallback = await agent.submit(targetId, targetName);
-      if (fallback.ok) {
-        obsTab = await settleAfterAction(tabId, before, action.timeoutMs, tabIdsBefore);
-        if (action.sessionId && obsTab !== tabId) {
-          const sess = extensionSessions.get(action.sessionId);
-          if (sess) {
-            sess.childTabIds.add(obsTab);
-            sess.activeTabId = obsTab;
-          }
+      submitted = fallback.ok;
+    }
+    if (submitted) {
+      obsTab = await settleAfterAction(tabId, before, Math.min(action.timeoutMs, 2500), tabIdsBefore);
+      if (action.sessionId && obsTab !== tabId) {
+        const sess = extensionSessions.get(action.sessionId);
+        if (sess) {
+          sess.childTabIds.add(obsTab);
+          sess.activeTabId = obsTab;
         }
       }
     }
   }
+
   const after = await currentUrl(obsTab);
+  let navChanged = obsTab !== tabId || after !== before;
+  let finalUrl = after;
+  if (submitRequested && searchIntent && verified && !navChanged) {
+    // Some SPAs route seconds after the submit event. Poll for a real outcome
+    // before declaring the submission failed.
+    const budget = Math.min(action.timeoutMs, 10_000);
+    let outcome: { url: string; state: PageStateProbe | null } = { url: after, state: baselineState };
+    try {
+      outcome = await withDebuggerDeadline(
+        waitForSearchOutcome(obsTab, before, baselineState, budget, () => agent.pageState().catch(() => null)),
+        budget + 1_500,
+        "search outcome",
+      );
+    } catch {
+      // Keep the last URL read; a missing outcome still fails closed below.
+    }
+    const finalUrlFromOutcome = outcome.url || after;
+    finalUrl = finalUrlFromOutcome;
+    navChanged = obsTab !== tabId || finalUrlFromOutcome !== before;
+    if (!navChanged && !searchTransitionChanged(baselineState, outcome.state)) {
+      return err(
+        "NAVIGATION_FAILED",
+        `search submission on ${targetName || targetId} was sent, but no navigation or search-state change was observed (url remained ${before})`,
+        true,
+      );
+    }
+  }
+
   void taskId;
+  const nativeNote = nativeError && typingMode !== "native"
+    ? ` (native path unavailable: ${nativeError.slice(0, 120)})`
+    : "";
+  const submitEvidence = submitRequested
+    ? (navChanged
+      ? `submitted via ${nativeSubmitMethod ?? "fallback"} and navigated (${finalUrl})`
+      : `submitted via ${nativeSubmitMethod ?? "fallback"}; search state changed`)
+    : "";
+  const finalObservation = await observe(obsTab);
   return {
     ok: true,
     targetId: targetId,
-    observation: await observe(obsTab),
-    evidence: action.params.submit
-      ? (after !== before ? `submitted (${after})` : "typed + submitted")
-      : "typed",
+    observation: finalObservation,
+    evidence: submitRequested
+      ? `${typingMode} typing verified${nativeNote}; ${submitEvidence}`
+      : `${typingMode} typing verified${nativeNote}`,
   };
 }
 
@@ -1338,7 +1725,7 @@ async function doPress(action: Extract<BrowserAction, { type: "press" }>, tabId:
       if (!fallback.ok) return err("UNKNOWN", fallback.error ?? "Enter dispatch failed", true);
     }
   } else {
-    await chrome.scripting.executeScript({
+    await execScript({
       target: { tabId },
       func: (k: string) => {
         const target = document.activeElement ?? document.body;
@@ -1522,7 +1909,7 @@ export async function observe(tabId: number, sessionId?: string): Promise<Browse
       }
     }
 
-    const [m] = await chrome.scripting.executeScript({
+    const [m] = await execScript({
       target: { tabId },
       func: () => ({ y: scrollY, w: innerWidth, h: innerHeight, dpr: devicePixelRatio }),
     });
@@ -1582,6 +1969,7 @@ export async function observe(tabId: number, sessionId?: string): Promise<Browse
       name: e.name,
       tag: e.tag || "el",
       inputType: e.inputType,
+      search: e.search,
       href: e.href,
       visible: e.visible,
       enabled: e.enabled,

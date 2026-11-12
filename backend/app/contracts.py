@@ -70,6 +70,9 @@ class InteractiveElement(BaseModel):
     name: str
     tag: str
     input_type: Optional[str] = Field(default=None, alias="inputType")
+    # Explicit search semantic from the observer. Optional so older payloads
+    # remain valid; never required for privacy or planning.
+    search: Optional[bool] = None
     href: Optional[str] = None
     value: Optional[str] = None
     visible: bool

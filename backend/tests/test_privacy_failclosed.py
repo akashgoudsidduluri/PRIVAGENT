@@ -91,3 +91,68 @@ def test_page_text_redaction_and_context_block():
     assert "<page-text>" in ctx
     assert "</page-text>" in ctx
     assert "[REDACTED]" in ctx
+
+
+def test_search_control_survives_element_truncation_on_ecommerce_page(monkeypatch):
+    """Product/result links must never push the primary search control out of
+    the budgeted planner payload, even when the search field was observed last
+    and carries no literal "search" in its accessible name."""
+    import app.config as config_mod
+
+    monkeypatch.setattr(config_mod, "MAX_INTERACTIVE_ELEMENTS", 10, raising=False)
+
+    elements = [
+        InteractiveElement.model_validate({
+            "targetId": f"product-{i}",
+            "role": "link",
+            "name": f"Product {i} ₹{i + 100}",
+            "tag": "a",
+            "href": f"https://shop.local/item/{i}",
+            "visible": True,
+            "enabled": True,
+        })
+        for i in range(60)
+    ]
+    elements.extend([
+        InteractiveElement.model_validate({
+            "targetId": "site-search",
+            "role": "searchbox",
+            "name": "Find an article",
+            "tag": "input",
+            "inputType": "text",
+            "search": True,
+            "visible": True,
+            "enabled": True,
+        }),
+        InteractiveElement.model_validate({
+            "targetId": "search-btn",
+            "role": "button",
+            "name": "Go",
+            "tag": "button",
+            "search": True,
+            "visible": True,
+            "enabled": True,
+        }),
+    ])
+    obs = BrowserObservation.model_validate({
+        "tabId": 1,
+        "url": "https://shop.local/",
+        "title": "Shop",
+        "interactive": elements,
+        "scroll": {"y": 0, "viewport": {"w": 900, "h": 600}},
+        "dpr": 1,
+    })
+
+    payload, decision = classify_and_redact(obs, instruction="buy a titan watch")
+
+    assert decision.send is True
+    assert payload.elements_original == 62
+    ctx = payload.to_context_block()
+    interactive_lines = [ln for ln in ctx.splitlines() if ln.startswith("- ")]
+    assert len(interactive_lines) == 10
+    assert "id=site-search" in ctx
+    assert "id=search-btn" in ctx
+    assert "Find an article" in ctx
+    # Controls precede the product links they compete with.
+    assert interactive_lines.index(next(ln for ln in interactive_lines if "id=site-search" in ln)) == 0
+
