@@ -57,7 +57,8 @@ def sanitize_snippet(text: str) -> str:
     cleaned = re.sub(r"<\s*/?\s*(?:system|user|assistant|instruction|prompt)[^>]*>", "", text, flags=re.IGNORECASE)
     # Normalize excessive newlines and whitespace
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return cleaned
+    from ..adversarial_guard import cleanse_untrusted
+    return cleanse_untrusted(cleaned)
 
 
 # ---------------------------------------------------------------------------
