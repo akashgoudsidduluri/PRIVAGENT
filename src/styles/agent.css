@@ -1249,3 +1249,6 @@
   background: rgba(255, 255, 255, 0.08);
   border-color: rgba(255, 255, 255, 0.4);
 }
+.agent-attachment { display: flex; align-items: center; gap: .7rem; margin: .6rem 0 1rem; color: #a8bfda; font-size: .8rem; }
+.agent-attachment input { max-width: 15rem; color: #d8e9f9; font: inherit; }
+.agent-attachment input::file-selector-button { border: 1px solid #2e5c77; border-radius: .55rem; background: #102943; color: #d8f6ff; padding: .4rem .7rem; cursor: pointer; margin-right: .5rem; }
