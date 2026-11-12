@@ -12,6 +12,7 @@ const chatHistoryList = document.getElementById("chatHistoryList") as HTMLUListE
 
 // Directive & Timeline Elements
 const missionInput = document.getElementById("missionInput") as HTMLTextAreaElement | null;
+const missionAttachment = document.getElementById("missionAttachment") as HTMLInputElement | null;
 const btnStartMission = document.getElementById("btnStartMission") as HTMLButtonElement | null;
 const btnCancelMission = document.getElementById("btnCancelMission") as HTMLButtonElement | null;
 const btnNewSession = document.getElementById("btnNewSession") as HTMLButtonElement | null;
@@ -296,7 +297,7 @@ function addStepItem(message: string, stepNum?: number): void {
   if (typeof stepNum === "number" && stepNum > 0) {
     updateStepsCount(stepNum);
   } else {
-    updateStepsCount(stepCounter + 1);
+    renderStepBudget();
   }
 
   // Normalize display: avoid double prefix like "[1] Step 1:"
@@ -305,6 +306,9 @@ function addStepItem(message: string, stepNum?: number): void {
   if (stepPrefixRegex.test(displayMessage)) {
     displayMessage = displayMessage.replace(stepPrefixRegex, "");
   }
+
+  const eventKey = `${stepNum ?? "status"}:${displayMessage}`;
+  if (Array.from(stepsList.children).some(node => (node as HTMLElement).dataset.eventKey === eventKey)) return;
 
   // Deduplicate against the immediate previous step
   const existingSteps = stepsList.querySelectorAll("li.agent-step-item");
@@ -318,6 +322,7 @@ function addStepItem(message: string, stepNum?: number): void {
 
   const li = document.createElement("li");
   li.className = "agent-step-item";
+  li.dataset.eventKey = eventKey;
   li.innerHTML = `
     <span class="agent-step-item__icon">${actionIcon(displayMessage)}</span>
     <span class="agent-step-item__text">${linkify(displayMessage)}</span>
@@ -818,24 +823,44 @@ btnStartMission?.addEventListener("click", async () => {
   setTaskState("planning");
 
   try {
+    let fileToken: string | undefined;
+    const selectedFile = missionAttachment?.files?.[0];
+    if (selectedFile) {
+      if (selectedFile.size > 5 * 1024 * 1024 || !/\.(pdf|png|jpe?g|txt|csv|docx|xlsx)$/i.test(selectedFile.name)) {
+        throw new Error("Attachment must be an allowed file under 5 MiB");
+      }
+      const encoded = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
+        reader.onerror = () => reject(new Error("Could not read attachment"));
+        reader.readAsDataURL(selectedFile);
+      });
+      const uploadResponse = await fetch(`${API}/api/attachments`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fileName: selectedFile.name, base64: encoded }),
+      });
+      if (!uploadResponse.ok) throw new Error(`Attachment rejected (HTTP ${uploadResponse.status})`);
+      fileToken = ((await uploadResponse.json()) as { fileToken: string }).fileToken;
+    }
     let res: Response;
     if (activeChatId) {
       res = await fetch(`${API}/api/chat/${activeChatId}/message`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ instruction }),
+        body: JSON.stringify({ instruction, fileToken }),
       });
     } else {
       res = await fetch(`${API}/api/task`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ instruction }),
+        body: JSON.stringify({ instruction, fileToken }),
       });
     }
 
     if (!res.ok) throw new Error(`Backend response HTTP ${res.status}`);
     const data = (await res.json()) as { task_id?: string; taskId?: string; chat_id?: string; chatId?: string };
     currentTaskId = data.task_id || data.taskId || null;
+    if (missionAttachment) missionAttachment.value = "";
     activeChatId = activeChatId || data.chat_id || data.chatId || null;
 
     // Refresh chat list to show active title and timestamp
@@ -956,7 +981,7 @@ function connectWebSocket(): void {
         };
       };
       if (env.type !== "PROGRESS") return;
-      if (env.taskId !== currentTaskId && env.payload?.chatId !== activeChatId) return;
+      if (!currentTaskId || env.taskId !== currentTaskId) return;
       const p = env.payload;
 
       lastProgressTime = Date.now();
@@ -968,7 +993,7 @@ function connectWebSocket(): void {
         } else if (p.sessionId) {
           const tabInfo = p.primaryTabId ? ` · Tab #${p.primaryTabId}` : "";
           const childInfo = p.childTabIds && p.childTabIds.length > 0 ? ` (+${p.childTabIds.length} child tabs)` : "";
-          missionSubtext.innerHTML = `<span style="color: #38bdf8; font-weight: 500;">🌐 Session: ${p.sessionId.slice(0, 8)}${tabInfo}${childInfo}</span>`;
+          missionSubtext.innerHTML = `<span style="color: #38bdf8; font-weight: 500;">🌐 Session: ${escapeHtml(p.sessionId.slice(0, 8))}${tabInfo}${childInfo}</span>`;
         }
       }
 
