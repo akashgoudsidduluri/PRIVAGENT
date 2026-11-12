@@ -120,6 +120,9 @@ class GroqProvider:
         models_to_try = [self._model] + [m for m in self.FALLBACK_MODELS if m != self._model]
         last_exc: Exception | None = None
         quota_hint = ""
+        # May stay unset when the loop exits on a non-retryable response whose
+        # body happens to mention 429; the post-loop cooldown check reads it.
+        retry_in: float = 0.0
 
         if not _groq_blocked():
             for curr_model in models_to_try:

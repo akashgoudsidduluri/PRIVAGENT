@@ -9,6 +9,7 @@ Enforces strict verification rules:
 """
 from __future__ import annotations
 
+from pathlib import Path
 import re
 import urllib.parse
 from dataclasses import dataclass
@@ -340,18 +341,109 @@ def verify_task_completion(
                     reason="No comparison results collected.",
                 )
 
-    # Rule 6: Research tasks require evidence
-    if category == "RESEARCH":
-        has_evidence = bool(mem.get("collected_research") or mem.get("notes"))
-        if not has_evidence and candidate_state == "completed":
-            # If the candidate answer is substantive (> 20 words) with numbers or prices, consider valid
-            if len(msg.split()) < 5 or "not found" in msg.lower():
-                return VerificationResult(
-                    state="failed",
-                    message=f"Research incomplete: no verified product details found.\n{msg}",
-                    is_verified=False,
-                    reason="No research facts were captured.",
-                )
+    # Rule 6: Research tasks require evidence and verification across 6 distinct stages
+    if category == "RESEARCH" or mem.get("is_research"):
+        if candidate_state == "failed":
+            return VerificationResult(
+                state="failed",
+                message=msg,
+                is_verified=False,
+                reason="Execution reported failure; verifier does not override failure into success.",
+            )
+
+        pkg_data = mem.get("research_knowledge_package") or {}
+        sources = pkg_data.get("sources", {}) if isinstance(pkg_data, dict) else getattr(pkg_data, "sources", {})
+
+        # Stage 1: Discovery stage
+        discovery_verified = bool(mem.get("autonomous_discovery") or mem.get("specified_website"))
+
+        # Stage 2: Collection stage - reject search results pages, verify independent sources
+        from .research.collector import is_search_results_page
+        substantive_sources = {}
+        for sid, s in sources.items():
+            s_url = s.get("url") if isinstance(s, dict) else getattr(s, "url", "")
+            s_score = s.get("reliability_score", 0) if isinstance(s, dict) else getattr(s, "reliability_score", 0)
+            if s_score > 0 and not is_search_results_page(s_url):
+                substantive_sources[sid] = s
+
+        inst_lower = instruction.lower()
+        requires_multi = any(k in inst_lower for k in ["multiple", "compare", "credible sources", "independent sources", "different sources", "cross-reference"])
+
+        distinct_domains = set()
+        for s in substantive_sources.values():
+            dom = s.get("domain") if isinstance(s, dict) else getattr(s, "domain", "")
+            if dom:
+                parts = dom.lower().split(".")
+                root = ".".join(parts[-2:]) if len(parts) >= 2 else dom.lower()
+                distinct_domains.add(root)
+
+        coll_reason = ""
+        collection_verified = bool(substantive_sources)
+        if requires_multi and len(distinct_domains) < 2:
+            collection_verified = False
+            coll_reason = f"Prompt requested multiple credible sources, but only {len(distinct_domains)} independent source(s) were examined."
+        elif not substantive_sources:
+            collection_verified = False
+            coll_reason = "No substantive research sources were examined (search results pages are not sources)."
+
+        # Stage 3: Synthesis stage - claims must have verified evidence linkage
+        claims = pkg_data.get("claims", {}) if isinstance(pkg_data, dict) else getattr(pkg_data, "claims", {})
+        evidence_items = pkg_data.get("evidence", {}) if isinstance(pkg_data, dict) else getattr(pkg_data, "evidence", {})
+        verified_claims = [
+            c for c in claims.values()
+            if (c.get("evidence_item_ids") if isinstance(c, dict) else getattr(c, "evidence_item_ids", []))
+        ]
+        synthesis_verified = bool(verified_claims or evidence_items or mem.get("collected_research"))
+
+        # Stage 4: Artifact generation & validation stage
+        artifacts = mem.get("artifacts") or []
+        requested_fmt = mem.get("requested_format") or mem.get("deliverable_type")
+        artifact_needed = bool(requested_fmt or any(fmt in inst_lower for fmt in ["pdf", "docx", "word", "excel", "report", "csv"]))
+        artifact_verified = True
+        artifact_reason = ""
+        if artifact_needed:
+            if not artifacts:
+                artifact_verified = False
+                artifact_reason = "Deliverable document was requested but not generated."
+            else:
+                for art in artifacts:
+                    fpath = Path(art.get("filepath", ""))
+                    if not fpath.exists() or fpath.stat().st_size == 0:
+                        artifact_verified = False
+                        artifact_reason = f"Deliverable {art.get('filename')} does not exist or is empty on disk."
+                        break
+
+        # Verification enforcement
+        if not collection_verified:
+            return VerificationResult(
+                state="failed",
+                message=f"Research incomplete: {coll_reason}\n\n{msg}",
+                is_verified=False,
+                reason=coll_reason,
+            )
+
+        if not synthesis_verified:
+            return VerificationResult(
+                state="failed",
+                message=f"Research incomplete: Synthesized findings lack verified evidence traceability.\n\n{msg}",
+                is_verified=False,
+                reason="Synthesized claims lack verifiable evidence items.",
+            )
+
+        if not artifact_verified:
+            return VerificationResult(
+                state="failed",
+                message=f"Research deliverable incomplete: {artifact_reason}\n\n{msg}",
+                is_verified=False,
+                reason=artifact_reason,
+            )
+
+        return VerificationResult(
+            state="completed",
+            message=msg,
+            is_verified=True,
+            reason=f"Research mission completed across {len(distinct_domains)} independent source(s) with verified evidence and deliverable generation.",
+        )
 
     # Conversational or general tasks. A failed execution candidate stays
     # failed: the conversational fallback may only confirm completion of

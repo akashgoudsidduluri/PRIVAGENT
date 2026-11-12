@@ -23,6 +23,78 @@ const resultCard = document.getElementById("agentResultCard") as HTMLElement | n
 const resultContent = document.getElementById("resultContent") as HTMLElement | null;
 const resultBadge = document.getElementById("resultBadge") as HTMLElement | null;
 const resultTimestamp = document.getElementById("resultTimestamp") as HTMLElement | null;
+const artifactsCard = document.getElementById("agentArtifactsCard") as HTMLElement | null;
+const artifactsList = document.getElementById("agentArtifactsList") as HTMLElement | null;
+const artifactsCount = document.getElementById("artifactsCount") as HTMLElement | null;
+
+interface ArtifactItem {
+  artifact_id: string;
+  task_id: string;
+  conversation_id: string;
+  filename: string;
+  file_format: string;
+  file_size_bytes: number;
+  title: string;
+  summary: string;
+  created_at: number;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+async function loadArtifacts(taskId?: string | null, chatId?: string | null): Promise<void> {
+  if (!artifactsCard || !artifactsList) return;
+  const targetUrl = taskId ? `${API}/api/tasks/${taskId}/artifacts` : (chatId ? `${API}/api/chats/${chatId}/artifacts` : null);
+  if (!targetUrl) {
+    artifactsCard.hidden = true;
+    return;
+  }
+
+  try {
+    const res = await fetch(targetUrl);
+    if (!res.ok) {
+      artifactsCard.hidden = true;
+      return;
+    }
+    const list = (await res.json()) as ArtifactItem[];
+    if (!Array.isArray(list) || list.length === 0) {
+      artifactsCard.hidden = true;
+      return;
+    }
+
+    artifactsCard.hidden = false;
+    if (artifactsCount) artifactsCount.textContent = `${list.length} artifact${list.length === 1 ? "" : "s"}`;
+    artifactsList.innerHTML = "";
+
+    list.forEach(art => {
+      const itemEl = document.createElement("div");
+      itemEl.className = "artifact-item";
+      const fmt = (art.file_format || "file").toLowerCase();
+      const badgeCls = `artifact-format-badge artifact-format-badge--${fmt}`;
+      const sizeStr = formatBytes(art.file_size_bytes || 0);
+
+      itemEl.innerHTML = `
+        <div class="artifact-info">
+          <span class="${badgeCls}">${escapeHtml(fmt.toUpperCase())}</span>
+          <div class="artifact-details">
+            <span class="artifact-filename" title="${escapeHtml(art.title || art.filename)}">${escapeHtml(art.title || art.filename)}</span>
+            <span class="artifact-meta">${escapeHtml(art.filename)} · ${sizeStr}</span>
+          </div>
+        </div>
+        <div class="artifact-actions">
+          <a href="${API}/api/artifacts/${art.artifact_id}/preview" target="_blank" rel="noopener noreferrer" class="btn-artifact btn-artifact--preview">Preview</a>
+          <a href="${API}/api/artifacts/${art.artifact_id}/download" class="btn-artifact btn-artifact--download" download>Download</a>
+        </div>
+      `;
+      artifactsList.appendChild(itemEl);
+    });
+  } catch {
+    artifactsCard.hidden = true;
+  }
+}
 
 // Human Gate
 const humanGate = document.getElementById("humanGate") as HTMLElement | null;
@@ -455,6 +527,7 @@ function renderCompletion(taskState: string, message: string, appendToTimeline =
       resultContent.innerHTML = `<div class="result-raw-text">${linkify(message || "Task stopped before completing all steps.")}</div>`;
     }
     resultCard.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    loadArtifacts(currentTaskId, activeChatId);
   }
 }
 
@@ -546,6 +619,8 @@ async function selectChat(chatId: string): Promise<void> {
   // Clear feed and load history
   if (stepsList) stepsList.innerHTML = "";
   if (resultCard) resultCard.hidden = true;
+  if (artifactsCard) artifactsCard.hidden = true;
+  loadArtifacts(null, chatId);
   if (stepsCount) stepsCount.textContent = "0 steps executed";
   renderStepBudget();
   setTaskState("ready");

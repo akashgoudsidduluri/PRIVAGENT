@@ -29,8 +29,9 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Local SQLite databases
-backend/data/*.db*
+# Local SQLite databases and runtime artifacts
+backend/data/
+backend/scratch/
 *.db
 *.db-wal
 *.db-shm

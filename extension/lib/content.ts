@@ -11,11 +11,32 @@ interface AgentElement {
   name: string;
   tag: string;
   inputType?: string;
+  /** Explicit semantic classification; never used to overwrite DOM attributes. */
+  search?: boolean;
   cssSelector: string;
   enabled: boolean;
   visible: boolean;
   bounds: { x: number; y: number; width: number; height: number };
   href?: string;
+}
+
+interface ValueProbe {
+  ok: boolean;
+  value?: string;
+  tag?: string;
+  inputType?: string;
+  editable?: boolean;
+  error?: string;
+}
+
+interface PageStateProbe {
+  url: string;
+  title: string;
+  readyState: string;
+  textLength: number;
+  textHash: number;
+  interactiveCount: number;
+  resultCount: number;
 }
 
 interface NavigatorAgent {
@@ -24,8 +45,10 @@ interface NavigatorAgent {
   clickCoords: (x: number, y: number) => { ok: boolean; targetId?: string; error?: string };
   getCoords: (targetId: string, name?: string) => { x: number; y: number; width: number; height: number } | null;
   getClickPoint: (targetId: string, name?: string) => { x: number; y: number; width: number; height: number } | null;
-  type: (targetId: string, text: string, clear: boolean, name?: string) => { ok: boolean; error?: string };
+  type: (targetId: string, text: string, clear: boolean, name?: string) => { ok: boolean; error?: string; value?: string };
   submit: (targetId: string, name?: string) => { ok: boolean; error?: string };
+  readValue: (targetId: string, name?: string) => ValueProbe;
+  pageState: () => PageStateProbe;
   scroll: (direction: "up" | "down" | "top" | "bottom", containerId?: string) => { ok: boolean; scrollY: number };
   extractText: (maxLen?: number) => string;
 }
@@ -51,6 +74,170 @@ function queryAllWithShadow(root: Document | ShadowRoot | Element, selector: str
     }
   } catch {}
   return list;
+}
+
+function normText(value: string | null | undefined): string {
+  return (value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function escapeSelector(value: string): string {
+  try {
+    return CSS.escape(value);
+  } catch {
+    return value.replace(/([^\w-])/g, "\\$1");
+  }
+}
+
+function rootById(el: Element, id: string): Element | null {
+  try {
+    const root = el.getRootNode() as Document | ShadowRoot;
+    if (root && "getElementById" in root) {
+      const found = (root as Document).getElementById(id);
+      if (found) return found;
+    }
+    if (root && "querySelector" in root) {
+      const found = (root as ShadowRoot).querySelector(`#${escapeSelector(id)}`);
+      if (found) return found;
+    }
+  } catch {}
+  try {
+    return document.getElementById(id);
+  } catch {
+    return null;
+  }
+}
+
+/** aria-labelledby ids can point into the same shadow root as the control. */
+function labelledByText(el: Element): string {
+  const ids = (el.getAttribute("aria-labelledby") || "").split(/\s+/).filter(Boolean);
+  if (ids.length === 0) return "";
+  return normText(ids.map(id => rootById(el, id)?.textContent || "").join(" "));
+}
+
+/** Native <label for> / wrapping label, including shadow-DOM labels. */
+function associatedLabelText(el: HTMLElement): string {
+  const input = el as HTMLInputElement;
+  try {
+    if (input.labels && input.labels.length > 0) {
+      return normText(Array.from(input.labels).map(l => l.textContent || "").join(" "));
+    }
+  } catch {}
+  const id = (el.id || "").trim();
+  if (id) {
+    try {
+      const root = el.getRootNode() as Document | ShadowRoot;
+      const label = root && "querySelector" in root
+        ? (root as ParentNode).querySelector(`label[for="${escapeSelector(id)}"]`)
+        : document.querySelector(`label[for="${escapeSelector(id)}"]`);
+      if (label) return normText(label.textContent);
+    } catch {}
+  }
+  return normText(el.closest("label")?.textContent);
+}
+
+/** Human-readable accessible name, preserving the page's own wording. */
+function accessibleName(el: HTMLElement): string {
+  const labelled = labelledByText(el);
+  if (labelled) return labelled;
+  const ariaLabel = normText(el.getAttribute("aria-label"));
+  if (ariaLabel) return ariaLabel;
+  const label = associatedLabelText(el);
+  if (label) return label;
+  const title = normText(el.getAttribute("title"));
+  if (title) return title;
+  const input = el as HTMLInputElement;
+  return normText(input.placeholder);
+}
+
+function isTextEntry(el: HTMLElement): boolean {
+  const tag = el.tagName.toLowerCase();
+  if (tag === "textarea" || el.isContentEditable || el.getAttribute("contenteditable") === "true") return true;
+  if (tag !== "input") return false;
+  const type = (el as HTMLInputElement).type.toLowerCase();
+  return !["button", "submit", "reset", "image", "file", "checkbox", "radio", "range", "color", "hidden", "password"].includes(type);
+}
+
+/**
+ * Stable attribute evidence for a control (id, name, type, wrapping search form).
+ * This is evidence, not a replacement for the accessible name.
+ */
+function attributeEvidence(el: HTMLElement): string {
+  const input = el as HTMLInputElement;
+  const bits: string[] = [
+    el.id || "",
+    input.name || "",
+    input.type || "",
+    el.getAttribute("role") || "",
+    el.getAttribute("autocomplete") || "",
+    el.getAttribute("class") || "",
+  ];
+  const form = el.closest("form");
+  if (form) {
+    bits.push(
+      form.getAttribute("role") || "",
+      form.getAttribute("action") || "",
+      form.id || "",
+      form.getAttribute("name") || "",
+      form.getAttribute("class") || "",
+    );
+  }
+  return bits.filter(Boolean).join(" ");
+}
+
+function insideSearchForm(el: HTMLElement): boolean {
+  const form = el.closest('form[role="search"], form[action*="search" i], form[id*="search" i], form[name*="search" i], [role="search"]');
+  return Boolean(form);
+}
+
+/**
+ * Explicit semantic classification for search fields/buttons.
+ * The original name and DOM attributes are preserved; this only adds a flag
+ * (and, for text fields, the standard searchbox role in the observation).
+ */
+function isSearchControl(el: HTMLElement, name: string): boolean {
+  const tag = el.tagName.toLowerCase();
+  const role = (el.getAttribute("role") || "").toLowerCase();
+  const input = el as HTMLInputElement;
+  const type = tag === "input" ? (input.type || "text").toLowerCase() : "";
+  const textEntry = isTextEntry(el);
+  const buttonLike = tag === "button" || role === "button" || type === "submit";
+
+  if (type === "search" || role === "searchbox") return true;
+  if (!textEntry && !buttonLike) return false;
+
+  const evidence = `${name} ${attributeEvidence(el)}`.toLowerCase();
+  const signal = /(?:^|[^a-z])(search|query|keyword|keywords|find)(?:[^a-z]|$)/i.test(evidence)
+    || /(?:^|\s)q(?:\s|$)/i.test(attributeEvidence(el))
+    || insideSearchForm(el);
+  return signal;
+}
+
+function derivedNameHint(el: HTMLElement): string {
+  const input = el as HTMLInputElement;
+  return normText([input.name, el.id, input.type].filter(Boolean).join(" "));
+}
+
+/**
+ * Distinguishing hint for a search field the page never named.
+ *
+ * Only the form field name is used: ids like "plain-search" add noise without
+ * disambiguating, while name="field-keywords" is the page's own stable handle.
+ */
+function searchFallbackHint(el: HTMLElement): string {
+  return normText((el as HTMLInputElement).name || "");
+}
+
+/** Every stable identity string the page exposes for an element. */
+function identityText(el: HTMLElement): string {
+  const input = el as HTMLInputElement;
+  return normText([
+    accessibleName(el),
+    el.getAttribute("data-navigator-id"),
+    input.name,
+    el.id,
+    input.type,
+    el.textContent,
+  ].filter(Boolean).join(" ")).toLowerCase();
 }
 
 function candidates(): AgentElement[] {
@@ -148,17 +335,18 @@ function candidates(): AgentElement[] {
     const anchor = (el.tagName.toLowerCase() === "a" ? el : el.closest("a[href]")) as HTMLAnchorElement | null;
     const href = anchor?.href || undefined;
 
+    const accessible = accessibleName(el);
+    const semanticFallback = (
+      (el.getAttribute("data-icon") ? `icon ${el.getAttribute("data-icon")}` : "") ||
+      (el.getAttribute("data-testid") && !el.textContent?.trim() ? el.getAttribute("data-testid") : "") ||
+      normText(el.textContent) ||
+      normText(input.value) ||
+      derivedNameHint(el)
+    );
     let name = (
       (isAdSkip ? "Skip Ad " : "") +
       (isOverlayClose && !el.textContent?.trim() ? "Close " : "") +
-      (el.getAttribute("aria-label") ||
-      el.getAttribute("title") ||
-      input.placeholder ||
-      (el.getAttribute("data-icon") ? `icon ${el.getAttribute("data-icon")}` : "") ||
-      (el.getAttribute("data-testid") && !el.textContent?.trim() ? el.getAttribute("data-testid") : "") ||
-      el.textContent ||
-      input.value ||
-      "")
+      (accessible || semanticFallback)
     ).replace(/\s+/g, " ").trim().slice(0, 140);
 
     if (isAdSkip && !name) name = "Skip Ad";
@@ -171,6 +359,18 @@ function candidates(): AgentElement[] {
     if (isWaCancelSearch) name = "Cancel search";
     if (isWaSearch && !name) name = "Search or start new chat";
     if (isWaChatRow && waChatTitle) name = waChatTitle;
+
+    // Semantic classification, not a blind rename. A name the page actually
+    // exposed (label, aria-label, title, placeholder) is kept verbatim. Only an
+    // unnamed search field gets a "Search" fallback plus its form-field name,
+    // so Amazon's #twotabsearchtextbox is discoverable without altering what
+    // Flipkart or a labelled search input already says.
+    const searchControl = isSearchControl(el, name);
+    if (searchControl && !accessible) {
+      const hint = searchFallbackHint(el);
+      name = `Search${hint ? ` (${hint})` : ""}`;
+    }
+    name = name.slice(0, 140);
 
     // Discard generic ad badges and empty link elements
     const nameLower = name.toLowerCase();
@@ -203,6 +403,7 @@ function candidates(): AgentElement[] {
                  isOverlayClose ? "close-button" :
                  isComposer ? "textbox" :
                  isWaSearch ? "textbox" :
+                 (searchControl && isTextEntry(el)) ? "searchbox" :
                  (isSendBtn || isVoiceBtn || isCancelVoice || isWaGroupFilter || isWaCancelSearch) ? "button" :
                  (isWaChatRow ? "listitem" : (el.getAttribute("role") || el.tagName.toLowerCase()));
     const cssSelector = rawId ? `#${CSS.escape(rawId)}` : `[data-navigator-id="${targetId}"]`;
@@ -213,6 +414,7 @@ function candidates(): AgentElement[] {
       name,
       tag: el.tagName.toLowerCase(),
       inputType: el.tagName.toLowerCase() === "input" ? input.type : undefined,
+      search: searchControl || undefined,
       cssSelector,
       enabled: !(input as HTMLButtonElement).disabled && !el.hasAttribute("aria-disabled"),
       visible: true,
@@ -229,50 +431,58 @@ function candidates(): AgentElement[] {
   return list;
 }
 
-function elementFor(targetId: string, name?: string): HTMLElement | null {
+function isEditableElement(el: HTMLElement): boolean {
+  return el instanceof HTMLInputElement
+    || el instanceof HTMLTextAreaElement
+    || el instanceof HTMLSelectElement
+    || el.isContentEditable
+    || el.getAttribute("contenteditable") === "true";
+}
+
+function elementFor(targetId: string, name?: string, requireEditable = false): HTMLElement | null {
   const cid = cleanId(targetId);
-  if (cid && registry.has(cid) && registry.get(cid)!.isConnected) {
-    return registry.get(cid)!;
-  }
-  if (targetId && registry.has(targetId) && registry.get(targetId)!.isConnected) {
-    return registry.get(targetId)!;
-  }
+  const pick = (node: HTMLElement | null | undefined): HTMLElement | null =>
+    node && node.isConnected && (!requireEditable || isEditableElement(node)) ? node : null;
+
+  const registered = pick(registry.get(cid)) ?? pick(registry.get(targetId));
+  if (registered) return registered;
 
   // 1. Direct query by data-navigator-id
   let el = cid ? (document.querySelector(`[data-navigator-id="${CSS.escape(cid)}"]`) as HTMLElement | null) : null;
-  if (el && el.isConnected) return el;
+  if (pick(el)) return el;
 
   // 2. Direct query by ID or name attribute
   if (cid) {
     el = document.getElementById(cid);
-    if (el && el.isConnected) return el;
+    if (pick(el)) return el;
     el = document.querySelector(`[name="${CSS.escape(cid)}"]`) as HTMLElement | null;
-    if (el && el.isConnected) return el;
+    if (pick(el)) return el;
   }
 
   // 3. Search within open Shadow Roots
   if (cid) {
     const shadowNodes = queryAllWithShadow(document, `[data-navigator-id="${CSS.escape(cid)}"], #${CSS.escape(cid)}`);
-    if (shadowNodes.length > 0 && (shadowNodes[0] as HTMLElement).isConnected) {
+    if (shadowNodes.length > 0 && pick(shadowNodes[0] as HTMLElement)) {
       return shadowNodes[0] as HTMLElement;
     }
   }
 
   // 4. Refresh candidates if registry was empty
   candidates();
-  if (cid && registry.has(cid) && registry.get(cid)!.isConnected) {
-    return registry.get(cid)!;
-  }
+  const refreshed = pick(registry.get(cid));
+  if (refreshed) return refreshed;
 
   // 5. Fallback search by accessible name / textContent
   if (name && name.trim()) {
     const wanted = name.trim().toLowerCase();
     const all = queryAllWithShadow(document, 'button, input, textarea, select, a[href], [role="button"], [role="link"], [role="textbox"], [role="searchbox"], [role="row"], [role="listitem"], [role="gridcell"], [tabindex], [data-testid], span[title], div[title], ytd-thumbnail, #video-title') as HTMLElement[];
+    // Typing/reading a value may never bind to a same-named button or link.
+    const pool = requireEditable ? all.filter(isEditableElement) : all;
 
     // Specialized WhatsApp resolution:
     if (window.location.hostname.includes("whatsapp.com")) {
       if (wanted === "groups" || wanted === "group" || wanted.includes("group filter")) {
-        const groupsBtn = all.find(e => {
+        const groupsBtn = pool.find(e => {
           const t = (e.getAttribute("aria-label") || e.textContent || "").trim().toLowerCase();
           return t === "groups" || t === "group";
         });
@@ -284,15 +494,10 @@ function elementFor(targetId: string, name?: string): HTMLElement | null {
       }
     }
 
-    // Exact or substring match on aria-label or textContent or placeholder
-    const matched = all.find(e => {
-      const txt = (
-        e.getAttribute("aria-label") ||
-        e.getAttribute("title") ||
-        e.textContent ||
-        (e as HTMLInputElement).placeholder ||
-        ""
-      ).trim().toLowerCase();
+    // Exact or substring match on the full accessible identity (aria-labelledby,
+    // aria-label, associated label, title, placeholder, name/id/type, text).
+    const matched = pool.find(e => {
+      const txt = identityText(e);
       return txt === wanted || txt.includes(wanted) || (txt.length >= 3 && wanted.includes(txt));
     });
     if (matched) return matched;
@@ -300,13 +505,8 @@ function elementFor(targetId: string, name?: string): HTMLElement | null {
     // Word token match
     const tokens = wanted.split(/\s+/).filter(t => t.length > 2);
     if (tokens.length > 0) {
-      const tokenMatch = all.find(e => {
-        const txt = (
-          e.getAttribute("aria-label") ||
-          e.getAttribute("title") ||
-          e.textContent ||
-          ""
-        ).trim().toLowerCase();
+      const tokenMatch = pool.find(e => {
+        const txt = identityText(e);
         return tokens.every(tok => txt.includes(tok));
       });
       if (tokenMatch) return tokenMatch;
@@ -314,6 +514,44 @@ function elementFor(targetId: string, name?: string): HTMLElement | null {
   }
 
   return null;
+}
+
+function editableValue(el: HTMLElement): string {
+  if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) {
+    return el.value;
+  }
+  if (el.isContentEditable || el.getAttribute("contenteditable") === "true") {
+    return el.textContent || "";
+  }
+  const nested = el.querySelector("input, textarea, select, [contenteditable='true'], [contenteditable]") as HTMLElement | null;
+  return nested ? editableValue(nested) : "";
+}
+
+function computePageState(): PageStateProbe {
+  const main = document.querySelector('main, [role="main"], #content, #centerCol, #dp, body') as HTMLElement | null;
+  const text = normText(main?.innerText || document.body?.innerText || "");
+  let hash = 0;
+  const limit = Math.min(text.length, 4000);
+  for (let i = 0; i < limit; i++) {
+    hash = ((hash * 31) + text.charCodeAt(i)) | 0;
+  }
+  const resultSelectors = [
+    '[data-component-type="s-search-result"]',
+    '.s-result-item',
+    '[data-testid*="result" i]',
+    '[class*="result" i]',
+    'article',
+    '[role="listitem"]',
+  ].join(", ");
+  return {
+    url: window.location.href,
+    title: document.title,
+    readyState: document.readyState,
+    textLength: text.length,
+    textHash: hash,
+    interactiveCount: document.querySelectorAll('button, input, textarea, a[href], [role="button"]').length,
+    resultCount: document.querySelectorAll(resultSelectors).length,
+  };
 }
 
 /**
@@ -483,7 +721,7 @@ window.__navigatorAgent = {
     // inside property setters and selection APIs. Never let that escape as an
     // unhandled exception: report it so the executor can surface STALE_TARGET.
     try {
-      let el = elementFor(targetId, name);
+      let el = elementFor(targetId, name, true);
       const nm = (name || "").toLowerCase();
 
       // Specialized WhatsApp Web element resolution:
@@ -612,7 +850,7 @@ window.__navigatorAgent = {
 
       // Submission is intentionally NOT done here. The executor performs one
       // and only one send/submit trigger, avoiding double-sent messages.
-      return { ok: true };
+      return { ok: true, value: editableValue(el) };
     } catch (e) {
       // Bounded: a framework error can echo the value it rejected, and this
       // string travels back to the backend.
@@ -648,6 +886,20 @@ window.__navigatorAgent = {
     el.dispatchEvent(new KeyboardEvent("keyup", opts));
     return { ok: true };
   },
+  readValue: (targetId, name) => {
+    const el = elementFor(targetId, name, true) ||
+      (document.activeElement instanceof HTMLElement ? document.activeElement : null);
+    if (!el) return { ok: false, error: "STALE_TARGET" };
+    return {
+      ok: true,
+      value: editableValue(el),
+      tag: el.tagName.toLowerCase(),
+      inputType: el.tagName.toLowerCase() === "input" ? (el as HTMLInputElement).type : undefined,
+      editable: el.isContentEditable || el.getAttribute("contenteditable") === "true"
+        || el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement,
+    };
+  },
+  pageState: () => computePageState(),
   scroll: (direction, containerId) => {
     const container = containerId ? elementFor(containerId) : null;
     const px = Math.round((container ? container.clientHeight : innerHeight) * 0.8);

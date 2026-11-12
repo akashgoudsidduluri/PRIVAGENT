@@ -367,6 +367,9 @@ describe("withAgent argument serialization regression tests", () => {
       if (fnStr.includes("devicePixelRatio")) {
         return [{ result: { y: 0, w: 1000, h: 800, dpr: 1 } }];
       }
+      if (fnStr.includes("readValue")) {
+        return [{ result: { ok: true, value: "test search", editable: true } }];
+      }
       return [{ result: { ok: true } }];
     });
 
