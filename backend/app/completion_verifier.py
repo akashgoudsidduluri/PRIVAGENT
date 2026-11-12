@@ -15,6 +15,71 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from .verification_layers import ActionEvidence, verify_layers
+
+_AUTHORITATIVE = re.compile(
+    r"\b(?:order (?:placed|confirmed)|payment (?:successful|received)|message sent|"
+    r"email sent|invitation sent|booking confirmed|account created|signed in successfully|"
+    r"file uploaded|changes saved)\b", re.IGNORECASE,
+)
+_EXTERNAL_WRITE = re.compile(
+    r"\b(?:pay|purchase|buy|book|send|login|log in|sign in|save|submit|post|upload|"
+    r"order|checkout|transfer|register|create account|schedule|invite)\b", re.I,
+)
+
+
+def verify_action_receipt(action: dict[str, Any], result: dict[str, Any], *,
+                          before: Any = None, goal: str = "") -> dict[str, Any]:
+    """Evaluate six explicit signals. An OK dispatch or optimistic text is not authority."""
+    receipt = result.get("verification") or {}
+    after = result.get("observation") or {}
+    before_url = before.get("url") if isinstance(before, dict) else getattr(before, "url", "")
+    after_url = after.get("url") if isinstance(after, dict) else getattr(after, "url", "")
+    before_text = before.get("pageText", "") if isinstance(before, dict) else getattr(before, "page_text", "")
+    after_text = after.get("pageText", "") if isinstance(after, dict) else getattr(after, "page_text", "")
+    changed = receipt.get("surfaceChanged")
+    if changed is None and after:
+        changed = (before_url != after_url or before_text != after_text)
+    authority = receipt.get("authoritativeConfirmation")
+    if authority is None and after_text and after_text != before_text:
+        status = receipt.get("transportStatus")
+        authority = bool(_AUTHORITATIVE.search(after_text)) if isinstance(status, int) and 200 <= status < 400 else None
+    target = action.get("target") or {}
+    target_confidence = receipt.get("targetConfidence")
+    if target_confidence is None and result.get("targetId") and target.get("targetId") == result.get("targetId"):
+        target_confidence = .85
+    # A browser API return says only the script ran. Trusted CDP acknowledgment
+    # must be provided by the executor; never infer it from result.ok.
+    evidence = ActionEvidence(
+        target_confidence=target_confidence,
+        dispatch_acknowledged=receipt.get("dispatchAcknowledged"),
+        surface_changed=changed,
+        transport_status=receipt.get("transportStatus"),
+        authoritative_confirmation=authority,
+        goal_aligned=receipt.get("goalAligned"),
+    )
+    write_effect = bool(action.get("type") == "upload_file" or
+        action.get("type") == "type" and (action.get("params") or {}).get("submit") or
+        _EXTERNAL_WRITE.search(goal))
+    # For a sent message, the receipt must show both the site's explicit
+    # affirmation and the exact submitted text in the post-action surface.
+    # Other goals with unknown constraints remain unknown rather than guessed.
+    if evidence.goal_aligned is None and action.get("type") == "type" and (action.get("params") or {}).get("submit"):
+        submitted = (action.get("params") or {}).get("text") or ""
+        if submitted and after_text and authority and re.search(r"\b(?:send|message|email)\b", goal, re.I):
+            evidence = ActionEvidence(evidence.target_confidence, evidence.dispatch_acknowledged,
+                                      evidence.surface_changed, evidence.transport_status,
+                                      evidence.authoritative_confirmation,
+                                      submitted.casefold() in after_text.casefold())
+    return verify_layers(evidence, mutating=write_effect)
+
+
+def requires_authoritative_confirmation(instruction: str, history: list[dict[str, Any]]) -> bool:
+    if not _EXTERNAL_WRITE.search(instruction):
+        return False
+    return bool(history) and any(h.get("result_ok") and
+        (h.get("action") or {}).get("type") in ("click", "type", "press", "upload_file") for h in history)
+
 
 @dataclass
 class VerificationResult:
@@ -264,6 +329,13 @@ def verify_task_completion(
             is_verified=True,
             reason="Task paused awaiting user authentication or input.",
         )
+
+    if candidate_state in ("completed", "running") and requires_authoritative_confirmation(instruction, hist):
+        confirmed = any((h.get("verification") or {}).get("layers", {}).get("authority") == "passed"
+                        and (h.get("verification") or {}).get("verified") for h in hist)
+        if not confirmed:
+            return VerificationResult("failed", f"Action not confirmed by the service. {msg}", False,
+                                      "No verified authoritative affirmation for the requested write.")
 
     category = classify_instruction_type(instruction)
 

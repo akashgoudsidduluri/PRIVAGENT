@@ -1,3 +1,5 @@
+import { semanticElement, checkTargetFreshness, queryAllWithShadow as semanticQuery, accessibleName as fullAccessibleName, viewportBounds } from "../src/semantic";
+import type { SemanticElement } from "../src/contracts";
 /**
  * Content script injected programmatically by the service worker.
  * Performs in-page interaction and returns serializable results.
@@ -7,6 +9,7 @@ export {}
 
 interface AgentElement {
   targetId: string;
+  semantic?: SemanticElement;
   role: string;
   name: string;
   tag: string;
@@ -51,6 +54,9 @@ interface NavigatorAgent {
   pageState: () => PageStateProbe;
   scroll: (direction: "up" | "down" | "top" | "bottom", containerId?: string) => { ok: boolean; scrollY: number };
   extractText: (maxLen?: number) => string;
+  selectOption: (targetId: string, option: string, name?: string) => Promise<{ ok: boolean; error?: string; value?: string }>;
+  setDate: (targetId: string, date: string, name?: string) => Promise<{ ok: boolean; error?: string; value?: string }>;
+  uploadFile: (targetId: string, fileName: string, base64: string, name?: string) => { ok: boolean; error?: string; value?: string };
 }
 
 declare global {
@@ -137,6 +143,8 @@ function associatedLabelText(el: HTMLElement): string {
 
 /** Human-readable accessible name, preserving the page's own wording. */
 function accessibleName(el: HTMLElement): string {
+  const computed = fullAccessibleName(el);
+  if (computed) return computed;
   const labelled = labelledByText(el);
   if (labelled) return labelled;
   const ariaLabel = normText(el.getAttribute("aria-label"));
@@ -287,14 +295,22 @@ function candidates(): AgentElement[] {
     'button[id*="accept"]',
   ].join(', ');
 
-  const nodes = queryAllWithShadow(document, selectors);
+  const nodes = semanticQuery(selectors);
   const list: AgentElement[] = [];
 
   nodes.forEach((n, i) => {
     const el = n as HTMLElement;
     const r = el.getBoundingClientRect();
+    const mapped = viewportBounds(el);
+    if (!mapped) return;
     const style = window.getComputedStyle(el);
-    const isHidden = style.display === "none" || style.visibility === "hidden" || style.opacity === "0";
+    let ancestor: Element | null = el;
+    let isHidden = false;
+    while (ancestor) {
+      const computed = getComputedStyle(ancestor);
+      if (computed.display === "none" || computed.visibility === "hidden" || Number(computed.opacity) === 0 || computed.fontSize === "0px" || Number.parseInt(computed.zIndex, 10) <= -999 || ancestor.getAttribute("aria-hidden") === "true") { isHidden = true; break; }
+      ancestor = ancestor.parentElement || ((ancestor.getRootNode() as ShadowRoot).host ?? null);
+    }
     const hasSize = r.width > 0 && r.height > 0;
     if (isHidden || !hasSize) return;
 
@@ -419,12 +435,8 @@ function candidates(): AgentElement[] {
       enabled: !(input as HTMLButtonElement).disabled && !el.hasAttribute("aria-disabled"),
       visible: true,
       href,
-      bounds: {
-        x: Math.round(r.left),
-        y: Math.round(r.top),
-        width: Math.round(r.width),
-        height: Math.round(r.height),
-      },
+      bounds: mapped,
+      semantic: semanticElement(el, targetId) || undefined,
     });
   });
 
@@ -442,7 +454,9 @@ function isEditableElement(el: HTMLElement): boolean {
 function elementFor(targetId: string, name?: string, requireEditable = false): HTMLElement | null {
   const cid = cleanId(targetId);
   const pick = (node: HTMLElement | null | undefined): HTMLElement | null =>
-    node && node.isConnected && (!requireEditable || isEditableElement(node)) ? node : null;
+    node && node.isConnected && (!requireEditable || isEditableElement(node)) &&
+    (!name || fullAccessibleName(node).toLowerCase() === name.toLowerCase() ||
+      (node.getAttribute("data-navigator-id") === cid && !fullAccessibleName(node))) ? node : null;
 
   const registered = pick(registry.get(cid)) ?? pick(registry.get(targetId));
   if (registered) return registered;
@@ -472,7 +486,12 @@ function elementFor(targetId: string, name?: string, requireEditable = false): H
   const refreshed = pick(registry.get(cid));
   if (refreshed) return refreshed;
 
-  // 5. Fallback search by accessible name / textContent
+  // 5. Re-resolve React/Vue replacements using semantic identity. Ambiguous
+  // names fail closed rather than clicking an arbitrary replacement.
+  const recovered = checkTargetFreshness(cid, undefined, name || undefined);
+  if (pick(recovered as HTMLElement | null)) return recovered as HTMLElement;
+
+  // 6. Fallback search by accessible name / textContent
   if (name && name.trim()) {
     const wanted = name.trim().toLowerCase();
     const all = queryAllWithShadow(document, 'button, input, textarea, select, a[href], [role="button"], [role="link"], [role="textbox"], [role="searchbox"], [role="row"], [role="listitem"], [role="gridcell"], [tabindex], [data-testid], span[title], div[title], ytd-thumbnail, #video-title') as HTMLElement[];
@@ -496,20 +515,21 @@ function elementFor(targetId: string, name?: string, requireEditable = false): H
 
     // Exact or substring match on the full accessible identity (aria-labelledby,
     // aria-label, associated label, title, placeholder, name/id/type, text).
-    const matched = pool.find(e => {
+    const matches = pool.filter(e => {
       const txt = identityText(e);
       return txt === wanted || txt.includes(wanted) || (txt.length >= 3 && wanted.includes(txt));
     });
-    if (matched) return matched;
+    if (matches.length === 1) return matches[0];
+    if (matches.length > 1) return null;
 
     // Word token match
     const tokens = wanted.split(/\s+/).filter(t => t.length > 2);
     if (tokens.length > 0) {
-      const tokenMatch = pool.find(e => {
+      const tokenMatches = pool.filter(e => {
         const txt = identityText(e);
         return tokens.every(tok => txt.includes(tok));
       });
-      if (tokenMatch) return tokenMatch;
+      if (tokenMatches.length === 1) return tokenMatches[0];
     }
   }
 
@@ -593,10 +613,11 @@ window.__navigatorAgent = {
     try {
       el.scrollIntoView({ block: "center", behavior: "instant" });
     } catch {}
-    const r = el.getBoundingClientRect();
+    const r = viewportBounds(el);
+    if (!r) return null;
     return {
-      x: Math.round(r.left + Math.max(1, r.width / 2)),
-      y: Math.round(r.top + Math.max(1, r.height / 2)),
+      x: Math.round(r.x + Math.max(1, r.width / 2)),
+      y: Math.round(r.y + Math.max(1, r.height / 2)),
       width: Math.round(r.width),
       height: Math.round(r.height),
     };
@@ -612,10 +633,11 @@ window.__navigatorAgent = {
     try {
       target.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
     } catch {}
-    const r = target.getBoundingClientRect();
+    const r = viewportBounds(target);
+    if (!r) return null;
     return {
-      x: Math.round(r.left + Math.max(1, r.width / 2)),
-      y: Math.round(r.top + Math.max(1, r.height / 2)),
+      x: Math.round(r.x + Math.max(1, r.width / 2)),
+      y: Math.round(r.y + Math.max(1, r.height / 2)),
       width: Math.round(r.width),
       height: Math.round(r.height),
     };
@@ -888,7 +910,8 @@ window.__navigatorAgent = {
   },
   readValue: (targetId, name) => {
     const el = elementFor(targetId, name, true) ||
-      (document.activeElement instanceof HTMLElement ? document.activeElement : null);
+      (!targetId && !name && document.activeElement instanceof HTMLElement && isEditableElement(document.activeElement)
+        ? document.activeElement : null);
     if (!el) return { ok: false, error: "STALE_TARGET" };
     return {
       ok: true,
@@ -900,8 +923,121 @@ window.__navigatorAgent = {
     };
   },
   pageState: () => computePageState(),
+  selectOption: async (targetId, option, name) => {
+    const control = elementFor(targetId, name);
+    if (!control) return { ok: false, error: "STALE_TARGET" };
+    if (control instanceof HTMLSelectElement) {
+      return window.__navigatorAgent!.type(targetId, option, true, name);
+    }
+    control.click();
+    const wanted = normText(option).toLowerCase();
+    // Portals are often siblings of the app root, outside the control.
+    const selector = '[role="option"], [role="menuitem"], [data-value], li[tabindex], [role="listbox"] li';
+    let matches: HTMLElement[] = [];
+    for (let i = 0; i < 20; i++) {
+      matches = queryAllWithShadow(document, selector).filter((el): el is HTMLElement =>
+        el instanceof HTMLElement && el.getBoundingClientRect().width > 0 &&
+        (normText(el.getAttribute("aria-label") || el.textContent).toLowerCase() === wanted ||
+          normText(el.getAttribute("data-value")).toLowerCase() === wanted));
+      if (matches.length) break;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    if (matches.length !== 1) return { ok: false, error: matches.length ? "ambiguous option" : "option not found" };
+    matches[0].click();
+    await new Promise(resolve => setTimeout(resolve, 40));
+    const display = normText(control.textContent || control.getAttribute("aria-label") || "").toLowerCase();
+    const value = control instanceof HTMLInputElement ? control.value : control.getAttribute("data-value") || display;
+    const selected = control.getAttribute("aria-activedescendant") === matches[0].id ||
+      control.getAttribute("aria-valuetext")?.toLowerCase() === wanted ||
+      normText(value).toLowerCase().includes(wanted);
+    return selected ? { ok: true, value } : { ok: false, error: "selection not reflected in control" };
+  },
+  setDate: async (targetId, date, name) => {
+    const control = elementFor(targetId, name);
+    if (!control) return { ok: false, error: "STALE_TARGET" };
+    if (control instanceof HTMLInputElement && control.type === "date") {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setter?.call(control, date);
+      control.dispatchEvent(new Event("input", { bubbles: true }));
+      control.dispatchEvent(new Event("change", { bubbles: true }));
+      return control.value === date ? { ok: true, value: date } : { ok: false, error: "date value did not persist" };
+    }
+    // Text calendars: obey the input's advertised format. A custom grid is
+    // handled only when a unique date-labelled cell is exposed by the site.
+    if (control instanceof HTMLInputElement && control.type === "text") {
+      const format = control.placeholder.toLowerCase();
+      const [year, month, day] = date.split("-");
+      const formatted = format.includes("dd/mm") ? `${day}/${month}/${year}`
+        : format.includes("mm/dd") ? `${month}/${day}/${year}` : date;
+      const result = window.__navigatorAgent!.type(targetId, formatted, true, name);
+      return result.ok && result.value === formatted ? { ok: true, value: formatted } : { ok: false, error: "date value did not persist" };
+    }
+    control.click();
+    const day = String(Number(date.slice(-2)));
+    const [year, month] = date.split("-");
+    const dateLabels = [date, `${month}/${day}/${year}`, `${day}/${month}/${year}`];
+    for (let move = 0; move < 24; move++) {
+      const candidates = queryAllWithShadow(document, '[data-date], [aria-label], [role="gridcell"]')
+        .filter((el): el is HTMLElement => el instanceof HTMLElement && el.getBoundingClientRect().width > 0 &&
+          (dateLabels.includes(el.getAttribute("data-date") || "") ||
+            dateLabels.some(label => (el.getAttribute("aria-label") || "").toLowerCase().includes(label.toLowerCase()))));
+      if (candidates.length === 1) {
+        candidates[0].click();
+        const value = control instanceof HTMLInputElement ? control.value : normText(control.textContent);
+        return value ? { ok: true, value } : { ok: false, error: "date selection not reflected" };
+      }
+      if (candidates.length > 1) return { ok: false, error: "ambiguous calendar date" };
+      const title = document.querySelector('[aria-live="polite"], [class*="month"], [data-calendar-month]')?.textContent || "";
+      const shown = Date.parse(`1 ${title}`);
+      if (Number.isNaN(shown)) break;
+      const desired = Number(year) * 12 + Number(month) - 1;
+      const current = new Date(shown).getFullYear() * 12 + new Date(shown).getMonth();
+      if (current === desired) break;
+      const direction = desired > current ? "next" : "previous";
+      const buttons = queryAllWithShadow(document, 'button[aria-label], [role="button"][aria-label]')
+        .filter((el): el is HTMLElement => el instanceof HTMLElement && new RegExp(direction, "i").test(el.getAttribute("aria-label") || ""));
+      if (buttons.length !== 1) break;
+      buttons[0].click();
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    return { ok: false, error: "calendar date not found or not verifiable" };
+  },
+  uploadFile: (targetId, fileName, base64, name) => {
+    const control = elementFor(targetId, name, true);
+    if (!(control instanceof HTMLInputElement) || control.type !== "file") return { ok: false, error: "file input not found" };
+    try {
+      const raw = atob(base64);
+      if (raw.length > 5 * 1024 * 1024) return { ok: false, error: "file exceeds 5 MiB" };
+      const bytes = Uint8Array.from(raw, ch => ch.charCodeAt(0));
+      const file = new File([bytes], fileName);
+      const transfer = new DataTransfer();
+      transfer.items.add(file);
+      control.files = transfer.files;
+      control.dispatchEvent(new Event("input", { bubbles: true }));
+      control.dispatchEvent(new Event("change", { bubbles: true }));
+      return control.files?.length === 1 && control.files[0].name === fileName && control.files[0].size === bytes.length
+        ? { ok: true, value: fileName } : { ok: false, error: "file selection not reflected" };
+    } catch { return { ok: false, error: "file selection failed" }; }
+  },
   scroll: (direction, containerId) => {
-    const container = containerId ? elementFor(containerId) : null;
+    let container = containerId ? elementFor(containerId) : null;
+    if (containerId && !container) return { ok: false, scrollY: 0 };
+    if (!container) {
+      const active = document.activeElement as HTMLElement | null;
+      const hovered = document.querySelector(":hover:last-of-type") as HTMLElement | null;
+      for (let node = active || hovered; node && node !== document.body; node = node.parentElement) {
+        const style = getComputedStyle(node);
+        if (/(auto|scroll)/.test(style.overflowY) && node.scrollHeight > node.clientHeight + 2) {
+          container = node;
+          break;
+        }
+      }
+      if (!container) {
+        const regions = queryAllWithShadow(document, '[role="dialog"], [role="listbox"], aside, [aria-modal="true"]');
+        container = regions.find((node): node is HTMLElement => node instanceof HTMLElement &&
+          /(auto|scroll)/.test(getComputedStyle(node).overflowY) && node.scrollHeight > node.clientHeight + 2) || null;
+      }
+    }
     const px = Math.round((container ? container.clientHeight : innerHeight) * 0.8);
     if (direction === "top") {
       if (container) container.scrollTop = 0;

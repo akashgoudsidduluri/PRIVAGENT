@@ -23,6 +23,7 @@ class TaskRecord:
     task_id: str
     instruction: str
     chat_id: Optional[str] = None
+    file_token: Optional[str] = None
     state: str = "planning"
     steps_done: int = 0
     message: str = ""
@@ -42,6 +43,7 @@ class TaskRecord:
     primary_tab_id: Optional[int] = None
     child_tab_ids: list[int] = field(default_factory=list)
     terminal_emitted: bool = False
+    last_observation: Any = None
 
 
 class ActionResultSlot:
@@ -149,6 +151,7 @@ class Hub:
             self._action_results.pop(action_id, None)
 
     async def broadcast_progress(self, task: TaskRecord) -> None:
+        from .privacy import scrub_persistent
         if task.state in TERMINAL_STATES:
             if task.terminal_emitted:
                 return
@@ -160,10 +163,10 @@ class Hub:
             "payload": {
                 "taskId": task.task_id,
                 "chatId": getattr(task, "chat_id", None),
-                "instruction": task.instruction,
+                "instruction": scrub_persistent(task.instruction),
                 "taskState": task.state,
                 "stepsDone": task.steps_done,
-                "message": task.message,
+                "message": scrub_persistent(task.message),
                 "screenshot": task.screenshot,
                 "plannerMs": task.planner_ms,
                 "observeMs": task.observe_ms,

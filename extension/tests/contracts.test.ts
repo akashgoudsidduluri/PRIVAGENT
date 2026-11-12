@@ -21,6 +21,9 @@ describe("contracts", () => {
       "select_tab",
       "new_tab",
       "close_tab",
+      "select_option",
+      "set_date",
+      "upload_file",
     ]);
   });
 

@@ -1,3 +1,4 @@
+import { accessibleName, queryAllWithShadow, perceptible, semanticElement, viewportBounds } from "./semantic";
 import type { BrowserObservation, InteractiveElement } from "./contracts";
 
 const SENSITIVE_INPUT_TYPES = new Set(["password", "hidden"]);
@@ -10,38 +11,32 @@ export function collectInteractiveElements(
   viewportW: number,
   viewportH: number
 ): InteractiveElement[] {
-  const nodes = Array.from(document.querySelectorAll(INTERACTIVE_SELECTORS));
+  const nodes = queryAllWithShadow(INTERACTIVE_SELECTORS);
   const out: InteractiveElement[] = [];
   for (const node of nodes) {
     const el = node as HTMLElement;
     assertDomNode(el);
     const rect = el.getBoundingClientRect();
+    const mapped = viewportBounds(el);
+    if (!mapped) continue;
     if (rect.width === 0 || rect.height === 0) continue;
     if (rect.bottom < 0 || rect.right < 0 || rect.top > viewportH || rect.left > viewportW) continue;
     const style = getComputedStyle(el);
-    if (style.visibility === "hidden" || style.display === "none") continue;
+    if (style.visibility === "hidden" || style.display === "none" || !perceptible(el)) continue;
     const input = el as HTMLInputElement;
     const inputType = el.tagName === "INPUT" ? input.type : undefined;
     const sensitive = inputType !== undefined && SENSITIVE_INPUT_TYPES.has(inputType);
     out.push({
       targetId: el.id || "",
+      semantic: semanticElement(el, el.id || "") || undefined,
       role: explicitRole(el) || implicitRole(el),
-      name:
-        trim(el.getAttribute("aria-label") ?? el.textContent) ??
-        trim(input?.placeholder) ??
-        trim(el.getAttribute("title")) ??
-        "",
+      name: accessibleName(el),
       tag: el.tagName.toLowerCase(),
       inputType,
       value: sensitive ? undefined : trim(input?.value),
       visible: true,
       enabled: !(el as HTMLButtonElement).disabled,
-      bounds: {
-        x: Math.round(rect.left),
-        y: Math.round(rect.top),
-        width: Math.round(rect.width),
-        height: Math.round(rect.height),
-      },
+      bounds: mapped,
     });
   }
   return out;

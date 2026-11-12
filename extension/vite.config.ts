@@ -13,7 +13,7 @@ export default defineConfig({
     outDir: "dist",
     emptyOutDir: true,
     rollupOptions: {
-      input: { background: "src/background.ts", content: "lib/content.ts" },
+      input: { background: "src/background.ts", content: "lib/content.ts", companion: "src/companion/runtime.ts" },
       output: { entryFileNames: "[name].js", format: "es" },
     },
   },

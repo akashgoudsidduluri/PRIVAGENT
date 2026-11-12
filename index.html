@@ -3,9 +3,9 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>NAVIGATOR — SIH 26171 · An AI Browser Agent That Respects Your Privacy</title>
+  <title>PrivAgent — Browser autonomy with visible control</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='10' fill='%23061032'/%3E%3Ccircle cx='12' cy='12' r='6.5' fill='none' stroke='%2346d7ff' stroke-width='1.8'/%3E%3Ccircle cx='12' cy='12' r='2.4' fill='%23a06bff'/%3E%3C/svg%3E" />
-  <meta name="description" content="SIH Problem 26171 — An AI browser agent with visual understanding, privacy preservation, and task automation." />
+  <meta name="description" content="PrivAgent brings missions, browser inspection, monitoring, and human approval into one private control center." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=IBM+Plex+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&display=swap" rel="stylesheet" />
@@ -19,7 +19,7 @@
       <span class="nav__logo" aria-hidden="true">
         <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3.5 3 14 0 18M12 3c-3 3.5-3 14 0 18"/></svg>
       </span>
-      <span class="nav__wordmark">NAVIGATOR<sup>SIH·26171</sup></span>
+      <span class="nav__wordmark">PRIVAGENT<sup>CONTROL CENTER</sup></span>
     </a>
     <button class="nav__toggle" aria-expanded="false" aria-controls="navLinks" aria-label="Menu">
       <span></span><span></span><span></span>
@@ -45,23 +45,28 @@
         <div class="hero__stars" id="stars"></div>
       </div>
       <img class="hero__art" src="/images/hero-space-02.png" alt="" aria-hidden="true" />
+      <div class="hero__preview" aria-label="Illustrative PrivAgent interface preview">
+        <div class="preview__top"><span class="preview__brand">P<span>•</span> <small>CONTROL CENTER</small></span><span class="preview__live"><i></i> MISSION VIEW</span></div>
+        <div class="preview__body"><div class="preview__rail"><b>◈</b><b>↗</b><b>▣</b><b>◎</b><b>⬡</b></div><div class="preview__main"><span class="preview__label">MISSION / 001</span><h3>From intent to evidence.</h3><p>Every step visible. Every sensitive decision yours.</p><div class="preview__trace"><span><i>01</i> Observe page <em>✓</em></span><span><i>02</i> Resolve target <em>✓</em></span><span><i>03</i> Verify outcome <em>↗</em></span></div><div class="preview__foot"><span>6 LAYERS OF VERIFICATION</span><span>HUMAN APPROVAL ON WRITES</span></div></div></div>
+        <span class="preview__caption">Illustrative workspace preview</span>
+      </div>
       <div class="hero__inner container">
-        <p class="hero__kicker reveal"><span class="chip">SIH Problem 26171</span><span class="chip chip--alt">Smart Hackathon·Vision·Privacy</span></p>
-        <h1 class="hero__title reveal">An <span class="grad">AI Browser Agent</span><br>That <span class="grad">Respects Your Privacy.</span></h1>
-        <p class="hero__sub reveal">NAVIGATOR sees the web the way you do — understanding every screen, filling every form, executing every workflow — while credentials and PII are redacted on your machine before any model sees them. Screenshots stay local unless you explicitly opt in. No sessions recorded. No training on your life.</p>
+        <p class="hero__kicker reveal"><span class="chip">THE PRIVATE OPERATIONS LAYER</span><span class="chip chip--alt">BUILT FOR SIH 26171</span></p>
+        <h1 class="hero__title reveal">A browser agent<br>That <span class="grad">Respects Your Privacy.</span></h1>
+        <p class="hero__sub reveal">Give it a mission. Watch each observation, action, and verification as it happens. PrivAgent brings browser work, persistent monitors, and approval gates into one local control center.</p>
         <div class="hero__cta reveal">
-          <a class="btn btn--primary btn--lg" href="#cta">Launch Live Demo
+          <a class="btn btn--primary btn--lg" href="/agent.html">Open Control Center
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
           </a>
-          <a class="btn btn--ghost btn--lg" href="#solution">
+          <a class="btn btn--ghost btn--lg" href="#workflow">
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6l8-4z"/></svg>
-            Read the Privacy Model
+            Explore the workflow
           </a>
         </div>
         <ul class="hero__stats reveal" role="list">
-          <li><strong data-count="100" data-suffix="%">0%</strong><span>fail-closed redaction</span></li>
-          <li><strong data-count="0" data-prefix="">0</strong><span>screenshots sent by default</span></li>
-          <li><strong data-count="25" data-suffix="">0</strong><span>step task budget</span></li>
+          <li><strong>11</strong><span>control center views</span></li>
+          <li><strong>6</strong><span>verification signals</span></li>
+          <li><strong>0</strong><span>screenshots by default</span></li>
         </ul>
       </div>
       <div class="hero__scroll" aria-hidden="true"><span></span></div>
@@ -151,14 +156,14 @@
     <section class="section" id="use-cases">
       <div class="container">
         <p class="section__kicker reveal">05 · Use Cases</p>
-        <h2 class="section__title reveal">Where NAVIGATOR earns <em>its clearance.</em></h2>
+        <h2 class="section__title reveal">A workspace for <em>real browser work.</em></h2>
         <div class="grid grid--3">
-          <article class="card reveal"><h3>Govt Portals &amp; Passports</h3><p>Watches appointment availability, auto-fills fields with your locally-saved profile, books the slot in seconds.</p></article>
-          <article class="card reveal"><h3>Banking &amp; Finance</h3><p>Reconciles monthly statements, pays scheduled bills, and flags anomalies — with local redaction and an approval gate before any sensitive action.</p></article>
-          <article class="card reveal"><h3>Healthcare</h3><p>Refills prescriptions and fetches reports from portals that never seem to work the same way twice.</p></article>
-          <article class="card reveal"><h3>E-Commerce Ops</h3><p>Re-orders stock from vendor portals, tracks dispatch status, escalates delays into your inbox.</p></article>
-          <article class="card reveal"><h3>Student Administration</h3><p>Timetable sync, fee reminders, form resubmission — the routine nobody automates, done quietly off-hours.</p></article>
-          <article class="card reveal"><h3>Accessibility Ally</h3><p>For users with motor or vision impairments, NAVIGATOR completes fiddly flows by voice — with credentials redacted from the run log.</p></article>
+          <article class="card reveal"><h3>Product research</h3><p>Compare listings, capture evidence, and export a sourced report from the pages you actually visited.</p></article>
+          <article class="card reveal"><h3>Travel planning</h3><p>Inspect route options and policies while keeping booking and payment decisions in human hands.</p></article>
+          <article class="card reveal"><h3>Inbox triage</h3><p>Connect a provider when configured, review message context, and approve a draft before any write.</p></article>
+          <article class="card reveal"><h3>Continuous watching</h3><p>Set a persistent monitor on a public page, then inspect differences and alerts in the mission view.</p></article>
+          <article class="card reveal"><h3>Dynamic web apps</h3><p>Use accessible names, bounds, and staleness recovery when controls move after a rerender.</p></article>
+          <article class="card reveal"><h3>Research deliverables</h3><p>Turn gathered evidence into downloadable documents with a clear source trail.</p></article>
         </div>
       </div>
     </section>
@@ -182,12 +187,12 @@
       <div class="container split split--team">
         <div class="split__copy">
           <p class="section__kicker reveal">07 · Team</p>
-          <h2 class="section__title reveal">Project <em>NAVIGATOR</em></h2>
-          <p class="reveal">Built for Smart India Hackathon 2026, problem statement <strong>26171</strong> — in partnership with <strong>ISRO</strong>. A mission-grade browser agent: it sees clearly, acts reliably, and keeps sensitive data on the ground.</p>
+          <h2 class="section__title reveal">Project <em>PrivAgent</em></h2>
+          <p class="reveal">Built around Smart India Hackathon problem statement <strong>26171</strong>. The goal is straightforward: let an agent do useful browser work while the operator can see and approve the consequential steps.</p>
           <ul class="badges reveal" role="list">
-            <li class="badge badge--isro">ISRO Partnered</li>
+            <li class="badge badge--isro">Human-governed</li>
             <li class="badge">SIH 26171</li>
-            <li class="badge">Privacy-First AI</li>
+            <li class="badge">Local-first AI</li>
           </ul>
         </div>
         <div class="team reveal">
@@ -236,10 +241,10 @@
     <!-- ============ CTA ============ -->
     <section class="cta" id="cta">
       <div class="container cta__inner">
-        <h2 class="cta__title reveal">Ready for a browser that <span class="grad">works for you — and for no one else?</span></h2>
+        <h2 class="cta__title reveal">Give your next task a <span class="grad">clear path to done.</span></h2>
         <div class="cta__actions reveal">
-          <a class="btn btn--primary btn--lg" href="#top">Launch Live Demo</a>
-          <a class="btn btn--ghost btn--lg" href="#team">Meet the Team</a>
+          <a class="btn btn--primary btn--lg" href="/agent.html">Open Control Center</a>
+          <a class="btn btn--ghost btn--lg" href="#console">Try a local task</a>
         </div>
       </div>
     </section>
@@ -247,7 +252,7 @@
 
   <footer class="footer">
     <div class="container footer__inner">
-      <p>NAVIGATOR · SIH 26171 · Privacy-First Browser Agent</p>
+      <p>PRIVAGENT · SIH 26171 · Human-governed browser agent</p>
       <p class="footer__meta">Built for Smart India Hackathon 2026 <span aria-hidden="true">·</span> <a href="#top">Back to top ↑</a></p>
     </div>
   </footer>

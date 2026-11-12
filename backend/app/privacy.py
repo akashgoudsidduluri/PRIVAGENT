@@ -11,6 +11,10 @@ here too, and screenshots are withheld unless explicitly opted in.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import IntEnum
+from threading import Lock
+from collections import deque
+import time
 from typing import Any, Optional
 from urllib.parse import unquote_plus, urlsplit, urlunsplit
 
@@ -25,6 +29,57 @@ MAX_NAME_LEN = 120
 MAX_TITLE_LEN = 200
 MAX_URL_LEN = 2048
 REDACTED = "[REDACTED]"
+_privacy_lock = Lock()
+_privacy_counts = {"observations": 0, "redactedObservations": 0, "screenshotsWithheld": 0}
+_privacy_events: deque[dict[str, Any]] = deque(maxlen=100)
+
+
+def privacy_counters() -> dict[str, int]:
+    with _privacy_lock:
+        return dict(_privacy_counts)
+
+
+def privacy_events() -> list[dict[str, Any]]:
+    with _privacy_lock:
+        return list(reversed(_privacy_events))
+
+
+class Sensitivity(IntEnum):
+    PUBLIC = 0
+    INTERNAL = 1
+    RESTRICTED_PII = 2
+    CREDENTIAL = 3
+
+
+_PRIVATE_KEY = re.compile(r"(?:password|passwd|secret|token|api[_-]?key|cookie|authorization|credential|otp|cvv|ssn|aadhaar|account[_-]?number|screenshot|base64|raw[_-]?html)", re.I)
+_PII_VALUE = re.compile(r"\b(?:[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}|\+?\d[\d -]{8,}\d)\b")
+
+
+def classify_sensitivity(value: str, key: str = "") -> Sensitivity:
+    """Conservative pattern classification for persistence decisions."""
+    if _PRIVATE_KEY.search(key) or any(PATTERNS[name].search(value) for name in
+                                   ("api_key", "jwt", "aws_key", "slack_token", "private_key", "sensitive_kv")):
+        return Sensitivity.CREDENTIAL
+    if _PII_VALUE.search(value) or PATTERNS["credit_card"].search(value) or PATTERNS["ssn"].search(value):
+        return Sensitivity.RESTRICTED_PII
+    return Sensitivity.INTERNAL if value.strip() else Sensitivity.PUBLIC
+
+
+def scrub_persistent(value: Any, key: str = "", depth: int = 0) -> Any:
+    """Fail closed for known sensitive fields and redact PII in episodic records."""
+    if depth > 15:
+        raise ValueError("persistent payload nesting exceeds privacy limit")
+    if _PRIVATE_KEY.search(key):
+        return REDACTED
+    if isinstance(value, dict):
+        return {str(k): scrub_persistent(v, str(k), depth + 1) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [scrub_persistent(item, key, depth + 1) for item in value[:1000]]
+    if isinstance(value, str):
+        return _PII_VALUE.sub(REDACTED, _redact_text(redact_text_urls(value), 100_000))
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    raise ValueError("unsupported persistent payload type")
 
 SENSITIVE_INPUT_TYPES = {"password", "hidden"}
 SENSITIVE_NAME_PATTERNS = re.compile(
@@ -195,6 +250,22 @@ def _redact_element(el: InteractiveElement) -> InteractiveElement:
         "value": value,
         "name": _redact_text(el.name or "", MAX_NAME_LEN),
     }
+    if el.semantic:
+        sem = el.semantic
+        ia = sem.interactability
+        bounds = ia.get("bounds", {})
+        safe_bounds = {k: float(bounds[k]) for k in ("x", "y", "width", "height")}
+        if not all(__import__("math").isfinite(v) and abs(v) < 100000 for v in safe_bounds.values()):
+            raise ValueError("invalid semantic bounds")
+        update_dict["semantic"] = sem.model_copy(update={
+            "semantic_name": _redact_text(sem.semantic_name, MAX_NAME_LEN),
+            "context_text": "" if el.input_type in SENSITIVE_INPUT_TYPES or _is_sensitive_name(el.name) or _has_sensitive_value(sem.context_text)
+                or re.search(r"\b(?:token|secret|password|api[_-]?key|session|otp)\s*[:=]", sem.context_text, re.I)
+                else _redact_text(sem.context_text, 160),
+            "interactability": {"bounds": safe_bounds, "visible": bool(ia.get("visible")),
+                "opacity": float(ia.get("opacity", 1)), "pointerEvents": str(ia.get("pointerEvents", ""))[:24],
+                "occluded": bool(ia.get("occluded"))},
+        })
     if el.href:
         update_dict["href"] = redact_url(el.href)
     return el.model_copy(update=update_dict)
@@ -316,19 +387,32 @@ class PrivacyFilteredPayload:
                 bits.append(f'href="{clean_href}"')
             if el.value is not None:
                 bits.append(f'value="{el.value}"')
+            if el.semantic:
+                sem = el.semantic
+                ia = sem.interactability
+                bits.append(f"control={sem.control_type}")
+                bits.append(f"semantic_name={sem.semantic_name!r}")
+                bounds = ia.get("bounds")
+                if bounds:
+                    bits.append(f"bounds={bounds['x']},{bounds['y']},{bounds['width']},{bounds['height']}")
+                if ia.get("occluded") or not ia.get("visible") or ia.get("pointerEvents") == "none":
+                    bits.append("non_interactable")
+                if sem.context_text:
+                    bits.append(f"context={sem.context_text!r}")
             lines.append("- " + " ".join(b for b in bits if b))
         if self.page_text:
+            from .adversarial_guard import quarantine_text
             cleaned_text = re.sub(r"[ \t]+", " ", self.page_text)
             cleaned_text = re.sub(r"\n\s*\n+", "\n", cleaned_text).strip()
             if cleaned_text:
                 lines.append("\n<page-text>")
-                lines.append(cleaned_text[:2000])
+                lines.append(quarantine_text(cleaned_text[:2000], "page"))
                 lines.append("</page-text>")
         return "\n".join(lines)
 
 
 def classify_and_redact(
-    obs: BrowserObservation, *, instruction: str
+    obs: BrowserObservation, *, instruction: str, record_metrics: bool = True
 ) -> tuple[PrivacyFilteredPayload, PrivacyDecision]:
     _stopwords = {
         "and", "the", "for", "check", "its", "find", "open", "show", "get", "with",
@@ -346,6 +430,10 @@ def classify_and_redact(
         has_sensitive_element = any(
             e.input_type in SENSITIVE_INPUT_TYPES or _is_sensitive_name(e.name)
             for e in obs.interactive
+        )
+        has_sensitive_element = has_sensitive_element or any(
+            _has_sensitive_value(str(text or ""))
+            for text in (obs.title, getattr(obs, "page_text", None))
         )
         safe_screenshot = None
         if getattr(config, "ALLOW_SCREENSHOTS", False) and not has_sensitive_element:
@@ -367,8 +455,9 @@ def classify_and_redact(
         safe_page_text = None
         raw_text = getattr(obs, "page_text", None) or (obs.get("pageText") if isinstance(obs, dict) else None)
         if raw_text:
+            from .adversarial_guard import cleanse_untrusted
             max_chars = int(getattr(config, "MAX_PAGE_TEXT_CHARS", 2500))
-            safe_page_text = _redact_text(redact_text_urls(str(raw_text)), max_chars)
+            safe_page_text = cleanse_untrusted(_redact_text(redact_text_urls(str(raw_text)), max_chars), max_chars)
         payload = PrivacyFilteredPayload(
             tab_id=obs.tab_id,
             url=redact_url(obs.url),
@@ -384,6 +473,18 @@ def classify_and_redact(
             query_terms=query_terms,
         )
         decision = PrivacyDecision(send=True, reason="redaction succeeded", violations=[])
+        redacted_any = (payload.url != obs.url or payload.title != obs.title or
+                        any((e.value != safe.value or e.name != safe.name) for e, safe in zip(obs.interactive, redacted)) or
+                        bool(raw_text and safe_page_text != str(raw_text)))
+        if record_metrics:
+            with _privacy_lock:
+                _privacy_counts["observations"] += 1
+                _privacy_counts["redactedObservations"] += int(redacted_any)
+                _privacy_counts["screenshotsWithheld"] += int(bool(getattr(obs, "screenshot", None) and safe_screenshot is None))
+                if redacted_any:
+                    _privacy_events.append({"at": time.time(), "type": "observation_redacted"})
+                if getattr(obs, "screenshot", None) and safe_screenshot is None:
+                    _privacy_events.append({"at": time.time(), "type": "screenshot_withheld"})
         return payload, decision
     except Exception as exc:  # fail-closed: any filter crash blocks the send
         raise PrivacyViolation(f"privacy filter failed; payload NOT sent: {exc}") from exc
