@@ -12,6 +12,7 @@ import { sanitizeObservation } from "./observer";
 /** Injected content-script API shape (see lib/content.ts). */
 interface AgentElement {
   targetId: string;
+  semantic?: import("./contracts").SemanticElement;
   role: string;
   name: string;
   tag: string;
@@ -55,6 +56,9 @@ interface AgentApi {
   pageState: () => Promise<PageStateProbe>;
   scroll: (d: "up" | "down" | "top" | "bottom", containerId?: string) => Promise<{ ok: boolean; scrollY: number }>;
   extractText: (maxLen?: number) => Promise<string>;
+  selectOption: (targetId: string, option: string, name?: string) => Promise<{ ok: boolean; error?: string; value?: string }>;
+  setDate: (targetId: string, date: string, name?: string) => Promise<{ ok: boolean; error?: string; value?: string }>;
+  uploadFile: (targetId: string, fileName: string, base64: string, name?: string) => Promise<{ ok: boolean; error?: string; value?: string }>;
 }
 
 export async function withAgent(tabId: number): Promise<AgentApi> {
@@ -75,9 +79,44 @@ export async function withAgent(tabId: number): Promise<AgentApi> {
   if (!injected) {
     await execScript({
       target: { tabId },
-      files: ["content.js"],
+      files: ["content.js", "companion.js"],
     }, 3_000);
   }
+  // Main-world instrumentation sees page fetch/XHR; isolated content scripts
+  // cannot observe in-flight requests from React applications.
+  if (!injected) try {
+    await execScript({ target: { tabId }, world: "MAIN", func: () => {
+      const w = window as any;
+      if (w.__privagentNetwork) return;
+      const state = { pending: 0, lastActivity: Date.now(), lastStatus: null as number | null };
+      Object.defineProperty(w, "__privagentNetwork", { value: state, configurable: false });
+      const originalFetch = w.fetch;
+      w.fetch = function (...args: any[]) {
+        state.pending++;
+        state.lastStatus = null;
+        state.lastActivity = Date.now();
+        try {
+          return originalFetch.apply(this, args).then((response: Response) => {
+            state.lastStatus = response.status;
+            return response;
+          }).finally(() => { state.pending--; state.lastActivity = Date.now(); });
+        } catch (error) { state.pending--; state.lastActivity = Date.now(); throw error; }
+      };
+      const originalSend = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.send = function (...args: any[]) {
+        state.pending++;
+        state.lastStatus = null;
+        state.lastActivity = Date.now();
+        this.addEventListener("loadend", () => {
+          state.pending--;
+          state.lastStatus = this.status;
+          state.lastActivity = Date.now();
+        }, { once: true });
+        try { return originalSend.apply(this, args as [XMLHttpRequestBodyInit | null | undefined]); }
+        catch (error) { state.pending--; state.lastActivity = Date.now(); throw error; }
+      };
+    } }, 250);
+  } catch { /* Network evidence stays unknown if page instrumentation is blocked. */ }
   return {
     list: async () => {
       const [r] = await execScript({
@@ -178,6 +217,21 @@ export async function withAgent(tabId: number): Promise<AgentApi> {
         args: [limit],
       });
       return (r?.result as string) ?? "";
+    },
+    selectOption: async (id, option, name) => {
+      const [r] = await execScript({ target: { tabId }, func: (i: string, o: string, n?: string) =>
+        (window as any).__navigatorAgent?.selectOption(i, o, n) ?? { ok: false, error: "no agent" }, args: [id, option, name ?? ""] }, 3_000);
+      return r?.result ?? { ok: false, error: "execution failed" };
+    },
+    setDate: async (id, date, name) => {
+      const [r] = await execScript({ target: { tabId }, func: (i: string, d: string, n?: string) =>
+        (window as any).__navigatorAgent?.setDate(i, d, n) ?? { ok: false, error: "no agent" }, args: [id, date, name ?? ""] }, 5_000);
+      return r?.result ?? { ok: false, error: "execution failed" };
+    },
+    uploadFile: async (id, fileName, base64, name) => {
+      const [r] = await execScript({ target: { tabId }, func: (i: string, f: string, b: string, n?: string) =>
+        (window as any).__navigatorAgent?.uploadFile(i, f, b, n) ?? { ok: false, error: "no agent" }, args: [id, fileName, base64, name ?? ""] }, 5_000);
+      return r?.result ?? { ok: false, error: "execution failed" };
     },
   };
 }
@@ -589,6 +643,32 @@ async function settleDom(tabId: number, quietMs = 120, maxMs = 700): Promise<voi
   } catch {
     // Navigation replaced the document mid-wait.
   }
+  const deadline = Date.now() + cap;
+  while (Date.now() < deadline) {
+    try {
+      const [probe] = await execScript({ target: { tabId }, world: "MAIN", func: () => {
+        const state = (window as any).__privagentNetwork;
+        return state ? { pending: state.pending, lastActivity: state.lastActivity } : null;
+      } }, 100);
+      const state = probe?.result;
+      if (!state || typeof state.pending !== "number" ||
+          (state.pending === 0 && Date.now() - state.lastActivity >= quiet)) break;
+    } catch { break; }
+    await sleep(40);
+  }
+}
+
+async function networkStatusSince(tabId: number, since: number): Promise<number | undefined> {
+  try {
+    const [probe] = await execScript({ target: { tabId }, world: "MAIN", func: () => {
+      const s = (window as any).__privagentNetwork;
+      return s ? { at: s.lastActivity, status: s.lastStatus, pending: s.pending } : null;
+    } }, 200);
+    const state = probe?.result;
+    return state && state.pending === 0 && state.at >= since &&
+      Number.isInteger(state.status) && state.status >= 100 && state.status < 600
+      ? state.status : undefined;
+  } catch { return undefined; }
 }
 
 async function detectNewTab(tabId: number, tabIdsBefore: Set<number>, windowId?: number): Promise<chrome.tabs.Tab | null> {
@@ -761,6 +841,9 @@ export async function executeAction(action: BrowserAction, taskId: string): Prom
       case "navigate": return await doNavigate(action, tabId);
       case "click": return await doClick(action, taskId, tabId);
       case "type": return await doType(action, taskId, tabId);
+      case "select_option": return await doSpecialInput(action, tabId, "selectOption");
+      case "set_date": return await doSpecialInput(action, tabId, "setDate");
+      case "upload_file": return await doSpecialInput(action, tabId, "uploadFile");
       case "press": return await doPress(action, tabId);
       case "scroll": return await doScroll(action, tabId);
       case "zoom": return await doZoom(action, tabId);
@@ -780,6 +863,26 @@ export async function executeAction(action: BrowserAction, taskId: string): Prom
   } catch (e) {
     return err("UNKNOWN", String(e), true);
   }
+}
+
+async function doSpecialInput(
+  action: Extract<BrowserAction, { type: "select_option" | "set_date" | "upload_file" }>,
+  tabId: number,
+  method: "selectOption" | "setDate" | "uploadFile",
+): Promise<ActionResult> {
+  await ensureTabActive(tabId);
+  const agent = await withAgent(tabId);
+  const target = findTarget(action.target, await agent.list(), "click");
+  if (!target) return err("STALE_TARGET", "special input target missing or ambiguous", true);
+  const p = action.params as any;
+  const result = method === "selectOption" ? await agent.selectOption(target.targetId, p.option, target.name)
+    : method === "setDate" ? await agent.setDate(target.targetId, p.date, target.name)
+    : await agent.uploadFile(target.targetId, p.fileName, p.base64, target.name);
+  if (!result.ok) return err("STALE_TARGET", result.error ?? "input not verified", true);
+  await settleDom(tabId);
+  return { ok: true, targetId: target.targetId, observation: await observe(tabId),
+    evidence: `${action.type} selected and read back`,
+    verification: { targetConfidence: 0.85, dispatchAcknowledged: false, surfaceChanged: true } };
 }
 
 function err(code: AgentError["code"], message: string, recoverable: boolean): ActionResult {
@@ -1357,6 +1460,7 @@ async function doClick(action: Extract<BrowserAction, { type: "click" }>, taskId
 
   const targetId = target.targetId;
   const targetName = target.name || action.target.name || "";
+  const dispatchedAt = Date.now();
 
   // 1. Activation point: a chat row's true centre when the planner matched an
   //    inner label, so list selection handlers fire reliably.
@@ -1421,6 +1525,12 @@ async function doClick(action: Extract<BrowserAction, { type: "click" }>, taskId
     targetId: targetId,
     observation: await observe(obsTab),
     evidence,
+    verification: {
+      targetConfidence: action.target.targetId === targetId ? .95 : .85,
+      dispatchAcknowledged: cdpSuccess,
+      surfaceChanged: navDetected || undefined,
+      transportStatus: await networkStatusSince(tabId, dispatchedAt),
+    },
   };
 }
 
@@ -1575,6 +1685,7 @@ async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: 
   //    the same debugger session verifies the value, waits for autocomplete,
   //    re-focuses if the SPA rerendered, and submits — no detach/reattach gap.
   let typingMode = "native";
+  const dispatchedAt = Date.now();
   let verified = false;
   let submitted = false;
   let nativeSubmitMethod: "button" | "enter" | undefined;
@@ -1704,6 +1815,12 @@ async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: 
     ok: true,
     targetId: targetId,
     observation: finalObservation,
+    verification: {
+      targetConfidence: action.target.targetId === targetId ? .95 : .85,
+      dispatchAcknowledged: typingMode === "native" && (!submitRequested || Boolean(nativeSubmitMethod)),
+      surfaceChanged: navChanged || (submitRequested && searchIntent ? true : undefined),
+      transportStatus: await networkStatusSince(tabId, dispatchedAt),
+    },
     evidence: submitRequested
       ? `${typingMode} typing verified${nativeNote}; ${submitEvidence}`
       : `${typingMode} typing verified${nativeNote}`,
@@ -1977,6 +2094,7 @@ export async function observe(tabId: number, sessionId?: string): Promise<Browse
       // a second line of defense.
       value: undefined,
       bounds: e.bounds,
+      semantic: e.semantic,
     })),
     scroll: { y: meta.y, viewport: { w: meta.w, h: meta.h } },
     dpr: meta.dpr,

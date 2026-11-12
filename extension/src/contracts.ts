@@ -15,6 +15,9 @@ export const ACTION_TYPES = [
   "select_tab",
   "new_tab",
   "close_tab",
+  "select_option",
+  "set_date",
+  "upload_file",
 ] as const;
 
 export type ActionType = (typeof ACTION_TYPES)[number];
@@ -37,6 +40,9 @@ export const TYPE_ACTION_RISK_FLOOR: Record<ActionType, RiskClass> = {
   select_tab: "read",
   new_tab: "write",
   close_tab: "write",
+  select_option: "write",
+  set_date: "write",
+  upload_file: "sensitive",
 };
 
 export interface ElementTarget {
@@ -117,6 +123,24 @@ export interface CloseTabAction extends ActionBase {
   params: { tabId: number };
 }
 
+export interface SelectOptionAction extends ActionBase {
+  type: "select_option";
+  target: ElementTarget;
+  params: { option: string };
+}
+
+export interface SetDateAction extends ActionBase {
+  type: "set_date";
+  target: ElementTarget;
+  params: { date: string }; // ISO 8601 calendar date
+}
+
+export interface UploadFileAction extends ActionBase {
+  type: "upload_file";
+  target: ElementTarget;
+  params: { fileName: string; base64: string }; // user-provided, approval gated, max 5 MiB
+}
+
 export type BrowserAction =
   | NavigateAction
   | ClickAction
@@ -128,9 +152,29 @@ export type BrowserAction =
   | ObserveAction
   | SelectTabAction
   | NewTabAction
-  | CloseTabAction;
+  | CloseTabAction
+  | SelectOptionAction
+  | SetDateAction
+  | UploadFileAction;
+
+export interface SemanticElement {
+  elementId: string;
+  role: string;
+  semanticName: string;
+  controlType: "search_input" | "custom_dropdown" | "calendar_picker" | "file_uploader" |
+    "toggle_switch" | "checkbox" | "radio" | "modal" | "generic";
+  interactability: {
+    bounds: { x: number; y: number; width: number; height: number };
+    visible: boolean;
+    opacity: number;
+    pointerEvents: string;
+    occluded: boolean;
+  };
+  contextText: string;
+}
 
 export interface InteractiveElement {
+  semantic?: SemanticElement;
   targetId: string;
   role: string;
   name: string;
@@ -171,6 +215,14 @@ export interface ActionResult {
   observation?: BrowserObservation;
   error?: AgentError;
   evidence?: string;
+  verification?: {
+    targetConfidence?: number;
+    dispatchAcknowledged?: boolean;
+    surfaceChanged?: boolean;
+    transportStatus?: number;
+    authoritativeConfirmation?: boolean;
+    goalAligned?: boolean;
+  };
 }
 
 export type TaskState =
@@ -180,7 +232,8 @@ export type TaskState =
   | "awaiting_input"
   | "completed"
   | "failed"
-  | "cancelled";
+  | "cancelled"
+  | "paused";
 
 export interface TaskProgress {
   taskId: string;
@@ -310,6 +363,32 @@ export function validateAction(
     case "click":
       if (!hasTarget) return { ok: false, error: "click requires a target" };
       break;
+    case "select_option":
+      if (!hasTarget || !params || typeof params.option !== "string" || !params.option.trim() || params.option.length > 300) {
+        return { ok: false, error: "select_option requires a target and short option" };
+      }
+      break;
+    case "set_date": {
+      const date = params?.date;
+      if (!hasTarget || typeof date !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(date) ||
+          Number.isNaN(Date.parse(`${date}T00:00:00Z`)) || new Date(`${date}T00:00:00Z`).toISOString().slice(0, 10) !== date) {
+        return { ok: false, error: "set_date requires a target and valid YYYY-MM-DD date" };
+      }
+      break;
+    }
+    case "upload_file": {
+      const filename = params?.fileName;
+      const data = params?.base64;
+      if (!hasTarget || typeof filename !== "string" || !/^[\w .()-]{1,120}\.(?:pdf|png|jpe?g|txt|csv|docx|xlsx)$/i.test(filename)
+          || typeof data !== "string" || data.length > 7_000_000 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(data)
+          || data.length === 0) {
+        return { ok: false, error: "upload_file requires approved file, allowed extension and at most 5 MiB" };
+      }
+      if (Math.floor(data.length * 3 / 4) - (data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0) > 5 * 1024 * 1024) {
+        return { ok: false, error: "file exceeds 5 MiB" };
+      }
+      break;
+    }
     case "type":
       if (!hasTarget) return { ok: false, error: "type requires a target" };
       if (!params || typeof params.text !== "string") {
