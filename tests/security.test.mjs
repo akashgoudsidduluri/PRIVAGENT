@@ -5,6 +5,7 @@ import {
   escapeHtml,
   linkify,
   linkLabel,
+  renderMarkdown,
   safeHttpUrl,
   safeImageSrc,
 } from "../src/sanitize.ts";
@@ -69,4 +70,38 @@ test("linkLabel shows a host, not a claim about the retailer", () => {
   assert.equal(linkLabel("https://www.amazon.in/dp/x"), "amazon.in");
   assert.equal(linkLabel("https://example.com/"), "example.com");
   assert.equal(linkLabel("nonsense"), "Open page");
+});
+
+test("renderMarkdown never emits raw HTML from model text", () => {
+  const out = renderMarkdown(
+    "## <img src=x onerror=alert(1)>\n\nText <script>alert(2)</script> here."
+  );
+  assert.ok(!out.includes("<img"), out);
+  assert.ok(!out.includes("<script"), out);
+  assert.ok(out.includes("&lt;img"));
+  assert.ok(out.includes("&lt;script&gt;"));
+});
+
+test("renderMarkdown renders headings, emphasis, lists and tables", () => {
+  const out = renderMarkdown(
+    "### Capabilities\n\n- **Bold** item\n- second\n\n| Store | Price |\n| --- | --- |\n| Amazon | 499 |"
+  );
+  assert.ok(out.includes("<h3>Capabilities</h3>"), out);
+  assert.ok(out.includes("<ul>") && out.includes("<li><strong>Bold</strong> item</li>"), out);
+  assert.ok(out.includes("<th>Store</th>") && out.includes("<td>Amazon</td>"), out);
+});
+
+test("renderMarkdown escapes fenced code and inline code", () => {
+  const out = renderMarkdown("```\n<b>code</b>\n```\n\nUse `x < y` inline.");
+  assert.ok(out.includes("<pre><code>&lt;b&gt;code&lt;/b&gt;</code></pre>"), out);
+  assert.ok(out.includes("<code>x &lt; y</code>"), out);
+});
+
+test("renderMarkdown keeps markdown links inert when the scheme is unsafe", () => {
+  const out = renderMarkdown("[click](javascript:alert(1))");
+  assert.ok(!out.includes("href=\"javascript"), out);
+  assert.ok(!out.includes("<a "), out);
+
+  const safe = renderMarkdown("[docs](https://example.com/a)");
+  assert.ok(safe.includes('href="https://example.com/a"'), safe);
 });

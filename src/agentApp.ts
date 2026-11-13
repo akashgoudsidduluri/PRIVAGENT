@@ -1,5 +1,5 @@
 import "./styles/agent.css";
-import { escapeHtml, linkify, linkLabel, safeHttpUrl, safeImageSrc } from "./sanitize";
+import { escapeHtml, linkify, linkLabel, renderMarkdown, safeHttpUrl, safeImageSrc } from "./sanitize";
 
 const API = "http://localhost:8000";
 
@@ -127,6 +127,10 @@ let cancelRequested = false;
 let isWorking = false;
 let lastProgressTime = 0;
 let pollInterval: number | null = null;
+// Instruction of the current (or last loaded) turn. Used to decide whether a
+// price badge is meaningful, so explanatory "$500" examples are not treated as
+// the mission's product price.
+let activeInstruction = "";
 
 interface ChatSummary {
   id: string;
@@ -136,19 +140,47 @@ interface ChatSummary {
   status: string;
 }
 
+interface ChatStepItem {
+  stepNum: number;
+  message: string;
+  action?: any;
+  status?: string;
+  result_ok?: boolean;
+}
+
 interface ChatMessage {
   id: string;
   chat_id: string;
   role: "user" | "agent" | "system";
   content: string;
   evidence?: string | null;
+  task_id?: string | null;
+  steps?: ChatStepItem[];
   created_at: string;
 }
 
+interface ActiveTaskInfo {
+  taskId: string;
+  taskState: string;
+  stepsDone: number;
+  message: string;
+  screenshot?: string | null;
+  intent?: string | null;
+  isBrowserTask?: boolean;
+  sessionId?: string | null;
+  primaryTabId?: number | null;
+  childTabIds?: number[];
+}
+
 interface ChatDetail {
-  chat: ChatSummary;
+  id?: string;
+  title?: string;
+  status?: string;
+  chat?: ChatSummary;
   messages: ChatMessage[];
   memory: Record<string, string>;
+  active_task?: ActiveTaskInfo | null;
+  total_steps?: number;
 }
 
 function setConnectionStatus(online: boolean, text: string): void {
@@ -241,16 +273,86 @@ function actionIcon(msg: string): string {
 
 function formatResultHtml(rawMessage: string): string {
   const urlMatch = rawMessage.match(/https?:\/\/[^\s"'<>)]+/);
-  // Show a single price badge only when the summary contains exactly one
-  // distinct price. In multi-product research summaries the first price is
-  // just one of several — surfacing it as "the price" would mislead.
+  // Show a single price badge only for a shopping directive. Explanatory
+  // answers often contain an example price ("price drops below $500"), and
+  // surfacing that as the mission's price is misleading.
+  const isCommerce = /\b(?:buy|purchase|price|cost|checkout|cart|order|deal|discount|shop|store|product|amazon|flipkart|croma|reliance|samsung|myntra|dress|laptop|phone|specs?)\b/i.test(activeInstruction);
   const allPrices = rawMessage.match(/(?:₹|Rs\.?|INR|\$)\s*\d[\d,]*(?:\.\d+)?/gi) ?? [];
   const normalized = new Set(allPrices.map(p => p.replace(/\s+/g, "")));
   const directUrl = urlMatch ? safeHttpUrl(urlMatch[0]) : null;
-  const price = normalized.size === 1 && allPrices.length > 0 ? (allPrices[0] ?? "").trim() : "";
+  const price = isCommerce && normalized.size === 1 && allPrices.length > 0 ? (allPrices[0] ?? "").trim() : "";
 
   let showcaseHtml = "";
-  if (directUrl || (price && /\d/.test(price))) {
+
+  // 1. Multi-Store Comparison Card Extraction
+  const hasMultipleStores = /amazon|flipkart|croma|reliance|samsung|myntra/i.test(rawMessage) && allPrices.length >= 2;
+  if (isCommerce && hasMultipleStores) {
+    const storeCards: string[] = [];
+    const csvRows: string[][] = [["Store", "Details", "Price", "Link"]];
+    const storePatterns = [
+      { name: "Amazon India", pattern: /amazon(?:\.in)?[:\s\-]+([^;|\n]+)/i, color: "amber" },
+      { name: "Flipkart", pattern: /flipkart(?:\.com)?[:\s\-]+([^;|\n]+)/i, color: "blue" },
+      { name: "Croma Retail", pattern: /croma(?:\.com)?[:\s\-]+([^;|\n]+)/i, color: "teal" },
+      { name: "Reliance Digital", pattern: /reliance(?:\s*digital)?[:\s\-]+([^;|\n]+)/i, color: "red" },
+      { name: "Samsung Official", pattern: /samsung(?:\.com)?[:\s\-]+([^;|\n]+)/i, color: "indigo" },
+    ];
+
+    let lowestPriceVal = Infinity;
+    let lowestStoreName = "";
+
+    for (const sp of storePatterns) {
+      const match = rawMessage.match(sp.pattern);
+      if (match) {
+        const snippet = match[1];
+        const pMatch = snippet.match(/(?:₹|Rs\.?|INR|\$)\s*(\d[\d,]*)/i);
+        const pStr = pMatch ? pMatch[0].replace(/\s+/g, " ") : "";
+        const pVal = pMatch ? parseInt(pMatch[1].replace(/,/g, ""), 10) : 0;
+        const uMatch = snippet.match(/https?:\/\/[^\s"'<>)]+/);
+        const uStr = uMatch ? safeHttpUrl(uMatch[0]) : "";
+
+        if (pVal > 0 && pVal < lowestPriceVal) {
+          lowestPriceVal = pVal;
+          lowestStoreName = sp.name;
+        }
+
+        csvRows.push([sp.name, snippet.replace(/https?:\/\/\S+/g, "").trim(), pStr, uStr || ""]);
+
+        storeCards.push(`
+          <div class="comparison-store-card comparison-store-card--${sp.color}">
+            <div class="comparison-store-name">${escapeHtml(sp.name)}</div>
+            <div class="comparison-store-price">${pStr ? escapeHtml(pStr) : "Price on site"}</div>
+            <div class="comparison-store-details">${escapeHtml(snippet.replace(/https?:\/\/\S+/g, "").trim().slice(0, 95))}</div>
+            ${uStr ? `<a href="${escapeHtml(uStr)}" target="_blank" rel="noopener noreferrer" class="comparison-store-btn">View on ${escapeHtml(sp.name.split(" ")[0])} ↗</a>` : ""}
+          </div>
+        `);
+      }
+    }
+
+    if (storeCards.length >= 2) {
+      const encodedCsv = encodeURIComponent(csvRows.map(r => r.map(c => `"${c.replace(/"/g, '""')}"`).join(",")).join("\n"));
+      showcaseHtml = `
+        <div class="comparison-showcase">
+          <div class="comparison-showcase__header">
+            <div>
+              <span class="deliverable-badge">📊 Cross-Platform Comparison</span>
+              <h4 class="comparison-showcase__title">Product Price &amp; Store Analysis</h4>
+            </div>
+            <button class="btn-download-excel" data-csv="${encodedCsv}">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              Export Excel (.csv)
+            </button>
+          </div>
+          <div class="comparison-grid">
+            ${storeCards.join("")}
+          </div>
+          ${lowestPriceVal < Infinity ? `<div class="comparison-best-deal">⭐ <strong>Best Deal:</strong> ${escapeHtml(lowestStoreName)} at ₹${lowestPriceVal.toLocaleString("en-IN")}</div>` : ""}
+        </div>
+      `;
+    }
+  }
+
+  // 2. Single Price Showcase Fallback
+  if (!showcaseHtml && (directUrl || (price && /\d/.test(price)))) {
     showcaseHtml = `
       <div class="product-showcase">
         <h4 class="product-showcase__title">Mission Summary</h4>
@@ -262,9 +364,23 @@ function formatResultHtml(rawMessage: string): string {
     `;
   }
 
+  // 3. Suggested Next Moves Launchpad
+  const nextMovesHtml = `
+    <div class="suggested-moves">
+      <span class="suggested-moves__label">Suggested Next Moves:</span>
+      <div class="suggested-moves__chips">
+        <button class="suggested-chip" data-prompt="Export this comparison into a formatted Excel spreadsheet">📊 Export to Excel</button>
+        <button class="suggested-chip" data-prompt="Email this comparison summary to b21650406@gmail.com">📧 Email this to me</button>
+        <button class="suggested-chip" data-prompt="Continuously monitor this product price and notify me if it drops">🔔 Monitor price for drops</button>
+        <button class="suggested-chip" data-prompt="What is on my calendar this week?">📅 Check Google Calendar</button>
+      </div>
+    </div>
+  `;
+
   return `
     ${showcaseHtml}
-    <div class="result-raw-text">${linkify(rawMessage)}</div>
+    <div class="result-raw-text md-body">${renderMarkdown(rawMessage)}</div>
+    ${nextMovesHtml}
   `;
 }
 
@@ -284,7 +400,8 @@ function addUserMessageItem(message: string): void {
 }
 
 function updateStepsCount(count: number): void {
-  stepCounter = Math.max(0, count);
+  const timelineSteps = stepsList ? stepsList.querySelectorAll("li.agent-step-item:not(.agent-step-item--user):not(.agent-step-item--result):not(.agent-step-item--failed)").length : 0;
+  stepCounter = Math.max(0, count, timelineSteps);
   if (stepsCount) stepsCount.textContent = `${stepCounter} step${stepCounter === 1 ? "" : "s"} executed`;
   renderStepBudget();
 }
@@ -310,6 +427,13 @@ function addStepItem(message: string, stepNum?: number): void {
   const eventKey = `${stepNum ?? "status"}:${displayMessage}`;
   if (Array.from(stepsList.children).some(node => (node as HTMLElement).dataset.eventKey === eventKey)) return;
 
+  // "Thinking..." is a live status, not a completed step. It is removed when
+  // the turn reaches a terminal state so it never looks stuck in the timeline.
+  const isTransient = /^thinking\.{0,3}$/i.test(displayMessage);
+  if (isTransient) {
+    stepsList.querySelectorAll('li[data-transient="true"]').forEach(el => el.remove());
+  }
+
   // Deduplicate against the immediate previous step
   const existingSteps = stepsList.querySelectorAll("li.agent-step-item");
   if (existingSteps.length > 0) {
@@ -323,6 +447,7 @@ function addStepItem(message: string, stepNum?: number): void {
   const li = document.createElement("li");
   li.className = "agent-step-item";
   li.dataset.eventKey = eventKey;
+  if (isTransient) li.dataset.transient = "true";
   li.innerHTML = `
     <span class="agent-step-item__icon">${actionIcon(displayMessage)}</span>
     <span class="agent-step-item__text">${linkify(displayMessage)}</span>
@@ -389,28 +514,16 @@ function addCompletionStepItem(taskState: string, message: string): void {
   if (!stepsList) return;
   const isOk = taskState === "completed";
 
-  // If a result card is already in the steps list, update it in place rather than creating duplicate
-  const existingResult = stepsList.querySelector(".agent-step-item--result, .agent-step-item--failed");
-  if (existingResult) {
-    existingResult.className = isOk ? "agent-step-item agent-step-item--result" : "agent-step-item agent-step-item--failed";
-    existingResult.innerHTML = `
-      <span class="agent-step-item__icon">${isOk ? "✓" : "✗"}</span>
-      <span class="agent-step-item__text">
-        <strong>${isOk ? "Mission Result" : "Task Incomplete"}</strong>:
-        ${linkify(message || (isOk ? "Mission completed." : "Task stopped."))}
-      </span>
-    `;
-    return;
-  }
-
+  // Each turn owns its own result item. Overwriting a previous turn's result
+  // made a follow-up failure erase the answer the user was still reading.
   const li = document.createElement("li");
   li.className = isOk ? "agent-step-item agent-step-item--result" : "agent-step-item agent-step-item--failed";
   li.innerHTML = `
     <span class="agent-step-item__icon">${isOk ? "✓" : "✗"}</span>
-    <span class="agent-step-item__text">
-      <strong>${isOk ? "Mission Result" : "Task Incomplete"}</strong>:
-      ${linkify(message || (isOk ? "Mission completed." : "Task stopped."))}
-    </span>
+    <div class="agent-step-item__text">
+      <div class="agent-step-item__label"><strong>${isOk ? "Mission Result" : "Task Incomplete"}</strong>:</div>
+      <div class="md-body">${renderMarkdown(message || (isOk ? "Mission completed." : "Task stopped."))}</div>
+    </div>
   `;
   stepsList.appendChild(li);
   li.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -430,6 +543,7 @@ async function syncActiveTask(taskId: string): Promise<boolean> {
     const t = (await res.json()) as {
       taskState: string;
       message: string;
+      stepsDone?: number;
       screenshot?: string | null;
       intent?: string;
       isBrowserTask?: boolean;
@@ -458,7 +572,7 @@ async function syncActiveTask(taskId: string): Promise<boolean> {
       updateVisualFrame(t.screenshot, t.message || "", t.taskState);
     }
     if (["completed", "failed", "cancelled"].includes(t.taskState)) {
-      renderCompletion(t.taskState, t.message || "");
+      renderCompletion(t.taskState, t.message || "", true, t.stepsDone);
       loadChatList();
       return true;
     }
@@ -492,20 +606,25 @@ function stopFallbackPolling(): void {
   }
 }
 
-function renderCompletion(taskState: string, message: string, appendToTimeline = true): void {
+function renderCompletion(taskState: string, message: string, appendToTimeline = true, stepsDone?: number): void {
   stopFallbackPolling();
   clearStalledNotice();
   setTaskState(taskState);
   setButtonWorking(false);
   if (btnCancelMission) btnCancelMission.hidden = true;
   if (humanGate) humanGate.hidden = true;
+  if (typeof stepsDone === "number" && stepsDone > 0) {
+    updateStepsCount(stepsDone);
+  }
+  // A live "Thinking..." row must not survive the turn that produced it.
+  stepsList?.querySelectorAll('li[data-transient="true"]').forEach(el => el.remove());
 
   if (currentTaskId && renderedTerminalTaskId === currentTaskId) {
     if (resultContent && !resultCard?.hidden) {
       if (taskState === "completed") {
         resultContent.innerHTML = formatResultHtml(message || "The autonomous task completed successfully.");
       } else {
-        resultContent.innerHTML = `<div class="result-raw-text">${linkify(message || "Task stopped before completing all steps.")}</div>`;
+        resultContent.innerHTML = `<div class="result-raw-text md-body">${renderMarkdown(message || "Task stopped before completing all steps.")}</div>`;
       }
     }
     return;
@@ -529,7 +648,7 @@ function renderCompletion(taskState: string, message: string, appendToTimeline =
     } else {
       resultCard.classList.add("is-failed");
       resultBadge.textContent = "✗ Task Blocked / Incomplete";
-      resultContent.innerHTML = `<div class="result-raw-text">${linkify(message || "Task stopped before completing all steps.")}</div>`;
+      resultContent.innerHTML = `<div class="result-raw-text md-body">${renderMarkdown(message || "Task stopped before completing all steps.")}</div>`;
     }
     resultCard.scrollIntoView({ behavior: "smooth", block: "nearest" });
     loadArtifacts(currentTaskId, activeChatId);
@@ -596,6 +715,15 @@ async function loadChatList(): Promise<void> {
 
       chatHistoryList.appendChild(li);
     });
+
+    if (!activeChatId) {
+      const savedChatId = localStorage.getItem("privagent_active_chat_id");
+      if (savedChatId && chats.some(c => c.id === savedChatId)) {
+        void selectChat(savedChatId);
+      } else if (chats.length > 0) {
+        void selectChat(chats[0].id);
+      }
+    }
   } catch {
     // Backend may still be spinning up
   }
@@ -603,6 +731,11 @@ async function loadChatList(): Promise<void> {
 
 async function selectChat(chatId: string): Promise<void> {
   activeChatId = chatId;
+  try {
+    localStorage.setItem("privagent_active_chat_id", chatId);
+  } catch {
+    // Storage might be restricted
+  }
   currentTaskId = null;
   stepCounter = 0;
   hideHumanGate();
@@ -654,10 +787,16 @@ async function selectChat(chatId: string): Promise<void> {
     }
 
     let lastAgentMsg: string | null = null;
+    let lastUserMsg = "";
     let finalTaskState = chatStatus === "failed" || chatStatus === "cancelled" ? chatStatus : "completed";
+    let calculatedSteps = 0;
+
+    const lastMsg = detail.messages[detail.messages.length - 1];
+    const isPendingUserTurn = lastMsg && lastMsg.role === "user";
 
     detail.messages.forEach(msg => {
       if (msg.role === "user") {
+        lastUserMsg = msg.content;
         addUserMessageItem(msg.content);
       } else if (msg.role === "agent") {
         lastAgentMsg = msg.content;
@@ -674,6 +813,19 @@ async function selectChat(chatId: string): Promise<void> {
           msgState = "failed";
           finalTaskState = "failed";
         }
+
+        // Rehydrate intermediate execution steps for this turn if present
+        if (Array.isArray(msg.steps) && msg.steps.length > 0) {
+          msg.steps.forEach(st => {
+            if (st && st.message) {
+              addStepItem(st.message, st.stepNum);
+              if (typeof st.stepNum === "number") {
+                calculatedSteps = Math.max(calculatedSteps, st.stepNum);
+              }
+            }
+          });
+        }
+
         addCompletionStepItem(msgState, msg.content);
         if (msg.evidence) {
           const urlMatch = msg.evidence.match(/https?:\/\/[^\s"'<>)]+/);
@@ -687,9 +839,44 @@ async function selectChat(chatId: string): Promise<void> {
       }
     });
 
-    if (lastAgentMsg) {
+    const totalSteps = typeof detail.total_steps === "number" && detail.total_steps > 0
+      ? detail.total_steps
+      : calculatedSteps;
+    if (totalSteps > 0) {
+      updateStepsCount(totalSteps);
+    }
+
+    // Check if there is an active in-flight task for this chat to reconnect to
+    if (detail.active_task && ["planning", "running", "awaiting_confirmation"].includes(detail.active_task.taskState)) {
+      const act = detail.active_task;
+      currentTaskId = act.taskId;
+      setButtonWorking(true);
+      if (btnCancelMission) btnCancelMission.hidden = false;
+      setTaskState(act.taskState);
+      startFallbackPolling(currentTaskId);
+      if (act.screenshot) {
+        updateVisualFrame(act.screenshot, act.message || "", act.taskState);
+      }
+      if (typeof act.stepsDone === "number" && act.stepsDone > 0) {
+        updateStepsCount(act.stepsDone);
+      }
+      if (resultCard) resultCard.hidden = true;
+      if (act.taskState === "awaiting_confirmation") {
+        fetch(`${API}/api/task/${act.taskId}`)
+          .then(r => r.json())
+          .then(t => {
+            const m = t.pending_confirmation?.message ?? "Authentication / Sign-in required";
+            showHumanGate(m);
+          })
+          .catch(() => showHumanGate("Authentication / Sign-in required"));
+      }
+    } else if (!isPendingUserTurn && lastAgentMsg) {
+      activeInstruction = lastUserMsg;
       renderCompletion(finalTaskState, lastAgentMsg, false);
       setTaskState(finalTaskState);
+    } else if (isPendingUserTurn) {
+      setTaskState("ready");
+      if (resultCard) resultCard.hidden = true;
     }
   } catch (err) {
     addStepItem(`⚠️ Failed to load chat history: ${err}`);
@@ -697,6 +884,13 @@ async function selectChat(chatId: string): Promise<void> {
 }
 
 async function deleteChat(chatId: string): Promise<void> {
+  try {
+    if (localStorage.getItem("privagent_active_chat_id") === chatId) {
+      localStorage.removeItem("privagent_active_chat_id");
+    }
+  } catch {
+    // Storage restricted
+  }
   try {
     await fetch(`${API}/api/chat/${chatId}`, { method: "DELETE" });
   } catch {
@@ -710,6 +904,11 @@ async function deleteChat(chatId: string): Promise<void> {
 }
 
 function createNewChat(): void {
+  try {
+    localStorage.removeItem("privagent_active_chat_id");
+  } catch {
+    // Storage restricted
+  }
   stopFallbackPolling();
   clearStalledNotice();
   activeChatId = null;
@@ -717,6 +916,7 @@ function createNewChat(): void {
   renderedTerminalTaskId = null;
   cancelRequested = false;
   stepCounter = 0;
+  activeInstruction = "";
   hideHumanGate();
 
   if (missionInput) {
@@ -790,7 +990,7 @@ missionInput?.addEventListener("keydown", (e: KeyboardEvent) => {
   }
 });
 
-// Preset Chips
+// Preset Chips & Suggested Action Pills
 document.querySelectorAll(".preset-chip").forEach(chip => {
   chip.addEventListener("click", () => {
     const prompt = chip.getAttribute("data-prompt");
@@ -802,9 +1002,41 @@ document.querySelectorAll(".preset-chip").forEach(chip => {
   });
 });
 
+// Delegated click handler for Deliverable Export & Suggested Next Moves
+document.addEventListener("click", event => {
+  const target = event.target as Element;
+  const excelBtn = target.closest<HTMLButtonElement>(".btn-download-excel");
+  if (excelBtn && excelBtn.dataset.csv) {
+    try {
+      const csvData = decodeURIComponent(excelBtn.dataset.csv);
+      const blob = new Blob([csvData], { type: "text/csv;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.setAttribute("href", url);
+      link.setAttribute("download", `PrivAgent_Price_Comparison_${new Date().toISOString().slice(0, 10)}.csv`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    } catch {
+      /* ignore download errors */
+    }
+    return;
+  }
+
+  const chipBtn = target.closest<HTMLButtonElement>(".suggested-chip");
+  if (chipBtn && chipBtn.dataset.prompt && missionInput) {
+    missionInput.value = chipBtn.dataset.prompt;
+    if (btnStartMission && !isWorking) btnStartMission.disabled = false;
+    missionInput.focus();
+    missionInput.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+});
+
 btnStartMission?.addEventListener("click", async () => {
   if (isWorking || !missionInput || !btnStartMission || !missionInput.value.trim()) return;
   const instruction = missionInput.value.trim();
+  activeInstruction = instruction;
 
   setButtonWorking(true);
   if (btnCancelMission) btnCancelMission.hidden = false;
@@ -882,7 +1114,7 @@ btnStartMission?.addEventListener("click", async () => {
       startFallbackPolling(currentTaskId);
       const stRes = await fetch(`${API}/api/task/${currentTaskId}`).catch(() => null);
       if (stRes && stRes.ok) {
-        const t = (await stRes.json()) as { taskState: string; message: string; screenshot?: string | null };
+        const t = (await stRes.json()) as { taskState: string; message: string; stepsDone?: number; screenshot?: string | null };
         if (t.taskState && t.taskState !== "planning") {
           setTaskState(t.taskState);
         }
@@ -891,7 +1123,7 @@ btnStartMission?.addEventListener("click", async () => {
         }
         if (["completed", "failed", "cancelled"].includes(t.taskState)) {
           stopFallbackPolling();
-          renderCompletion(t.taskState, t.message || "");
+          renderCompletion(t.taskState, t.message || "", true, t.stepsDone);
           loadChatList();
         }
       }
@@ -981,7 +1213,16 @@ function connectWebSocket(): void {
         };
       };
       if (env.type !== "PROGRESS") return;
-      if (!currentTaskId || env.taskId !== currentTaskId) return;
+      if (!currentTaskId || env.taskId !== currentTaskId) {
+        if (activeChatId && env.payload.chatId === activeChatId) {
+          currentTaskId = env.taskId;
+          setButtonWorking(true);
+          if (btnCancelMission) btnCancelMission.hidden = false;
+          startFallbackPolling(currentTaskId);
+        } else {
+          return;
+        }
+      }
       const p = env.payload;
 
       lastProgressTime = Date.now();
@@ -999,7 +1240,7 @@ function connectWebSocket(): void {
 
       if (["completed", "failed", "cancelled"].includes(p.taskState)) {
         stopFallbackPolling();
-        renderCompletion(p.taskState, p.message);
+        renderCompletion(p.taskState, p.message, true, p.stepsDone);
         loadChatList();
         return;
       }
@@ -1045,7 +1286,19 @@ initLlmSettings();
 // back: the config response carries keyConfigured (boolean) only.
 // ---------------------------------------------------------------------------
 
-const DEFAULT_SEEDED_MODELS = ["glm-5.3-flash", "deepseek-v4-flash"];
+const FREE_GATEWAY_MODELS: Record<string, string> = {
+  "deepseek-v4.1-flash": "DeepSeek V4.1 Flash — Primary Reasoning & Coding (Default)",
+  "glm-5.3-flash": "GLM 5.3 Flash — Coding & Agent Tasks",
+  "qwen-3.8-flash": "Qwen 3.8 Flash — General & Information Extraction",
+  "mimo-2.6-pro": "MiMo 2.6 Pro — Complex Reasoning & Analysis",
+  "minimax-m3.1-flash": "MiniMax M3.1 Flash — Alternative Coding & Reasoning",
+};
+
+const DEFAULT_SEEDED_MODELS = Object.keys(FREE_GATEWAY_MODELS);
+
+function formatModelLabel(id: string): string {
+  return FREE_GATEWAY_MODELS[id] || id;
+}
 
 function $(id: string): HTMLElement | null {
   return document.getElementById(id);
@@ -1070,9 +1323,13 @@ async function initLlmSettings(): Promise<void> {
 
   const providerSelect = $("llmProviderSelect") as HTMLSelectElement | null;
   providerSelect?.addEventListener("change", () => {
-    const show = providerSelect.value === "antseed";
+    const isGateway = providerSelect.value === "antseed" || providerSelect.value === "deepai";
     const fields = $("antseedFields");
-    if (fields) fields.hidden = !show;
+    if (fields) fields.hidden = !isGateway;
+    const base = $("llmBaseUrl") as HTMLInputElement | null;
+    if (base && providerSelect.value === "deepai" && (!base.value || base.value.includes(":8377"))) {
+      base.value = "http://127.0.0.1:8787/v1";
+    }
   });
   wireModelModeToggle();
   $("btnLlmDiscover")?.addEventListener("click", () => { void discoverLlmModels(); });
@@ -1090,7 +1347,7 @@ async function refreshLlmSettings(): Promise<void> {
     if (providerSelect) {
       providerSelect.value = cfg.provider;
       const fields = $("antseedFields");
-      if (fields) fields.hidden = cfg.provider !== "antseed";
+      if (fields) fields.hidden = cfg.provider !== "antseed" && cfg.provider !== "deepai";
     }
     const base = $("llmBaseUrl") as HTMLInputElement | null;
     if (base) base.value = cfg.baseUrl;
@@ -1102,7 +1359,7 @@ async function refreshLlmSettings(): Promise<void> {
     const modelSel = $("llmModelSelect") as HTMLSelectElement | null;
     if (modelSel) {
       if (!modelSel.options.length) {
-        DEFAULT_SEEDED_MODELS.forEach(m => modelSel.add(new Option(m, m)));
+        DEFAULT_SEEDED_MODELS.forEach(m => modelSel.add(new Option(formatModelLabel(m), m)));
       }
       if (cfg.model) {
         let found = false;
@@ -1110,7 +1367,7 @@ async function refreshLlmSettings(): Promise<void> {
           if (opt.value === cfg.model) { modelSel.value = cfg.model; found = true; break; }
         }
         if (!found) {
-          modelSel.add(new Option(cfg.model, cfg.model));
+          modelSel.add(new Option(formatModelLabel(cfg.model), cfg.model));
           modelSel.value = cfg.model;
         }
         const custom = $("llmModelCustom") as HTMLInputElement | null;
@@ -1160,7 +1417,7 @@ async function discoverLlmModels(): Promise<void> {
     if (data.discovered && modelSel) {
       const keep = modelSel.value;
       modelSel.options.length = 0;
-      models.forEach(m => modelSel.add(new Option(m, m)));
+      models.forEach(m => modelSel.add(new Option(formatModelLabel(m), m)));
       if (keep && models.includes(keep)) modelSel.value = keep;
       if (status) status.textContent = `Discovered ${models.length} model${models.length === 1 ? "" : "s"}.`;
     } else if (status) {
@@ -1182,8 +1439,9 @@ async function saveLlmSettings(opts: { silentStatus?: boolean } = {}): Promise<b
   if (!provider) return false;
 
   const body: Record<string, unknown> = { provider };
-  if (provider === "antseed") {
-    const baseUrl = baseEl?.value.trim() || "http://localhost:8377/v1";
+  if (provider === "antseed" || provider === "deepai") {
+    const defaultUrl = provider === "deepai" ? "http://127.0.0.1:8787/v1" : "http://localhost:8377/v1";
+    const baseUrl = baseEl?.value.trim() || defaultUrl;
     body.baseUrl = baseUrl;
     const modelId = (custom && !custom.hidden && custom.value.trim())
       ? custom.value.trim()

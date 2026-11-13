@@ -29,9 +29,14 @@ def _resolve() -> tuple[str, str, str, str]:
     """(provider, base_url, api_key, model) after runtime/env resolution."""
     with _lock:
         provider = _state["provider"] or config.PROVIDER
-        base_url = _state["base_url"] or config.ANTSEED_BASE_URL
-        api_key = _state["api_key"] if _state["api_key"] is not None else config.ANTSEED_API_KEY_ENV
-        model = _state["model"] or config.ANTSEED_MODEL
+        if provider == "deepai":
+            base_url = _state["base_url"] or getattr(config, "DEEPAI_GATEWAY_BASE_URL", "http://127.0.0.1:8787/v1")
+            api_key = _state["api_key"] if _state["api_key"] is not None else getattr(config, "DEEPAI_GATEWAY_KEY", "")
+            model = _state["model"] or getattr(config, "DEEPAI_GATEWAY_MODEL", "deepseek-v4.1-flash")
+        else:
+            base_url = _state["base_url"] or config.ANTSEED_BASE_URL
+            api_key = _state["api_key"] if _state["api_key"] is not None else config.ANTSEED_API_KEY_ENV
+            model = _state["model"] or config.ANTSEED_MODEL
     return provider, base_url, api_key, model
 
 
@@ -51,7 +56,7 @@ def configure(
                 _state[k] = None
         if provider is not None:
             p = provider.strip().lower()
-            if p not in ("mock", "groq", "gemini", "antseed"):
+            if p not in ("mock", "groq", "gemini", "antseed", "deepai"):
                 raise ValueError("Unknown provider name.")
             _state["provider"] = p
         if base_url is not None:
@@ -71,11 +76,7 @@ def active() -> bool:
 
 
 def public_state() -> dict[str, Any]:
-    with _lock:
-        provider = _state["provider"] or config.PROVIDER
-        base_url = _state["base_url"] or config.ANTSEED_BASE_URL
-        api_key = _state["api_key"] if _state["api_key"] is not None else config.ANTSEED_API_KEY_ENV
-        model = _state["model"] or config.ANTSEED_MODEL
+    provider, base_url, api_key, model = _resolve()
     return {
         "provider": provider,
         "baseUrl": base_url,
@@ -107,7 +108,19 @@ def provider_for_runtime():
                 "Antseed is selected but no API key is configured. Enter one in the provider settings panel."
             )
         from .openai_compatible import OpenAICompatibleProvider
-        return OpenAICompatibleProvider(api_key=api_key, base_url=base_url, model=model or None)
+        return OpenAICompatibleProvider(api_key=api_key, base_url=base_url, model=model or None, provider_name="antseed")
+    if provider == "deepai":
+        if not api_key:
+            raise ProviderUnavailable(
+                "DeepAI Gateway is selected but DEEPAI_GATEWAY_KEY is not configured. Enter one in the provider settings panel or set DEEPAI_GATEWAY_KEY in .env."
+            )
+        from .openai_compatible import OpenAICompatibleProvider
+        return OpenAICompatibleProvider(
+            api_key=api_key,
+            base_url=base_url,
+            model=model or "deepseek-v4.1-flash",
+            provider_name="deepai",
+        )
     raise ProviderUnavailable(f"Unknown provider '{provider}'.")
 
 

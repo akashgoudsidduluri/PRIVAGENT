@@ -34,6 +34,7 @@ from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.pdfgen import canvas
 from reportlab.platypus import (
+    HRFlowable,
     Image,
     PageBreak,
     Paragraph,
@@ -42,6 +43,7 @@ from reportlab.platypus import (
     Table,
     TableStyle,
 )
+from PIL import Image as PILImage
 
 from ..document_plan import BlockType, ContentBlock, DocumentSection, build_structured_document_plan
 from ..models import (
@@ -54,6 +56,7 @@ from .base import BaseRenderer
 
 class NumberedCanvas(canvas.Canvas):
     """Two-pass canvas to compute total pages and stamp running headers and footers."""
+    doc_title: str = "PrivAgent Autonomous Research Report"
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -78,8 +81,9 @@ class NumberedCanvas(canvas.Canvas):
 
         # Running Header (pages > 1)
         if self._pageNumber > 1:
-            self.drawString(54, 11 * 72 - 36, "PrivAgent Autonomous Research Report")
-            self.drawRightString(8.5 * 72 - 54, 11 * 72 - 36, "Verified Deliverable")
+            hdr_text = self.doc_title[:65] + ("..." if len(self.doc_title) > 65 else "")
+            self.drawString(54, 11 * 72 - 36, hdr_text)
+            self.drawRightString(8.5 * 72 - 54, 11 * 72 - 36, "VERIFIED DELIVERABLE")
             self.setStrokeColor(colors.HexColor("#CBD5E1"))
             self.setLineWidth(0.5)
             self.line(54, 11 * 72 - 40, 8.5 * 72 - 54, 11 * 72 - 40)
@@ -111,6 +115,9 @@ class PdfRenderer(BaseRenderer):
             **kwargs,
         )
 
+        # Set canvas running header document title
+        NumberedCanvas.doc_title = doc_plan.metadata.title or "PrivAgent Autonomous Research Report"
+
         doc = SimpleDocTemplate(
             str(out_file),
             pagesize=letter,
@@ -122,34 +129,43 @@ class PdfRenderer(BaseRenderer):
 
         styles = getSampleStyleSheet()
 
-        # Custom Typography Styles
+        # Custom Publication-Grade Typography Styles
+        badge_style = ParagraphStyle(
+            "DocBadge",
+            parent=styles["Normal"],
+            fontName="Helvetica-Bold",
+            fontSize=8,
+            leading=10,
+            textColor=colors.HexColor("#2563EB"),
+            spaceAfter=4,
+        )
         title_style = ParagraphStyle(
             "DocTitle",
             parent=styles["Normal"],
             fontName="Helvetica-Bold",
-            fontSize=20,
-            leading=24,
-            textColor=colors.HexColor("#1E3A8A"),
+            fontSize=21,
+            leading=25,
+            textColor=colors.HexColor("#0F172A"),
             spaceAfter=4,
         )
         subtitle_style = ParagraphStyle(
             "DocSubTitle",
             parent=styles["Normal"],
-            fontName="Helvetica-Oblique",
-            fontSize=11,
+            fontName="Helvetica",
+            fontSize=10.5,
             leading=14,
             textColor=colors.HexColor("#475569"),
-            spaceAfter=10,
+            spaceAfter=12,
         )
         h1_style = ParagraphStyle(
             "Heading1_Custom",
             parent=styles["Heading1"],
             fontName="Helvetica-Bold",
-            fontSize=13,
+            fontSize=13.5,
             leading=17,
             textColor=colors.HexColor("#1E3A8A"),
-            spaceBefore=10,
-            spaceAfter=6,
+            spaceBefore=14,
+            spaceAfter=3,
             keepWithNext=True,
         )
         h2_style = ParagraphStyle(
@@ -157,9 +173,9 @@ class PdfRenderer(BaseRenderer):
             parent=styles["Heading2"],
             fontName="Helvetica-Bold",
             fontSize=11,
-            leading=14,
-            textColor=colors.HexColor("#334155"),
-            spaceBefore=8,
+            leading=14.5,
+            textColor=colors.HexColor("#1E293B"),
+            spaceBefore=10,
             spaceAfter=4,
             keepWithNext=True,
         )
@@ -168,7 +184,7 @@ class PdfRenderer(BaseRenderer):
             parent=styles["Normal"],
             fontName="Helvetica",
             fontSize=9.5,
-            leading=13.5,
+            leading=14,
             textColor=colors.HexColor("#1E293B"),
             spaceAfter=6,
         )
@@ -191,46 +207,71 @@ class PdfRenderer(BaseRenderer):
             leading=11,
             textColor=colors.HexColor("#64748B"),
             alignment=1,  # Center
+            spaceBefore=4,
             spaceAfter=8,
         )
 
         story: list[Any] = []
 
-        # 2. Document Title & Subtitle (Slide 1 if presentation)
-        if doc_plan.is_slides:
-            story.append(Paragraph(f"Slide 1: {doc_plan.metadata.title}", title_style))
-            story.append(Paragraph(doc_plan.metadata.subtitle, subtitle_style))
-        else:
-            story.append(Paragraph(doc_plan.metadata.title, title_style))
-            story.append(Paragraph(doc_plan.metadata.subtitle, subtitle_style))
+        # 2. Document Classification Badge & Title Block
+        story.append(Paragraph(
+            "<font color='#2563EB'><b>AUTONOMOUS TECHNICAL DOSSIER</b></font> &nbsp;|&nbsp; "
+            "<font color='#64748B'>CROSS-VERIFIED EVIDENCE & PROVENANCE</font>",
+            badge_style,
+        ))
 
-        # 3. Metadata Box
+        if doc_plan.is_slides:
+            disp_title = f"Slide 1: {doc_plan.metadata.title}"
+        else:
+            disp_title = doc_plan.metadata.title
+
+        title_block = Table(
+            [[
+                Paragraph(disp_title, title_style),
+            ]],
+            colWidths=[504],
+        )
+        title_block.setStyle(
+            TableStyle([
+                ("LINELEFT", (0, 0), (0, -1), 4.0, colors.HexColor("#1E3A8A")),
+                ("LEFTPADDING", (0, 0), (-1, -1), 10),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+            ])
+        )
+        story.append(title_block)
+        story.append(Spacer(1, 4))
+        story.append(Paragraph(doc_plan.metadata.subtitle, subtitle_style))
+
+        # 3. Modern Metadata Card (2x2 Grid)
         meta_data = [
             [
-                Paragraph(f"<b>Objective:</b> {doc_plan.metadata.objective}", body_style),
-                Paragraph(f"<b>Date:</b> {doc_plan.metadata.date_str}", body_style),
+                Paragraph(f"<b>Research Scope:</b> {doc_plan.metadata.objective}", body_style),
+                Paragraph(f"<b>Generation Date:</b> {doc_plan.metadata.date_str}", body_style),
             ],
             [
                 Paragraph(
-                    f"<b>Sources:</b> {doc_plan.metadata.sources_count} authoritative websites"
+                    f"<b>Authoritative Sources:</b> {doc_plan.metadata.sources_count} visited websites"
                     if doc_plan.metadata.sources_count > 0
-                    else "<b>Sources:</b> 0 (conversational synthesis)",
+                    else "<b>Authoritative Sources:</b> Direct technical synthesis",
                     body_style,
                 ),
-                Paragraph(f"<b>Verified Claims:</b> {doc_plan.metadata.claims_count} findings", body_style),
+                Paragraph(f"<b>Verified Empirical Findings:</b> {doc_plan.metadata.claims_count} validated claims", body_style),
             ],
         ]
         meta_table = Table(meta_data, colWidths=[330, 174])
         meta_table.setStyle(
             TableStyle([
-                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F1F5F9")),
-                ("PADDING", (0, 0), (-1, -1), 6),
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F8FAFC")),
+                ("PADDING", (0, 0), (-1, -1), 7),
                 ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E1")),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LINEBELOW", (0, 0), (-1, 0), 0.5, colors.HexColor("#E2E8F0")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
             ])
         )
         story.append(meta_table)
-        story.append(Spacer(1, 14))
+        story.append(Spacer(1, 10))
 
         # 4. Render Sections and Generic Content Blocks from Document Plan
         for sec_idx, sec in enumerate(doc_plan.sections):
@@ -242,6 +283,8 @@ class PdfRenderer(BaseRenderer):
                 story.append(Paragraph(f"Slide {sec_idx + 1}: {sec.title}", sec_title_style))
             else:
                 story.append(Paragraph(sec.title, sec_title_style))
+                if sec.level == 1:
+                    story.append(HRFlowable(width="100%", thickness=1.0, color=colors.HexColor("#1E3A8A"), spaceBefore=2, spaceAfter=8))
 
             for block in sec.blocks:
                 if block.block_type == BlockType.TEXT and block.text:
@@ -258,8 +301,18 @@ class PdfRenderer(BaseRenderer):
 
                 elif block.block_type == BlockType.CALLOUT:
                     callout_items = []
+                    bg_col = colors.HexColor("#F8FAFC")
+                    bar_col = colors.HexColor("#2563EB")
+
                     if block.callout_type == "contradiction":
+                        bg_col = colors.HexColor("#FFFBEB")
+                        bar_col = colors.HexColor("#F59E0B")
                         callout_items.append(Paragraph("<b><font color='#D97706'>⚠️ Contradictory Evidence Identified Across Literature</font></b>", body_style))
+                    elif block.callout_type in ("takeaway", "synthesis"):
+                        bg_col = colors.HexColor("#F0FDF4")
+                        bar_col = colors.HexColor("#059669")
+                        callout_items.append(Paragraph("<b><font color='#059669'>📌 Strategic Takeaway & Architectural Synthesis</font></b>", body_style))
+
                     if block.text:
                         callout_items.append(Paragraph(block.text, body_style))
                     for itm in block.items:
@@ -268,9 +321,11 @@ class PdfRenderer(BaseRenderer):
                     callout_tbl = Table([[callout_items]], colWidths=[504])
                     callout_tbl.setStyle(
                         TableStyle([
-                            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#FFFBEB")),
-                            ("BOX", (0, 0), (-1, -1), 1.0, colors.HexColor("#F59E0B")),
-                            ("PADDING", (0, 0), (-1, -1), 6),
+                            ("BACKGROUND", (0, 0), (-1, -1), bg_col),
+                            ("LINELEFT", (0, 0), (0, -1), 3.5, bar_col),
+                            ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E1")),
+                            ("PADDING", (0, 0), (-1, -1), 7),
+                            ("LEFTPADDING", (0, 0), (-1, -1), 12),
                         ])
                     )
                     story.append(callout_tbl)
@@ -280,10 +335,23 @@ class PdfRenderer(BaseRenderer):
                     v = block.visual_asset
                     local_img_path = ensure_local_image_asset(v, cache_dir=out_file.parent / "images")
                     if local_img_path and Path(local_img_path).exists():
-                        story.append(Paragraph(v.title, h2_style))
-                        img = Image(local_img_path, width=420, height=170)
-                        img.hAlign = "CENTER"
-                        story.append(img)
+                        story.append(Paragraph(f"<b>{v.title}</b>", h2_style))
+                        try:
+                            with PILImage.open(local_img_path) as pimg:
+                                orig_w, orig_h = pimg.size
+                            aspect = orig_h / max(orig_w, 1)
+                            target_w = min(480.0, float(orig_w))
+                            target_h = target_w * aspect
+                            if target_h > 210.0:
+                                target_h = 210.0
+                                target_w = target_h / aspect
+                            img = Image(local_img_path, width=target_w, height=target_h)
+                            img.hAlign = "CENTER"
+                            story.append(img)
+                        except Exception:
+                            img = Image(local_img_path, width=420, height=170)
+                            img.hAlign = "CENTER"
+                            story.append(img)
                         cap_text = f"Figure: {v.caption}" if v.caption else f"Figure: {v.title}"
                         if v.attribution:
                             cap_text += f" | {v.attribution}"
@@ -292,23 +360,37 @@ class PdfRenderer(BaseRenderer):
 
                 elif block.block_type == BlockType.FORMULA and block.formula_item:
                     f = block.formula_item
-                    story.append(Paragraph(f.name, h2_style))
+                    formula_card_items = []
+                    formula_card_items.append(Paragraph(f"<b>Mathematical Formulation: {f.name}</b>", h2_style))
                     if f.explanation:
-                        story.append(Paragraph(f.explanation, body_style))
+                        formula_card_items.append(Paragraph(f.explanation, body_style))
                     matching_vis = next((va for va in pkg.visuals if va.metadata.get("formula_id") == f.formula_id), None)
                     if matching_vis and matching_vis.url_or_path and Path(matching_vis.url_or_path).exists():
-                        img = Image(matching_vis.url_or_path, width=320, height=52)
-                        img.hAlign = "CENTER"
-                        story.append(img)
-                        story.append(Spacer(1, 4))
+                        f_img = Image(matching_vis.url_or_path, width=320, height=52)
+                        f_img.hAlign = "CENTER"
+                        formula_card_items.append(f_img)
                     else:
-                        story.append(Paragraph(f"<code>{f.latex}</code>", body_style))
+                        formula_card_items.append(Paragraph(f"<font face='Courier' color='#1E3A8A'><b>$$ {f.latex} $$</b></font>", body_style))
                     if f.worked_example:
-                        story.append(Paragraph(f"<b>Worked Example:</b> {f.worked_example}", body_style))
+                        formula_card_items.append(Spacer(1, 2))
+                        formula_card_items.append(Paragraph(f"<b>Worked Example & Parameterization:</b> {f.worked_example}", body_style))
+
+                    f_card = Table([[formula_card_items]], colWidths=[504])
+                    f_card.setStyle(
+                        TableStyle([
+                            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F8FAFC")),
+                            ("LINELEFT", (0, 0), (0, -1), 3.0, colors.HexColor("#4F46E5")),
+                            ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E1")),
+                            ("PADDING", (0, 0), (-1, -1), 7),
+                            ("LEFTPADDING", (0, 0), (-1, -1), 12),
+                        ])
+                    )
+                    story.append(f_card)
+                    story.append(Spacer(1, 8))
 
                 elif block.block_type == BlockType.TABLE and block.data_table:
                     t = block.data_table
-                    story.append(Paragraph(t.title, h2_style))
+                    story.append(Paragraph(f"<b>Table: {t.title}</b>", h2_style))
                     if t.caption:
                         story.append(Paragraph(t.caption, caption_style))
 
@@ -324,18 +406,20 @@ class PdfRenderer(BaseRenderer):
                     rep_table = Table(tbl_data, colWidths=[col_w] * len(t.headers))
                     rep_table.setStyle(
                         TableStyle([
-                            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1E3A8A")),
-                            ("PADDING", (0, 0), (-1, -1), 4),
+                            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1E293B")),
+                            ("PADDING", (0, 0), (-1, -1), 5),
+                            ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
+                            ("TOPPADDING", (0, 0), (-1, 0), 6),
                             ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E1")),
                             ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#FFFFFF"), colors.HexColor("#F8FAFC")]),
                             ("VALIGN", (0, 0), (-1, -1), "TOP"),
                         ])
                     )
                     story.append(rep_table)
-                    story.append(Spacer(1, 8))
+                    story.append(Spacer(1, 10))
 
                 elif block.block_type == BlockType.PROVENANCE_TABLE:
-                    story.append(Paragraph(block.title or "Source Provenance & Verification Ledger", h2_style))
+                    story.append(Paragraph(f"<b>{block.title or 'Source Provenance & Verification Ledger'}</b>", h2_style))
                     if ordered_sources:
                         ref_rows = [
                             [
@@ -356,14 +440,17 @@ class PdfRenderer(BaseRenderer):
                         ref_table = Table(ref_rows, colWidths=[24, 180, 210, 90])
                         ref_table.setStyle(
                             TableStyle([
-                                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1E3A8A")),
-                                ("PADDING", (0, 0), (-1, -1), 4),
+                                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1E293B")),
+                                ("PADDING", (0, 0), (-1, -1), 5),
+                                ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
+                                ("TOPPADDING", (0, 0), (-1, 0), 6),
                                 ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E1")),
                                 ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#FFFFFF"), colors.HexColor("#F8FAFC")]),
                                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
                             ])
                         )
                         story.append(ref_table)
+                        story.append(Spacer(1, 10))
                         story.append(Spacer(1, 10))
 
                 elif block.block_type == BlockType.BIBLIOGRAPHY:

@@ -71,6 +71,16 @@ def test_parse_page_constraint_approximate_and_max():
     assert c_max.max_pages == 4
 
 
+def test_parse_page_constraint_range():
+    """A page range must preserve both bounds instead of collapsing to the upper number."""
+    for text in ("Make a 3-5 page report on transformers", "Write three to five pages on transformers"):
+        constraint = parse_page_constraint(text)
+        assert constraint.constraint_type == PageConstraintType.APPROXIMATE
+        assert constraint.min_pages == 3
+        assert constraint.max_pages == 5
+        assert constraint.target_pages == 5
+
+
 def test_parse_page_constraint_slides_and_content_driven():
     """Verify slide deck parsing and content-driven fallback."""
     c_slides = parse_page_constraint("Create a 10-slide presentation on quantum computing", deliverable_type="presentation")

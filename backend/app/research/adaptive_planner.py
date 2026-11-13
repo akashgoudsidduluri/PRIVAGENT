@@ -144,6 +144,10 @@ RE_MAX_PAGE = re.compile(
     rf"\b(?:under|less\s+than|at\s+most|maximum|max\.?|up\s+to|no\s+more\s+than)\s*({PAGE_NUM_PATTERN})\s*(?:-\s*)?pages?\b",
     re.IGNORECASE,
 )
+RE_RANGE_PAGE = re.compile(
+    rf"\b({PAGE_NUM_PATTERN})\s*(?:-|–|—|to)\s*({PAGE_NUM_PATTERN})\s*(?:pages?|(?:-\s*)?page\s+(?:report|pdf|doc(?:ument)?|deliverable))\b",
+    re.IGNORECASE,
+)
 RE_EXACT_PAGE = re.compile(
     rf"\b({PAGE_NUM_PATTERN})\s*-\s*page(?:\s+report|\s+pdf|\s+doc(?:ument)?|\s+deliverable)?\b|\b({PAGE_NUM_PATTERN})\s+pages?\b",
     re.IGNORECASE,
@@ -220,6 +224,21 @@ def parse_page_constraint(
                 min_pages=1,
                 max_pages=n,
                 raw_expression=m_max.group(0),
+            )
+
+    # Page range (e.g. "3-5 page report", "three to five pages")
+    m_range = RE_RANGE_PAGE.search(text)
+    if m_range:
+        n1 = _parse_num(m_range.group(1))
+        n2 = _parse_num(m_range.group(2))
+        if n1 and n2 and 0 < n1 <= n2:
+            return PageConstraint(
+                constraint_type=PageConstraintType.APPROXIMATE,
+                target_pages=n2,
+                min_pages=n1,
+                max_pages=n2,
+                tolerance=n2 - n1,
+                raw_expression=m_range.group(0),
             )
 
     # Exact page count (e.g. "5-page report", "five pages")

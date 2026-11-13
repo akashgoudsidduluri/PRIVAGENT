@@ -1,5 +1,5 @@
 import { Relay } from "./relay";
-import { executeAction, isDrivableTabUrl } from "./actionExecutor";
+import { executeAction, extensionSessions, isDrivableTabUrl } from "./actionExecutor";
 import type { ActionResult } from "./contracts";
 import { authorizedCompanionTab, emptyCompanionState, nextCompanionState } from "./companion/companionState";
 import type { CompanionSnapshot } from "./companion/companionDrawer";
@@ -135,6 +135,10 @@ async function handleMessage(taskId: string, raw: unknown): Promise<void> {
       executeAction(action as Parameters<typeof executeAction>[0], taskId),
       actionMs + 5_000,
     );
+    if (action?.type === "init_session" && typeof (result as any)?.primaryTabId === "number") {
+      primaryTabId = (result as any).primaryTabId;
+      persistCompanion();
+    }
     relay.send({ type: "RESULT", taskId, payload: result });
     // Completion state is driven solely by backend PROGRESS, after verification.
   } catch (e) {
@@ -165,9 +169,18 @@ chrome.alarms?.onAlarm.addListener(alarm => {
 connect();
 connectProgress();
 
+function isAuthorizedCompanionTab(tabId: number | undefined): boolean {
+  if (typeof tabId !== "number") return false;
+  if (authorizedCompanionTab(tabId, primaryTabId, childTabIds)) return true;
+  for (const sess of extensionSessions.values()) {
+    if (sess.primaryTabId === tabId || sess.childTabIds.has(tabId)) return true;
+  }
+  return false;
+}
+
 async function reinjectCompanion(tabId: number): Promise<void> {
   await restored;
-  if (!authorizedCompanionTab(tabId, primaryTabId, childTabIds)) return;
+  if (!isAuthorizedCompanionTab(tabId)) return;
   try {
     const tab = await chrome.tabs.get(tabId);
     if (!isDrivableTabUrl(tab.url || "") || !/^https?:\/\//.test(tab.url || "")) return;
@@ -187,11 +200,11 @@ chrome.webNavigation.onCompleted.addListener(details => {
 chrome.runtime.onMessage.addListener((message, sender, reply) => {
   if (sender.id !== chrome.runtime.id || !sender.tab) return;
   if (message.type === "COMPANION_SYNC") {
-    void restored.then(() => reply(authorizedCompanionTab(sender.tab?.id, primaryTabId, childTabIds) ? companionState : null));
+    void restored.then(() => reply(isAuthorizedCompanionTab(sender.tab?.id) ? companionState : null));
     return true;
   }
   void restored.then(() => {
-    if (!authorizedCompanionTab(sender.tab?.id, primaryTabId, childTabIds)) return;
+    if (!isAuthorizedCompanionTab(sender.tab?.id)) return;
   if (message.type === "COMPANION_OPEN_DASHBOARD") {
     chrome.tabs.create({url: "http://localhost:5173/agent.html#agent-workspace"});
     return;

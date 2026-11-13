@@ -5,6 +5,12 @@ export default defineConfig({
   plugins: [{
     name: "copy-extension-static",
     apply: "build",
+    renderChunk(code, chunk) {
+      if (chunk.fileName === "content.js" || chunk.fileName === "companion.js") {
+        return `(() => {\n${code}\n})();`;
+      }
+      return null;
+    },
     closeBundle() {
       cpSync("manifest.json", "dist/manifest.json");
     },

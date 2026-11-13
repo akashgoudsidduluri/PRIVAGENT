@@ -227,22 +227,26 @@ def is_export_deliverable_directive(
     if m:
         raw_fmt = m.group(1).lower()
         fmt = detect_requested_format(raw_fmt) or detect_requested_format(clean)
-        if not fmt and context:
+        deliv = detect_deliverable_type(clean) or ("presentation" if fmt == "pptx" else "report")
+        if not fmt and deliv == "presentation":
+            fmt = "pptx"
+        elif not fmt and context:
             fmt = context.get("requested_format")
         if not fmt:
             fmt = "pdf"
-        deliv = detect_deliverable_type(clean) or ("presentation" if fmt == "pptx" else "report")
         return True, fmt, deliv
 
     # Check reformat / page-adjustment / image-adding export directives on existing deliverables
     m_reformat = REFORMAT_PAGES_IMAGES_PATTERN.match(clean)
     if m_reformat:
         fmt = detect_requested_format(clean)
-        if not fmt and context:
+        deliv = detect_deliverable_type(clean) or ("presentation" if fmt == "pptx" else "report")
+        if not fmt and deliv == "presentation":
+            fmt = "pptx"
+        elif not fmt and context:
             fmt = context.get("requested_format")
         if not fmt:
             fmt = "pdf"
-        deliv = detect_deliverable_type(clean) or ("presentation" if fmt == "pptx" else "report")
         return True, fmt, deliv
 
     return False, None, None
@@ -498,7 +502,8 @@ def is_research_or_deliverable_request(
 
     # Standard default format based on deliverable type when unspecified
     if not req_format:
-        if is_follow_up and context and context.get("requested_format"):
+        prior_deliv = context.get("deliverable_type") if context else None
+        if is_follow_up and context and context.get("requested_format") and not (deliv_type and deliv_type != prior_deliv):
             req_format = context["requested_format"]
         elif deliv_type == "presentation":
             req_format = "pptx"
@@ -506,9 +511,6 @@ def is_research_or_deliverable_request(
             req_format = "xlsx"
         elif deliv_type == "report":
             req_format = "docx"
-
-    topic_hint = extract_research_topic(text, context=context) or prior_topic
-    return True, deliv_type, req_format, topic_hint
 
     topic_hint = extract_research_topic(text, context=context) or prior_topic
     return True, deliv_type, req_format, topic_hint
@@ -602,6 +604,27 @@ DIRECT_SITE_TRIGGER = re.compile(
 EMAIL_TRIGGER = re.compile(
     r"\b(?:open|check|go\s+to|access|view|read)\s+(?:my\s+)?(?:e-?mail|mail|inbox|gmail|outlook|webmail)\b"
     r"|^(?:open\s+mail|check\s+mail|open\s+gmail|check\s+email|go\s+to\s+inbox|open\s+inbox)[!.\s]*$",
+    re.IGNORECASE,
+)
+
+EMAIL_SCAN_MISSION_PATTERN = re.compile(
+    r"\b(?:continuously\s+scan|monitor|moinitor|scan\s+and\s+clean|clean\s+up\s+my|cleanup\s+my|scan\s+my)\s+(?:my\s+)?(?:e-?mails?|mailbox|inbox)\b|"
+    r"\b(?:identify\s+unnecessary\s+emails?|remove\s+unnecessary|detect\s+important\s+emails?|email\s+monitoring)\b|"
+    r"\b(?:what\s+did\s+you\s+delete|why\s+did\s+you\s+delete|show\s+me\s+important\s+emails?|emails?\s+i\s+haven'?t\s+replied|what\s+deadlines|today'?s?\s+email\s+summary|pause\s+email|resume\s+email)\b|"
+    r"\b(?:what\s+is\s+my\s+(?:e-?mail|mail|account)|which\s+account\s+are\s+you\s+monitoring|are\s+you\s+(?:still\s+)?scanning|is\s+monitoring\s+active|are\s+(?:you|u)\s+deleting)\b|"
+    r"\b(?:check\s+now|i\s+have\s+connected|is\s+my\s+(?:e-?mail|mail)\s+connected|verify\s+(?:connection|e-?mail|mail))\b|"
+    r"\b(?:remind|notify|alert)\s+(?:me\s+)?(?:if|when|about)\s+.*?\b(?:emails?|mails?|inbox)\b|"
+    r"\b(?:emails?|mails?|inbox)\b.*?\b(?:notify|alert|remind)\s+me\b",
+    re.IGNORECASE,
+)
+
+CALENDAR_DIRECTIVE_PATTERN = re.compile(
+    r"\b(?:check|show|view|list|get|what'?s?\s+on)\s+(?:my\s+)?(?:calendar|schedule|agenda|meetings?|events?)\b|"
+    r"\b(?:do\s+i\s+have|are\s+there)\s+any\s+(?:meetings?|events?|appointments?|calls?)\b|"
+    r"\bcalendar\s+(?:status|events?|schedule)\b|"
+    r"\b(?:upcoming|next)\s+(?:meetings?|events?|appointments?|calls?)\b|"
+    r"\b(?:schedule|create|add|book)\s+(?:an?\s+)?(?:event|meeting|invite|appointment|call)\b|"
+    r"\bgoogle\s+calendar\b",
     re.IGNORECASE,
 )
 
@@ -764,6 +787,51 @@ def classify_intent(
             intent=TaskIntent.NON_BROWSER,
             confidence=1.0,
             reason=f"unsupported capability: {supp_reason}",
+            operation_type=ResearchOperationType.NORMAL_CONVERSATION,
+        )
+
+    # 4c. Check for autonomous email monitoring mission or companion query
+    if EMAIL_SCAN_MISSION_PATTERN.search(text):
+        return IntentClassification(
+            intent=TaskIntent.NON_BROWSER,
+            confidence=0.99,
+            reason="Autonomous Email Intelligence directive",
+            operation_type=ResearchOperationType.NORMAL_CONVERSATION,
+        )
+
+    # 4c2. Check for continuous background monitoring directive (price watch, page monitoring)
+    try:
+        from .continuous_monitoring_companion import is_continuous_monitoring_directive
+        if is_continuous_monitoring_directive(text):
+            return IntentClassification(
+                intent=TaskIntent.NON_BROWSER,
+                confidence=0.99,
+                reason="Continuous background monitoring directive",
+                operation_type=ResearchOperationType.NORMAL_CONVERSATION,
+            )
+    except Exception:
+        pass
+
+    # 4c3. Check for direct email dispatch directive
+    try:
+        from .email_dispatch import is_email_dispatch_instruction
+        is_dispatch, _ = is_email_dispatch_instruction(text)
+        if is_dispatch:
+            return IntentClassification(
+                intent=TaskIntent.NON_BROWSER,
+                confidence=0.99,
+                reason="Direct email dispatch directive",
+                operation_type=ResearchOperationType.NORMAL_CONVERSATION,
+            )
+    except Exception:
+        pass
+
+    # 4d. Check for Google Calendar directive
+    if CALENDAR_DIRECTIVE_PATTERN.search(text):
+        return IntentClassification(
+            intent=TaskIntent.NON_BROWSER,
+            confidence=0.99,
+            reason="Google Calendar directive",
             operation_type=ResearchOperationType.NORMAL_CONVERSATION,
         )
 

@@ -198,6 +198,31 @@ async def test_reproduced_inputs_single_completed_package(tmp_path):
 # Test 2: Multiple Research Packages in One Chat (Disambiguation)
 # ---------------------------------------------------------------------------
 
+def test_export_ignores_in_progress_package(tmp_path):
+    """An explicit export must not select a package still being collected."""
+    temp_db = str(tmp_path / "test_running.db")
+    db.init_db(db_path=temp_db)
+    chat = db.create_chat(title="Mixed State", db_path=temp_db)
+    chat_id = chat["id"]
+    completed = _build_test_package("pkg_done", "Transformer Architecture")
+    running = _build_test_package("pkg_running", "Battery Chemistry")
+    db.save_research_package(completed.to_dict(), chat_id, "task_done", status="completed", db_path=temp_db)
+    db.save_research_package(running.to_dict(), chat_id, "task_running", status="running", db_path=temp_db)
+    with db.get_connection(temp_db) as conn:
+        conn.execute("UPDATE research_packages SET updated_at=1 WHERE package_id='pkg_done'")
+        conn.execute("UPDATE research_packages SET updated_at=2 WHERE package_id='pkg_running'")
+
+    res = resolve_target_package(
+        chat_id,
+        "export the previous analysis as a pdf",
+        requested_format="pdf",
+        db_path=temp_db,
+        completed_only=True,
+    )
+    assert res.package is not None
+    assert res.package["package_id"] == "pkg_done"
+
+
 def test_multiple_packages_disambiguation(tmp_path):
     """Verify package resolution distinguishes specific topics, recency anchors, and ambiguous prompts."""
     temp_db = str(tmp_path / "test_multi.db")

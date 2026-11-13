@@ -842,7 +842,21 @@ class WebsiteResolver:
             return None, None
         inst = instruction.strip()
 
-        # 1. Direct site opening patterns: "open <site>", "visit <site>", "go to <site>"
+        # 1. Direct site / specific page opening patterns: "open <site>", "visit <site>", "open the Wikipedia page about X"
+        wiki_m = re.match(
+            r"^(?:open|visit|go\s+to|navigate\s+to)\s+(?:the\s+)?([a-zA-Z0-9_\-\.]+)\s+(?:page|article|site|website)?\s*(?:about|on|for)\s+(.+?)(?:\.|\s+(?:and|,)\s+find|\s+(?:and|,)\s+search|\s+(?:and|,)\s+extract|$)",
+            inst,
+            re.IGNORECASE,
+        )
+        if wiki_m:
+            cand = wiki_m.group(1).strip()
+            topic_hint = wiki_m.group(2).strip()
+            cand_lower = cand.lower()
+            if cand_lower in KNOWN_DOMAINS_REGISTRY or any(re.search(kd["patterns"][0], cand_lower) for kd in KNOWN_DOMAINS_REGISTRY.values()):
+                rest = inst[wiki_m.end():].strip()
+                obj = f"{topic_hint}. {rest}".strip(". ") if rest else topic_hint
+                return cand, obj or topic_hint
+
         direct_m = re.match(r"^(?:open|visit|go\s+to|navigate\s+to|browse\s+to)\s+([a-zA-Z0-9_\-\.\:\/]+(?:\s+[a-zA-Z0-9_\-\.]+)?)(?:\s+(?:and|,)\s+(.+))?$", inst, re.IGNORECASE)
         if direct_m:
             candidate_entity = direct_m.group(1).strip()
@@ -895,17 +909,42 @@ class WebsiteResolver:
             if not clean:
                 return []
 
-        # Extract explicit subtopics before stripping
+        # Multi-sentence / structured decomposition:
+        # Separate main topic from subtopic and deliverable clauses
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", clean) if s.strip()]
+        topic_sentence = sentences[0] if sentences else clean
+
+        # Extract explicit subtopics from subsequent clauses or including clauses
         explicit_subtopics = []
-        sub_m = re.search(
-            r"\b(?:including|such as|covering|specifically|focusing on|details on|breakdown of)\s+(.+?)(?:\.|\band\s+generate|\band\s+compare|\bcompare|\bgenerate|\bcreate|\bproduce|\bexport|$)",
-            objective,
-            re.IGNORECASE,
-        )
-        if sub_m:
-            raw_sub = sub_m.group(1).strip()
-            parts = [re.sub(r"\b(?:formulas|equations|diagrams|figures|charts|tables|references|citations|examples)\b", "", p, flags=re.IGNORECASE).strip() for p in re.split(r"[,;]|\band\b", raw_sub)]
-            explicit_subtopics = [p for p in parts if len(p.split()) >= 1 and len(p) >= 3]
+        for s in sentences[1:]:
+            # Skip pure deliverable instructions ("Generate a PDF", "Create DOCX", "Include formulas and images")
+            if re.search(r"\b(generate|create|prepare|export|write|make|output|produce)\s+.*?\b(pdf|docx|pptx|xlsx|csv|html|markdown|report|spreadsheet)\b", s, re.IGNORECASE):
+                continue
+            if re.search(r"^(?:include|with)\s+.*?\b(formulas?|equations?|images?|diagrams?|tables?|figures?|charts?|references?|citations?)\b", s, re.IGNORECASE):
+                continue
+            sub_m = re.search(r"^(?:explain|find|compare|cover|examine|details on|breakdown of|focusing on|specifically)\s+(?:their\s+)?(.+)$", s, re.IGNORECASE)
+            raw_sub = sub_m.group(1).strip() if sub_m else s
+            raw_sub = re.sub(r"\s+(?:using\s+.*|with\s+.*|and\s+create\s+.*|and\s+generate\s+.*)$", "", raw_sub, flags=re.IGNORECASE).strip()
+            parts = [re.sub(r"\b(?:formulas|equations|diagrams|figures|charts|tables|references|citations|examples|source\s+links|options)\b", "", p, flags=re.IGNORECASE).strip() for p in re.split(r"[,;]|\band\b", raw_sub)]
+            for p in parts:
+                p_clean = p.strip(". ")
+                if len(p_clean) >= 3 and p_clean.lower() not in ("their", "its", "each", "briefly", "retailer sources"):
+                    explicit_subtopics.append(p_clean)
+
+        # Also extract inline "including ...", "such as ..."
+        if not explicit_subtopics:
+            sub_m = re.search(
+                r"\b(?:including|such as|covering|specifically|focusing on|details on|breakdown of|explain|examine|cover)\s+(.+?)(?:\.|\band\s+generate|\band\s+compare|\bcompare|\bgenerate|\bcreate|\bproduce|\bexport|\binclude|$)",
+                objective,
+                re.IGNORECASE,
+            )
+            if sub_m:
+                raw_sub = sub_m.group(1).strip()
+                parts = [re.sub(r"\b(?:formulas|equations|diagrams|figures|charts|tables|references|citations|examples)\b", "", p, flags=re.IGNORECASE).strip() for p in re.split(r"[,;]|\band\b", raw_sub)]
+                explicit_subtopics = [p.strip(". ") for p in parts if len(p.strip(". ")) >= 3 and p.lower() not in ("their", "its", "each", "briefly", "retailer sources")]
+
+        # Use topic_sentence as basis for clean
+        clean = topic_sentence
 
         # 1. Strip conversational openers and slang
         clean = re.sub(
@@ -933,16 +972,10 @@ class WebsiteResolver:
             flags=re.IGNORECASE,
         ).strip()
         clean = re.sub(r"^(?:now|then|next|also)\s+", "", clean, flags=re.IGNORECASE).strip()
-        clean = re.sub(
-            r"^(?:(?:hey|hi|yo|hello|ok|okay|bro|dude|man|please|pls|buddy|pal|friend|so|well)\s+)+",
-            "",
-            clean,
-            flags=re.IGNORECASE,
-        ).strip()
 
         # 2. Clean leading command verbs and articles
         clean = re.sub(
-            r"^(?:find|search(?:\s+for)?|look\s+up|research|compare(?:\s+the)?|get|show|check|discover|explain|describe|analyze|summarize)\s+",
+            r"^(?:find|search(?:\s+for)?|look\s+up|research|compare(?:\s+the)?|get|show|check|discover|explain|describe|analyze|summarize|open(?:\s+the)?(?:\s+wikipedia\s+page\s+about)?)\s+",
             "",
             clean,
             flags=re.IGNORECASE,
@@ -1005,6 +1038,7 @@ class WebsiteResolver:
         clean = re.sub(r"\s+(?:bro|man|dude|buddy|pal|friend|pls|please|thanks|thank\s+you|for\s+me|as\s+well|too)$", "", clean, flags=re.IGNORECASE).strip()
         clean = re.sub(r"^(?:and|also|too|with|in|for|about)\s+", "", clean, flags=re.IGNORECASE).strip()
         clean = re.sub(r"\s+(?:too|also|as\s+well|for\s+it|about\s+it|instead)$", "", clean, flags=re.IGNORECASE).strip()
+        clean = re.sub(r"\s+(?:in|for)\s+(?:India|US|UK)$", "", clean, flags=re.IGNORECASE).strip()
         clean = re.sub(r"[,;.!?]+$", "", clean).strip()
         clean = re.sub(r"[,;]+", " ", clean).strip()
         clean = re.sub(r"\s+", " ", clean).strip()
@@ -1048,27 +1082,44 @@ class WebsiteResolver:
         queries: list[str] = []
 
         if category == "shopping":
-            queries.append(f"{clean} price")
-            queries.append(f"{clean} buy online best deals")
-            if "best" in clean.lower() or "cheapest" in clean.lower():
-                queries.append(f"{clean} reviews specs comparison")
-            else:
-                queries.append(f"best {clean} reviews specs comparison")
-        elif category == "research":
+            is_india = "india" in objective.lower() or (context or {}).get("user_region") == "IN"
+            suffix = " India" if is_india else ""
             if explicit_subtopics:
-                queries.append(f"{clean} original architecture Attention Is All You Need")
-                for st in explicit_subtopics[:4]:
-                    queries.append(f"{clean} {st}")
-                queries.append(f"{clean} encoder decoder vs decoder only")
+                queries.append(f"{clean} price{suffix}")
+                queries.append(f"{clean} {' '.join(explicit_subtopics[:3])}")
+                queries.append(f"best {clean} buy online deals{suffix}")
+            else:
+                queries.append(f"{clean} price{suffix}")
+                queries.append(f"{clean} buy online best deals{suffix}")
+                if "best" in clean.lower() or "cheapest" in clean.lower():
+                    queries.append(f"{clean} reviews specs comparison")
+                else:
+                    queries.append(f"best {clean} reviews specs comparison")
+        elif category in ("software_architecture", "cloud_services"):
+            if explicit_subtopics:
+                queries.append(f"{clean} comparison overview")
+                queries.append(f"{clean} {' '.join(explicit_subtopics[:3])}")
+                queries.append(f"{clean} {' '.join(explicit_subtopics[3:6])}" if len(explicit_subtopics) > 3 else f"{clean} trade-offs architecture")
+            else:
+                queries.append(f"{clean} comparison architecture")
+                queries.append(f"{clean} scalability performance trade-offs")
+                queries.append(f"{clean} technical documentation guide")
+        elif category in ("agriculture_science", "research"):
+            if explicit_subtopics:
+                queries.append(f"{clean} {' '.join(explicit_subtopics[:2])}")
+                queries.append(f"{clean} {' '.join(explicit_subtopics[2:4])}" if len(explicit_subtopics) > 2 else f"{clean} technical overview")
+                queries.append(f"{clean} {' '.join(explicit_subtopics[4:6])}" if len(explicit_subtopics) > 4 else f"{clean} research findings")
+            elif "transformer" in clean.lower() or "attention" in clean.lower():
+                queries.append(f"{clean} architecture technical breakdown")
+                queries.append(f"{clean} self-attention and multi-head attention")
+                queries.append(f"{clean} positional encoding formula")
             elif any(w in clean.lower() for w in ("platform", "framework", "implementation", "library")):
                 queries.append(f"{clean} frameworks libraries python")
                 queries.append(f"{clean} models benchmarks comparison")
                 queries.append(f"{clean} architecture technical documentation")
             else:
-                queries.append(f"{clean} architecture technical breakdown")
-                queries.append(f"{clean} self-attention and multi-head attention")
-                queries.append(f"{clean} positional encoding formula")
-                queries.append(f"{clean} developments 2024 2026")
+                queries.append(f"{clean} overview technical principles")
+                queries.append(f"{clean} key components methodologies")
                 queries.append(f"{clean} authoritative research overview")
         elif category == "travel":
             queries.append(f"{clean} booking prices")
@@ -1139,22 +1190,68 @@ class WebsiteResolver:
                     "is_primary": False,
                 },
             ]
-        elif category == "research":
+        elif category == "software_architecture":
             primary_hubs = [
                 {
-                    "domain": "nature.com",
-                    "url_template": "https://www.nature.com/search?q={query}",
-                    "name": "Nature Publishing",
-                    "credibility": 0.99,
+                    "domain": "google.com",
+                    "url_template": "https://www.google.com/search?q={query}",
+                    "name": "Google Technical Documentation",
+                    "credibility": 0.95,
                     "suitability": 0.98,
+                    "is_primary": True,
+                },
+                {
+                    "domain": "en.wikipedia.org",
+                    "url_template": "https://en.wikipedia.org/wiki/Special:Search?search={query}",
+                    "name": "Wikipedia",
+                    "credibility": 0.92,
+                    "suitability": 0.95,
                     "is_primary": True,
                 },
                 {
                     "domain": "arxiv.org",
                     "url_template": "https://arxiv.org/search/?query={query}&searchtype=all",
                     "name": "arXiv",
-                    "credibility": 0.99,
-                    "suitability": 0.97,
+                    "credibility": 0.90,
+                    "suitability": 0.88,
+                    "is_primary": False,
+                },
+            ]
+        elif category == "cloud_services":
+            primary_hubs = [
+                {
+                    "domain": "google.com",
+                    "url_template": "https://www.google.com/search?q={query}",
+                    "name": "Google Cloud & Enterprise Documentation Search",
+                    "credibility": 0.95,
+                    "suitability": 0.98,
+                    "is_primary": True,
+                },
+                {
+                    "domain": "en.wikipedia.org",
+                    "url_template": "https://en.wikipedia.org/wiki/Special:Search?search={query}",
+                    "name": "Wikipedia",
+                    "credibility": 0.90,
+                    "suitability": 0.92,
+                    "is_primary": False,
+                },
+            ]
+        elif category == "agriculture_science":
+            primary_hubs = [
+                {
+                    "domain": "google.com",
+                    "url_template": "https://www.google.com/search?q={query}",
+                    "name": "Google Agriculture Science & Research",
+                    "credibility": 0.95,
+                    "suitability": 0.98,
+                    "is_primary": True,
+                },
+                {
+                    "domain": "en.wikipedia.org",
+                    "url_template": "https://en.wikipedia.org/wiki/Special:Search?search={query}",
+                    "name": "Wikipedia",
+                    "credibility": 0.90,
+                    "suitability": 0.95,
                     "is_primary": True,
                 },
                 {
@@ -1162,18 +1259,83 @@ class WebsiteResolver:
                     "url_template": "https://www.science.org/action/doSearch?AllField={query}",
                     "name": "Science / AAAS",
                     "credibility": 0.98,
-                    "suitability": 0.95,
+                    "suitability": 0.92,
                     "is_primary": True,
                 },
                 {
-                    "domain": "en.wikipedia.org",
-                    "url_template": "https://en.wikipedia.org/wiki/Special:Search?search={query}",
-                    "name": "Wikipedia",
-                    "credibility": 0.85,
-                    "suitability": 0.88,
+                    "domain": "nature.com",
+                    "url_template": "https://www.nature.com/search?q={query}",
+                    "name": "Nature Publishing",
+                    "credibility": 0.99,
+                    "suitability": 0.90,
                     "is_primary": False,
                 },
             ]
+        elif category == "research":
+            # Check if query is software architecture or cloud related
+            q_lower = (queries[0] if queries else "").lower()
+            if any(w in q_lower for w in ("architecture", "microservices", "monolithic", "serverless", "distributed", "software", "cloud", "aws", "azure")):
+                primary_hubs = [
+                    {
+                        "domain": "google.com",
+                        "url_template": "https://www.google.com/search?q={query}",
+                        "name": "Google Technical Documentation",
+                        "credibility": 0.95,
+                        "suitability": 0.98,
+                        "is_primary": True,
+                    },
+                    {
+                        "domain": "en.wikipedia.org",
+                        "url_template": "https://en.wikipedia.org/wiki/Special:Search?search={query}",
+                        "name": "Wikipedia",
+                        "credibility": 0.92,
+                        "suitability": 0.95,
+                        "is_primary": True,
+                    },
+                    {
+                        "domain": "arxiv.org",
+                        "url_template": "https://arxiv.org/search/?query={query}&searchtype=all",
+                        "name": "arXiv",
+                        "credibility": 0.90,
+                        "suitability": 0.88,
+                        "is_primary": False,
+                    },
+                ]
+            else:
+                primary_hubs = [
+                    {
+                        "domain": "nature.com",
+                        "url_template": "https://www.nature.com/search?q={query}",
+                        "name": "Nature Publishing",
+                        "credibility": 0.99,
+                        "suitability": 0.98,
+                        "is_primary": True,
+                    },
+                    {
+                        "domain": "arxiv.org",
+                        "url_template": "https://arxiv.org/search/?query={query}&searchtype=all",
+                        "name": "arXiv",
+                        "credibility": 0.99,
+                        "suitability": 0.97,
+                        "is_primary": True,
+                    },
+                    {
+                        "domain": "science.org",
+                        "url_template": "https://www.science.org/action/doSearch?AllField={query}",
+                        "name": "Science / AAAS",
+                        "credibility": 0.98,
+                        "suitability": 0.95,
+                        "is_primary": True,
+                    },
+                    {
+                        "domain": "en.wikipedia.org",
+                        "url_template": "https://en.wikipedia.org/wiki/Special:Search?search={query}",
+                        "name": "Wikipedia",
+                        "credibility": 0.85,
+                        "suitability": 0.88,
+                        "is_primary": False,
+                    },
+                ]
         elif category == "travel":
             primary_hubs = [
                 {
@@ -1362,10 +1524,16 @@ class WebsiteResolver:
 
         # SCENARIO B: User did NOT specify a website -> Autonomous Discovery
         clean_inst = instruction.lower()
-        if any(w in clean_inst for w in ("laptop", "iphone", "phone", "price", "buy", "shop", "cheapest", "under ₹", "under rs", "under $")):
+        if any(w in clean_inst for w in ("laptop", "iphone", "phone", "price", "buy", "shop", "cheapest", "under ₹", "under rs", "under $", "samsung", "smartphone")):
             category = "shopping"
         elif any(w in clean_inst for w in ("flight", "hotel", "travel", "ticket", "train")):
             category = "travel"
+        elif any(w in clean_inst for w in ("microservices", "monolithic", "serverless", "distributed systems", "software architecture")):
+            category = "software_architecture"
+        elif any(w in clean_inst for w in ("aws", "azure", "google cloud", "oracle cloud", "cloud provider", "cloud services")):
+            category = "cloud_services"
+        elif any(w in clean_inst for w in ("agriculture", "farming", "crop", "irrigation", "soil")):
+            category = "agriculture_science"
         elif any(w in clean_inst for w in ("research", "study", "scientific", "battery", "architecture", "developments", "quantum", "formula", "academic")):
             category = "research"
         else:

@@ -410,7 +410,10 @@ class HtmlRenderer(BaseRenderer):
             doc_parts.append("      </section>")
 
         # 5. Visual Assets & Figures
-        visuals_to_embed = [v for v in pkg.visuals if v.url_or_path and Path(v.url_or_path).exists() and v.asset_type != "formula"]
+        visuals_to_embed = [
+            v for v in pkg.visuals
+            if v.url_or_path and (v.url_or_path.startswith(("http://", "https://")) or Path(v.url_or_path).exists()) and v.asset_type != "formula"
+        ]
         if visuals_to_embed:
             doc_parts.append('      <section id="visuals" aria-labelledby="visuals-title">')
             doc_parts.append('        <h2 id="visuals-title" class="section-title">5. Visual Intelligence & Architecture Figures</h2>')

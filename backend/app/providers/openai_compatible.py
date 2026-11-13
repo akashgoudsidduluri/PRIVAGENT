@@ -30,7 +30,63 @@ from .gemini import extract_json_from_text
 from .limits import log_provider_call
 
 _DEFAULT_TIMEOUT_S = 30.0
-_SEEDED_MODELS = ["glm-5.3-flash", "deepseek-v4-flash"]
+
+DEEPAI_FREE_MODELS = {
+    "deepseek-v4.1-flash": {
+        "name": "DeepSeek V4.1 Flash",
+        "role": "Primary reasoning and coding (Default)",
+        "category": "reasoning_coding",
+        "tier": "free",
+        "default": True,
+    },
+    "glm-5.3-flash": {
+        "name": "GLM 5.3 Flash",
+        "role": "Coding and agent tasks",
+        "category": "agent_coding",
+        "tier": "free",
+        "default": False,
+    },
+    "qwen-3.8-flash": {
+        "name": "Qwen 3.8 Flash",
+        "role": "General-purpose tasks and information extraction",
+        "category": "extraction_summary",
+        "tier": "free",
+        "default": False,
+    },
+    "mimo-2.6-pro": {
+        "name": "MiMo 2.6 Pro",
+        "role": "Complex reasoning and analysis",
+        "category": "complex_analysis",
+        "tier": "free",
+        "default": False,
+    },
+    "minimax-m3.1-flash": {
+        "name": "MiniMax M3.1 Flash",
+        "role": "Alternative coding and reasoning",
+        "category": "alternative_reasoning",
+        "tier": "free",
+        "default": False,
+    },
+}
+
+_SEEDED_MODELS = list(DEEPAI_FREE_MODELS.keys())
+
+
+def select_model_for_task(task_type: str = "planning", requested_model: Optional[str] = None) -> str:
+    """Return an appropriate free-tier model id.
+
+    Guarantees that only free-tier models are selected, defaulting to deepseek-v4.1-flash.
+    Never silently routes requests to unverified or paid models.
+    """
+    if requested_model and requested_model in DEEPAI_FREE_MODELS:
+        return requested_model
+    if task_type in ("extraction", "summarization", "harvest"):
+        return "qwen-3.8-flash"
+    if task_type in ("deep_analysis", "synthesis", "comparison"):
+        return "mimo-2.6-pro"
+    if task_type in ("coding", "agent_navigation"):
+        return "glm-5.3-flash"
+    return "deepseek-v4.1-flash"
 
 
 def validate_base_url(base_url: str) -> str:
@@ -89,11 +145,13 @@ class OpenAICompatibleProvider:
         model: Optional[str] = None,
         timeout_s: float = _DEFAULT_TIMEOUT_S,
         transport: Any = None,
+        provider_name: str = "deepai",
     ) -> None:
         self._api_key = api_key or ""
         self.base_url = validate_base_url(base_url)
         self._model = (model or "").strip()
         self._timeout_s = timeout_s
+        self.provider_name = provider_name
         self._client = httpx.Client(timeout=timeout_s, transport=transport)
         # Telemetry for the UI and audit logs
         self.last_usage: dict[str, Any] = {}
@@ -108,7 +166,8 @@ class OpenAICompatibleProvider:
     # ------------------------------------------------------------------ #
 
     def name(self) -> str:
-        return f"antseed:{self._model}" if self._model else "antseed"
+        tag = self.provider_name or "deepai"
+        return f"{tag}:{self._model}" if self._model else tag
 
     def _url(self, path: str) -> str:
         # The only two paths this class ever builds; both derive from the
@@ -150,23 +209,69 @@ class OpenAICompatibleProvider:
     # Conversational / capability answers
     # ------------------------------------------------------------------ #
 
-    def chat_call(self, prompt: str, history: Optional[list[dict[str, Any]]] = None) -> str:
+    def chat_call(
+        self,
+        prompt: str,
+        history: Optional[list[dict[str, Any]]] = None,
+        system_prompt: Optional[str] = None,
+    ) -> str:
+        try:
+            from ..capabilities import SYSTEM_CAPABILITY_PROMPT
+            sys_prompt = system_prompt or SYSTEM_CAPABILITY_PROMPT
+        except Exception:
+            sys_prompt = system_prompt or "You are PrivAgent, a helpful, privacy-preserving AI browser assistant."
+        from .history import normalize_history
+        messages: list[dict[str, str]] = [{"role": "system", "content": sys_prompt}]
+        messages.extend(normalize_history(history))
+        messages.append({"role": "user", "content": prompt})
+
+        content, _body = self._completion(
+            payload={
+                "model": self._model,
+                "messages": messages,
+                "temperature": 0.7,
+                "max_tokens": 800,
+            },
+            context="Conversational call failed",
+        )
+        return content
+
+    def chat_stream(
+        self, prompt: str, history: Optional[list[dict[str, Any]]] = None
+    ):
+        """Stream completion tokens from the gateway."""
         try:
             from ..capabilities import SYSTEM_CAPABILITY_PROMPT
             sys_prompt = SYSTEM_CAPABILITY_PROMPT
         except Exception:
             sys_prompt = "You are PrivAgent, a helpful, privacy-preserving AI browser assistant."
+        from .history import normalize_history
         messages: list[dict[str, str]] = [{"role": "system", "content": sys_prompt}]
-        for h in (history or [])[-6:]:
-            if isinstance(h, dict) and h.get("role") and h.get("content"):
-                messages.append({"role": str(h["role"]), "content": str(h["content"])})
+        messages.extend(normalize_history(history))
         messages.append({"role": "user", "content": prompt})
 
-        content, _body = self._completion(
-            payload={"model": self._model, "messages": messages, "temperature": 0.7},
-            context="Conversational call failed",
-        )
-        return content
+        payload = {"model": self._model, "messages": messages, "stream": True, "temperature": 0.7}
+        with self._client.stream(
+            "POST", self._url("chat/completions"), headers=self._headers(), json=payload
+        ) as resp:
+            if resp.status_code != 200:
+                err_text = resp.read().decode("utf-8", errors="replace")[:200]
+                raise ProviderUnavailable(f"Streaming failed with HTTP {resp.status_code}: {err_text}")
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                if line.startswith("data: "):
+                    data_str = line[6:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        token = delta.get("content") or delta.get("reasoning_content") or ""
+                        if token:
+                            yield token
+                    except Exception:
+                        continue
 
     # ------------------------------------------------------------------ #
     # Planning
@@ -188,6 +293,7 @@ class OpenAICompatibleProvider:
             ],
             "response_format": {"type": "json_object"},
             "temperature": 0.1,
+            "max_tokens": 4096,
         }
         content, _body = self._completion(payload=base_payload, context="Planner call failed")
         try:
@@ -280,16 +386,33 @@ class OpenAICompatibleProvider:
             raise ProviderUnavailable(f"{context}: HTTP {resp2.status_code} ({err2})")
 
         self._log_fail(dur_ms, resp.status_code, {}, err_text)
+        err_msg = ""
+        try:
+            err_json = resp.json()
+            if isinstance(err_json, dict) and "error" in err_json:
+                raw_e = err_json["error"]
+                err_msg = raw_e.get("message") if isinstance(raw_e, dict) else str(raw_e)
+        except Exception:
+            pass
+        detail = f" — {err_msg}" if err_msg else f" ({err_text})"
+
         if resp.status_code in (401, 403):
             raise ProviderUnavailable(
-                f"{context}: HTTP {resp.status_code}. Check the API key for this provider."
+                f"{context}: HTTP {resp.status_code}{detail}. Check the API key and permissions for this provider."
             )
         if resp.status_code == 404:
             raise ProviderUnavailable(
-                f"{context}: HTTP 404. Check the base URL and model id "
-                f"({self.base_url}, model '{self._model}')."
+                f"{context}: HTTP 404{detail}. Model '{self._model}' or endpoint not found on {self.base_url}."
             )
-        raise ProviderUnavailable(f"{context}: HTTP {resp.status_code} ({err_text})")
+        if resp.status_code == 429:
+            raise ProviderUnavailable(
+                f"{context}: HTTP 429 (Rate Limit / Quota Exceeded){detail}."
+            )
+        if resp.status_code in (502, 503, 504):
+            raise ProviderUnavailable(
+                f"{context}: HTTP {resp.status_code} (Gateway / Upstream Service Unavailable){detail}."
+            )
+        raise ProviderUnavailable(f"{context}: HTTP {resp.status_code}{detail}")
 
     def _record_success(self, body: dict[str, Any], started: float) -> None:
         self.last_usage = body.get("usage") or {}
@@ -325,7 +448,14 @@ def _safe_json(resp: Any) -> dict[str, Any]:
 
 def _content_of(body: dict[str, Any]) -> str:
     try:
-        return (body["choices"][0]["message"]["content"] or "").strip()
+        choice = body["choices"][0]
+        msg = choice.get("message", {})
+        content = (msg.get("content") or "").strip()
+        if not content and choice.get("text"):
+            content = (choice.get("text") or "").strip()
+        if not content and msg.get("reasoning_content"):
+            content = (msg.get("reasoning_content") or "").strip()
+        return content
     except (KeyError, IndexError, TypeError):
         return ""
 

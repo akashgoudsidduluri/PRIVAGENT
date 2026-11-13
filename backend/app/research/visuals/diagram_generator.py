@@ -164,12 +164,105 @@ def render_diagram_to_png(
         ax.annotate("Li+ Intercalation", xy=(0.66, 0.58), xytext=(0.61, 0.58),
                     arrowprops=dict(arrowstyle="->", color="#DC2626", lw=2.5))
 
+    elif "agri" in t_clean or "farm" in t_clean or "crop" in t_clean:
+        stages = [
+            ("Field Perception: Soil Sensors, Drone Multispectral & Satellite Imagery", 0.78, "#ECFDF5", "#059669"),
+            ("Edge Gateway: Telemetry Ingestion & Real-Time Filtering", 0.60, "#F0FDF4", "#16A34A"),
+            ("AI Inference Core: Crop Disease CNNs & Yield Forecasting Models", 0.44, "#FEF3C7", "#D97706"),
+            ("Autonomous Decision Engine: Precision VRA & Irrigation Optimization", 0.28, "#E0F2FE", "#0284C7"),
+            ("Actuation & Feedback: Smart Drones, Pivot Sprayers & Farm Management ERP", 0.12, "#EDE9FE", "#7C3AED"),
+        ]
+        for name, y, facecol, edgecol in stages:
+            rect = patches.FancyBboxPatch(
+                (0.1, y - 0.05), 0.8, 0.09,
+                boxstyle="round,pad=0.02,rounding_size=0.03",
+                facecolor=facecol, edgecolor=edgecol, linewidth=2,
+            )
+            ax.add_patch(rect)
+            ax.text(0.5, y - 0.005, name, ha="center", va="center", fontsize=9.5, fontweight="bold", color="#0F172A")
+
+        for i in range(len(stages) - 1):
+            y_curr = stages[i][1] - 0.05
+            y_next = stages[i + 1][1] + 0.04
+            ax.annotate("", xy=(0.5, y_next), xytext=(0.5, y_curr),
+                        arrowprops=dict(arrowstyle="->", color="#334155", lw=2, shrinkA=2, shrinkB=2))
+
+    elif "cloud" in t_clean or "microservice" in t_clean or "distributed" in t_clean:
+        stages = [
+            ("Edge Routing: Global Anycast CDN, WAF & TLS Termination", 0.78, "#E0F2FE", "#0284C7"),
+            ("Ingress Gateway: Rate Limiting, Service Mesh & JWT Authentication", 0.60, "#F0FDF4", "#16A34A"),
+            ("Microservice Compute Mesh: Stateless Container Pods & gRPC RPCs", 0.44, "#FEF3C7", "#D97706"),
+            ("Distributed Caching: In-Memory Redis / Memcached Tier", 0.28, "#FEE2E2", "#DC2626"),
+            ("Persistence Tier: Sharded Primary DB + Multi-Region Read Replicas", 0.12, "#EDE9FE", "#7C3AED"),
+        ]
+        for name, y, facecol, edgecol in stages:
+            rect = patches.FancyBboxPatch(
+                (0.1, y - 0.05), 0.8, 0.09,
+                boxstyle="round,pad=0.02,rounding_size=0.03",
+                facecolor=facecol, edgecolor=edgecol, linewidth=2,
+            )
+            ax.add_patch(rect)
+            ax.text(0.5, y - 0.005, name, ha="center", va="center", fontsize=9.5, fontweight="bold", color="#0F172A")
+
+        for i in range(len(stages) - 1):
+            y_curr = stages[i][1] - 0.05
+            y_next = stages[i + 1][1] + 0.04
+            ax.annotate("", xy=(0.5, y_next), xytext=(0.5, y_curr),
+                        arrowprops=dict(arrowstyle="->", color="#334155", lw=2, shrinkA=2, shrinkB=2))
+
+    elif "agent" in t_clean or "autonomous" in t_clean:
+        stages = [
+            ("Perception & Multi-Modal Sensory Observation", 0.78, "#E0F2FE", "#0284C7"),
+            ("Context Memory & Retrieval Augmented Ledger (RAG)", 0.60, "#F0FDF4", "#16A34A"),
+            ("Cognitive Planner & Reasoning Engine (ReAct / Chain-of-Thought)", 0.44, "#FEF3C7", "#D97706"),
+            ("Action Execution: Tool APIs, Browser DOM & Environment Sandboxes", 0.28, "#FEE2E2", "#DC2626"),
+            ("Evaluation, Self-Reflection & Verifiable Deliverable Output", 0.12, "#EDE9FE", "#7C3AED"),
+        ]
+        for name, y, facecol, edgecol in stages:
+            rect = patches.FancyBboxPatch(
+                (0.1, y - 0.05), 0.8, 0.09,
+                boxstyle="round,pad=0.02,rounding_size=0.03",
+                facecolor=facecol, edgecolor=edgecol, linewidth=2,
+            )
+            ax.add_patch(rect)
+            ax.text(0.5, y - 0.005, name, ha="center", va="center", fontsize=9.5, fontweight="bold", color="#0F172A")
+
+        for i in range(len(stages) - 1):
+            y_curr = stages[i][1] - 0.05
+            y_next = stages[i + 1][1] + 0.04
+            ax.annotate("", xy=(0.5, y_next), xytext=(0.5, y_curr),
+                        arrowprops=dict(arrowstyle="->", color="#334155", lw=2, shrinkA=2, shrinkB=2))
+
+    elif "operating system" in t_clean or "kernel" in t_clean or "virtual memory" in t_clean:
+        stages = [
+            ("User Space: Applications, CLI Tools & User-Level Libraries", 0.78, "#E0F2FE", "#0284C7"),
+            ("System Call Interface (POSIX ABI / Trap Handler)", 0.60, "#F0FDF4", "#16A34A"),
+            ("Kernel Subsystems: Process Scheduler (CFS), VFS & Network Stack", 0.44, "#FEF3C7", "#D97706"),
+            ("Memory Management: Multi-Level Page Tables & TLB Translation", 0.28, "#FEE2E2", "#DC2626"),
+            ("Hardware Layer: MMU, CPU Privilege Rings & DMA Device Controllers", 0.12, "#EDE9FE", "#7C3AED"),
+        ]
+        for name, y, facecol, edgecol in stages:
+            rect = patches.FancyBboxPatch(
+                (0.1, y - 0.05), 0.8, 0.09,
+                boxstyle="round,pad=0.02,rounding_size=0.03",
+                facecolor=facecol, edgecolor=edgecol, linewidth=2,
+            )
+            ax.add_patch(rect)
+            ax.text(0.5, y - 0.005, name, ha="center", va="center", fontsize=9.5, fontweight="bold", color="#0F172A")
+
+        for i in range(len(stages) - 1):
+            y_curr = stages[i][1] - 0.05
+            y_next = stages[i + 1][1] + 0.04
+            ax.annotate("", xy=(0.5, y_next), xytext=(0.5, y_curr),
+                        arrowprops=dict(arrowstyle="->", color="#334155", lw=2, shrinkA=2, shrinkB=2))
+
     else:
-        # 3-tier system diagram
+        # Dynamic topic-tailored system diagram
+        t_title = topic.strip().title()
         tiers = [
-            ("Presentation & User Interface Layer", 0.75, "#E2E8F0", "#475569"),
-            ("Core Logic, Security & Processing Engine", 0.48, "#DBEAFE", "#2563EB"),
-            ("Data Persistence & External Systems Layer", 0.21, "#DCFCE7", "#16A34A"),
+            (f"{t_title} — Client Interface & Ingestion Pipeline", 0.75, "#E2E8F0", "#475569"),
+            (f"{t_title} — Algorithmic Processing & Core Evaluation Logic", 0.48, "#DBEAFE", "#2563EB"),
+            (f"{t_title} — Data Storage, Analytics & Persistence Backbone", 0.21, "#DCFCE7", "#16A34A"),
         ]
         for name, y, facecol, edgecol in tiers:
             rect = patches.FancyBboxPatch(

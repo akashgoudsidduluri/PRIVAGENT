@@ -13,9 +13,10 @@ class NativeConnector:
     origin = ""
     service = ""
 
-    def __init__(self, token: str | None = None, *, client: httpx.Client | None = None):
+    def __init__(self, token: str | None = None, *, client: httpx.Client | None = None, refresh_hook: Any = None):
         self._token = token
         self._client = client or httpx.Client(timeout=12, follow_redirects=False)
+        self._refresh_hook = refresh_hook
 
     @property
     def configured(self) -> bool:
@@ -30,6 +31,13 @@ class NativeConnector:
         response = self._client.request(method, self.origin + path, params=params, json=json, content=content,
                                         headers={"Authorization": f"Bearer {self._token}", "Accept": "application/json",
                                                  **(headers or {})})
+        if response.status_code == 401 and self._refresh_hook:
+            new_token = self._refresh_hook()
+            if new_token and new_token != self._token:
+                self._token = new_token
+                response = self._client.request(method, self.origin + path, params=params, json=json, content=content,
+                                                headers={"Authorization": f"Bearer {self._token}", "Accept": "application/json",
+                                                         **(headers or {})})
         if response.status_code < 200 or response.status_code >= 300:
             # Provider error bodies can echo account data or tokens.
             raise ConnectorError(f"{self.service} API returned HTTP {response.status_code}")
