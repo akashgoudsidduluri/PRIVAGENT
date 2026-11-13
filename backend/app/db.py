@@ -168,6 +168,92 @@ def init_db(db_path: Optional[str] = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_monitor_due ON monitoring_missions(status, next_run_at);
             CREATE INDEX IF NOT EXISTS idx_monitor_events ON monitoring_events(mission_id, detected_at DESC);
             CREATE INDEX IF NOT EXISTS idx_mcp_audit_created ON mcp_audit(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS email_monitoring_missions (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT,
+                account_email TEXT NOT NULL,
+                provider TEXT NOT NULL DEFAULT 'gmail',
+                frequency_seconds INTEGER NOT NULL DEFAULT 300 CHECK(frequency_seconds >= 60),
+                status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'paused', 'stopped', 'failed')),
+                sync_cursor TEXT,
+                policy_authorized INTEGER NOT NULL DEFAULT 0,
+                dry_run INTEGER NOT NULL DEFAULT 1,
+                cleanup_policy_json TEXT NOT NULL DEFAULT '{}',
+                notification_policy_json TEXT NOT NULL DEFAULT '{}',
+                last_sync_at REAL,
+                next_run_at REAL,
+                total_processed INTEGER NOT NULL DEFAULT 0,
+                unnecessary_detected INTEGER NOT NULL DEFAULT 0,
+                moved_to_trash INTEGER NOT NULL DEFAULT 0,
+                important_detected INTEGER NOT NULL DEFAULT 0,
+                neglected_detected INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS email_classifications (
+                id TEXT PRIMARY KEY,
+                mission_id TEXT NOT NULL REFERENCES email_monitoring_missions(id) ON DELETE CASCADE,
+                message_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                sender TEXT NOT NULL,
+                recipient TEXT NOT NULL DEFAULT '',
+                subject TEXT NOT NULL,
+                snippet TEXT NOT NULL DEFAULT '',
+                received_at REAL NOT NULL,
+                category TEXT NOT NULL CHECK(category IN ('unnecessary', 'important', 'uncertain')),
+                subcategory TEXT NOT NULL DEFAULT 'unknown',
+                importance_score REAL NOT NULL DEFAULT 0.0,
+                unnecessary_confidence REAL NOT NULL DEFAULT 0.0,
+                reasoning TEXT NOT NULL,
+                deadline TEXT,
+                required_action TEXT,
+                is_unread INTEGER NOT NULL DEFAULT 1,
+                is_replied INTEGER NOT NULL DEFAULT 0,
+                action_taken TEXT NOT NULL DEFAULT 'none' CHECK(action_taken IN ('none', 'dry_run_flagged', 'moved_to_trash', 'restored')),
+                action_verified INTEGER NOT NULL DEFAULT 0,
+                action_timestamp REAL,
+                notified INTEGER NOT NULL DEFAULT 0,
+                notification_dismissed INTEGER NOT NULL DEFAULT 0,
+                raw_headers_json TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                UNIQUE(mission_id, message_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS email_audit_log (
+                id TEXT PRIMARY KEY,
+                mission_id TEXT NOT NULL REFERENCES email_monitoring_missions(id) ON DELETE CASCADE,
+                message_id TEXT,
+                action TEXT NOT NULL,
+                details_json TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS email_notifications (
+                id TEXT PRIMARY KEY,
+                mission_id TEXT NOT NULL REFERENCES email_monitoring_missions(id) ON DELETE CASCADE,
+                message_id TEXT NOT NULL,
+                sender TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                importance_reason TEXT NOT NULL,
+                neglect_reason TEXT NOT NULL,
+                received_at REAL NOT NULL,
+                deadline TEXT,
+                recommended_action TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'sent', 'dismissed', 'resolved')),
+                created_at REAL NOT NULL,
+                sent_at REAL,
+                resolved_at REAL,
+                UNIQUE(mission_id, message_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_email_missions_status ON email_monitoring_missions(status, next_run_at);
+            CREATE INDEX IF NOT EXISTS idx_email_class_mission ON email_classifications(mission_id, received_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_email_class_category ON email_classifications(mission_id, category);
+            CREATE INDEX IF NOT EXISTS idx_email_audit_mission ON email_audit_log(mission_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_email_notif_status ON email_notifications(mission_id, status);
             """
         )
         # Earlier control-center previews created narrower tables. Add only
@@ -183,6 +269,9 @@ def init_db(db_path: Optional[str] = None) -> None:
                 "task_id": "TEXT", "title": "TEXT NOT NULL DEFAULT ''",
                 "diff_data": "TEXT NOT NULL DEFAULT '{}'", "notification_sent": "INTEGER NOT NULL DEFAULT 0",
                 "state_hash": "TEXT NOT NULL DEFAULT ''",
+            },
+            "messages": {
+                "task_id": "TEXT",
             },
         }
         for table, columns in migrations.items():
@@ -225,8 +314,42 @@ def get_chat(chat_id: str, db_path: Optional[str] = None) -> Optional[dict[str, 
         if not row:
             return None
         chat = dict(row)
-        chat["messages"] = get_messages(chat_id, limit=50, db_path=db_path)
+        messages = get_messages(chat_id, limit=100, db_path=db_path)
+        checkpoints = get_checkpoints_for_chat(chat_id, db_path=db_path)
+
+        def _format_history_steps(hist: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            formatted = []
+            for idx, h in enumerate(hist):
+                action = h.get("action") or {}
+                act_type = action.get("type") or "step"
+                ev = h.get("evidence") or ""
+                display = f"Step {idx + 1}: {act_type} -> {ev}" if ev else f"Step {idx + 1}: {act_type}"
+                formatted.append({
+                    "stepNum": idx + 1,
+                    "message": display,
+                    "action": action,
+                    "status": h.get("status") or ("verified" if h.get("result_ok") else "failed"),
+                    "result_ok": bool(h.get("result_ok")),
+                })
+            return formatted
+
+        cp_by_task = {cp["task_id"]: cp for cp in checkpoints if cp.get("task_id")}
+        agent_msgs = [m for m in messages if m.get("role") == "agent"]
+        for idx, m in enumerate(agent_msgs):
+            tid = m.get("task_id")
+            cp = cp_by_task.get(tid) if tid else None
+            if not cp and idx < len(checkpoints):
+                cp = checkpoints[idx]
+            if cp:
+                hist = cp.get("history") or []
+                m["steps"] = _format_history_steps(hist)
+                if not m.get("task_id"):
+                    m["task_id"] = cp.get("task_id")
+
+        chat["messages"] = messages
         chat["memory"] = get_chat_memory(chat_id, db_path=db_path)
+        chat["checkpoints"] = checkpoints
+        chat["total_steps"] = sum(len(cp.get("history", [])) for cp in checkpoints)
         return chat
 
 
@@ -258,6 +381,7 @@ def add_message(
     role: str,
     content: str,
     evidence: Optional[str] = None,
+    task_id: Optional[str] = None,
     db_path: Optional[str] = None,
 ) -> dict[str, Any]:
     from .privacy import scrub_persistent
@@ -267,10 +391,10 @@ def add_message(
     with get_connection(db_path) as conn:
         conn.execute(
             """
-            INSERT INTO messages (id, chat_id, role, content, evidence)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO messages (id, chat_id, role, content, evidence, task_id)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (msg_id, chat_id, role, content, evidence),
+            (msg_id, chat_id, role, content, evidence, task_id),
         )
         conn.execute(
             "UPDATE chats SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -282,22 +406,44 @@ def add_message(
         "role": role,
         "content": content,
         "evidence": evidence,
+        "task_id": task_id,
     }
 
 
-def get_messages(chat_id: str, limit: int = 20, db_path: Optional[str] = None) -> list[dict[str, Any]]:
+def get_messages(chat_id: str, limit: int = 50, db_path: Optional[str] = None) -> list[dict[str, Any]]:
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, chat_id, role, content, evidence, task_id, created_at
+            FROM messages
+            WHERE chat_id = ?
+            ORDER BY created_at ASC, rowid ASC
+            LIMIT ?
+            """,
+            (chat_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_recent_messages(chat_id: str, limit: int = 6, db_path: Optional[str] = None) -> list[dict[str, Any]]:
+    """Return the most recent messages for a chat in chronological order.
+
+    ``get_messages`` keeps the oldest rows when a limit is supplied, which is
+    right for a paginated transcript but wrong for conversational context: a
+    long chat would replay its first turns forever.
+    """
     with get_connection(db_path) as conn:
         rows = conn.execute(
             """
             SELECT id, chat_id, role, content, evidence, created_at
             FROM messages
             WHERE chat_id = ?
-            ORDER BY created_at ASC
+            ORDER BY created_at DESC, rowid DESC
             LIMIT ?
             """,
-            (chat_id, limit),
+            (chat_id, max(1, int(limit))),
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [dict(r) for r in reversed(rows)]
 
 
 def set_chat_memory(chat_id: str, key: str, value: str, db_path: Optional[str] = None) -> None:
@@ -513,6 +659,31 @@ def get_latest_checkpoint_for_chat(conversation_id: str, db_path: Optional[str] 
         return d
 
 
+def get_checkpoints_for_chat(conversation_id: str, db_path: Optional[str] = None) -> list[dict[str, Any]]:
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM task_checkpoints
+            WHERE conversation_id = ?
+            ORDER BY updated_at ASC, rowid ASC
+            """,
+            (conversation_id,),
+        ).fetchall()
+        result = []
+        for row in rows:
+            d = dict(row)
+            try:
+                d["history"] = json.loads(d.get("history") or "[]")
+            except Exception:
+                d["history"] = []
+            try:
+                d["working_memory"] = json.loads(d.get("working_memory") or "{}")
+            except Exception:
+                d["working_memory"] = {}
+            result.append(d)
+        return result
+
+
 # ---------------------------------------------------------------------------
 # Artifact Metadata Registry and Storage
 # ---------------------------------------------------------------------------
@@ -716,6 +887,440 @@ def list_packages_for_chat(conversation_id: str, db_path: Optional[str] = None) 
                 d["data"] = {}
             results.append(d)
         return results
+
+
+# ---------------------------------------------------------------------------
+# Email Intelligence Persistence and Audit Logging
+# ---------------------------------------------------------------------------
+
+def create_email_mission(
+    account_email: str,
+    provider: str = "gmail",
+    frequency_seconds: int = 300,
+    cleanup_policy: Optional[dict[str, Any]] = None,
+    notification_policy: Optional[dict[str, Any]] = None,
+    conversation_id: Optional[str] = None,
+    mission_id: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> dict[str, Any]:
+    """Create or register an email monitoring mission in SQLite."""
+    ident = mission_id or f"email_{uuid.uuid4().hex[:12]}"
+    now = time.time()
+    clean_pol = json.dumps(cleanup_policy or {
+        "allow_promotions": True,
+        "allow_newsletters": True,
+        "allow_notifications": True,
+        "min_confidence": 0.80,
+        "protected_categories": ["financial", "security", "education", "recruitment", "personal"],
+    })
+    notif_pol = json.dumps(notification_policy or {
+        "notify_deadlines": True,
+        "notify_interviews": True,
+        "notify_unanswered_important": True,
+        "neglect_threshold_seconds": 3600,
+    })
+
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO email_monitoring_missions (
+                id, conversation_id, account_email, provider, frequency_seconds,
+                status, policy_authorized, dry_run, cleanup_policy_json,
+                notification_policy_json, next_run_at, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, 'active', 0, 1, ?, ?, ?, ?, ?)
+            """,
+            (ident, conversation_id, account_email, provider.lower(), frequency_seconds,
+             clean_pol, notif_pol, now, now, now),
+        )
+        # Mirror into monitoring_missions so the shared continuous monitoring loop claims it
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO monitoring_missions (
+                id, conversation_id, title, target_url, trigger_type,
+                interval_seconds, condition_type, condition_params,
+                status, next_run_at, created_at
+            )
+            VALUES (?, ?, ?, ?, 'interval', ?, 'email_intelligence', '{}', 'active', ?, ?)
+            """,
+            (ident, conversation_id, f"Email Intelligence ({account_email})",
+             f"email://{provider.lower()}/{account_email}", frequency_seconds, now, now),
+        )
+        conn.commit()
+
+    log_email_audit(
+        ident,
+        "mission_created",
+        {"account_email": account_email, "provider": provider, "frequency_seconds": frequency_seconds},
+        db_path=db_path,
+    )
+    return get_email_mission(ident, db_path=db_path) or {"id": ident, "account_email": account_email}
+
+
+def get_email_mission(mission_id: str, db_path: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """Retrieve an email monitoring mission by ID."""
+    with get_connection(db_path) as conn:
+        row = conn.execute("SELECT * FROM email_monitoring_missions WHERE id = ?", (mission_id,)).fetchone()
+        if not row:
+            return None
+        res = dict(row)
+        try:
+            res["cleanup_policy"] = json.loads(res.get("cleanup_policy_json") or "{}")
+        except Exception:
+            res["cleanup_policy"] = {}
+        try:
+            res["notification_policy"] = json.loads(res.get("notification_policy_json") or "{}")
+        except Exception:
+            res["notification_policy"] = {}
+        return res
+
+
+def list_email_missions(db_path: Optional[str] = None) -> list[dict[str, Any]]:
+    """List all email monitoring missions."""
+    with get_connection(db_path) as conn:
+        rows = conn.execute("SELECT * FROM email_monitoring_missions ORDER BY created_at DESC").fetchall()
+        results = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["cleanup_policy"] = json.loads(d.get("cleanup_policy_json") or "{}")
+            except Exception:
+                d["cleanup_policy"] = {}
+            try:
+                d["notification_policy"] = json.loads(d.get("notification_policy_json") or "{}")
+            except Exception:
+                d["notification_policy"] = {}
+            results.append(d)
+        return results
+
+
+def update_email_mission(mission_id: str, updates: dict[str, Any], db_path: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """Update fields on an email monitoring mission and sync with monitoring_missions table."""
+    valid_fields = {
+        "status", "sync_cursor", "policy_authorized", "dry_run",
+        "cleanup_policy_json", "notification_policy_json", "last_sync_at",
+        "next_run_at", "total_processed", "unnecessary_detected",
+        "moved_to_trash", "important_detected", "neglected_detected",
+        "frequency_seconds",
+    }
+    set_clauses = []
+    params = []
+    for k, v in updates.items():
+        if k in valid_fields:
+            set_clauses.append(f"{k} = ?")
+            params.append(v)
+    if not set_clauses:
+        return get_email_mission(mission_id, db_path=db_path)
+
+    set_clauses.append("updated_at = ?")
+    now = time.time()
+    params.append(now)
+    params.append(mission_id)
+
+    with get_connection(db_path) as conn:
+        conn.execute(f"UPDATE email_monitoring_missions SET {', '.join(set_clauses)} WHERE id = ?", params)
+        if "status" in updates or "next_run_at" in updates or "frequency_seconds" in updates:
+            m_set = []
+            m_params = []
+            if "status" in updates:
+                m_set.append("status = ?")
+                m_params.append(updates["status"])
+            if "next_run_at" in updates:
+                m_set.append("next_run_at = ?")
+                m_params.append(updates["next_run_at"])
+            if "frequency_seconds" in updates:
+                m_set.append("interval_seconds = ?")
+                m_params.append(updates["frequency_seconds"])
+            if m_set:
+                m_params.append(mission_id)
+                conn.execute(f"UPDATE monitoring_missions SET {', '.join(m_set)} WHERE id = ?", m_params)
+        conn.commit()
+
+    return get_email_mission(mission_id, db_path=db_path)
+
+
+def save_email_classification(record: dict[str, Any], db_path: Optional[str] = None) -> dict[str, Any]:
+    """Persist or update an email classification record."""
+    ident = record.get("id") or f"cls_{uuid.uuid4().hex[:12]}"
+    now = time.time()
+    headers_json = json.dumps(record.get("raw_headers", {}))
+
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO email_classifications (
+                id, mission_id, message_id, thread_id, sender, recipient,
+                subject, snippet, received_at, category, subcategory,
+                importance_score, unnecessary_confidence, reasoning,
+                deadline, required_action, is_unread, is_replied,
+                action_taken, action_verified, action_timestamp,
+                notified, notification_dismissed, raw_headers_json,
+                created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(mission_id, message_id) DO UPDATE SET
+                thread_id = excluded.thread_id,
+                sender = excluded.sender,
+                recipient = excluded.recipient,
+                subject = excluded.subject,
+                snippet = excluded.snippet,
+                received_at = excluded.received_at,
+                category = excluded.category,
+                subcategory = excluded.subcategory,
+                importance_score = excluded.importance_score,
+                unnecessary_confidence = excluded.unnecessary_confidence,
+                reasoning = excluded.reasoning,
+                deadline = excluded.deadline,
+                required_action = excluded.required_action,
+                is_unread = excluded.is_unread,
+                is_replied = excluded.is_replied,
+                action_taken = excluded.action_taken,
+                action_verified = excluded.action_verified,
+                action_timestamp = excluded.action_timestamp,
+                notified = excluded.notified,
+                notification_dismissed = excluded.notification_dismissed,
+                raw_headers_json = excluded.raw_headers_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                ident, record["mission_id"], record["message_id"],
+                record.get("thread_id", record["message_id"]),
+                record.get("sender", ""), record.get("recipient", ""),
+                record.get("subject", ""), record.get("snippet", ""),
+                float(record.get("received_at") or now),
+                record.get("category", "uncertain"),
+                record.get("subcategory", "unknown"),
+                float(record.get("importance_score", 0.0)),
+                float(record.get("unnecessary_confidence", 0.0)),
+                record.get("reasoning", ""),
+                record.get("deadline"), record.get("required_action"),
+                int(bool(record.get("is_unread", 1))),
+                int(bool(record.get("is_replied", 0))),
+                record.get("action_taken", "none"),
+                int(bool(record.get("action_verified", 0))),
+                record.get("action_timestamp"),
+                int(bool(record.get("notified", 0))),
+                int(bool(record.get("notification_dismissed", 0))),
+                headers_json,
+                float(record.get("created_at") or now),
+                now,
+            ),
+        )
+        conn.commit()
+
+    return get_email_classification_by_message_id(record["mission_id"], record["message_id"], db_path=db_path) or record
+
+
+def get_email_classification_by_message_id(mission_id: str, message_id: str, db_path: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """Retrieve classification record for a given message ID."""
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM email_classifications WHERE mission_id = ? AND message_id = ?",
+            (mission_id, message_id),
+        ).fetchone()
+        if not row:
+            return None
+        res = dict(row)
+        try:
+            res["raw_headers"] = json.loads(res.get("raw_headers_json") or "{}")
+        except Exception:
+            res["raw_headers"] = {}
+        return res
+
+
+def get_email_classifications(
+    mission_id: str,
+    category: Optional[str] = None,
+    action_taken: Optional[str] = None,
+    limit: int = 100,
+    db_path: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """List classified emails for a mission with optional category or action filters."""
+    query = "SELECT * FROM email_classifications WHERE mission_id = ?"
+    params: list[Any] = [mission_id]
+    if category:
+        query += " AND category = ?"
+        params.append(category)
+    if action_taken:
+        query += " AND action_taken = ?"
+        params.append(action_taken)
+    query += " ORDER BY received_at DESC LIMIT ?"
+    params.append(limit)
+
+    with get_connection(db_path) as conn:
+        rows = conn.execute(query, params).fetchall()
+        results = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["raw_headers"] = json.loads(d.get("raw_headers_json") or "{}")
+            except Exception:
+                d["raw_headers"] = {}
+            results.append(d)
+        return results
+
+
+def log_email_audit(
+    mission_id: str,
+    action: str,
+    details: dict[str, Any],
+    message_id: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> dict[str, Any]:
+    """Record an audit trail event for an email monitoring action."""
+    ident = f"aud_{uuid.uuid4().hex[:12]}"
+    now = time.time()
+    from .privacy import scrub_persistent
+    sanitized_details = scrub_persistent(details)
+    details_json = json.dumps(sanitized_details)
+
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO email_audit_log (id, mission_id, message_id, action, details_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (ident, mission_id, message_id, action, details_json, now),
+        )
+        conn.commit()
+
+    return {"id": ident, "mission_id": mission_id, "action": action, "timestamp": now}
+
+
+def get_email_audit_logs(mission_id: str, limit: int = 100, db_path: Optional[str] = None) -> list[dict[str, Any]]:
+    """Retrieve chronological audit logs for an email mission."""
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM email_audit_log WHERE mission_id = ? ORDER BY created_at DESC LIMIT ?",
+            (mission_id, limit),
+        ).fetchall()
+        results = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["details"] = json.loads(d.get("details_json") or "{}")
+            except Exception:
+                d["details"] = {}
+            results.append(d)
+        return results
+
+
+def save_email_notification(notif: dict[str, Any], db_path: Optional[str] = None) -> dict[str, Any]:
+    """Persist an important neglected email notification."""
+    ident = notif.get("id") or f"notif_{uuid.uuid4().hex[:12]}"
+    now = time.time()
+
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO email_notifications (
+                id, mission_id, message_id, sender, subject,
+                importance_reason, neglect_reason, received_at,
+                deadline, recommended_action, status, created_at, sent_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'sent', ?, ?)
+            ON CONFLICT(mission_id, message_id) DO UPDATE SET
+                importance_reason = excluded.importance_reason,
+                neglect_reason = excluded.neglect_reason,
+                deadline = excluded.deadline,
+                recommended_action = excluded.recommended_action
+            """,
+            (
+                ident, notif["mission_id"], notif["message_id"],
+                notif.get("sender", ""), notif.get("subject", ""),
+                notif.get("importance_reason", ""), notif.get("neglect_reason", ""),
+                float(notif.get("received_at") or now),
+                notif.get("deadline"), notif.get("recommended_action", "Review and respond"),
+                now, now,
+            ),
+        )
+        conn.commit()
+
+    return {"id": ident, "message_id": notif["message_id"], "status": "sent"}
+
+
+def get_email_notifications(
+    mission_id: str,
+    status: Optional[str] = None,
+    limit: int = 50,
+    db_path: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """List notifications for an email mission."""
+    query = "SELECT * FROM email_notifications WHERE mission_id = ?"
+    params: list[Any] = [mission_id]
+    if status:
+        query += " AND status = ?"
+        params.append(status)
+    query += " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+
+    with get_connection(db_path) as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+def update_email_notification_status(
+    notif_id: str,
+    status: str,
+    db_path: Optional[str] = None,
+) -> bool:
+    """Update notification status (dismissed / resolved)."""
+    now = time.time()
+    field = "resolved_at" if status == "resolved" else "sent_at"
+    with get_connection(db_path) as conn:
+        cur = conn.execute(
+            f"UPDATE email_notifications SET status = ?, {field} = ? WHERE id = ?",
+            (status, now, notif_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def get_email_dashboard_stats(mission_id: str, db_path: Optional[str] = None) -> dict[str, Any]:
+    """Aggregate live counts and summary data for the Email Intelligence Dashboard."""
+    with get_connection(db_path) as conn:
+        mission = conn.execute("SELECT * FROM email_monitoring_missions WHERE id = ?", (mission_id,)).fetchone()
+        if not mission:
+            return {}
+
+        counts = conn.execute(
+            """
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN category = 'unnecessary' THEN 1 ELSE 0 END) as unnecessary_count,
+                SUM(CASE WHEN category = 'important' THEN 1 ELSE 0 END) as important_count,
+                SUM(CASE WHEN category = 'uncertain' THEN 1 ELSE 0 END) as uncertain_count,
+                SUM(CASE WHEN action_taken = 'moved_to_trash' THEN 1 ELSE 0 END) as trashed_count,
+                SUM(CASE WHEN action_taken = 'dry_run_flagged' THEN 1 ELSE 0 END) as dry_run_count,
+                SUM(CASE WHEN category = 'important' AND is_replied = 1 THEN 1 ELSE 0 END) as handled_count,
+                SUM(CASE WHEN category = 'important' AND is_replied = 0 THEN 1 ELSE 0 END) as neglected_count
+            FROM email_classifications
+            WHERE mission_id = ?
+            """,
+            (mission_id,),
+        ).fetchone()
+
+        m_dict = dict(mission)
+        return {
+            "mission_id": mission_id,
+            "account_email": m_dict.get("account_email"),
+            "provider": m_dict.get("provider"),
+            "status": m_dict.get("status"),
+            "policy_authorized": bool(m_dict.get("policy_authorized")),
+            "dry_run": bool(m_dict.get("dry_run")),
+            "last_sync_at": m_dict.get("last_sync_at"),
+            "next_run_at": m_dict.get("next_run_at"),
+            "frequency_seconds": m_dict.get("frequency_seconds"),
+            "total_processed": counts["total"] or 0,
+            "unnecessary_detected": counts["unnecessary_count"] or 0,
+            "moved_to_trash": counts["trashed_count"] or 0,
+            "dry_run_flagged": counts["dry_run_count"] or 0,
+            "important_detected": counts["important_count"] or 0,
+            "important_handled": counts["handled_count"] or 0,
+            "neglected_awaiting_attention": counts["neglected_count"] or 0,
+            "uncertain_review_required": counts["uncertain_count"] or 0,
+        }
+
 
 
 

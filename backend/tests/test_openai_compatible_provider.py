@@ -154,6 +154,36 @@ def test_chat_call_returns_content_and_sends_bearer_header():
     assert p.last_usage.get("total_tokens") == 7
 
 
+def test_chat_call_normalizes_stored_agent_role_for_followups():
+    """The DB stores assistant turns as "agent"; providers only accept "assistant"."""
+    captured: dict = {}
+
+    def fake_post(url, headers=None, json=None):
+        captured["json"] = json
+
+        class R:
+            status_code = 200
+            text = ""
+            def json(self):
+                return {"choices": [{"message": {"content": "ok"}}]}
+
+        return R()
+
+    p = OpenAICompatibleProvider(api_key="k", base_url="http://localhost:8377/v1", model="m")
+    p._client.post = fake_post  # type: ignore[method-assign]
+    out = p.chat_call("follow up", history=[
+        {"role": "user", "content": "first"},
+        {"role": "agent", "content": "previous answer"},
+        {"role": "system", "content": "must not be replayed"},
+        {"role": "assistant", "content": "   "},
+    ], system_prompt="classify this email")
+    assert out == "ok"
+    messages = captured["json"]["messages"]
+    assert messages[0] == {"role": "system", "content": "classify this email"}
+    assert [m["role"] for m in messages] == ["system", "user", "assistant", "user"]
+    assert messages[2]["content"] == "previous answer"
+
+
 def test_auth_error_message_names_the_key_not_its_value():
     p = OpenAICompatibleProvider(api_key="secret-value-xyz", base_url="http://localhost:8377/v1", model="m")
 

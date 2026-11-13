@@ -83,7 +83,7 @@ npm run dev
 cd backend
 # Activate the Python 3.12+ venv
 venv\Scripts\activate
-uvicorn app.main:app --port 8000 --reload
+uvicorn app.main:app --port 8000 --reload --reload-dir app
 # Running on http://localhost:8000
 ```
 

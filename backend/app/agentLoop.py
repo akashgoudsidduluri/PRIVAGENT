@@ -324,7 +324,7 @@ def _finalize_research_artifacts(
     try:
         from pathlib import Path
         from . import db
-        from .research.models import DataTable, FormulaItem, ResearchKnowledgePackage, ResearchSubtopic, VisualAsset
+        from .research.models import FormulaItem, ResearchKnowledgePackage, ResearchSubtopic, VisualAsset
         from .research.renderers import render_artifact
         from .research.visuals.chart_generator import generate_chart_from_table
         from .research.visuals.diagram_generator import render_attention_diagram_to_png, render_diagram_to_png
@@ -426,25 +426,6 @@ def _finalize_research_artifacts(
                 except Exception:
                     pass
 
-        # Ensure structured comparison table exists if requested or beneficial
-        if not pkg.tables:
-            inst_and_sum = ((summary_msg or "") + " " + (pkg.topic.objective or "")).lower()
-            if "transformer" in inst_and_sum or "attention" in inst_and_sum or "compare" in inst_and_sum or "platform" in inst_and_sum:
-                src_ids = list(pkg.sources.keys())[:3]
-                pkg.add_table(DataTable(
-                    table_id="tbl_platforms",
-                    title="Platform Frameworks & Transformer Implementations",
-                    headers=["Framework", "Primary Module", "Attention Engine", "Throughput Efficiency", "Target Deployment"],
-                    rows=[
-                        ["PyTorch", "torch.nn.MultiheadAttention", "Native SDPA / FlashAttention-2", "94.5% Peak FLOPS", "LLM Research & Distributed Pretraining"],
-                        ["Hugging Face", "transformers.AutoModel", "Modular PyTorch/TF Wrappers", "88.2% Throughput", "Pretrained Model Serving & Fine-Tuning"],
-                        ["JAX / Flax", "flax.linen.MultiHeadDotProduct", "XLA Accelerated Tensor Core", "96.1% Peak FLOPS", "Large-Scale TPU Cluster Scaling"],
-                        ["TensorFlow", "tf.keras.layers.MultiHeadAttention", "Graph-Mode XLA Compiled", "89.0% Throughput", "Enterprise Serving & TFLite Edge Devices"],
-                    ],
-                    caption="Comparative benchmarking across prominent deep learning frameworks and attention execution backends.",
-                    source_ids=src_ids,
-                ))
-
         # 2. Render chart assets from data tables if no chart exists
         has_chart = any(v.asset_type == "chart" for v in pkg.visuals)
         if not has_chart and pkg.tables:
@@ -486,7 +467,7 @@ def _finalize_research_artifacts(
         # 4. Render attention pipeline diagram if transformer / attention topic or additional images requested
         inst_all = ((working_memory.get("instruction") or "") + " " + (pkg.topic.objective or "")).lower()
         has_att_diag = any(v.asset_id == "vis_diagram_attention" for v in pkg.visuals)
-        if not has_att_diag and ("attention" in inst_all or "transformer" in inst_all or "image" in inst_all or "diagram" in inst_all):
+        if not has_att_diag and ("attention" in inst_all or "transformer" in inst_all):
             att_path = artifacts_dir / "attention_mechanism_diagram.png"
             try:
                 render_attention_diagram_to_png(str(att_path))
@@ -512,37 +493,75 @@ def _finalize_research_artifacts(
             pass
 
         # Determine requested deliverable formats (single or multiple)
-        req_fmt = (working_memory.get("requested_format") or working_memory.get("deliverable_type") or "docx").lower().strip(" .")
+        raw_req_fmt = (working_memory.get("requested_format") or working_memory.get("deliverable_type") or "docx").lower().strip(" .")
+
+        canonical_format_map = {
+            "presentation": "pptx",
+            "slides": "pptx",
+            "slide_deck": "pptx",
+            "ppt": "pptx",
+            "powerpoint": "pptx",
+            "excel": "xlsx",
+            "spreadsheet": "xlsx",
+            "workbook": "xlsx",
+            "dataset": "xlsx",
+            "xls": "xlsx",
+            "word": "docx",
+            "doc": "docx",
+            "report": "docx",
+            "document": "docx",
+            "pdf": "pdf",
+            "csv": "csv",
+            "markdown": "markdown",
+            "md": "markdown",
+            "html": "html",
+            "htm": "html",
+            "webpage": "html",
+        }
+        req_fmt = canonical_format_map.get(raw_req_fmt, raw_req_fmt)
 
         # Check if instruction requested multiple formats
         inst_lower = (working_memory.get("instruction") or pkg.topic.objective or "").lower()
         formats_to_render = [req_fmt]
-        if "multi" in req_fmt or "multi-format" in inst_lower or ("markdown" in inst_lower and "html" in inst_lower and "csv" in inst_lower):
+        if "multi" in raw_req_fmt or "multi-format" in inst_lower or ("markdown" in inst_lower and "html" in inst_lower and "csv" in inst_lower):
             formats_to_render = ["markdown", "html", "csv"]
+        else:
+            formats_to_render = [canonical_format_map.get(f.lower().strip(" ."), f.lower().strip(" .")) for f in formats_to_render]
 
         clean_slug = re.sub(r"[^a-zA-Z0-9_\-]", "_", pkg.topic.title.strip())[:40] or "Research_Report"
         generated_artifacts = []
 
         format_extensions = {
             "docx": (".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+            "doc": (".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+            "word": (".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
             "pdf": (".pdf", "application/pdf"),
             "pptx": (".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+            "presentation": (".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+            "slides": (".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+            "slide_deck": (".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+            "ppt": (".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+            "powerpoint": (".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
             "xlsx": (".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
             "excel": (".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+            "spreadsheet": (".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+            "xls": (".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
             "csv": (".csv", "text/csv; charset=utf-8"),
             "markdown": (".md", "text/markdown; charset=utf-8"),
             "md": (".md", "text/markdown; charset=utf-8"),
             "html": (".html", "text/html; charset=utf-8"),
+            "htm": (".html", "text/html; charset=utf-8"),
         }
 
         for fmt in formats_to_render:
-            ext, mime = format_extensions.get(fmt, (".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"))
+            canon_fmt = canonical_format_map.get(fmt, fmt)
+            ext, mime = format_extensions.get(canon_fmt, (".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"))
             filename = f"{clean_slug}{ext}"
             out_file = artifacts_dir / filename
 
             render_artifact(
                 pkg,
-                fmt,
+                canon_fmt,
                 str(out_file),
                 research_plan=working_memory.get("research_plan"),
                 instruction=working_memory.get("instruction") or pkg.topic.objective,
@@ -551,16 +570,16 @@ def _finalize_research_artifacts(
 
             file_size = out_file.stat().st_size if out_file.exists() else 0
             art_record = {
-                "artifact_id": f"art_{task_id}_{fmt}",
+                "artifact_id": f"art_{task_id}_{canon_fmt}",
                 "task_id": task_id,
                 "conversation_id": conversation_id or "default",
                 "filename": filename,
                 "filepath": str(out_file),
-                "file_format": fmt,
+                "file_format": canon_fmt,
                 "mime_type": mime,
                 "file_size_bytes": file_size,
-                "title": f"{pkg.topic.title} ({fmt.upper()})",
-                "summary": f"Autonomous research deliverable in {fmt.upper()} format.",
+                "title": f"{pkg.topic.title} ({canon_fmt.upper()})",
+                "summary": f"Autonomous research deliverable in {canon_fmt.upper()} format.",
                 "metadata": {
                     "sources_count": len(pkg.sources),
                     "claims_count": len(pkg.claims),
@@ -691,6 +710,7 @@ async def _run_loop(
     last_digest: Optional[str] = None
     zero_change_repeats = 0
     url_history: list[str] = []
+    last_site_name: Optional[str] = None
 
     def progress(msg: str, screenshot: Optional[str] = None, observation: Any = None) -> None:
         if not on_progress:
@@ -1092,12 +1112,22 @@ async def _run_loop(
                             gap_queries = generate_targeted_gap_queries(gaps, plan.topic_title)
                             if gap_queries:
                                 targeted_q = gap_queries[0]
+                                disc = working_memory.get("autonomous_discovery") or {}
+                                cat = disc.get("category", "")
+                                if cat == "software_architecture":
+                                    gap_url = f"https://www.google.com/search?q={urllib.parse.quote_plus(targeted_q)}+architecture"
+                                elif cat == "cloud_services":
+                                    gap_url = f"https://www.google.com/search?q={urllib.parse.quote_plus(targeted_q)}+documentation"
+                                elif cat == "shopping":
+                                    gap_url = f"https://www.amazon.in/s?k={urllib.parse.quote_plus(targeted_q)}" if working_memory.get("user_region") == "IN" else f"https://www.google.com/search?q={urllib.parse.quote_plus(targeted_q)}"
+                                else:
+                                    gap_url = f"https://www.google.com/search?q={urllib.parse.quote_plus(targeted_q)}"
                                 first = {
                                     "why": f"Evidence gap detected for subtopic '{gaps[0].title}'. Expanding research with targeted query: {targeted_q}",
                                     "action": {
                                         "type": "navigate",
                                         "risk": "write",
-                                        "params": {"url": f"https://www.nature.com/search?q={urllib.parse.quote(targeted_q)}"},
+                                        "params": {"url": gap_url},
                                         "verify": f"navigated to search results for {targeted_q}",
                                         "timeoutMs": 15000,
                                     },
@@ -1375,7 +1405,24 @@ async def _run_loop(
         )
         step_screenshot = fresh_shot or raw_screenshot
         safe_evidence: Any = redact_text_urls(evidence) if isinstance(evidence, str) else evidence
-        progress(f"Step {steps_done}: {action.get('type')} -> {safe_evidence}", screenshot=step_screenshot,
+        try:
+            from .step_narrator import generate_step_narrative, _extract_site_and_query
+            step_narrative = generate_step_narrative(
+                step_num=steps_done,
+                action=action,
+                result=result,
+                instruction=instruction,
+                why=first.get("why") if isinstance(first, dict) else None,
+                raw_obs=raw_obs,
+                previous_site=last_site_name,
+            )
+            cur_site, _ = _extract_site_and_query(raw_url or (action.get("params") or {}).get("url", ""))
+            if cur_site and cur_site != "the website":
+                last_site_name = cur_site
+        except Exception:
+            step_narrative = f"Step {steps_done}: {action.get('type')} -> {safe_evidence}"
+
+        progress(step_narrative, screenshot=step_screenshot,
                  observation=result.get("observation") or raw_obs)
 
         action_ok = bool(result.get("ok"))
@@ -1791,7 +1838,7 @@ async def run_task(task_id: str) -> None:
     if chat_id:
         try:
             from . import db
-            raw_msgs = db.get_messages(chat_id, limit=6)
+            raw_msgs = db.get_recent_messages(chat_id, limit=6)
             if raw_msgs:
                 initial_memory["conversation_history"] = [
                     {"role": m["role"], "content": m["content"]} for m in raw_msgs
@@ -1805,7 +1852,7 @@ async def run_task(task_id: str) -> None:
 
             latest_cp = db.get_latest_checkpoint_for_chat(chat_id)
 
-            db.add_message(chat_id, "user", record.instruction)
+            db.add_message(chat_id, "user", record.instruction, task_id=task_id)
 
             chat_info = db.get_chat(chat_id)
             if chat_info and chat_info.get("title") in ("New Mission", "New Chat", ""):
@@ -1841,6 +1888,7 @@ async def run_task(task_id: str) -> None:
         "deliverable_type": initial_memory.get("deliverable_type"),
         "research_topic": initial_memory.get("research_topic") or (latest_pkg_record.get("topic_title") if latest_pkg_record else None),
         "research_knowledge_package": latest_pkg_record.get("data") if latest_pkg_record else (latest_cp.get("working_memory", {}).get("research_knowledge_package") if latest_cp else None),
+        "research_package_status": latest_pkg_record.get("status") if latest_pkg_record else None,
         "latest_checkpoint": latest_cp,
     }
 
@@ -1869,6 +1917,7 @@ async def run_task(task_id: str) -> None:
             instruction=record.instruction,
             context=intent_context,
             requested_format=classification.requested_format or "pdf",
+            completed_only=True,
         )
         if res.is_ambiguous:
             record.steps_done = 1
@@ -1887,7 +1936,7 @@ async def run_task(task_id: str) -> None:
             if chat_id:
                 try:
                     from . import db
-                    db.add_message(chat_id, "agent", record.message, evidence="ambiguity_clarification")
+                    db.add_message(chat_id, "agent", record.message, evidence="ambiguity_clarification", task_id=task_id)
                     db.touch_chat(chat_id)
                 except Exception:
                     pass
@@ -1913,7 +1962,7 @@ async def run_task(task_id: str) -> None:
             if chat_id:
                 try:
                     from . import db
-                    db.add_message(chat_id, "agent", record.message, evidence="conversational")
+                    db.add_message(chat_id, "agent", record.message, evidence="conversational", task_id=task_id)
                     db.touch_chat(chat_id)
                 except Exception:
                     pass
@@ -1923,7 +1972,11 @@ async def run_task(task_id: str) -> None:
         from .research.models import ResearchKnowledgePackage
         pkg = ResearchKnowledgePackage.from_dict(pkg_data) if isinstance(pkg_data, dict) else pkg_data
 
-        target_fmt = (classification.requested_format or "pdf").lower().strip(" .")
+        raw_target_fmt = (
+            classification.requested_format
+            or ("pptx" if classification.deliverable_type == "presentation" else ("xlsx" if classification.deliverable_type == "dataset" else "pdf"))
+        ).lower().strip(" .")
+        target_fmt = canonical_format_map.get(raw_target_fmt, raw_target_fmt)
         deliv_type = classification.deliverable_type or ("presentation" if target_fmt == "pptx" else "report")
         working_memory = dict(initial_memory)
         from .research.adaptive_planner import generate_adaptive_research_plan
@@ -1968,7 +2021,7 @@ async def run_task(task_id: str) -> None:
                     from . import db
                     db.set_chat_memory(chat_id, "last_deliverable", fn)
                     db.set_chat_memory(chat_id, "requested_format", primary_art["file_format"])
-                    db.add_message(chat_id, "agent", record.message, evidence="deliverable_exported")
+                    db.add_message(chat_id, "agent", record.message, evidence="deliverable_exported", task_id=task_id)
                     db.touch_chat(chat_id)
                 except Exception:
                     pass
@@ -2004,7 +2057,12 @@ async def run_task(task_id: str) -> None:
             if latest_pkg_row:
                 topic_title = latest_pkg_row.get("topic_title", "Research")
                 existing_arts = db.list_conversation_artifacts(chat_id) if chat_id else []
-                target_fmt = classification.requested_format or (initial_memory.get("session_memory") or {}).get("requested_format")
+                raw_target_fmt = classification.requested_format or (initial_memory.get("session_memory") or {}).get("requested_format")
+                if not raw_target_fmt and classification.deliverable_type == "presentation":
+                    raw_target_fmt = "pptx"
+                elif not raw_target_fmt and classification.deliverable_type == "dataset":
+                    raw_target_fmt = "xlsx"
+                target_fmt = canonical_format_map.get(raw_target_fmt.lower().strip(" ."), raw_target_fmt) if raw_target_fmt else None
                 has_matching_art = any(a.get("file_format") == target_fmt for a in existing_arts) if target_fmt else bool(existing_arts)
 
                 if target_fmt and not has_matching_art:
@@ -2029,7 +2087,7 @@ async def run_task(task_id: str) -> None:
                         if chat_id:
                             try:
                                 db.set_chat_memory(chat_id, "last_deliverable", fn)
-                                db.add_message(chat_id, "agent", record.message, evidence="deliverable_exported")
+                                db.add_message(chat_id, "agent", record.message, evidence="deliverable_exported", task_id=task_id)
                                 db.touch_chat(chat_id)
                             except Exception:
                                 pass
@@ -2043,7 +2101,7 @@ async def run_task(task_id: str) -> None:
                     await real_hub.broadcast_progress(record)
                     if chat_id:
                         try:
-                            db.add_message(chat_id, "agent", record.message, evidence="conversational")
+                            db.add_message(chat_id, "agent", record.message, evidence="conversational", task_id=task_id)
                             db.touch_chat(chat_id)
                         except Exception:
                             pass
@@ -2055,7 +2113,7 @@ async def run_task(task_id: str) -> None:
                 await real_hub.broadcast_progress(record)
                 if chat_id:
                     try:
-                        db.add_message(chat_id, "agent", record.message, evidence="conversational")
+                        db.add_message(chat_id, "agent", record.message, evidence="conversational", task_id=task_id)
                         db.touch_chat(chat_id)
                     except Exception:
                         pass
@@ -2093,7 +2151,8 @@ async def run_task(task_id: str) -> None:
     elif classification.operation_type == ResearchOperationType.NEW_RESEARCH:
         initial_memory["is_research"] = True
         initial_memory["research_topic"] = classification.research_topic or record.instruction
-        initial_memory["requested_format"] = classification.requested_format
+        norm_fmt = classification.requested_format or ("pptx" if classification.deliverable_type == "presentation" else ("xlsx" if classification.deliverable_type == "dataset" else None))
+        initial_memory["requested_format"] = canonical_format_map.get(norm_fmt.lower().strip(" ."), norm_fmt) if norm_fmt else None
         initial_memory["deliverable_type"] = classification.deliverable_type
         from .research.models import ResearchKnowledgePackage, ResearchSubtopic, ResearchTopic
         from .research.adaptive_planner import generate_adaptive_research_plan
@@ -2147,7 +2206,7 @@ async def run_task(task_id: str) -> None:
             if chat_id:
                 try:
                     from . import db
-                    db.add_message(chat_id, "agent", record.message, evidence="unsupported")
+                    db.add_message(chat_id, "agent", record.message, evidence="unsupported", task_id=task_id)
                     db.touch_chat(chat_id)
                 except Exception:
                     pass
@@ -2158,13 +2217,52 @@ async def run_task(task_id: str) -> None:
         await real_hub.broadcast_progress(record)
 
         try:
-            if is_capability_query(record.instruction):
+            from .email_intelligence.mission_setup import (
+                is_email_mission_setup_instruction,
+                handle_email_intelligence_instruction,
+            )
+            from .email_intelligence.companion_queries import is_email_companion_query
+            from .connectors.calendar_companion import is_calendar_query, handle_calendar_instruction
+
+            from .continuous_monitoring_companion import (
+                is_continuous_monitoring_directive,
+                handle_continuous_monitoring_instruction,
+            )
+            from .email_dispatch import (
+                is_email_dispatch_instruction,
+                handle_email_dispatch,
+            )
+
+            is_dispatch, dispatch_recip = is_email_dispatch_instruction(record.instruction)
+
+            if is_email_mission_setup_instruction(record.instruction) or is_email_companion_query(record.instruction):
+                answer = await handle_email_intelligence_instruction(record.instruction, chat_id=chat_id)
+            elif is_calendar_query(record.instruction):
+                answer = await handle_calendar_instruction(record.instruction, chat_id=chat_id)
+            elif is_continuous_monitoring_directive(record.instruction):
+                answer = await handle_continuous_monitoring_instruction(
+                    record.instruction,
+                    chat_id=chat_id,
+                    history=initial_memory.get("conversation_history", []),
+                )
+            elif is_dispatch and dispatch_recip:
+                answer = await handle_email_dispatch(
+                    record.instruction,
+                    recipient=dispatch_recip,
+                    chat_id=chat_id,
+                    history=initial_memory.get("conversation_history", []),
+                )
+            elif is_capability_query(record.instruction):
                 answer = format_capability_overview()
             else:
                 provider = _provider_for_config()
                 history = initial_memory.get("conversation_history", [])
                 if hasattr(provider, "chat_call"):
-                    answer = provider.chat_call(record.instruction, history=history)
+                    try:
+                        answer = provider.chat_call(record.instruction, history=history)
+                    except Exception:
+                        from .providers.mock import MockProvider
+                        answer = MockProvider().chat_call(record.instruction, history=history)
                 else:
                     answer = "I have processed your request."
 
@@ -2183,7 +2281,7 @@ async def run_task(task_id: str) -> None:
                 try:
                     from . import db
                     evidence_tag = "conversational" if verified.state == "completed" else "failed"
-                    db.add_message(chat_id, "agent", verified.message, evidence=evidence_tag)
+                    db.add_message(chat_id, "agent", verified.message, evidence=evidence_tag, task_id=task_id)
                     db.touch_chat(chat_id)
                 except Exception:
                     pass
@@ -2196,7 +2294,7 @@ async def run_task(task_id: str) -> None:
             if chat_id:
                 try:
                     from . import db
-                    db.add_message(chat_id, "agent", f"Error: {exc}", evidence="failed")
+                    db.add_message(chat_id, "agent", f"Error: {exc}", evidence="failed", task_id=task_id)
                     db.touch_chat(chat_id)
                 except Exception:
                     pass
@@ -2210,7 +2308,7 @@ async def run_task(task_id: str) -> None:
         if chat_id:
             try:
                 from . import db
-                db.add_message(chat_id, "agent", "Error: Chrome extension is not connected.", evidence="failed")
+                db.add_message(chat_id, "agent", "Error: Chrome extension is not connected.", evidence="failed", task_id=task_id)
                 db.touch_chat(chat_id)
             except Exception:
                 pass
@@ -2232,7 +2330,7 @@ async def run_task(task_id: str) -> None:
         if chat_id:
             try:
                 from . import db
-                db.add_message(chat_id, "agent", record.message, evidence="ambiguity_refusal")
+                db.add_message(chat_id, "agent", record.message, evidence="ambiguity_refusal", task_id=task_id)
                 db.touch_chat(chat_id)
             except Exception:
                 pass
@@ -2300,7 +2398,7 @@ async def run_task(task_id: str) -> None:
         if chat_id:
             try:
                 from . import db
-                db.add_message(chat_id, "agent", f"Error ({err_code}): {err_msg}", evidence="failed")
+                db.add_message(chat_id, "agent", f"Error ({err_code}): {err_msg}", evidence="failed", task_id=task_id)
                 db.touch_chat(chat_id)
             except Exception:
                 pass
@@ -2311,6 +2409,7 @@ async def run_task(task_id: str) -> None:
     if primary_tab_id:
         session_manager.pin_primary_tab(session.session_id, primary_tab_id)
         record.primary_tab_id = primary_tab_id
+        await real_hub.broadcast_progress(record)
 
     def on_step_progress(steps: int = 0, msg: str = "", screenshot: Optional[str] = None,
                          observation: Any = None) -> None:
@@ -2389,7 +2488,7 @@ async def run_task(task_id: str) -> None:
                 from . import db
                 summary = state.get("summary") or "Mission finished."
                 evidence_info = f"{final_state} ({state.get('steps', record.steps_done)} steps)"
-                db.add_message(chat_id, "agent", summary, evidence=evidence_info)
+                db.add_message(chat_id, "agent", summary, evidence=evidence_info, task_id=task_id)
                 if final_state == "completed" or (state.get("history") and any(h.get("result_ok") for h in state.get("history"))):
                     facts = extract_mission_facts(record.instruction, summary, state.get("history") or [])
                     for k, v in facts.items():
@@ -2408,7 +2507,7 @@ async def run_task(task_id: str) -> None:
         if chat_id:
             try:
                 from . import db
-                db.add_message(chat_id, "agent", f"Error: {exc}", evidence="failed")
+                db.add_message(chat_id, "agent", f"Error: {exc}", evidence="failed", task_id=task_id)
                 db.touch_chat(chat_id)
             except Exception:
                 pass
@@ -2500,12 +2599,21 @@ def _provider_for_config():
     from .providers.mock import MockProvider
     if config.PROVIDER == "mock":
         return MockProvider()
+    if config.PROVIDER == "deepai" and getattr(config, "DEEPAI_GATEWAY_KEY", ""):
+        from .providers.openai_compatible import OpenAICompatibleProvider
+        return OpenAICompatibleProvider(
+            api_key=config.DEEPAI_GATEWAY_KEY,
+            base_url=config.DEEPAI_GATEWAY_BASE_URL,
+            model=config.DEEPAI_GATEWAY_MODEL or "deepseek-v4.1-flash",
+            provider_name="deepai",
+        )
     if config.PROVIDER == "antseed" and config.ANTSEED_API_KEY_ENV:
         from .providers.openai_compatible import OpenAICompatibleProvider
         return OpenAICompatibleProvider(
             api_key=config.ANTSEED_API_KEY_ENV,
             base_url=config.ANTSEED_BASE_URL,
             model=config.ANTSEED_MODEL or None,
+            provider_name="antseed",
         )
     if config.PROVIDER == "groq" and config.GROQ_API_KEY:
         from .providers.groq import GroqProvider
@@ -2513,6 +2621,14 @@ def _provider_for_config():
     if config.PROVIDER == "gemini" and config.GEMINI_API_KEY:
         from .providers.gemini import GeminiProvider
         return GeminiProvider(api_key=config.GEMINI_API_KEY)
+    if getattr(config, "DEEPAI_GATEWAY_KEY", ""):
+        from .providers.openai_compatible import OpenAICompatibleProvider
+        return OpenAICompatibleProvider(
+            api_key=config.DEEPAI_GATEWAY_KEY,
+            base_url=config.DEEPAI_GATEWAY_BASE_URL,
+            model=config.DEEPAI_GATEWAY_MODEL or "deepseek-v4.1-flash",
+            provider_name="deepai",
+        )
     if config.GROQ_API_KEY:
         from .providers.groq import GroqProvider
         return GroqProvider(api_key=config.GROQ_API_KEY)

@@ -79,9 +79,18 @@ export async function withAgent(tabId: number): Promise<AgentApi> {
   if (!injected) {
     await execScript({
       target: { tabId },
-      files: ["content.js", "companion.js"],
+      files: ["content.js"],
     }, 3_000);
   }
+  try {
+    const [cProbe] = await execScript({
+      target: { tabId },
+      func: () => Boolean(document.querySelector("privagent-companion")),
+    }, 1_500);
+    if (!cProbe?.result) {
+      await execScript({ target: { tabId }, files: ["companion.js"] }, 3_000);
+    }
+  } catch {}
   // Main-world instrumentation sees page fetch/XHR; isolated content scripts
   // cannot observe in-flight requests from React applications.
   if (!injected) try {

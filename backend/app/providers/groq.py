@@ -66,17 +66,20 @@ class GroqProvider:
     def name(self) -> str:
         return f"groq:{self._model}"
 
-    def chat_call(self, prompt: str, history: Optional[list[dict[str, Any]]] = None) -> str:
+    def chat_call(
+        self,
+        prompt: str,
+        history: Optional[list[dict[str, Any]]] = None,
+        system_prompt: Optional[str] = None,
+    ) -> str:
         try:
             from ..capabilities import SYSTEM_CAPABILITY_PROMPT
-            sys_prompt = SYSTEM_CAPABILITY_PROMPT
+            sys_prompt = system_prompt or SYSTEM_CAPABILITY_PROMPT
         except Exception:
-            sys_prompt = "You are PrivAgent, a helpful, privacy-preserving AI browser assistant."
+            sys_prompt = system_prompt or "You are PrivAgent, a helpful, privacy-preserving AI browser assistant."
+        from .history import normalize_history
         messages = [{"role": "system", "content": sys_prompt}]
-        if history:
-            for h in history[-6:]:
-                if isinstance(h, dict) and h.get("role") and h.get("content"):
-                    messages.append({"role": h["role"], "content": h["content"]})
+        messages.extend(normalize_history(history))
         messages.append({"role": "user", "content": prompt})
 
         models_to_try = [self._model] + [m for m in self.FALLBACK_MODELS if m != self._model]

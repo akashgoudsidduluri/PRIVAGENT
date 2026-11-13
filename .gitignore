@@ -32,6 +32,7 @@ Thumbs.db
 # Local SQLite databases and runtime artifacts
 backend/data/
 backend/scratch/
+artifact_proof
 *.db
 *.db-wal
 *.db-shm

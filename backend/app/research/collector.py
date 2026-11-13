@@ -667,13 +667,20 @@ def extract_page_images(
 
         # Normalize canonical image URL by stripping tracking parameters
         clean_query = urllib.parse.parse_qs(parsed.query)
-        clean_query = {k: v for k, v in clean_query.items() if not k.lower().startswith("utm_") and k.lower() not in ("ref", "source", "fbclid")}
+        clean_query = {
+            k: v for k, v in clean_query.items()
+            if not any(t in k.lower() for t in ("utm_", "fbclid", "gclid", "campaign", "source", "ref"))
+        }
+        # If the path already points to a static raster image file, omit tracking query entirely if clean_query has no semantic parameters
+        final_query = urllib.parse.urlencode(clean_query, doseq=True)
+        if any(parsed.path.lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif")):
+            final_query = ""
         canon_img_url = urllib.parse.urlunparse((
             parsed.scheme,
             parsed.netloc.lower(),
             parsed.path,
             parsed.params,
-            urllib.parse.urlencode(clean_query, doseq=True),
+            final_query,
             "",
         ))
 
@@ -681,10 +688,21 @@ def extract_page_images(
             continue
 
         # Filtering heuristics:
+        # Prohibit raw SVG or AVIF vectors if renderers require raster formats
+        p_path_lower = parsed.path.lower()
+        if p_path_lower.endswith(".svg") or "/svg/" in p_path_lower:
+            # If it's a thumbnail with a raster extension like .svg.png, allow it; otherwise skip raw svg
+            if not any(p_path_lower.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp")):
+                continue
+
         # Check explicit dimension attributes
         w = cand.get("width")
         h = cand.get("height")
-        if (w is not None and w < 80) or (h is not None and h < 80):
+        if (w is not None and w < 100) or (h is not None and h < 100):
+            continue
+
+        # Skip tiny thumbnail icons (e.g. Wikipedia 16px, 20px, 32px icons)
+        if re.search(r"/(?:[1-4]\d|50)px-", canon_img_url):
             continue
 
         # Check tracking and advertisement patterns
@@ -965,8 +983,28 @@ def harvest_page_evidence(
 
     # 6. Extract Substantive Website Images & Associate Provenance
     try:
-        extracted_images = extract_page_images(canon_url, text, meta["title"], domain, src_id)
-        for img in extracted_images[:3]:
+        html_content = text
+        # If text does not contain HTML tags and the URL is a safe public HTTP/HTTPS URL,
+        # fetch the page HTML with proper User-Agent to extract genuine diagrams and schematics
+        if ("<img" not in text.lower() and "<figure" not in text.lower()) and canon_url.startswith(("http://", "https://")):
+            try:
+                from ..website_resolver import is_safe_public_url
+                safe, _ = is_safe_public_url(canon_url)
+                if safe:
+                    import httpx
+                    fetch_headers = {
+                        "User-Agent": "PrivAgentResearchBot/1.0 (https://github.com/privagent; contact@privagent.local)",
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                    }
+                    with httpx.Client(timeout=4.0, follow_redirects=True) as client:
+                        resp = client.get(canon_url, headers=fetch_headers)
+                        if resp.status_code == 200 and resp.text:
+                            html_content = resp.text
+            except Exception:
+                pass
+
+        extracted_images = extract_page_images(canon_url, html_content, meta["title"], domain, src_id)
+        for img in extracted_images[:4]:
             pkg.add_visual(img)
     except Exception:
         pass

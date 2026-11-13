@@ -155,7 +155,50 @@ def test_refusal_cannot_produce_successful_completion():
 
 
 # ============================================================================
-# 5. Duplicate mission results are prevented
+# 5. Substantive conversational answers may mention a limitation
+# ============================================================================
+
+def test_substantive_conversational_answer_with_limitation_is_completed():
+    """A full capability answer is a result even if it names a limitation."""
+    answer = (
+        "### PrivAgent Autonomous Capabilities\n\n"
+        "- **Real-browser automation**: navigate pages, search Google, and open webmail.\n"
+        "- **Fail-closed privacy**: redact credentials, cards, SSNs and tokens before any LLM call.\n"
+        "- **Tab isolation**: work only inside the authorized session tab.\n"
+        "- **Human handoff**: pause for login, 2FA or CAPTCHA.\n"
+        "- **Conversational assistance**: code writing, calculations and explanations.\n\n"
+        "Note that I cannot continuously monitor sites 24/7 without an active mission."
+    )
+    assert is_refusal_message(answer) is True  # the phrase is present …
+    outcome = verify_task_completion("what about automation and site monitoring", "completed", answer)
+    assert outcome.state == "completed"  # … but the answer is still a result
+    assert outcome.is_verified is True
+
+
+def test_limitation_phrase_does_not_rescue_a_short_answer():
+    short = "I cannot continuously monitor sites 24/7."
+    assert is_refusal_message(short) is True
+    outcome = verify_task_completion("what about automation and site monitoring", "completed", short)
+    assert outcome.state == "failed"
+    assert outcome.is_verified is False
+
+
+def test_limitation_phrase_does_not_rescue_a_browser_mission():
+    """The relaxation is conversational-only; a browse task cannot pass this way."""
+    answer = (
+        "### Attempted browsing\n\n"
+        "- Opened the browser session.\n"
+        "- Tried the destination twice.\n"
+        "- The page did not load within the budget.\n\n"
+        "I cannot finish the sign-in handoff on my own."
+    )
+    outcome = verify_task_completion("open mail", "completed", answer)
+    assert outcome.state == "failed"
+    assert outcome.is_verified is False
+
+
+# ============================================================================
+# 6. Duplicate mission results are prevented
 # ============================================================================
 
 @pytest.mark.asyncio

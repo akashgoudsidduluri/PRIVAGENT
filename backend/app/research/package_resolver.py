@@ -52,8 +52,13 @@ def resolve_target_package(
     context: Optional[dict[str, Any]] = None,
     requested_format: Optional[str] = "pdf",
     db_path: Optional[str] = None,
+    completed_only: bool = False,
 ) -> PackageResolutionResult:
-    """Resolve the target ResearchKnowledgePackage for deliverable export or refinement."""
+    """Resolve the target ResearchKnowledgePackage for deliverable export or refinement.
+
+    ``completed_only`` keeps an explicit export from silently selecting a
+    package that is still being collected in another task.
+    """
     ctx = context or {}
     candidates: list[dict[str, Any]] = []
     seen_pkg_ids: set[str] = set()
@@ -67,6 +72,8 @@ def resolve_target_package(
                 pid = p.get("package_id")
                 if pid and pid not in seen_pkg_ids:
                     seen_pkg_ids.add(pid)
+                    if completed_only and p.get("status") not in (None, "completed"):
+                        continue
                     candidates.append(p)
         except Exception as exc:
             logger.error("Database error while listing packages for chat %s: %s", chat_id, exc, exc_info=True)
@@ -83,17 +90,18 @@ def resolve_target_package(
                     pid = pkg_data.get("package_id") or f"pkg_{cp.get('task_id', 'unknown')}"
                     if pid not in seen_pkg_ids:
                         seen_pkg_ids.add(pid)
-                        top = pkg_data.get("topic") or {}
-                        top_title = top.get("title") if isinstance(top, dict) else getattr(top, "title", "Research Findings")
-                        candidates.append({
-                            "package_id": pid,
-                            "conversation_id": chat_id,
-                            "task_id": cp.get("task_id", ""),
-                            "topic_title": top_title,
-                            "status": "completed",
-                            "data": pkg_data,
-                            "updated_at": cp.get("updated_at", 0),
-                        })
+                        if not completed_only or wm.get("research_stage") == "completed":
+                            top = pkg_data.get("topic") or {}
+                            top_title = top.get("title") if isinstance(top, dict) else getattr(top, "title", "Research Findings")
+                            candidates.append({
+                                "package_id": pid,
+                                "conversation_id": chat_id,
+                                "task_id": cp.get("task_id", ""),
+                                "topic_title": top_title,
+                                "status": "completed",
+                                "data": pkg_data,
+                                "updated_at": cp.get("updated_at", 0),
+                            })
         except Exception as exc:
             logger.error("Database error while fetching latest checkpoint for chat %s: %s", chat_id, exc, exc_info=True)
             db_errors.append(f"get_checkpoint: {exc}")
@@ -104,17 +112,18 @@ def resolve_target_package(
         pid = ctx_pkg.get("package_id") or "pkg_context"
         if pid not in seen_pkg_ids:
             seen_pkg_ids.add(pid)
-            top = ctx_pkg.get("topic") or {}
-            top_title = top.get("title") if isinstance(top, dict) else getattr(top, "title", "Research Findings")
-            candidates.append({
-                "package_id": pid,
-                "conversation_id": chat_id or "default",
-                "task_id": ctx.get("task_id", ""),
-                "topic_title": top_title,
-                "status": "completed",
-                "data": ctx_pkg,
-                "updated_at": 0,
-            })
+            if not completed_only or ctx.get("research_package_status") in (None, "completed"):
+                top = ctx_pkg.get("topic") or {}
+                top_title = top.get("title") if isinstance(top, dict) else getattr(top, "title", "Research Findings")
+                candidates.append({
+                    "package_id": pid,
+                    "conversation_id": chat_id or "default",
+                    "task_id": ctx.get("task_id", ""),
+                    "topic_title": top_title,
+                    "status": "completed",
+                    "data": ctx_pkg,
+                    "updated_at": 0,
+                })
 
     # Case A: No packages found
     if not candidates:

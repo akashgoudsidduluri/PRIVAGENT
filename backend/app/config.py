@@ -1,7 +1,10 @@
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+_env_file = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(dotenv_path=_env_file, override=True)
+load_dotenv(override=True)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
@@ -14,7 +17,16 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "").strip()
 ANTSEED_BASE_URL = os.getenv("ANTSEED_BASE_URL", "http://localhost:8377/v1").strip()
 ANTSEED_API_KEY_ENV = os.getenv("ANTSEED_API_KEY", "").strip()
 ANTSEED_MODEL = os.getenv("ANTSEED_MODEL", "").strip()
-PROVIDER = os.getenv("NAVIGATOR_PROVIDER", "groq" if GROQ_API_KEY else ("gemini" if GEMINI_API_KEY else "mock"))
+
+# DeepAI Gateway — local OpenAI-compatible service for DeepSeek & free models.
+DEEPAI_GATEWAY_BASE_URL = os.getenv("DEEPAI_GATEWAY_BASE_URL", "http://127.0.0.1:8787/v1").strip()
+DEEPAI_GATEWAY_KEY = os.getenv("DEEPAI_GATEWAY_KEY", "").strip()
+DEEPAI_GATEWAY_MODEL = os.getenv("DEEPAI_GATEWAY_MODEL", "deepseek-v4.1-flash").strip()
+
+PROVIDER = os.getenv(
+    "NAVIGATOR_PROVIDER",
+    "deepai" if DEEPAI_GATEWAY_KEY else ("groq" if GROQ_API_KEY else ("gemini" if GEMINI_API_KEY else "mock"))
+)
 MAX_STEPS = int(os.getenv("MAX_STEPS", "25"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 TASK_TIMEOUT_S = float(os.getenv("TASK_TIMEOUT_S", "360"))

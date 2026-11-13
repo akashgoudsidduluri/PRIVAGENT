@@ -106,6 +106,21 @@ def validate_and_cache_image(
     if not valid:
         return False, reason, None
 
+    # Universal normalization: Convert WEBP, GIF, or non-PNG images to PNG if saving as .png
+    # to guarantee 100% compatibility across ReportLab, docx, and pptx renderers
+    try:
+        if dest_file.suffix.lower() == ".png" and (meta and meta.get("format") != "PNG"):
+            with Image.open(io.BytesIO(raw_data)) as im:
+                rgb_im = im.convert("RGB") if im.mode in ("RGBA", "P", "LA") else im
+                buf = io.BytesIO()
+                rgb_im.save(buf, format="PNG")
+                raw_data = buf.getvalue()
+                if meta:
+                    meta["format"] = "PNG"
+                    meta["size_bytes"] = len(raw_data)
+    except Exception:
+        pass
+
     try:
         dest_file.parent.mkdir(parents=True, exist_ok=True)
         dest_file.write_bytes(raw_data)
@@ -140,11 +155,15 @@ def fetch_and_validate_image_url(
     redirect_chain: list[str] = []
 
     try:
+        req_headers = {
+            "User-Agent": "PrivAgentResearchBot/1.0 (https://github.com/privagent; contact@privagent.local)",
+            "Accept": "image/avif,image/webp,image/apng,image/png,image/jpeg,image/*,*/*;q=0.8",
+        }
         with httpx.Client(timeout=timeout, follow_redirects=False) as client:
             for _ in range(max_redirects + 1):
                 resp = client.get(
                     current_url,
-                    headers={"User-Agent": "PrivAgent/1.0 (Research Artifact Generator)"},
+                    headers=req_headers,
                 )
 
                 if resp.is_redirect:

@@ -81,9 +81,10 @@ class MCPDiscovery:
                         registered = f"{name}.{item.name}"
                         async def invoke(args, server_name=name, tool_name=item.name):
                             return await self.call(server_name, tool_name, args)
-                        self.registry.register(Tool(registered, item.inputSchema, invoke,
-                                                    mutating=item.name not in spec.read_only_tools,
-                                                    server=name, description=item.description or ""))
+                        self.registry.replace(Tool(registered, item.inputSchema, invoke,
+                                                   mutating=item.name not in spec.read_only_tools,
+                                                   server=name, description=item.description or "",
+                                                   discovered=True))
                         names.append(registered)
                     cursor = page.nextCursor
                     if not cursor: break

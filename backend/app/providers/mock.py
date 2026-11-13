@@ -45,7 +45,8 @@ class MockProvider:
             })
         return {"goal": instruction, "steps": steps}
 
-    def chat_call(self, prompt: str, history: Optional[list[dict[str, Any]]] = None) -> str:
+    def chat_call(self, prompt: str, history: Optional[list[dict[str, Any]]] = None,
+                  system_prompt: Optional[str] = None) -> str:
         lower = (prompt or "").strip().lower()
         if any(w in lower for w in ("hi", "hello", "hey", "greetings", "howdy")):
             return "Hello! I am PrivAgent, your privacy-preserving AI assistant. How can I help you today?"

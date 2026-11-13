@@ -35,55 +35,78 @@ def extract_json_from_text(text: str) -> dict[str, Any]:
 
     Handles:
     - Pure JSON strings
+    - Reasoning model tags (<think>...</think>)
     - Markdown code fences (```json ... ``` or ``` ... ```) with arbitrary preamble/postamble
     - Embedded JSON objects surrounded by explanatory prose
+    - Minor trailing commas or formatting flaws
 
     Raises ValueError / json.JSONDecodeError if no valid JSON dict can be extracted.
     """
     if not text:
         raise ValueError("PLAN_INVALID: Model returned empty response")
 
-    cleaned = text.strip()
+    # Strip reasoning tags emitted by reasoning models (DeepSeek R1/V3, etc.)
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE).strip()
+    if not cleaned:
+        cleaned = text.strip()
+
+    def _try_parse(s: str) -> Optional[dict[str, Any]]:
+        s_clean = s.strip()
+        try:
+            d = json.loads(s_clean)
+            if isinstance(d, dict):
+                return d
+        except Exception:
+            pass
+        # Fallback: clean trailing commas before closing braces/brackets
+        try:
+            repaired = re.sub(r",\s*([\}\]])", r"\1", s_clean)
+            d = json.loads(repaired)
+            if isinstance(d, dict):
+                return d
+        except Exception:
+            pass
+        return None
 
     # 1. Fast path: text is already a clean JSON object
     if cleaned.startswith("{") and cleaned.endswith("}"):
-        try:
-            data = json.loads(cleaned)
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            pass
+        res = _try_parse(cleaned)
+        if res is not None:
+            return res
 
     # 2. Markdown code fences: ```json ... ``` or ``` ... ```
-    fence_matches = re.findall(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
+    fence_matches = re.findall(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, re.IGNORECASE)
     for fence in fence_matches:
-        fence_clean = fence.strip()
-        try:
-            data = json.loads(fence_clean)
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            idx = fence_clean.find("{")
-            if idx != -1:
-                try:
-                    data, _ = json.JSONDecoder().raw_decode(fence_clean, idx)
-                    if isinstance(data, dict):
-                        return data
-                except Exception:
-                    pass
+        res = _try_parse(fence)
+        if res is not None:
+            return res
+        idx = fence.find("{")
+        if idx != -1:
+            try:
+                data, _ = json.JSONDecoder().raw_decode(fence, idx)
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
 
     # 3. Embedded JSON object in surrounding prose
     start_pos = 0
     while True:
-        idx = text.find("{", start_pos)
+        idx = cleaned.find("{", start_pos)
         if idx == -1:
             break
         try:
-            data, _ = json.JSONDecoder().raw_decode(text, idx)
+            data, _ = json.JSONDecoder().raw_decode(cleaned, idx)
             if isinstance(data, dict):
                 return data
         except Exception:
-            pass
+            # Also try substring from idx to last }
+            last_brace = cleaned.rfind("}")
+            if last_brace > idx:
+                sub = cleaned[idx : last_brace + 1]
+                res = _try_parse(sub)
+                if res is not None:
+                    return res
         start_pos = idx + 1
 
     raise ValueError(f"PLAN_INVALID: Model returned non-JSON: {text[:200]}")
@@ -125,12 +148,17 @@ class GeminiProvider:
     def name(self) -> str:
         return f"gemini:{self._model}"
 
-    def chat_call(self, prompt: str, history: Optional[list[dict[str, Any]]] = None) -> str:
+    def chat_call(
+        self,
+        prompt: str,
+        history: Optional[list[dict[str, Any]]] = None,
+        system_prompt: Optional[str] = None,
+    ) -> str:
         try:
             from ..capabilities import SYSTEM_CAPABILITY_PROMPT
-            sys_instruction = SYSTEM_CAPABILITY_PROMPT
+            sys_instruction = system_prompt or SYSTEM_CAPABILITY_PROMPT
         except Exception:
-            sys_instruction = "You are PrivAgent, a helpful, privacy-preserving AI browser automation assistant."
+            sys_instruction = system_prompt or "You are PrivAgent, a helpful, privacy-preserving AI browser automation assistant."
         models_to_try = [self._model] + [m for m in self.FALLBACK_MODELS if m != self._model]
         available = [m for m in models_to_try if not _model_blocked(m)]
         if not available:

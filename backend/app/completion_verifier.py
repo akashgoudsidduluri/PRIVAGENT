@@ -118,6 +118,22 @@ def is_refusal_message(message: str) -> bool:
     return any(p.search(clean) for p in REFUSAL_PATTERNS)
 
 
+def is_substantive_conversational_answer(message: str, instruction: str) -> bool:
+    """True for a real answer that only mentions a limitation in passing.
+
+    Capability answers legitimately say things like "I cannot continuously
+    monitor sites 24/7" while still delivering a full, useful result. Requiring
+    a conversational instruction plus a long, structured answer keeps bare
+    refusals ("I cannot access browsers.") failing as before.
+    """
+    if classify_instruction_type(instruction) != "CONVERSATIONAL":
+        return False
+    text = (message or "").strip()
+    if len(text) < 240:
+        return False
+    return bool(re.search(r"(?m)^\s*(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|\|)", text))
+
+
 def is_waiting_for_user(message: str, state: str) -> bool:
     """True if task is waiting for user action (auth, CAPTCHA, approval)."""
     if state in ("awaiting_confirmation", "awaiting_input", "waiting_user"):
@@ -287,8 +303,12 @@ def verify_task_completion(
     if not current_url and isinstance(observation, dict):
         current_url = observation.get("url") or ""
 
-    # Rule 1: A refusal, explanation, empty response, or provider error NEVER counts as completed.
-    if is_refusal_message(msg):
+    category = classify_instruction_type(instruction)
+
+    # Rule 1: A refusal, explanation, empty response, or provider error NEVER
+    # counts as completed. A substantive conversational answer may mention a
+    # limitation ("I cannot monitor sites 24/7") and still be a real result.
+    if is_refusal_message(msg) and not is_substantive_conversational_answer(msg, instruction):
         return VerificationResult(
             state="failed",
             message=msg,
@@ -336,8 +356,6 @@ def verify_task_completion(
         if not confirmed:
             return VerificationResult("failed", f"Action not confirmed by the service. {msg}", False,
                                       "No verified authoritative affirmation for the requested write.")
-
-    category = classify_instruction_type(instruction)
 
     # Rule 3: Unsupported operations must fail honestly
     if category == "UNSUPPORTED":

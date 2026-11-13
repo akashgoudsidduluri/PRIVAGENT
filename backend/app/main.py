@@ -84,7 +84,7 @@ class AttachmentInput(BaseModel):
 
 
 @app.get("/api/connectors")
-async def connector_status() -> list[dict]:
+def connector_status() -> list[dict]:
     from .connectors.oauth import oauth_manager
     return oauth_manager.status()
 
@@ -96,6 +96,56 @@ async def start_connector(provider: str) -> dict[str, str]:
         return {"authorizationUrl": oauth_manager.start(provider)}
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
+
+
+class ConnectorConfigureInput(BaseModel):
+    client_id: Optional[str] = Field(default=None, alias="clientId")
+    client_secret: Optional[str] = Field(default=None, alias="clientSecret")
+    access_token: Optional[str] = Field(default=None, alias="accessToken")
+    refresh_token: Optional[str] = Field(default=None, alias="refreshToken")
+    model_config = {"populate_by_name": True}
+
+
+@app.post("/api/connectors/{provider}/configure")
+async def configure_connector(provider: str, body: ConnectorConfigureInput) -> dict[str, Any]:
+    from .connectors.oauth import oauth_manager
+    if provider not in {item["provider"] for item in oauth_manager.status()}:
+        raise HTTPException(404, "unknown connector")
+    auth_url = None
+    if body.access_token or body.refresh_token:
+        oauth_manager.set_tokens(provider, access_token=body.access_token, refresh_token=body.refresh_token)
+        # Automatically update active email mission account email
+        try:
+            conn = oauth_manager.connector("gmail" if provider == "google" else "outlook")
+            if getattr(conn, "configured", False):
+                prof = conn.get_profile()
+                email_addr = prof.get("emailAddress") or prof.get("mail")
+                if email_addr:
+                    logger.info("Live OAuth connected for %s: %s", provider, email_addr)
+                    from .email_intelligence.sync_engine import run_email_mission_tick
+                    missions = db.list_email_missions()
+                    if missions:
+                        for m in missions:
+                            db.update_email_mission(m["id"], {"account_email": email_addr, "sync_cursor": ""})
+                        asyncio.create_task(run_email_mission_tick(missions[0]["id"]))
+                    else:
+                        new_m = db.create_email_mission(account_email=email_addr, provider="gmail" if provider == "google" else "outlook")
+                        asyncio.create_task(run_email_mission_tick(new_m["id"]))
+        except Exception as exc:
+            logger.warning("Could not sync email profile for %s: %s", provider, exc)
+    elif body.client_id and body.client_secret:
+        oauth_manager.set_credentials(provider, body.client_id, body.client_secret)
+        try:
+            auth_url = oauth_manager.start(provider)
+        except Exception:
+            pass
+    else:
+        raise HTTPException(400, "Must provide accessToken, refreshToken, or (clientId and clientSecret)")
+    return {
+        "ok": True,
+        "authorizationUrl": auth_url,
+        "status": [item for item in oauth_manager.status() if item["provider"] == provider][0],
+    }
 
 
 @app.get("/api/connectors/{provider}/callback")
@@ -188,12 +238,18 @@ async def discover_llm_models() -> dict[str, Any]:
     offer manual model entry honestly, plus the static seed list either way.
     """
     from .providers import provider_settings
-    from .providers.openai_compatible import seeded_models
+    from .providers.openai_compatible import seeded_models, DEEPAI_FREE_MODELS
     seeded = seeded_models()
     try:
         provider = provider_settings.provider_for_runtime()
     except Exception as exc:
-        return {"discovered": False, "reason": str(exc), "seeded": seeded, "models": list(seeded)}
+        return {
+            "discovered": False,
+            "reason": str(exc),
+            "seeded": seeded,
+            "models": list(seeded),
+            "free_models": DEEPAI_FREE_MODELS,
+        }
     list_models = getattr(provider, "list_models", None)
     if list_models is None:
         return {
@@ -201,6 +257,7 @@ async def discover_llm_models() -> dict[str, Any]:
             "reason": f"Provider '{provider.name() if hasattr(provider, 'name') else type(provider).__name__}' does not support model discovery.",
             "seeded": seeded,
             "models": list(seeded),
+            "free_models": DEEPAI_FREE_MODELS,
         }
     try:
         models = list_models()
@@ -210,14 +267,22 @@ async def discover_llm_models() -> dict[str, Any]:
             "reason": str(exc),
             "seeded": seeded,
             "models": list(seeded),
+            "free_models": DEEPAI_FREE_MODELS,
         }
     merged: list[str] = []
     seen: set[str] = set()
-    for m in list(models) + seeded:
+    # Prioritize the 5 free models at top
+    for m in seeded + list(models):
         if m not in seen:
             seen.add(m)
             merged.append(m)
-    return {"discovered": True, "models": merged, "seeded": seeded, "reason": None}
+    return {
+        "discovered": True,
+        "models": merged,
+        "seeded": seeded,
+        "free_models": DEEPAI_FREE_MODELS,
+        "reason": None,
+    }
 
 
 @app.post("/api/test/execute_action")
@@ -250,6 +315,24 @@ async def get_chat_session(chat_id: str) -> dict[str, Any]:
     chat = db.get_chat(chat_id)
     if not chat:
         raise HTTPException(status_code=404, detail="chat not found")
+    from .hub import TERMINAL_STATES
+    active_task = None
+    for t in hub.tasks.values():
+        if getattr(t, "chat_id", None) == chat_id and t.state not in TERMINAL_STATES:
+            active_task = {
+                "taskId": t.task_id,
+                "taskState": t.state,
+                "stepsDone": t.steps_done,
+                "message": t.message,
+                "screenshot": t.screenshot,
+                "intent": t.intent,
+                "isBrowserTask": t.intent != "NON_BROWSER" if t.intent else True,
+                "sessionId": t.session_id,
+                "primaryTabId": t.primary_tab_id,
+                "childTabIds": t.child_tab_ids,
+            }
+            break
+    chat["active_task"] = active_task
     return chat
 
 
@@ -409,13 +492,16 @@ async def pause_task(task_id: str) -> dict[str, str]:
 @app.post("/api/task/{task_id}/resume")
 async def resume_task(task_id: str) -> dict[str, str]:
     task = _require(task_id)
-    if task.state != "paused":
+    if task.state not in ("paused", "interrupted"):
         raise HTTPException(409, f"task is {task.state}, cannot resume")
-    from .agentLoop import request_resume
+    from .agentLoop import request_resume, _pause_events
+    is_in_memory_paused = task_id in _pause_events
     request_resume(task_id)
     task.state = "running"
     task.message = "Mission resumed."
     await hub.broadcast_progress(task)
+    if not is_in_memory_paused:
+        _spawn(_run_task_later(task.task_id))
     return {"taskState": "running"}
 
 
@@ -452,7 +538,7 @@ def _require(task_id: str):
             # restored state from the recorded final agent message instead of
             # assuming "completed" whenever step_index > 0 (which used to report
             # crashed/interrupted tasks as successful).
-            state = "failed"
+            state = "interrupted"
             message = (
                 f"Backend restarted before this task finished; "
                 f"progress preserved at step {cp.get('step_index', 0)}."
@@ -624,3 +710,5 @@ from .capabilities_api import router as capabilities_router
 app.include_router(capabilities_router)
 from .memory.api import router as memory_router
 app.include_router(memory_router)
+from .email_api import router as email_router
+app.include_router(email_router)

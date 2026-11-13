@@ -53,24 +53,51 @@ def _autofit_columns(ws: Any, max_len_cap: int = 60) -> None:
 
 
 def _parse_numeric_for_excel(val: Any) -> tuple[Any, bool]:
-    """Check if cell string is a currency or percentage and return clean number for formulas."""
+    """Check if cell string is a pure currency or number and return clean number for formulas."""
     if val is None:
         return "", False
     if isinstance(val, (int, float)):
         return val, True
     s = str(val).strip()
-    # Currency
-    m_curr = re.search(r"^(?:₹|Rs\.?|\$)\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+)", s)
+    if not s:
+        return "", False
+
+    # If the string contains words or parentheses (e.g. "(128 GB)", "per month"), preserve it as text!
+    if re.search(r"[a-zA-Z\(\)]", s):
+        # Allow pure standard currency codes like "USD 1200" or "INR 50000"
+        m_code = re.match(r"^(?:USD|INR|EUR|GBP|AUD|CAD)\s*([0-9,]+(?:\.[0-9]+)?)$", s, re.IGNORECASE)
+        if m_code:
+            try:
+                clean_num = m_code.group(1).replace(",", "")
+                return float(clean_num) if "." in clean_num else int(clean_num), True
+            except ValueError:
+                pass
+        return val, False
+
+    # Standalone Currency symbol with Indian or Western grouping: e.g. "₹1,19,900", "$450.50", "₹129999"
+    m_curr = re.match(r"^(?:₹|Rs\.?|\$|€|£)?\s*([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)\s*$", s)
     if m_curr:
         try:
-            return float(m_curr.group(1).replace(",", "")), True
+            clean_num = m_curr.group(1).replace(",", "")
+            if clean_num:
+                return float(clean_num) if "." in clean_num else int(clean_num), True
         except ValueError:
             pass
+
+    # Percentage: e.g. "94.6%", "18%"
+    m_pct = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*%$", s)
+    if m_pct:
+        try:
+            return float(m_pct.group(1)), True
+        except ValueError:
+            pass
+
     # Plain number
     m_num = re.match(r"^[-+]?[0-9]*\.?[0-9]+$", s.replace(",", ""))
     if m_num:
         try:
-            return float(s.replace(",", "")), True
+            clean_num = s.replace(",", "")
+            return float(clean_num) if "." in clean_num else int(clean_num), True
         except ValueError:
             pass
     return val, False
@@ -138,14 +165,23 @@ class XlsxRenderer(BaseRenderer):
         _autofit_columns(ws_sum)
 
         # -------------------------------------------------------------------
-        # Sheet 2: Data & Comparison
+        # Sheet 2+: Data & Comparison Tables (Dynamic Multi-Sheet Support)
         # -------------------------------------------------------------------
-        if pkg.tables:
-            ws_data = wb.create_sheet(title="Comparison & Metrics")
+        seen_sheet_titles = {"executive summary"}
+        for t_idx, t in enumerate(pkg.tables, start=1):
+            if t_idx == 1:
+                clean_title = "Comparison & Metrics"
+            else:
+                raw_title = t.title or f"Table {t_idx} Metrics"
+                clean_title = re.sub(r"[\\/*?:\[\]]", "_", raw_title).strip()[:30] or f"Metrics {t_idx}"
+            if clean_title.lower() in seen_sheet_titles:
+                clean_title = f"{clean_title[:24]} ({t_idx})"
+            seen_sheet_titles.add(clean_title.lower())
+
+            ws_data = wb.create_sheet(title=clean_title)
             ws_data.views.sheetView[0].showGridLines = True
             ws_data.freeze_panes = "A2"
 
-            t = pkg.tables[0]
             # Write headers
             for col_idx, h in enumerate(t.headers, start=1):
                 c = ws_data.cell(row=1, column=col_idx, value=str(h))
@@ -156,20 +192,24 @@ class XlsxRenderer(BaseRenderer):
 
             # Write data rows
             num_cols = len(t.headers)
-            numeric_cols = set()
+            numeric_col_counts: dict[int, int] = {c: 0 for c in range(1, num_cols + 1)}
 
             for row_idx, r in enumerate(t.rows, start=2):
                 bg = ALT_ROW_FILL if row_idx % 2 == 1 else WHITE_FILL
                 for col_idx, val in enumerate(r, start=1):
                     parsed_val, is_num = _parse_numeric_for_excel(val)
                     if is_num:
-                        numeric_cols.add(col_idx)
+                        numeric_col_counts[col_idx] += 1
                     cell = ws_data.cell(row=row_idx, column=col_idx, value=parsed_val)
                     cell.font = REGULAR_FONT
                     cell.fill = bg
                     cell.border = CELL_BORDER
                     if is_num:
                         cell.alignment = Alignment(horizontal="right")
+
+            # A column is only truly numeric for calculation if at least 60% of its rows are numeric
+            threshold = max(2, int(len(t.rows) * 0.60))
+            numeric_cols = {c for c, count in numeric_col_counts.items() if count >= threshold}
 
             # Add Calculation Summary Rows (Average, Min, Max) if numeric columns exist
             if numeric_cols and len(t.rows) >= 2:

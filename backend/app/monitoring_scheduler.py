@@ -71,6 +71,27 @@ def claim_due(now: float | None = None, limit: int = 5, db_path: str | None = No
             next_at = next_due_at(row["trigger_type"], row["schedule_cron"], row["interval_seconds"], current)
             conn.execute("UPDATE monitoring_missions SET next_run_at=? WHERE id=?", (next_at, row["id"]))
             claims.append(dict(row))
+
+        # Also claim due email intelligence missions
+        rem_limit = max(0, limit - len(claims))
+        if rem_limit > 0:
+            try:
+                email_rows = conn.execute("""SELECT * FROM email_missions
+                    WHERE status='active' AND next_run_at IS NOT NULL AND next_run_at<=?
+                    ORDER BY next_run_at ASC LIMIT ?""", (current, rem_limit)).fetchall()
+                for erow in email_rows:
+                    freq = erow["frequency_seconds"] if "frequency_seconds" in erow.keys() else 300
+                    next_at = current + (freq or 300)
+                    conn.execute("UPDATE email_missions SET next_run_at=? WHERE id=?", (next_at, erow["id"]))
+                    claims.append({
+                        "id": erow["id"],
+                        "target_url": f"email://{erow.get('account_email', 'inbox')}",
+                        "condition_type": "email_intelligence",
+                        "conversation_id": erow.get("conversation_id"),
+                        "frequency_seconds": freq,
+                    })
+            except Exception:
+                pass
     return claims
 
 
@@ -78,6 +99,16 @@ async def execute_monitor(mission: dict) -> None:
     from .agentLoop import run_task
     from .change_detector import evaluate_observation, broadcast_event
     target_url = mission["target_url"]
+
+    if target_url.startswith("email://") or mission.get("condition_type") == "email_intelligence":
+        from .email_intelligence import run_email_mission_tick
+        try:
+            await run_email_mission_tick(mission["id"])
+        except Exception:
+            with db.get_connection() as conn:
+                conn.execute("UPDATE email_missions SET last_sync_at=? WHERE id=?", (time.time(), mission["id"]))
+        return
+
     record = hub.new_task(f"Open {target_url} and observe its public visible page text and price. Report only observed facts.",
                           chat_id=mission["conversation_id"])
     record.state = "planning"

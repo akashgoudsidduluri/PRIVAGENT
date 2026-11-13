@@ -132,4 +132,70 @@ test("selectChat renders real failed/blocked status and never forces completed",
   }
 });
 
+test("agentApp appends each turn's result instead of overwriting the previous one", () => {
+  const start = agentAppTs.indexOf("function addCompletionStepItem");
+  const end = agentAppTs.indexOf("async function syncActiveTask");
+  if (start === -1 || end === -1) throw new Error("missing addCompletionStepItem helper");
+  const body = agentAppTs.slice(start, end);
+  if (body.includes("existingResult")) {
+    throw new Error("completion still overwrites an earlier turn's result in place");
+  }
+  if (!body.includes("stepsList.appendChild(li)")) {
+    throw new Error("completion does not append a new timeline item");
+  }
+});
+
+test("agentApp removes transient Thinking rows when a turn terminates", () => {
+  if (!agentAppTs.includes('data-transient')) {
+    throw new Error("Thinking status rows are not marked transient");
+  }
+  const start = agentAppTs.indexOf("function renderCompletion");
+  const end = agentAppTs.indexOf("function showHumanGate");
+  if (start === -1 || end === -1) throw new Error("missing renderCompletion helper");
+  const body = agentAppTs.slice(start, end);
+  if (!body.includes('li[data-transient="true"]')) {
+    throw new Error("terminal rendering does not clear stale Thinking rows");
+  }
+});
+
+// 7. Rehydration & Refresh Resilience
+test("selectChat restores intermediate steps into timeline on reload", () => {
+  if (!agentAppTs.includes("msg.steps.forEach")) {
+    throw new Error("selectChat does not iterate msg.steps to rehydrate intermediate steps");
+  }
+  if (!agentAppTs.includes("addStepItem(st.message, st.stepNum)")) {
+    throw new Error("selectChat does not add intermediate steps to timeline");
+  }
+});
+
+test("selectChat updates executed step counter to reflect total steps", () => {
+  if (!agentAppTs.includes("detail.total_steps") && !agentAppTs.includes("calculatedSteps")) {
+    throw new Error("selectChat does not calculate executed step count");
+  }
+  if (!agentAppTs.includes("updateStepsCount(totalSteps)")) {
+    throw new Error("selectChat does not update step counter on chat load");
+  }
+});
+
+test("selectChat reconnects to running active_task and preserves pending user turn", () => {
+  if (!agentAppTs.includes("detail.active_task")) {
+    throw new Error("selectChat does not check detail.active_task");
+  }
+  if (!agentAppTs.includes("isPendingUserTurn")) {
+    throw new Error("selectChat does not guard against showing previous turn result for pending turn");
+  }
+  if (!agentAppTs.includes("!isPendingUserTurn && lastAgentMsg")) {
+    throw new Error("selectChat improperly renders completion when user turn is still in-flight");
+  }
+});
+
+test("agentApp persists and restores active chat across reloads", () => {
+  if (!agentAppTs.includes('localStorage.setItem("privagent_active_chat_id"')) {
+    throw new Error("activeChatId is not saved to localStorage on selection");
+  }
+  if (!agentAppTs.includes('localStorage.getItem("privagent_active_chat_id"')) {
+    throw new Error("saved activeChatId is not restored from localStorage on load");
+  }
+});
+
 console.log("frontend recovery & task dispatch tests\n" + tests.join("\n"));

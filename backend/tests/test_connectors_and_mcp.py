@@ -1,6 +1,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
@@ -108,7 +109,7 @@ def test_mcp_discovery_schema_policy_sanitizer_and_audit(tmp_path, monkeypatch):
     monkeypatch.setenv("PRIVAGENT_DB_PATH", str(tmp_path / "mcp.db"))
     registry = Registry()
     discovery = MCPDiscovery(registry)
-    spec = ServerSpec("test", "stdio", command="/bin/true", read_only_tools=frozenset({"lookup"}))
+    spec = ServerSpec("test", "stdio", command=sys.executable, read_only_tools=frozenset({"lookup"}))
     with pytest.raises(PermissionError): discovery.register_server(spec)
     discovery.register_server(spec, trusted_user=True)
     class Session:
@@ -118,6 +119,9 @@ def test_mcp_discovery_schema_policy_sanitizer_and_audit(tmp_path, monkeypatch):
     @asynccontextmanager
     async def fake_session(_): yield Session()
     discovery._session = fake_session
+    assert asyncio.run(discovery.discover("test")) == ["test.lookup", "test.write"]
+    # Re-running discovery refreshes the same server's catalog instead of
+    # failing on duplicate tool names.
     assert asyncio.run(discovery.discover("test")) == ["test.lookup", "test.write"]
     assert not registry.tools["test.lookup"].mutating
     assert registry.tools["test.write"].mutating

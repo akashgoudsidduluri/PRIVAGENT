@@ -20,6 +20,7 @@ class Tool:
     mutating: bool = True  # unknown tools are never assumed read-only
     server: str = "local"
     description: str = ""
+    discovered: bool = False  # true only for tools learned from an MCP server
 
 
 class Registry:
@@ -30,6 +31,22 @@ class Registry:
     def register(self, tool: Tool):
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", tool.name) or tool.name in self.tools:
             raise ValueError("invalid or duplicate tool name")
+        Draft202012Validator.check_schema(tool.schema)
+        if tool.schema.get("type") != "object":
+            raise ValueError("tool arguments must be an object schema")
+        self.tools[tool.name] = tool
+
+    def replace(self, tool: Tool):
+        """Refresh a tool discovered again from the same server.
+
+        Re-running discovery must not fail just because the tool was already
+        catalogued. A name owned by a different server remains a collision.
+        """
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", tool.name):
+            raise ValueError("invalid tool name")
+        existing = self.tools.get(tool.name)
+        if existing is not None and (not existing.discovered or existing.server != tool.server):
+            raise ValueError("tool name belongs to another source")
         Draft202012Validator.check_schema(tool.schema)
         if tool.schema.get("type") != "object":
             raise ValueError("tool arguments must be an object schema")
