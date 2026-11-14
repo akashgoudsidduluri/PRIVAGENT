@@ -123,6 +123,30 @@ _AUTH_PATH_TOKENS = {
     "checkout", "payment", "pay-now", "makepayment", "billing", "purchase",
 }
 
+CANONICAL_FORMAT_MAP: dict[str, str] = {
+    "presentation": "pptx",
+    "slides": "pptx",
+    "slide_deck": "pptx",
+    "ppt": "pptx",
+    "powerpoint": "pptx",
+    "excel": "xlsx",
+    "spreadsheet": "xlsx",
+    "workbook": "xlsx",
+    "dataset": "xlsx",
+    "xls": "xlsx",
+    "word": "docx",
+    "doc": "docx",
+    "report": "docx",
+    "document": "docx",
+    "pdf": "pdf",
+    "csv": "csv",
+    "markdown": "markdown",
+    "md": "markdown",
+    "html": "html",
+    "json": "json",
+}
+canonical_format_map = CANONICAL_FORMAT_MAP
+
 
 def request_cancel(task_id: str) -> None:
     _cancelled.add(task_id)
@@ -2257,14 +2281,29 @@ async def run_task(task_id: str) -> None:
             else:
                 provider = _provider_for_config()
                 history = initial_memory.get("conversation_history", [])
+                answer = None
                 if hasattr(provider, "chat_call"):
                     try:
                         answer = provider.chat_call(record.instruction, history=history)
                     except Exception:
-                        from .providers.mock import MockProvider
-                        answer = MockProvider().chat_call(record.instruction, history=history)
-                else:
-                    answer = "I have processed your request."
+                        pass
+                if not answer:
+                    from . import config
+                    if config.GROQ_API_KEY:
+                        try:
+                            from .providers.groq import GroqProvider
+                            answer = GroqProvider(config.GROQ_API_KEY).chat_call(record.instruction, history=history)
+                        except Exception:
+                            pass
+                    if not answer and config.GEMINI_API_KEY:
+                        try:
+                            from .providers.gemini import GeminiProvider
+                            answer = GeminiProvider(config.GEMINI_API_KEY).chat_call(record.instruction, history=history)
+                        except Exception:
+                            pass
+                if not answer:
+                    from .providers.mock import MockProvider
+                    answer = MockProvider().chat_call(record.instruction, history=history)
 
             verified = verify_task_completion(
                 instruction=record.instruction,
@@ -2273,7 +2312,7 @@ async def run_task(task_id: str) -> None:
                 observation=None,
                 working_memory=initial_memory,
             )
-            record.steps_done = 1
+            record.steps_done = 0
             record.state = verified.state
             record.message = verified.message
             await real_hub.broadcast_progress(record)
@@ -2645,9 +2684,22 @@ def _real_planner(record: TaskRecord):
     def planner(_instr: str, payload: Any, history: list[dict[str, Any]], working_memory: Optional[dict[str, Any]] = None):
         from .planner import plan_from_observation
         from .privacy import PrivacyFilteredPayload
+        from .providers.errors import ProviderUnavailable
         pf = PrivacyFilteredPayload(**payload) if isinstance(payload, dict) else payload
         # exclude_none keeps the WebSocket payload aligned with the TS contract:
         # unset optional params are omitted, never serialized as JSON null.
-        return plan_from_observation(instruction=instruction, payload=pf, provider=provider, history=history, working_memory=working_memory).model_dump(by_alias=True, exclude_none=True)
+        try:
+            return plan_from_observation(instruction=instruction, payload=pf, provider=provider, history=history, working_memory=working_memory).model_dump(by_alias=True, exclude_none=True)
+        except ProviderUnavailable:
+            from . import config
+            from .providers.groq import GroqProvider
+            from .providers.gemini import GeminiProvider
+            if config.GROQ_API_KEY and not isinstance(provider, GroqProvider):
+                fb_provider = GroqProvider(api_key=config.GROQ_API_KEY)
+                return plan_from_observation(instruction=instruction, payload=pf, provider=fb_provider, history=history, working_memory=working_memory).model_dump(by_alias=True, exclude_none=True)
+            elif config.GEMINI_API_KEY and not isinstance(provider, GeminiProvider):
+                fb_provider = GeminiProvider(api_key=config.GEMINI_API_KEY)
+                return plan_from_observation(instruction=instruction, payload=pf, provider=fb_provider, history=history, working_memory=working_memory).model_dump(by_alias=True, exclude_none=True)
+            raise
 
     return planner

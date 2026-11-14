@@ -407,12 +407,13 @@ def build_structured_document_plan(
                     placed_formula_ids.add(f.formula_id)
 
         # Correlate and place matching Visual Assets (Extracted Images & Diagrams) inline
-        for v in valid_visuals:
-            if v.asset_id not in placed_visual_ids and v.asset_type != "formula":
-                v_words = set(re.findall(r"\b[a-z]{4,}\b", (v.title + " " + (v.caption or "")).lower()))
-                if v.subtopic_id == sub.subtopic_id or (sub_title_words & v_words):
-                    s_sub.add_visual(v)
-                    placed_visual_ids.add(v.asset_id)
+        if target_pages != 5:
+            for v in valid_visuals:
+                if v.asset_id not in placed_visual_ids and v.asset_type != "formula":
+                    v_words = set(re.findall(r"\b[a-z]{4,}\b", (v.title + " " + (v.caption or "")).lower()))
+                    if v.subtopic_id == sub.subtopic_id or (sub_title_words & v_words):
+                        s_sub.add_visual(v)
+                        placed_visual_ids.add(v.asset_id)
 
         sections.append(s_sub)
 

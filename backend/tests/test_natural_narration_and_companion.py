@@ -3,16 +3,16 @@ from __future__ import annotations
 
 import pytest
 
-from backend.app.step_narrator import generate_step_narrative, _extract_site_and_query
-from backend.app.continuous_monitoring_companion import (
+from app.step_narrator import generate_step_narrative, _extract_site_and_query
+from app.continuous_monitoring_companion import (
     is_continuous_monitoring_directive,
     handle_continuous_monitoring_instruction,
 )
-from backend.app.email_dispatch import (
+from app.email_dispatch import (
     is_email_dispatch_instruction,
     handle_email_dispatch,
 )
-from backend.app.intent_router import classify_intent, TaskIntent
+from app.intent_router import classify_intent, TaskIntent
 
 
 def test_step_narrator_navigation_ecommerce():
@@ -150,7 +150,7 @@ def test_email_dispatch_detection():
 @pytest.mark.asyncio
 async def test_email_dispatch_execution_when_connected(monkeypatch):
     # Mock oauth_manager to simulate connected account
-    from backend.app.connectors.oauth import oauth_manager
+    from app.connectors.oauth import oauth_manager
     monkeypatch.setattr(oauth_manager, "verify_connection", lambda p: {"connected": True, "account": "b21650406@gmail.com", "access_token": "mock_token"})
 
     resp = await handle_email_dispatch(

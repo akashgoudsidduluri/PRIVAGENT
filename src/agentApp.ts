@@ -364,18 +364,49 @@ function formatResultHtml(rawMessage: string): string {
     `;
   }
 
-  // 3. Suggested Next Moves Launchpad
-  const nextMovesHtml = `
-    <div class="suggested-moves">
-      <span class="suggested-moves__label">Suggested Next Moves:</span>
-      <div class="suggested-moves__chips">
-        <button class="suggested-chip" data-prompt="Export this comparison into a formatted Excel spreadsheet">📊 Export to Excel</button>
-        <button class="suggested-chip" data-prompt="Email this comparison summary to b21650406@gmail.com">📧 Email this to me</button>
-        <button class="suggested-chip" data-prompt="Continuously monitor this product price and notify me if it drops">🔔 Monitor price for drops</button>
-        <button class="suggested-chip" data-prompt="What is on my calendar this week?">📅 Check Google Calendar</button>
+  // 3. Contextual Suggested Next Moves Launchpad
+  let nextMovesHtml = "";
+  const lowerInstr = (activeInstruction || "").toLowerCase().trim();
+  const isGreeting = /^(?:hi|hello|hey|howdy|greetings|who are you|what can you do)\b/i.test(lowerInstr);
+  const isEmailOrCalendar = /\b(?:email|mail|inbox|gmail|outlook|calendar|meetings?|events?|schedule)\b/i.test(lowerInstr) || /\b(?:email|mail|inbox|calendar)\b/i.test(rawMessage);
+  const isShopping = isCommerce || hasMultipleStores || allPrices.length > 0;
+
+  if (isShopping) {
+    nextMovesHtml = `
+      <div class="suggested-moves">
+        <span class="suggested-moves__label">Suggested Next Moves:</span>
+        <div class="suggested-moves__chips">
+          ${hasMultipleStores ? `<button class="suggested-chip" data-prompt="Export this comparison into a formatted Excel spreadsheet">📊 Export to Excel</button>` : ""}
+          <button class="suggested-chip" data-prompt="Email this comparison summary to b21650406@gmail.com">📧 Email this to me</button>
+          <button class="suggested-chip" data-prompt="Continuously monitor this product price and notify me if it drops">🔔 Monitor price for drops</button>
+          <button class="suggested-chip" data-prompt="What is on my calendar this week?">📅 Check Google Calendar</button>
+        </div>
       </div>
-    </div>
-  `;
+    `;
+  } else if (isEmailOrCalendar) {
+    nextMovesHtml = `
+      <div class="suggested-moves">
+        <span class="suggested-moves__label">Suggested Next Moves:</span>
+        <div class="suggested-moves__chips">
+          <button class="suggested-chip" data-prompt="Show me today's email summary">📬 Check important emails</button>
+          <button class="suggested-chip" data-prompt="What is on my calendar this week?">📅 Check Google Calendar</button>
+          <button class="suggested-chip" data-prompt="Continuously monitor my email for job and internship alerts">🔔 Monitor email for jobs</button>
+        </div>
+      </div>
+    `;
+  } else if (isGreeting) {
+    nextMovesHtml = `
+      <div class="suggested-moves">
+        <span class="suggested-moves__label">Quick Missions:</span>
+        <div class="suggested-moves__chips">
+          <button class="suggested-chip" data-prompt="Compare price of Samsung Galaxy A26 on Amazon, Flipkart, and Croma">🛒 Compare phone prices</button>
+          <button class="suggested-chip" data-prompt="Show me today's email summary">📬 Check my unread emails</button>
+          <button class="suggested-chip" data-prompt="What is on my calendar this week?">📅 Check Google Calendar</button>
+          <button class="suggested-chip" data-prompt="Find Realme 15 Pro on Amazon and check its price and display specs">📱 Phone specs &amp; price</button>
+        </div>
+      </div>
+    `;
+  }
 
   return `
     ${showcaseHtml}
@@ -514,15 +545,26 @@ function addCompletionStepItem(taskState: string, message: string): void {
   if (!stepsList) return;
   const isOk = taskState === "completed";
 
-  // Each turn owns its own result item. Overwriting a previous turn's result
-  // made a follow-up failure erase the answer the user was still reading.
+  // Check if this was a direct conversational reply or an autonomous browser mission
+  const lowerMsg = (message || "").toLowerCase();
+  const lowerInstr = (activeInstruction || "").toLowerCase().trim();
+  const isGreeting = /^(?:hi|hello|hey|howdy|greetings|namaste|who are you|what can you do)\b/i.test(lowerInstr);
+  const isConversational = isGreeting || (stepCounter === 0 && !/\b(?:amazon|flipkart|croma|buy|price|search|http|navigate|click)\b/i.test(lowerMsg));
+
   const li = document.createElement("li");
   li.className = isOk ? "agent-step-item agent-step-item--result" : "agent-step-item agent-step-item--failed";
+
+  const icon = isOk ? (isConversational ? "🤖" : "✓") : "✗";
+  const label = isOk ? (isConversational ? "PrivAgent" : "Mission Result") : "Task Incomplete";
+  const bodyHtml = isOk
+    ? formatResultHtml(message || "Mission completed.")
+    : `<div class="result-raw-text md-body">${renderMarkdown(message || "Task stopped before completing all steps.")}</div>`;
+
   li.innerHTML = `
-    <span class="agent-step-item__icon">${isOk ? "✓" : "✗"}</span>
+    <span class="agent-step-item__icon">${icon}</span>
     <div class="agent-step-item__text">
-      <div class="agent-step-item__label"><strong>${isOk ? "Mission Result" : "Task Incomplete"}</strong>:</div>
-      <div class="md-body">${renderMarkdown(message || (isOk ? "Mission completed." : "Task stopped."))}</div>
+      <div class="agent-step-item__label"><strong>${label}</strong>:</div>
+      ${bodyHtml}
     </div>
   `;
   stepsList.appendChild(li);
@@ -613,7 +655,7 @@ function renderCompletion(taskState: string, message: string, appendToTimeline =
   setButtonWorking(false);
   if (btnCancelMission) btnCancelMission.hidden = true;
   if (humanGate) humanGate.hidden = true;
-  if (typeof stepsDone === "number" && stepsDone > 0) {
+  if (typeof stepsDone === "number") {
     updateStepsCount(stepsDone);
   }
   // A live "Thinking..." row must not survive the turn that produced it.
@@ -635,6 +677,9 @@ function renderCompletion(taskState: string, message: string, appendToTimeline =
 
   if (appendToTimeline) {
     addCompletionStepItem(taskState, message);
+    if (resultCard) resultCard.hidden = true;
+    loadArtifacts(currentTaskId, activeChatId);
+    return;
   }
 
   if (resultCard && resultContent && resultBadge) {

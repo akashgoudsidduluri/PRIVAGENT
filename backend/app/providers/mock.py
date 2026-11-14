@@ -48,8 +48,13 @@ class MockProvider:
     def chat_call(self, prompt: str, history: Optional[list[dict[str, Any]]] = None,
                   system_prompt: Optional[str] = None) -> str:
         lower = (prompt or "").strip().lower()
-        if any(w in lower for w in ("hi", "hello", "hey", "greetings", "howdy")):
-            return "Hello! I am PrivAgent, your privacy-preserving AI assistant. How can I help you today?"
+        if any(w in lower for w in ("hi", "hello", "hey", "greetings", "howdy", "namaste")):
+            return (
+                "Hey! PrivAgent here — your privacy-first web co-pilot. "
+                "I can search and compare prices on Amazon, Flipkart, and Croma, check your emails, "
+                "keep watch on price drops in the background, or automate whatever multi-step web task you need. "
+                "What are we doing today?"
+            )
         if "transformer" in lower:
             return "Transformers are deep learning architectures based on self-attention mechanisms that process input sequences in parallel rather than sequentially."
         if "bfs" in lower or "c++" in lower:
