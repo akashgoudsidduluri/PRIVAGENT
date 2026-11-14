@@ -3,10 +3,12 @@ import pytest
 from cryptography.fernet import Fernet
 
 from app.auth_manager import AuthenticationManager
-from app.website_capabilities.base import ActionRiskLevel
-from app.website_capabilities.irctc import IrctcCapability
-from app.website_capabilities.leetcode import LeetCodeCapability
-from app.website_capabilities.registry import (
+from app.website_capabilities import (
+    ActionRiskLevel,
+    BaseWebsiteCapability,
+    GenericWebsiteCapability,
+    IrctcCapability,
+    LeetCodeCapability,
     get_capability_for_domain,
     get_capability_for_service,
     resolve_capability,

@@ -8,8 +8,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from .website_capabilities.base import BaseWebsiteCapability
-from .website_capabilities.registry import (
+from .website_capabilities import (
+    BaseWebsiteCapability,
     get_capability_for_domain,
     get_capability_for_service,
     resolve_capability,

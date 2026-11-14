@@ -24,6 +24,10 @@ from .planner import plan_from_observation
 from .privacy import classify_and_redact, redact_text_urls, redact_url
 from .providers.errors import ProviderUnavailable
 
+import logging
+
+logger = logging.getLogger("privagent.agent_loop")
+
 MAX_STEPS = config.MAX_STEPS
 MAX_RETRIES = config.MAX_RETRIES
 TASK_TIMEOUT_S = config.TASK_TIMEOUT_S
@@ -1397,8 +1401,7 @@ async def _run_loop(
         # Capability Risk & Zero-Agent Payment Guard
         custom_gate_msg = None
         try:
-            from .website_capabilities.base import ActionRiskLevel
-            from .website_capabilities.registry import get_capability_for_domain
+            from .website_capabilities import ActionRiskLevel, get_capability_for_domain
             target_domain_cap = get_capability_for_domain(raw_url)
             action_risk_level, risk_reason = target_domain_cap.check_action_risk(
                 action.get("type", ""),
@@ -1436,7 +1439,7 @@ async def _run_loop(
             if is_auth_page:
                 try:
                     from .auth_manager import get_auth_manager
-                    from .website_capabilities.registry import get_capability_for_domain
+                    from .website_capabilities import get_capability_for_domain
                     auth_mgr = get_auth_manager()
                     cap = get_capability_for_domain(raw_url)
                     _maybe_fresh = obs_factory()

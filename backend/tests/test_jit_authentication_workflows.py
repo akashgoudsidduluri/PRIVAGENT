@@ -11,10 +11,13 @@ import pytest
 from cryptography.fernet import Fernet
 
 from app.auth_manager import AuthenticationManager
-from app.website_capabilities.base import ActionRiskLevel
-from app.website_capabilities.irctc import IrctcCapability
-from app.website_capabilities.leetcode import LeetCodeCapability
-from app.website_capabilities.registry import resolve_capability, get_capability_for_domain
+from app.website_capabilities import (
+    ActionRiskLevel,
+    IrctcCapability,
+    LeetCodeCapability,
+    get_capability_for_domain,
+    resolve_capability,
+)
 from app.completion_verifier import verify_task_completion
 from app.continuous_monitoring_companion import is_continuous_monitoring_directive
 from app.db import init_db
