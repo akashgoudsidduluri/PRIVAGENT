@@ -759,6 +759,54 @@ async def _run_loop(
         except Exception:
             pass
 
+    # Just-in-Time Authentication Check at mission start
+    if steps_done == 0 and confirm_gate is not None:
+        try:
+            from .auth_manager import get_auth_manager
+            auth_mgr = get_auth_manager()
+            needs_auth, cap, auth_msg = auth_mgr.check_auth_needed(instruction)
+            if needs_auth and cap:
+                logger.info("JIT Auth required for %s on task %s", cap.service_id, task_id)
+                prompt_text = auth_msg or cap.get_auth_prompt_message()
+                progress(prompt_text)
+
+                nav_action = {"type": "navigate", "params": {"url": cap.login_url}, "risk": "low"}
+                await _execute_with_retries(ext_hub, nav_action, task_id, session_id=session_id)
+
+                fake_auth_action = {
+                    "type": "authenticate",
+                    "service": cap.service_id,
+                    "url": cap.login_url,
+                    "risk": "sensitive",
+                }
+                approved = await _request_confirmation(
+                    confirm_gate, fake_auth_action, task_id, confirm_timeout_s, custom_message=prompt_text
+                )
+
+                if is_cancelled(task_id):
+                    return {"final": "cancelled", "steps": steps_done, "summary": None, "history": history}
+
+                if approved:
+                    _maybe_fresh = obs_factory()
+                    post_auth_obs = await _maybe_fresh if asyncio.iscoroutine(_maybe_fresh) else _maybe_fresh
+                    is_auth, account_id, reason = auth_mgr.verify_and_save_session(cap, post_auth_obs)
+                    if is_auth:
+                        logger.info("JIT Auth verified for %s (account: %s)", cap.service_id, account_id)
+                        progress(f"✓ Authentication verified as {account_id}! Continuing your mission...")
+                        cached_obs = post_auth_obs
+                    else:
+                        logger.warning("JIT Auth verification inconclusive: %s", reason)
+                        progress(f"Sign-in verification note: {reason}. Resuming task...")
+                else:
+                    return {
+                        "final": "failed",
+                        "steps": steps_done,
+                        "summary": f"User cancelled authentication for {cap.display_name}",
+                        "history": history,
+                    }
+        except Exception as e:
+            logger.error("Error during JIT auth pre-check: %s", e)
+
     while steps_done < MAX_STEPS:
         pause_event = _pause_events.get(task_id)
         if pause_event is not None and not pause_event.is_set():
@@ -1345,18 +1393,60 @@ async def _run_loop(
         is_wa_qr = _is_whatsapp_qr(raw_url, raw_obs)
         is_auth_page = _is_auth_url(raw_url)
         is_strict = getattr(confirm_gate, "strict_write_confirm", True) if confirm_gate is not None else False
-        needs_confirm = action.get("risk") == "sensitive" or is_auth_page or is_wa_qr or (
+
+        # Capability Risk & Zero-Agent Payment Guard
+        custom_gate_msg = None
+        try:
+            from .website_capabilities.base import ActionRiskLevel
+            from .website_capabilities.registry import get_capability_for_domain
+            target_domain_cap = get_capability_for_domain(raw_url)
+            action_risk_level, risk_reason = target_domain_cap.check_action_risk(
+                action.get("type", ""),
+                action.get("params", {}),
+                raw_url,
+            )
+            if action_risk_level == ActionRiskLevel.PROHIBITED:
+                logger.warning("Zero-Agent policy blocked prohibited action: %s", risk_reason)
+                progress(f"🛡️ Policy Guard: {risk_reason}")
+                return {
+                    "final": "ok",
+                    "steps": steps_done,
+                    "summary": f"Payment Handoff: {risk_reason}",
+                    "history": history,
+                    "zero_agent_handoff": True,
+                }
+            elif action_risk_level == ActionRiskLevel.CONFIRMATION_REQUIRED:
+                custom_gate_msg = risk_reason
+        except Exception:
+            pass
+
+        needs_confirm = bool(custom_gate_msg) or action.get("risk") == "sensitive" or is_auth_page or is_wa_qr or (
             is_strict and action.get("risk") == "write" and action.get("type") not in ("navigate", "scroll", "zoom", "wait", "observe", "select_tab")
         )
         approved = False
         if confirm_gate is not None and needs_confirm:
-            gate_msg = _gate_message(action, is_wa_qr, is_auth_page)
+            gate_msg = custom_gate_msg or _gate_message(action, is_wa_qr, is_auth_page)
             approved = await _request_confirmation(confirm_gate, action, task_id, confirm_timeout_s, custom_message=gate_msg)
             if is_cancelled(task_id):
                 return {"final": "cancelled", "steps": steps_done, "summary": None, "history": history}
             if approved is False:
                 return {"final": "failed", "steps": steps_done,
                         "summary": f"user rejected action: {action.get('type')}", "history": history}
+
+            if is_auth_page:
+                try:
+                    from .auth_manager import get_auth_manager
+                    from .website_capabilities.registry import get_capability_for_domain
+                    auth_mgr = get_auth_manager()
+                    cap = get_capability_for_domain(raw_url)
+                    _maybe_fresh = obs_factory()
+                    fresh_obs = await _maybe_fresh if asyncio.iscoroutine(_maybe_fresh) else _maybe_fresh
+                    is_auth, account_id, reason = auth_mgr.verify_and_save_session(cap, fresh_obs)
+                    if is_auth:
+                        progress(f"✓ Authentication verified as {account_id}! Resuming your task...")
+                        cached_obs = fresh_obs
+                except Exception as e:
+                    logger.debug("In-loop auth verification exception: %s", e)
 
         pause_event = _pause_events.get(task_id)
         if pause_event is not None and not pause_event.is_set():

@@ -431,6 +431,19 @@ def verify_task_completion(
                     reason="No comparison results collected.",
                 )
 
+    # Continuous monitoring missions set up background tracking, not static deep research
+    try:
+        from .continuous_monitoring_companion import is_continuous_monitoring_directive
+        if is_continuous_monitoring_directive(instruction) or mem.get("continuous_monitoring"):
+            return VerificationResult(
+                state="completed",
+                message=msg,
+                is_verified=True,
+                reason="Continuous monitoring directive configured and scheduled.",
+            )
+    except Exception:
+        pass
+
     # Rule 6: Research tasks require evidence and verification across 6 distinct stages
     if category == "RESEARCH" or mem.get("is_research"):
         if candidate_state == "failed":

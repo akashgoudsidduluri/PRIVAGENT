@@ -596,7 +596,7 @@ CONTINUATION_PATTERNS = [
 DIRECT_SITE_TRIGGER = re.compile(
     r"\b(?:open|visit|go\s+to|navigate\s+to|browse\s+to)\s+"
     r"(?:the\s+)?(?:official\s+)?(?:website\s+|webpage\s+|site\s+|page\s+)?"
-    r"(?:google|youtube|amazon|wikipedia|flipkart|reddit|github|twitter|x|linkedin|facebook|instagram|netflix|bing|yahoo|duckduckgo|react|vue|angular|python|rust|golang|huggingface|arxiv|mdn|apple|microsoft|spotify|mail|gmail|email|outlook|webmail)"
+    r"(?:google|youtube|amazon|wikipedia|flipkart|reddit|github|twitter|x|linkedin|facebook|instagram|netflix|bing|yahoo|duckduckgo|react|vue|angular|python|rust|golang|huggingface|arxiv|mdn|apple|microsoft|spotify|mail|gmail|email|outlook|webmail|leetcode|hackerrank|codeforces|irctc|croma)"
     r"(?:\s+(?:docs|documentation|homepage|website|search|site|store|app|portal|page|inbox))?\b",
     re.IGNORECASE,
 )
@@ -660,8 +660,21 @@ SHOPPING_DISCOVERY_TRIGGER = re.compile(
 )
 
 TRAVEL_SEARCH_TRIGGER = re.compile(
-    r"\b(?:find|search(?:\s+for)?|check|book|look\s+up)\s+(?:flights?|hotels?|trains?|cabs?|trips?|tickets?)\s+(?:from|to|in|between|for)\b"
-    r"|\b(?:flight|hotel|train)\s+(?:prices?|fares?|rates?|booking)\b",
+    r"\b(?:find|search(?:\s+for)?|check|book|look\s+up)\s+(?:(?:me\s+)?(?:a|an|the|my)\s+)?(?:(?:flight|hotel|train|cab|trip|bus)\s+)?(?:flights?|hotels?|trains?|cabs?|trips?|tickets?)\s+(?:from|to|in|between|for)\b"
+    r"|\b(?:flight|hotel|train|ticket|irctc)\s+(?:prices?|fares?|rates?|booking|status|availability)\b"
+    r"|\b(?:irctc|redbus|makemytrip|ixigo|easemytrip)\b",
+    re.IGNORECASE,
+)
+
+CODING_PLATFORM_TRIGGER = re.compile(
+    r"\b(?:leetcode|hackerrank|codeforces|geeksforgeeks|codechef)\b|"
+    r"\b(?:submit|solve|check)\s+(?:two\s+sum|problem|solution|submission|question|daily\s+challenge)\b",
+    re.IGNORECASE,
+)
+
+AUTH_LOGIN_TRIGGER = re.compile(
+    r"\b(?:log\s*in|sign\s*in|authenticate)\s+(?:to|on|into)\s+([a-zA-Z0-9_\-\.]+)\b|"
+    r"\b(?:connect|link)\s+(?:my\s+)?([a-zA-Z0-9_\-\.]+)\s+account\b",
     re.IGNORECASE,
 )
 
@@ -680,6 +693,8 @@ BROWSER_TRIGGERS = [
     COMPARISON_BROWSER_TRIGGER,
     SHOPPING_DISCOVERY_TRIGGER,
     TRAVEL_SEARCH_TRIGGER,
+    CODING_PLATFORM_TRIGGER,
+    AUTH_LOGIN_TRIGGER,
     re.compile(r"\b(?:navigate\s+to|go\s+to|open|browse\s+to|visit)\s+(?:the\s+)?(?:website\s+|site\s+)?(?:https?://|[a-zA-Z0-9-]+\.(?:com|org|in|net|edu|gov|io|co|ai|dev|app|info))\b", re.IGNORECASE),
     re.compile(r"\b(?:search\s+(?:on\s+)?(?:amazon|google|wikipedia|youtube|flipkart|bing|github|reddit|twitter|ebay)|search\s+for\s+.*\s+on\s+[a-zA-Z0-9-]+)\b", re.IGNORECASE),
     re.compile(r"\b(?:look\s+up|find\s+products?|find\s+prices?|check\s+weather|check\s+flights?)\s+on\b", re.IGNORECASE),

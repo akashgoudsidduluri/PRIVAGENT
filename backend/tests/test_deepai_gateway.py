@@ -164,7 +164,7 @@ def test_five_free_models_live_completion(model_id: str):
         assert len(res.strip()) > 0
     except ProviderUnavailable as exc:
         msg = str(exc).lower()
-        if any(term in msg for term in ("402", "credits", "payment", "timed out", "502", "503", "504", "no policy-allowed peer", "unavailable")):
+        if any(term in msg for term in ("402", "429", "credits", "payment", "quota", "rate limit", "free limit", "timed out", "502", "503", "504", "no policy-allowed peer", "unavailable")):
             pytest.skip(f"Model '{model_id}' unavailable on live Antseed gateway: {exc}")
         raise
 

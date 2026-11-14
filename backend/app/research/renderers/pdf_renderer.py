@@ -26,6 +26,7 @@ finance, operating systems, product research).
 from __future__ import annotations
 
 import datetime
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -52,6 +53,28 @@ from ..models import (
 )
 from ..visuals.image_pipeline import ensure_local_image_asset
 from .base import BaseRenderer
+
+
+def _sanitize_reportlab_xml(text: str) -> str:
+    if not text:
+        return ""
+    # Normalize <br>, <br >, <br / > to <br/>
+    s = re.sub(r"<br\s*/?>", "<br/>", str(text), flags=re.IGNORECASE)
+    # Remove unsupported or unclosed tags
+    s = re.sub(r"</?(?:div|span|p|section|article|header|footer|hr)[^>]*>", "<br/>", s, flags=re.IGNORECASE)
+    # Escape standalone unescaped ampersands that are not XML entities
+    s = re.sub(r"&(?!(?:amp|lt|gt|quot|apos|nbsp);)", "&amp;", s)
+    return s
+
+
+def _safe_paragraph(text: str, style: ParagraphStyle) -> Paragraph:
+    sanitized = _sanitize_reportlab_xml(text)
+    try:
+        return Paragraph(sanitized, style)
+    except Exception:
+        # If ReportLab fails to parse XML, strip tags and render as plain text
+        plain = re.sub(r"<[^>]+>", " ", sanitized)
+        return Paragraph(plain, style)
 
 
 class NumberedCanvas(canvas.Canvas):
@@ -227,7 +250,7 @@ class PdfRenderer(BaseRenderer):
 
         title_block = Table(
             [[
-                Paragraph(disp_title, title_style),
+                _safe_paragraph(disp_title, title_style),
             ]],
             colWidths=[504],
         )
@@ -242,22 +265,22 @@ class PdfRenderer(BaseRenderer):
         )
         story.append(title_block)
         story.append(Spacer(1, 4))
-        story.append(Paragraph(doc_plan.metadata.subtitle, subtitle_style))
+        story.append(_safe_paragraph(doc_plan.metadata.subtitle, subtitle_style))
 
         # 3. Modern Metadata Card (2x2 Grid)
         meta_data = [
             [
-                Paragraph(f"<b>Research Scope:</b> {doc_plan.metadata.objective}", body_style),
-                Paragraph(f"<b>Generation Date:</b> {doc_plan.metadata.date_str}", body_style),
+                _safe_paragraph(f"<b>Research Scope:</b> {doc_plan.metadata.objective}", body_style),
+                _safe_paragraph(f"<b>Generation Date:</b> {doc_plan.metadata.date_str}", body_style),
             ],
             [
-                Paragraph(
+                _safe_paragraph(
                     f"<b>Authoritative Sources:</b> {doc_plan.metadata.sources_count} visited websites"
                     if doc_plan.metadata.sources_count > 0
                     else "<b>Authoritative Sources:</b> Direct technical synthesis",
                     body_style,
                 ),
-                Paragraph(f"<b>Verified Empirical Findings:</b> {doc_plan.metadata.claims_count} validated claims", body_style),
+                _safe_paragraph(f"<b>Verified Empirical Findings:</b> {doc_plan.metadata.claims_count} validated claims", body_style),
             ],
         ]
         meta_table = Table(meta_data, colWidths=[330, 174])
@@ -280,23 +303,23 @@ class PdfRenderer(BaseRenderer):
 
             sec_title_style = h1_style if sec.level == 1 else h2_style
             if doc_plan.is_slides and sec_idx > 0:
-                story.append(Paragraph(f"Slide {sec_idx + 1}: {sec.title}", sec_title_style))
+                story.append(_safe_paragraph(f"Slide {sec_idx + 1}: {sec.title}", sec_title_style))
             else:
-                story.append(Paragraph(sec.title, sec_title_style))
+                story.append(_safe_paragraph(sec.title, sec_title_style))
                 if sec.level == 1:
                     story.append(HRFlowable(width="100%", thickness=1.0, color=colors.HexColor("#1E3A8A"), spaceBefore=2, spaceAfter=8))
 
             for block in sec.blocks:
                 if block.block_type == BlockType.TEXT and block.text:
                     if block.title:
-                        story.append(Paragraph(f"<b>{block.title}</b>", h2_style))
-                    story.append(Paragraph(block.text, body_style))
+                        story.append(_safe_paragraph(f"<b>{block.title}</b>", h2_style))
+                    story.append(_safe_paragraph(block.text, body_style))
 
                 elif block.block_type == BlockType.BULLET_LIST and block.items:
                     if block.title:
-                        story.append(Paragraph(f"<b>{block.title}</b>", body_style))
+                        story.append(_safe_paragraph(f"<b>{block.title}</b>", body_style))
                     for item in block.items:
-                        story.append(Paragraph(f"• {item}", bullet_style))
+                        story.append(_safe_paragraph(f"• {item}", bullet_style))
                     story.append(Spacer(1, 4))
 
                 elif block.block_type == BlockType.CALLOUT:
@@ -307,16 +330,16 @@ class PdfRenderer(BaseRenderer):
                     if block.callout_type == "contradiction":
                         bg_col = colors.HexColor("#FFFBEB")
                         bar_col = colors.HexColor("#F59E0B")
-                        callout_items.append(Paragraph("<b><font color='#D97706'>⚠️ Contradictory Evidence Identified Across Literature</font></b>", body_style))
+                        callout_items.append(_safe_paragraph("<b><font color='#D97706'>⚠️ Contradictory Evidence Identified Across Literature</font></b>", body_style))
                     elif block.callout_type in ("takeaway", "synthesis"):
                         bg_col = colors.HexColor("#F0FDF4")
                         bar_col = colors.HexColor("#059669")
-                        callout_items.append(Paragraph("<b><font color='#059669'>📌 Strategic Takeaway & Architectural Synthesis</font></b>", body_style))
+                        callout_items.append(_safe_paragraph("<b><font color='#059669'>📌 Strategic Takeaway & Architectural Synthesis</font></b>", body_style))
 
                     if block.text:
-                        callout_items.append(Paragraph(block.text, body_style))
+                        callout_items.append(_safe_paragraph(block.text, body_style))
                     for itm in block.items:
-                        callout_items.append(Paragraph(f"• {itm}", bullet_style))
+                        callout_items.append(_safe_paragraph(f"• {itm}", bullet_style))
 
                     callout_tbl = Table([[callout_items]], colWidths=[504])
                     callout_tbl.setStyle(
@@ -390,16 +413,16 @@ class PdfRenderer(BaseRenderer):
 
                 elif block.block_type == BlockType.TABLE and block.data_table:
                     t = block.data_table
-                    story.append(Paragraph(f"<b>Table: {t.title}</b>", h2_style))
+                    story.append(_safe_paragraph(f"<b>Table: {t.title}</b>", h2_style))
                     if t.caption:
-                        story.append(Paragraph(t.caption, caption_style))
+                        story.append(_safe_paragraph(t.caption, caption_style))
 
                     tbl_data = []
-                    header_row = [Paragraph(f"<b><font color='#FFFFFF'>{h}</font></b>", body_style) for h in t.headers]
+                    header_row = [_safe_paragraph(f"<b><font color='#FFFFFF'>{h}</font></b>", body_style) for h in t.headers]
                     tbl_data.append(header_row)
 
                     for r in t.rows:
-                        row_cells = [Paragraph(str(cell), body_style) for cell in r]
+                        row_cells = [_safe_paragraph(str(cell), body_style) for cell in r]
                         tbl_data.append(row_cells)
 
                     col_w = 504.0 / max(len(t.headers), 1)
@@ -419,23 +442,23 @@ class PdfRenderer(BaseRenderer):
                     story.append(Spacer(1, 10))
 
                 elif block.block_type == BlockType.PROVENANCE_TABLE:
-                    story.append(Paragraph(f"<b>{block.title or 'Source Provenance & Verification Ledger'}</b>", h2_style))
+                    story.append(_safe_paragraph(f"<b>{block.title or 'Source Provenance & Verification Ledger'}</b>", h2_style))
                     if ordered_sources:
                         ref_rows = [
                             [
-                                Paragraph("<b><font color='#FFFFFF'>#</font></b>", body_style),
-                                Paragraph("<b><font color='#FFFFFF'>Document Title & Publisher</font></b>", body_style),
-                                Paragraph("<b><font color='#FFFFFF'>Canonical URL</font></b>", body_style),
-                                Paragraph("<b><font color='#FFFFFF'>Verification Tier</font></b>", body_style),
+                                _safe_paragraph("<b><font color='#FFFFFF'>#</font></b>", body_style),
+                                _safe_paragraph("<b><font color='#FFFFFF'>Document Title & Publisher</font></b>", body_style),
+                                _safe_paragraph("<b><font color='#FFFFFF'>Canonical URL</font></b>", body_style),
+                                _safe_paragraph("<b><font color='#FFFFFF'>Verification Tier</font></b>", body_style),
                             ]
                         ]
                         for num, src in ordered_sources:
                             tier = src.reliability_tier or ("Peer-Reviewed" if src.is_primary else "Credible Reference")
                             ref_rows.append([
-                                Paragraph(f"[{num}]", body_style),
-                                Paragraph(f"{src.title or src.domain}<br/><font color='#64748B'>{src.domain}</font>", body_style),
-                                Paragraph(f"<font color='#0284C7'>{src.url}</font>", body_style),
-                                Paragraph(f"{tier}", body_style),
+                                _safe_paragraph(f"[{num}]", body_style),
+                                _safe_paragraph(f"{src.title or src.domain}<br/><font color='#64748B'>{src.domain}</font>", body_style),
+                                _safe_paragraph(f"<font color='#0284C7'>{src.url}</font>", body_style),
+                                _safe_paragraph(f"{tier}", body_style),
                             ])
                         ref_table = Table(ref_rows, colWidths=[24, 180, 210, 90])
                         ref_table.setStyle(
@@ -455,16 +478,16 @@ class PdfRenderer(BaseRenderer):
 
                 elif block.block_type == BlockType.BIBLIOGRAPHY:
                     if ordered_sources:
-                        story.append(Paragraph("<b>Bibliographic Citations & Verified URLs:</b>", body_style))
+                        story.append(_safe_paragraph("<b>Bibliographic Citations & Verified URLs:</b>", body_style))
                         for num, src in ordered_sources:
                             c_title = src.title or src.domain
                             acc_date = datetime.datetime.fromtimestamp(src.access_timestamp, datetime.timezone.utc).strftime("%Y.%m.%d")
                             tier = src.reliability_tier or ("Peer-Reviewed" if src.is_primary else "Credible Reference")
                             p_txt = f"[{num}] <b>\"{c_title}\"</b>. <i>{src.domain}</i> • Tier: {tier} • Accessed: {acc_date}<br/>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<font color='#0284C7'>{src.url}</font>"
-                            story.append(Paragraph(p_txt, bullet_style))
+                            story.append(_safe_paragraph(p_txt, bullet_style))
                     else:
                         story.append(
-                            Paragraph(
+                            _safe_paragraph(
                                 "<i>No external sources were consulted or cited for this deliverable. "
                                 "Findings are compiled from conversational context without verified external citations.</i>",
                                 body_style,

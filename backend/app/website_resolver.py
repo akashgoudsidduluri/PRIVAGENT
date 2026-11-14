@@ -239,6 +239,17 @@ KNOWN_DOMAINS_REGISTRY: dict[str, dict[str, Any]] = {
         "patterns": [r"\bgoogle\s+hotels\b", r"\bhotels\s+on\s+google\b"],
         "category": "travel",
     },
+    "irctc": {
+        "name": "IRCTC",
+        "primary_domain": "irctc.co.in",
+        "allowed_domains": ["irctc.co.in", "www.irctc.co.in"],
+        "regional_urls": {
+            "IN": "https://www.irctc.co.in/nget/train-search",
+            "GLOBAL": "https://www.irctc.co.in/nget/train-search",
+        },
+        "patterns": [r"\birctc(?:\.co\.in)?\b", r"\bindian\s+railways?\b", r"\btrains?\s+(?:ticket|booking|from|to)\b"],
+        "category": "travel",
+    },
 
     # E-Commerce & Retail
     "amazon": {

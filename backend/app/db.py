@@ -254,6 +254,22 @@ def init_db(db_path: Optional[str] = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_email_class_category ON email_classifications(mission_id, category);
             CREATE INDEX IF NOT EXISTS idx_email_audit_mission ON email_audit_log(mission_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_email_notif_status ON email_notifications(mission_id, status);
+
+            CREATE TABLE IF NOT EXISTS authenticated_sessions (
+                service_id TEXT PRIMARY KEY,
+                domain TEXT NOT NULL,
+                account_identifier TEXT,
+                auth_type TEXT NOT NULL DEFAULT 'browser_cookie',
+                encrypted_credentials TEXT,
+                status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'expired', 'invalidated', 'pending')),
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL,
+                expires_at REAL,
+                last_verified_at REAL NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_auth_sessions_domain ON authenticated_sessions(domain);
+            CREATE INDEX IF NOT EXISTS idx_auth_sessions_status ON authenticated_sessions(status);
             """
         )
         # Earlier control-center previews created narrower tables. Add only
@@ -272,6 +288,14 @@ def init_db(db_path: Optional[str] = None) -> None:
             },
             "messages": {
                 "task_id": "TEXT",
+            },
+            "authenticated_sessions": {
+                "account_identifier": "TEXT",
+                "auth_type": "TEXT NOT NULL DEFAULT 'browser_cookie'",
+                "encrypted_credentials": "TEXT",
+                "status": "TEXT NOT NULL DEFAULT 'active'",
+                "metadata_json": "TEXT NOT NULL DEFAULT '{}'",
+                "expires_at": "REAL",
             },
         }
         for table, columns in migrations.items():
@@ -1320,6 +1344,133 @@ def get_email_dashboard_stats(mission_id: str, db_path: Optional[str] = None) ->
             "neglected_awaiting_attention": counts["neglected_count"] or 0,
             "uncertain_review_required": counts["uncertain_count"] or 0,
         }
+
+
+def save_authenticated_session_record(session: dict[str, Any], db_path: Optional[str] = None) -> None:
+    """Insert or update an authenticated session record."""
+    service_id = str(session["service_id"]).strip().lower()
+    domain = str(session.get("domain", "")).strip().lower()
+    account_identifier = session.get("account_identifier")
+    auth_type = session.get("auth_type", "browser_cookie")
+    encrypted_credentials = session.get("encrypted_credentials")
+    status = session.get("status", "active")
+    metadata_json = session.get("metadata_json") or json.dumps(session.get("metadata") or {})
+    created_at = float(session.get("created_at") or time.time())
+    expires_at = float(session["expires_at"]) if session.get("expires_at") is not None else None
+    last_verified_at = float(session.get("last_verified_at") or time.time())
+
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO authenticated_sessions (
+                service_id, domain, account_identifier, auth_type,
+                encrypted_credentials, status, metadata_json,
+                created_at, expires_at, last_verified_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(service_id) DO UPDATE SET
+                domain = excluded.domain,
+                account_identifier = COALESCE(excluded.account_identifier, authenticated_sessions.account_identifier),
+                auth_type = excluded.auth_type,
+                encrypted_credentials = COALESCE(excluded.encrypted_credentials, authenticated_sessions.encrypted_credentials),
+                status = excluded.status,
+                metadata_json = excluded.metadata_json,
+                expires_at = excluded.expires_at,
+                last_verified_at = excluded.last_verified_at
+            """,
+            (
+                service_id, domain, account_identifier, auth_type,
+                encrypted_credentials, status, metadata_json,
+                created_at, expires_at, last_verified_at,
+            ),
+        )
+
+
+def get_authenticated_session_record(service_id: str, db_path: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """Retrieve an authenticated session record by its service_id."""
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM authenticated_sessions WHERE service_id = ?",
+            (service_id.strip().lower(),),
+        ).fetchone()
+        if not row:
+            return None
+        res = dict(row)
+        try:
+            res["metadata"] = json.loads(res.get("metadata_json") or "{}")
+        except Exception:
+            res["metadata"] = {}
+        return res
+
+
+def get_authenticated_session_by_domain(domain: str, db_path: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """Retrieve an active authenticated session record matching a domain."""
+    clean_domain = domain.strip().lower()
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM authenticated_sessions
+            WHERE (domain = ? OR domain LIKE ? OR ? LIKE ('%' || domain || '%'))
+              AND status = 'active'
+            ORDER BY last_verified_at DESC LIMIT 1
+            """,
+            (clean_domain, f"%{clean_domain}%", clean_domain),
+        ).fetchone()
+        if not row:
+            return None
+        res = dict(row)
+        try:
+            res["metadata"] = json.loads(res.get("metadata_json") or "{}")
+        except Exception:
+            res["metadata"] = {}
+        return res
+
+
+def list_authenticated_session_records(
+    include_all: bool = False,
+    db_path: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """List authenticated session records, optionally filtering by active status."""
+    with get_connection(db_path) as conn:
+        query = (
+            "SELECT * FROM authenticated_sessions ORDER BY last_verified_at DESC"
+            if include_all
+            else "SELECT * FROM authenticated_sessions WHERE status = 'active' ORDER BY last_verified_at DESC"
+        )
+        rows = conn.execute(query).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["metadata"] = json.loads(d.get("metadata_json") or "{}")
+            except Exception:
+                d["metadata"] = {}
+            result.append(d)
+        return result
+
+
+def delete_authenticated_session_record(service_id: str, db_path: Optional[str] = None) -> bool:
+    """Delete an authenticated session record by its service_id."""
+    with get_connection(db_path) as conn:
+        cur = conn.execute(
+            "DELETE FROM authenticated_sessions WHERE service_id = ?",
+            (service_id.strip().lower(),),
+        )
+        return cur.rowcount > 0
+
+
+def update_authenticated_session_status(
+    service_id: str,
+    status: str,
+    db_path: Optional[str] = None,
+) -> bool:
+    """Update status of an authenticated session (active, expired, invalidated)."""
+    with get_connection(db_path) as conn:
+        cur = conn.execute(
+            "UPDATE authenticated_sessions SET status = ?, last_verified_at = ? WHERE service_id = ?",
+            (status, time.time(), service_id.strip().lower()),
+        )
+        return cur.rowcount > 0
+
 
 
 
