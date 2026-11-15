@@ -367,3 +367,89 @@ def test_task_checkpoint_restored_from_db_without_404():
     assert restored.steps_done == 3
     assert restored.session_id == "sess-123"
 
+
+def test_in_flight_active_task_hydrates_all_intermediate_steps_on_chat_reconnect():
+    """When a tab is closed and reopened while an agent task is in-flight,
+
+    GET /api/chat/{id} and GET /api/task/{id} must deliver all executed steps
+    from task_checkpoints so the UI displays all steps 1..N rather than only
+    subsequent steps.
+    """
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app import db, hub
+
+    client = TestClient(app)
+    chat = db.create_chat("Mission Tab Reconnect Test")
+    cid = chat["id"]
+    task_id = "task_reconnect_steps_test"
+
+    t = hub.TaskRecord(
+        task_id=task_id,
+        instruction="navigate and extract pricing",
+        chat_id=cid,
+        state="running",
+        steps_done=3,
+        message="Step 3: Clicking price table...",
+    )
+    hub.hub.tasks[task_id] = t
+
+    history = [
+        {
+            "action": {"type": "navigate", "params": {"url": "https://store.test"}},
+            "result_ok": True,
+            "narrative": "Step 1: Navigating to store...",
+        },
+        {
+            "action": {"type": "wait"},
+            "result_ok": True,
+            "narrative": "Step 2: Pausing a moment for page rendering...",
+        },
+        {
+            "action": {"type": "click"},
+            "result_ok": True,
+            "narrative": "Step 3: Clicking price table...",
+        },
+    ]
+    db.save_task_checkpoint(task_id, cid, "sess_reconnect", 3, "https://store.test", history, {})
+
+    res_chat = client.get(f"/api/chat/{cid}")
+    assert res_chat.status_code == 200
+    data = res_chat.json()
+    act = data.get("active_task")
+    assert act is not None
+    assert act["taskId"] == task_id
+    assert len(act.get("steps", [])) == 3
+    assert act["steps"][0]["stepNum"] == 1
+    assert act["steps"][0]["message"] == "Step 1: Navigating to store..."
+    assert act["steps"][1]["stepNum"] == 2
+    assert act["steps"][2]["stepNum"] == 3
+
+    res_task = client.get(f"/api/task/{task_id}")
+    assert res_task.status_code == 200
+    task_data = res_task.json()
+    assert len(task_data.get("steps", [])) == 3
+
+
+def test_can_you_access_my_mail_routes_to_companion_and_never_creates_docx():
+    """Inquiries like 'hi, can you access my mail' must route to NON_BROWSER companion,
+
+    never launching autonomous research or generating DOCX files.
+    """
+    from app.intent_router import classify_intent, TaskIntent, ResearchOperationType
+    from app.email_intelligence.companion_queries import is_email_companion_query
+
+    queries = [
+        "hi, can you access my mail",
+        "can you access my mail",
+        "do you have access to my mail",
+        "is my mail connected",
+        "check now",
+    ]
+    for q in queries:
+        c = classify_intent(q)
+        assert c.intent == TaskIntent.NON_BROWSER, f"Failed for {q}: {c.intent}"
+        assert c.operation_type != ResearchOperationType.NEW_RESEARCH, f"Triggered NEW_RESEARCH for {q}"
+        assert is_email_companion_query(q) is True, f"Companion query failed for {q}"
+
+

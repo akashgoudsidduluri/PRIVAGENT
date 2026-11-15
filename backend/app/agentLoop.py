@@ -79,6 +79,23 @@ _IDEMPOTENT_RETRY_TYPES = {"observe", "scroll", "wait", "zoom", "select_tab"}
 # in production, so the loop re-observes instead of trusting a stale tab view.
 _FORCE_REOBSERVE_ACTIONS = {"select_tab", "close_tab"}
 
+CANONICAL_FORMAT_MAP: dict[str, str] = {
+    "presentation": "pptx",
+    "slides": "pptx",
+    "slide_deck": "pptx",
+    "ppt": "pptx",
+    "powerpoint": "pptx",
+    "excel": "xlsx",
+    "spreadsheet": "xlsx",
+    "workbook": "xlsx",
+    "word": "docx",
+    "document": "docx",
+    "doc": "docx",
+    "webpage": "html",
+    "web": "html",
+}
+canonical_format_map = CANONICAL_FORMAT_MAP
+
 _cancelled: set[str] = set()
 
 # Chat/messaging hosts where "typed with submit" genuinely means "sent".
@@ -1440,6 +1457,7 @@ async def _run_loop(
             "status": action_status,
             "evidence": safe_evidence,
             "verification": receipt,
+            "narrative": step_narrative,
         }
         if not action_ok:
             err = result.get("error") or {}

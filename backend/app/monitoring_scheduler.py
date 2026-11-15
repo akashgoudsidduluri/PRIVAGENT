@@ -4,10 +4,13 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+import logging
 import time
 
 from . import db
 from .hub import hub
+
+logger = logging.getLogger(__name__)
 
 
 def _cron_part(raw: str, low: int, high: int) -> set[int]:
@@ -72,26 +75,30 @@ def claim_due(now: float | None = None, limit: int = 5, db_path: str | None = No
             conn.execute("UPDATE monitoring_missions SET next_run_at=? WHERE id=?", (next_at, row["id"]))
             claims.append(dict(row))
 
-        # Also claim due email intelligence missions
+        # Also claim due email intelligence missions (avoid duplicate claims if mirrored in monitoring_missions)
         rem_limit = max(0, limit - len(claims))
+        claimed_ids = {c["id"] for c in claims}
         if rem_limit > 0:
             try:
-                email_rows = conn.execute("""SELECT * FROM email_missions
+                email_rows = conn.execute("""SELECT * FROM email_monitoring_missions
                     WHERE status='active' AND next_run_at IS NOT NULL AND next_run_at<=?
                     ORDER BY next_run_at ASC LIMIT ?""", (current, rem_limit)).fetchall()
                 for erow in email_rows:
-                    freq = erow["frequency_seconds"] if "frequency_seconds" in erow.keys() else 300
-                    next_at = current + (freq or 300)
-                    conn.execute("UPDATE email_missions SET next_run_at=? WHERE id=?", (next_at, erow["id"]))
+                    ed = dict(erow)
+                    if ed["id"] in claimed_ids:
+                        continue
+                    freq = ed.get("frequency_seconds") or 300
+                    next_at = current + freq
+                    conn.execute("UPDATE email_monitoring_missions SET next_run_at=? WHERE id=?", (next_at, ed["id"]))
                     claims.append({
-                        "id": erow["id"],
-                        "target_url": f"email://{erow.get('account_email', 'inbox')}",
+                        "id": ed["id"],
+                        "target_url": f"email://{ed.get('account_email') or 'inbox'}",
                         "condition_type": "email_intelligence",
-                        "conversation_id": erow.get("conversation_id"),
+                        "conversation_id": ed.get("conversation_id"),
                         "frequency_seconds": freq,
                     })
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.error("Failed to claim email monitoring missions: %s", exc)
     return claims
 
 
@@ -106,7 +113,7 @@ async def execute_monitor(mission: dict) -> None:
             await run_email_mission_tick(mission["id"])
         except Exception:
             with db.get_connection() as conn:
-                conn.execute("UPDATE email_missions SET last_sync_at=? WHERE id=?", (time.time(), mission["id"]))
+                conn.execute("UPDATE email_monitoring_missions SET last_sync_at=? WHERE id=?", (time.time(), mission["id"]))
         return
 
     record = hub.new_task(f"Open {target_url} and observe its public visible page text and price. Report only observed facts.",

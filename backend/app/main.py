@@ -125,9 +125,12 @@ async def configure_connector(provider: str, body: ConnectorConfigureInput) -> d
                     from .email_intelligence.sync_engine import run_email_mission_tick
                     missions = db.list_email_missions()
                     if missions:
-                        for m in missions:
-                            db.update_email_mission(m["id"], {"account_email": email_addr, "sync_cursor": ""})
-                        asyncio.create_task(run_email_mission_tick(missions[0]["id"]))
+                        primary = missions[0]
+                        db.update_email_mission(primary["id"], {"account_email": email_addr, "sync_cursor": "", "status": "active"})
+                        # Deactivate or clean up any redundant missions to avoid competing sync loops
+                        for m in missions[1:]:
+                            db.update_email_mission(m["id"], {"status": "paused"})
+                        asyncio.create_task(run_email_mission_tick(primary["id"]))
                     else:
                         new_m = db.create_email_mission(account_email=email_addr, provider="gmail" if provider == "google" else "outlook")
                         asyncio.create_task(run_email_mission_tick(new_m["id"]))
@@ -319,6 +322,12 @@ async def get_chat_session(chat_id: str) -> dict[str, Any]:
     active_task = None
     for t in hub.tasks.values():
         if getattr(t, "chat_id", None) == chat_id and t.state not in TERMINAL_STATES:
+            cp = db.get_task_checkpoint(t.task_id)
+            steps = []
+            if cp and cp.get("history"):
+                steps = db.format_history_steps(cp["history"])
+            elif getattr(t, "steps", None):
+                steps = t.steps
             active_task = {
                 "taskId": t.task_id,
                 "taskState": t.state,
@@ -330,6 +339,7 @@ async def get_chat_session(chat_id: str) -> dict[str, Any]:
                 "sessionId": t.session_id,
                 "primaryTabId": t.primary_tab_id,
                 "childTabIds": t.child_tab_ids,
+                "steps": steps,
             }
             break
     chat["active_task"] = active_task
@@ -431,6 +441,12 @@ async def _run_task_later(task_id: str) -> None:
 async def get_task(task_id: str) -> dict[str, Any]:
     task = _require(task_id)
     from .privacy import scrub_persistent
+    cp = db.get_task_checkpoint(task_id)
+    steps = []
+    if cp and cp.get("history"):
+        steps = db.format_history_steps(cp["history"])
+    elif getattr(task, "steps", None):
+        steps = task.steps
     return {
         "taskId": task.task_id,
         "instruction": scrub_persistent(task.instruction),
@@ -447,6 +463,7 @@ async def get_task(task_id: str) -> dict[str, Any]:
         "primaryTabId": task.primary_tab_id,
         "childTabIds": task.child_tab_ids,
         "isBrowserTask": task.intent != "NON_BROWSER" if task.intent else True,
+        "steps": steps,
     }
 
 
@@ -693,6 +710,8 @@ async def ws_client(ws: WebSocket) -> None:
         while True:
             await ws.receive_text()
     except WebSocketDisconnect:
+        pass
+    except (ConnectionResetError, BrokenPipeError, OSError):
         pass
     except Exception:  # noqa: BLE001
         logger.exception("client websocket failed")

@@ -3,16 +3,16 @@ from __future__ import annotations
 
 import pytest
 
-from backend.app.step_narrator import generate_step_narrative, _extract_site_and_query
-from backend.app.continuous_monitoring_companion import (
+from app.step_narrator import generate_step_narrative, _extract_site_and_query
+from app.continuous_monitoring_companion import (
     is_continuous_monitoring_directive,
     handle_continuous_monitoring_instruction,
 )
-from backend.app.email_dispatch import (
+from app.email_dispatch import (
     is_email_dispatch_instruction,
     handle_email_dispatch,
 )
-from backend.app.intent_router import classify_intent, TaskIntent
+from app.intent_router import classify_intent, TaskIntent
 
 
 def test_step_narrator_navigation_ecommerce():
@@ -150,7 +150,7 @@ def test_email_dispatch_detection():
 @pytest.mark.asyncio
 async def test_email_dispatch_execution_when_connected(monkeypatch):
     # Mock oauth_manager to simulate connected account
-    from backend.app.connectors.oauth import oauth_manager
+    from app.connectors.oauth import oauth_manager
     monkeypatch.setattr(oauth_manager, "verify_connection", lambda p: {"connected": True, "account": "b21650406@gmail.com", "access_token": "mock_token"})
 
     resp = await handle_email_dispatch(
@@ -161,4 +161,87 @@ async def test_email_dispatch_execution_when_connected(monkeypatch):
     )
     assert "b21650406@gmail.com" in resp
     assert "Connected Account" in resp
+
+
+def test_restore_companion_query_execution_and_capability(monkeypatch):
+    from app.email_intelligence.companion_queries import is_email_companion_query, answer_email_companion_query
+    from app import db
+
+    # 1. Capability check
+    cap_query = "are you capable of restoring last deleted mail?"
+    assert is_email_companion_query(cap_query) is True
+    ans = answer_email_companion_query(cap_query)
+    assert ans["answered"] is True
+    assert "Reversible Trash" in ans["text"]
+
+    # 2. Execution check when mock connected
+    from app.connectors.oauth import oauth_manager
+    monkeypatch.setattr(oauth_manager, "verify_connection", lambda p: {"connected": True, "account": "user@test.org"})
+
+    class MockGmailConn:
+        def list_messages(self, query="", limit=10):
+            return {"messages": [{"id": "msg_trash_999"}]}
+        def get_message(self, mid):
+            return {
+                "id": mid,
+                "payload": {"headers": [{"name": "Subject", "value": "Meeting agenda"}, {"name": "From", "value": "boss@test.org"}]},
+            }
+        def untrash_message(self, mid):
+            return {"id": mid, "labelIds": ["INBOX"]}
+
+    monkeypatch.setattr(oauth_manager, "connector", lambda p: MockGmailConn())
+
+    exec_query = "then restore lastly deleted mail"
+    assert is_email_companion_query(exec_query) is True
+    res = answer_email_companion_query(exec_query)
+    assert res["answered"] is True
+    assert "Successfully Restored Email" in res["text"] or "Restored Email from Trash to Inbox" in res["text"]
+    assert "Meeting agenda" in res["text"]
+    assert "boss@test.org" in res["text"]
+    assert "msg_trash_999" in res["text"]
+
+
+def test_i_connected_everything_companion_query(monkeypatch):
+    from app.email_intelligence.companion_queries import is_email_companion_query, answer_email_companion_query
+    from app.connectors.oauth import oauth_manager
+
+    monkeypatch.setattr(oauth_manager, "verify_connection", lambda p: {"connected": True, "account": "user@test.org"})
+    q = "i connected evrything"
+    assert is_email_companion_query(q) is True
+    ans = answer_email_companion_query(q)
+    assert ans["answered"] is True
+    assert "Mail Account Connected & Verified" in ans["text"]
+
+
+def test_promotional_and_safety_queries(monkeypatch):
+    from app.email_intelligence.companion_queries import is_email_companion_query, answer_email_companion_query
+    from app.connectors.oauth import oauth_manager
+
+    monkeypatch.setattr(oauth_manager, "verify_connection", lambda p: {"connected": True, "account": "user@test.org"})
+
+    # 1. "can you automatically delete promotional emails"
+    q_promo = "can you automatically delete promotional emails"
+    assert is_email_companion_query(q_promo) is True
+    ans_promo = answer_email_companion_query(q_promo)
+    assert ans_promo["answered"] is True
+    assert "Autonomous Promotional Email Cleanup Engine" in ans_promo["text"]
+    assert "Reversible Trash Only" in ans_promo["text"]
+
+    # 2. "ensure they are not important"
+    q_safe = "ensure they are not important"
+    assert is_email_companion_query(q_safe) is True
+    ans_safe = answer_email_companion_query(q_safe)
+    assert ans_safe["answered"] is True
+    assert "Fail-Closed Safeguard" in ans_safe["text"]
+    assert "Banking" in ans_safe["text"]
+    assert "Security" in ans_safe["text"]
+
+    # 3. "it is connected, lets start"
+    q_start = "it is connected, lets start"
+    assert is_email_companion_query(q_start) is True
+    ans_start = answer_email_companion_query(q_start)
+    assert ans_start["answered"] is True
+    assert "Autonomous Email Cleanup Started" in ans_start["text"]
+
+
 

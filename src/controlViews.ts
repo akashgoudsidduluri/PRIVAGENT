@@ -7,10 +7,23 @@ const card = (title: string, body: string, label = 'LOCAL RUNTIME') => '<section
 const tag = (value: unknown) => '<span class="cc-tag">' + safe(value) + '</span>';
 const button = (text: string, action: string, value: unknown) => '<button class="cc-button cc-button--outline" data-' + action + '="' + safe(value) + '">' + text + '</button>';
 
-async function request(path: string, options?: RequestInit): Promise<any> {
-  const response = await fetch(API + path, { ...options, signal: AbortSignal.timeout(9000) });
-  if (!response.ok) throw Error('Backend returned ' + response.status);
-  return response.json();
+async function request(path: string, options?: RequestInit, timeoutMs = 15000): Promise<any> {
+  let lastError: any;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const response = await fetch(API + path, { ...options, signal: AbortSignal.timeout(timeoutMs) });
+      if (!response.ok) throw Error('Backend returned ' + response.status);
+      return await response.json();
+    } catch (err: any) {
+      lastError = err;
+      if (attempt === 0 && (err.name === 'TimeoutError' || String(err).includes('signal timed out') || String(err).includes('Failed to fetch'))) {
+        await new Promise(res => setTimeout(res, 500));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastError;
 }
 const jsonOptions = (method: string, value: unknown): RequestInit => ({ method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) });
 const showError = (scope: Element, error: unknown) => {
@@ -19,9 +32,12 @@ const showError = (scope: Element, error: unknown) => {
   note.textContent = String(error);
 };
 const rerender = () => window.dispatchEvent(new Event('hashchange'));
+let emailTimerInterval: number | undefined;
 
 export async function mountControlView(index: number, content: HTMLElement, isCurrent: () => boolean): Promise<void> {
-  content.innerHTML = empty('Reading local runtime…', 'Connecting to localhost:8000');
+  if (!content.children.length) {
+    content.innerHTML = empty('Reading local runtime…', 'Connecting to localhost:8000');
+  }
   try {
     if (index === 0) {
       const [health, chats, missions] = await Promise.all([request('/api/health'), request('/api/chats'), request('/api/control/missions')]);
@@ -209,7 +225,8 @@ export async function mountControlView(index: number, content: HTMLElement, isCu
     if (index === 7) await mountMemory(content, isCurrent);
     if (index === 8) {
       const chats = await request('/api/chats');
-      const groups = await Promise.all(chats.slice(0, 25).map((c: any) => request('/api/chats/' + encodeURIComponent(c.id) + '/artifacts')));
+      const sample = (chats || []).slice(0, 10);
+      const groups = await Promise.all(sample.map((c: any) => request('/api/chats/' + encodeURIComponent(c.id) + '/artifacts').catch(() => [])));
       if (!isCurrent()) return;
       content.innerHTML = card('Deliverables', groups.flat().map((a: any) => '<article class="cc-row"><div><small>' + safe(a.file_format?.toUpperCase()) + ' · ' + safe(a.file_size_bytes) + ' bytes</small><h3>' + safe(a.title || a.filename) + '</h3><p>' + safe(a.summary) + '</p></div><a class="cc-button" href="' + API + '/api/artifacts/' + encodeURIComponent(a.artifact_id) + '/download">Download ↗</a></article>').join('') || empty('Room for your next discovery', 'Completed research exports will appear here.'), 'ARTIFACT MEMORY');
     }
@@ -322,6 +339,10 @@ async function mountMemory(content: HTMLElement, isCurrent: () => boolean): Prom
 }
 
 async function mountEmailIntelligence(content: HTMLElement, isCurrent: () => boolean): Promise<void> {
+  if (emailTimerInterval !== undefined) {
+    window.clearInterval(emailTimerInterval);
+    emailTimerInterval = undefined;
+  }
   const missions = await request('/api/email/missions');
   if (!isCurrent()) return;
 
@@ -379,18 +400,23 @@ async function mountEmailIntelligence(content: HTMLElement, isCurrent: () => boo
     card('Important Handled', '<strong class="cc-number" style="color:#8cf2ac">' + safe(stats.important_handled) + '</strong><p>Attended / replied</p>') +
     '</div>';
 
-  // Policy & Controls Banner
+  // Policy & Controls Banner with Live 5-Minute Timer
   const controlsHtml = card('Monitoring Controls & Deletion Policy',
     '<div class="cc-row"><div>' +
-    '<small>' + safe(mission.provider.toUpperCase()) + ' · ' + safe(mission.account_email) + ' · every ' + safe(mission.frequency_seconds) + 's</small>' +
+    '<small>' + safe(mission.provider.toUpperCase()) + ' · ' + safe(mission.account_email) + ' · auto-sync every 5 mins (' + safe(mission.frequency_seconds) + 's)</small>' +
     '<h3>Status: ' + safe(mission.status.toUpperCase()) + ' ' + modeBadge + '</h3>' +
+    '<div style="display:flex;align-items:center;gap:10px;margin:10px 0;padding:8px 14px;background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.25);border-radius:6px;width:fit-content">' +
+    '<span style="font-size:16px">⏱</span>' +
+    '<span style="color:#cbd5e1;font-size:13px;font-weight:500">Auto-sync timer:</span>' +
+    '<strong id="emailSyncCountdown" style="font-family:monospace;font-size:16px;color:#6ee7b7;background:rgba(0,0,0,0.35);padding:2px 8px;border-radius:4px;border:1px solid rgba(110,231,183,0.3)">05:00</strong>' +
+    '</div>' +
     '<p>Protected categories (<strong>Banking, Financial, Security, Academic, Recruitment, Personal, Deadlines</strong>) are strictly locked and never automatically deleted.</p>' +
     '</div><div class="cc-row-actions">' +
     (isAuth
       ? button('Switch to Dry-Run Mode', 'email-dryrun', mission.id)
       : '<button class="cc-button" data-email-authorize="' + safe(mission.id) + '">✓ Authorize Autonomous Cleanup</button>') +
     button(mission.status === 'active' ? 'Pause' : 'Resume', 'email-toggle-status', mission.id) +
-    button('Sync Now ↻', 'email-sync-now', mission.id) +
+    '<button class="cc-button" id="btnManualSync" data-email-sync-now="' + safe(mission.id) + '"><span id="syncBtnIcon">↻</span> <span id="syncBtnText">Sync Now (Manual)</span></button>' +
     '</div></div>', 'GOVERNANCE');
 
   // Subtabs navigation
@@ -543,13 +569,73 @@ async function mountEmailIntelligence(content: HTMLElement, isCurrent: () => boo
     } catch (err) { showError(content, err); }
   });
 
-  content.querySelector<HTMLButtonElement>('[data-email-sync-now]')?.addEventListener('click', async (e) => {
-    const btn = e.currentTarget as HTMLButtonElement;
-    btn.disabled = true;
+  // 5-minute Auto-Sync Countdown and Manual Sync logic
+  let remainingSeconds = 300;
+  if (mission.next_run_at) {
+    const diff = Math.round(Number(mission.next_run_at) - (Date.now() / 1000));
+    if (diff > 0 && diff <= 300) {
+      remainingSeconds = diff;
+    }
+  }
+
+  const countdownEl = content.querySelector<HTMLElement>('#emailSyncCountdown');
+  const syncBtn = content.querySelector<HTMLButtonElement>('#btnManualSync');
+  const syncBtnText = content.querySelector<HTMLElement>('#syncBtnText');
+
+  const updateCountdownDisplay = (secs: number) => {
+    if (!countdownEl) return;
+    const m = String(Math.floor(secs / 60)).padStart(2, '0');
+    const s = String(secs % 60).padStart(2, '0');
+    countdownEl.textContent = `${m}:${s}`;
+  };
+
+  let isSyncing = false;
+  const executeSync = async (isManual = false) => {
+    if (isSyncing) return;
+    isSyncing = true;
+    if (countdownEl) countdownEl.textContent = 'Syncing...';
+    if (syncBtn) syncBtn.disabled = true;
+    if (syncBtnText) syncBtnText.textContent = 'Syncing inbox... ⏳';
+
     try {
       await request('/api/email/missions/' + encodeURIComponent(mission.id) + '/sync', { method: 'POST' });
       rerender();
-    } catch (err) { showError(content, err); btn.disabled = false; }
+    } catch (err) {
+      showError(content, err);
+      isSyncing = false;
+      if (syncBtn) syncBtn.disabled = false;
+      if (syncBtnText) syncBtnText.textContent = 'Sync Now (Manual)';
+      remainingSeconds = 300;
+      updateCountdownDisplay(remainingSeconds);
+    }
+  };
+
+  updateCountdownDisplay(remainingSeconds);
+
+  if (mission.status === 'active') {
+    emailTimerInterval = window.setInterval(() => {
+      if (!isCurrent()) {
+        if (emailTimerInterval !== undefined) {
+          window.clearInterval(emailTimerInterval);
+          emailTimerInterval = undefined;
+        }
+        return;
+      }
+      if (isSyncing) return;
+      if (remainingSeconds > 0) {
+        remainingSeconds--;
+        updateCountdownDisplay(remainingSeconds);
+      } else {
+        remainingSeconds = 300;
+        executeSync(false);
+      }
+    }, 1000);
+  } else {
+    if (countdownEl) countdownEl.textContent = 'PAUSED';
+  }
+
+  syncBtn?.addEventListener('click', () => {
+    executeSync(true);
   });
 }
 

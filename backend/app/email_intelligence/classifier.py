@@ -228,6 +228,27 @@ def classify_email(email: EmailItem) -> EmailClassificationResult:
         _CLASSIFICATION_CACHE[cache_key] = res
         return res
 
+    # 1.5 Fast-Path Protected Category Safeguard:
+    # If content strictly matches protected classes (financial, security, education, recruitment, personal),
+    # immediately classify as important without incurring a 3-second remote LLM call per email.
+    protected_early = _detect_protected_subcategory(sanitized["sender"], sanitized["subject"], sanitized["snippet"])
+    if protected_early:
+        prot_subcat, prot_reason = protected_early
+        combined_text = f"{sanitized['subject']} {sanitized['snippet']}"
+        deadline = _extract_deadline(combined_text)
+        res = EmailClassificationResult(
+            category="important",
+            subcategory=prot_subcat,
+            importance_score=0.92,
+            unnecessary_confidence=0.0,
+            reasoning=f"Protected category safeguard ({prot_subcat}): {prot_reason}",
+            deadline=deadline,
+            required_action="Review and respond" if prot_subcat in ("recruitment", "interview", "personal") else None,
+            recommended_action="Review important message",
+        )
+        _CLASSIFICATION_CACHE[cache_key] = res
+        return res
+
     # 2. Run LLM or high-fidelity fallback classifier
     raw_result = _classify_with_llm_or_fallback(sanitized)
 
