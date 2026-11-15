@@ -202,6 +202,14 @@ def classify_instruction_type(instruction: str) -> str:
     if is_multi_site_instruction(instruction):
         return "COMPARISON"
 
+    # MCP tool directives (e.g. database query, tables inspection) are not web research
+    try:
+        from .mcp.coordinator import is_mcp_directive
+        if is_mcp_directive(instruction):
+            return "CONVERSATIONAL"
+    except Exception:
+        pass
+
     # Navigation patterns
     nav_pattern = re.compile(
         r"^(?:open|go\s+to|navigate\s+to|visit|browse\s+to)\s+"

@@ -155,6 +155,28 @@ def init_db(db_path: Optional[str] = None) -> None:
                 latency_ms INTEGER NOT NULL, status TEXT NOT NULL, output_hash TEXT NOT NULL,
                 created_at REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS mcp_servers (
+                name TEXT PRIMARY KEY,
+                transport TEXT NOT NULL CHECK(transport IN ('stdio', 'sse')),
+                command TEXT,
+                args_json TEXT NOT NULL DEFAULT '[]',
+                url TEXT,
+                headers_json TEXT NOT NULL DEFAULT '{}',
+                env_json TEXT NOT NULL DEFAULT '{}',
+                read_only_tools_json TEXT NOT NULL DEFAULT '[]',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS mcp_tools (
+                name TEXT PRIMARY KEY,
+                server_name TEXT NOT NULL,
+                schema_json TEXT NOT NULL DEFAULT '{}',
+                description TEXT NOT NULL DEFAULT '',
+                mutating INTEGER NOT NULL DEFAULT 1,
+                discovered INTEGER NOT NULL DEFAULT 1,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
 
             CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id);
             CREATE INDEX IF NOT EXISTS idx_semantic_expiry ON user_semantic_facts(expires_at);
@@ -168,6 +190,7 @@ def init_db(db_path: Optional[str] = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_monitor_due ON monitoring_missions(status, next_run_at);
             CREATE INDEX IF NOT EXISTS idx_monitor_events ON monitoring_events(mission_id, detected_at DESC);
             CREATE INDEX IF NOT EXISTS idx_mcp_audit_created ON mcp_audit(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_mcp_tools_server ON mcp_tools(server_name);
 
             CREATE TABLE IF NOT EXISTS email_monitoring_missions (
                 id TEXT PRIMARY KEY,
@@ -1332,6 +1355,158 @@ def get_email_dashboard_stats(mission_id: str, db_path: Optional[str] = None) ->
             "neglected_awaiting_attention": counts["neglected_count"] or 0,
             "uncertain_review_required": counts["uncertain_count"] or 0,
         }
+
+
+# ==============================================================================
+# MCP Server & Tool Persistence
+# ==============================================================================
+
+def save_mcp_server(spec: dict[str, Any], *, db_path: Optional[str] = None) -> None:
+    """Save or update an MCP server specification in SQLite."""
+    init_db(db_path)
+    now = time.time()
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO mcp_servers(
+                name, transport, command, args_json, url, headers_json, env_json, read_only_tools_json, created_at, updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(name) DO UPDATE SET
+                transport = excluded.transport,
+                command = excluded.command,
+                args_json = excluded.args_json,
+                url = excluded.url,
+                headers_json = excluded.headers_json,
+                env_json = excluded.env_json,
+                read_only_tools_json = excluded.read_only_tools_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                spec["name"],
+                spec.get("transport", "stdio"),
+                spec.get("command"),
+                json.dumps(list(spec.get("args") or [])),
+                spec.get("url"),
+                json.dumps(dict(spec.get("headers") or {})),
+                json.dumps(dict(spec.get("env") or {})),
+                json.dumps(list(spec.get("read_only_tools") or [])),
+                spec.get("created_at", now),
+                now,
+            ),
+        )
+
+
+def list_mcp_servers(*, db_path: Optional[str] = None) -> list[dict[str, Any]]:
+    """List all persisted MCP servers."""
+    init_db(db_path)
+    with get_connection(db_path) as conn:
+        rows = conn.execute("SELECT * FROM mcp_servers ORDER BY created_at ASC").fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["args"] = json.loads(d.get("args_json") or "[]")
+            d["headers"] = json.loads(d.get("headers_json") or "{}")
+            d["env"] = json.loads(d.get("env_json") or "{}")
+            d["read_only_tools"] = json.loads(d.get("read_only_tools_json") or "[]")
+            result.append(d)
+        return result
+
+
+def get_mcp_server(name: str, *, db_path: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """Get a single persisted MCP server by name."""
+    init_db(db_path)
+    with get_connection(db_path) as conn:
+        row = conn.execute("SELECT * FROM mcp_servers WHERE name = ?", (name,)).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["args"] = json.loads(d.get("args_json") or "[]")
+        d["headers"] = json.loads(d.get("headers_json") or "{}")
+        d["env"] = json.loads(d.get("env_json") or "{}")
+        d["read_only_tools"] = json.loads(d.get("read_only_tools_json") or "[]")
+        return d
+
+
+def delete_mcp_server(name: str, *, db_path: Optional[str] = None) -> bool:
+    """Delete an MCP server and its associated tools."""
+    init_db(db_path)
+    with get_connection(db_path) as conn:
+        cur = conn.execute("DELETE FROM mcp_servers WHERE name = ?", (name,))
+        conn.execute("DELETE FROM mcp_tools WHERE server_name = ?", (name,))
+        return cur.rowcount > 0
+
+
+def save_mcp_tools(server_name: str, tools: list[dict[str, Any]], *, db_path: Optional[str] = None) -> None:
+    """Save or update discovered tools for an MCP server."""
+    init_db(db_path)
+    now = time.time()
+    with get_connection(db_path) as conn:
+        for t in tools:
+            conn.execute(
+                """
+                INSERT INTO mcp_tools(
+                    name, server_name, schema_json, description, mutating, discovered, created_at, updated_at
+                ) VALUES(?,?,?,?,?,?,?,?)
+                ON CONFLICT(name) DO UPDATE SET
+                    server_name = excluded.server_name,
+                    schema_json = excluded.schema_json,
+                    description = excluded.description,
+                    mutating = excluded.mutating,
+                    discovered = excluded.discovered,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    t["name"],
+                    server_name,
+                    json.dumps(dict(t.get("schema") or {})),
+                    t.get("description", ""),
+                    1 if t.get("mutating", True) else 0,
+                    1 if t.get("discovered", True) else 0,
+                    t.get("created_at", now),
+                    now,
+                ),
+            )
+
+
+def list_mcp_tools(server_name: Optional[str] = None, *, db_path: Optional[str] = None) -> list[dict[str, Any]]:
+    """List all persisted MCP tools, optionally filtered by server."""
+    init_db(db_path)
+    with get_connection(db_path) as conn:
+        if server_name:
+            rows = conn.execute("SELECT * FROM mcp_tools WHERE server_name = ? ORDER BY name ASC", (server_name,)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM mcp_tools ORDER BY name ASC").fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["schema"] = json.loads(d.get("schema_json") or "{}")
+            d["mutating"] = bool(d.get("mutating", 1))
+            d["discovered"] = bool(d.get("discovered", 1))
+            result.append(d)
+        return result
+
+
+def get_mcp_tool(name: str, *, db_path: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """Get a single persisted tool by name."""
+    init_db(db_path)
+    with get_connection(db_path) as conn:
+        row = conn.execute("SELECT * FROM mcp_tools WHERE name = ?", (name,)).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["schema"] = json.loads(d.get("schema_json") or "{}")
+        d["mutating"] = bool(d.get("mutating", 1))
+        d["discovered"] = bool(d.get("discovered", 1))
+        return d
+
+
+def delete_mcp_tools_by_server(server_name: str, *, db_path: Optional[str] = None) -> int:
+    """Delete all tools belonging to a server."""
+    init_db(db_path)
+    with get_connection(db_path) as conn:
+        cur = conn.execute("DELETE FROM mcp_tools WHERE server_name = ?", (server_name,))
+        return cur.rowcount
+
 
 
 

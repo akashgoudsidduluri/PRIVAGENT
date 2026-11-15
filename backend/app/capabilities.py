@@ -19,6 +19,7 @@ class Capability(str, Enum):
     AUTH_HANDOFF = "AUTH_HANDOFF"
     MULTI_SITE_RESEARCH = "MULTI_SITE_RESEARCH"
     CONVERSATIONAL_REASONING = "CONVERSATIONAL_REASONING"
+    MCP_TOOL_INTEGRATION = "MCP_TOOL_INTEGRATION"
 
 
 @dataclass
@@ -58,6 +59,12 @@ SUPPORTED_CAPABILITIES: dict[Capability, CapabilityDeclaration] = {
         capability=Capability.CONVERSATIONAL_REASONING,
         name="Conversational & Analytical Reasoning",
         description="Fast-path conversational answers, algorithms, coding assistance, calculations, and explanations without launching browser sessions.",
+        supported=True,
+    ),
+    Capability.MCP_TOOL_INTEGRATION: CapabilityDeclaration(
+        capability=Capability.MCP_TOOL_INTEGRATION,
+        name="Model Context Protocol (MCP) Capabilities",
+        description="Autonomous discovery, schema validation, and gated execution of local and remote MCP tools (databases, filesystems, developer tools) under unified human-approval policy.",
         supported=True,
     ),
 }
@@ -123,6 +130,7 @@ def format_capability_overview() -> str:
         "- **🛡️ Tab Isolation**: Tasks run in authorized session tabs; unrelated tabs (like YouTube or work tabs) remain strictly untouched.\n"
         "- **🔑 Human Authentication Handoff**: When a site requires login, 2FA, or CAPTCHA, PrivAgent pauses safely for user completion without credential exposure.\n"
         "- **📊 Multi-Site Comparison**: Multi-retailer price comparisons (Amazon, Flipkart, Samsung) with full status tracking across visited and unavailable stores.\n"
+        "- **🔌 Model Context Protocol (MCP)**: Execute registered MCP tools (e.g. SQLite databases, developer tools, filesystems) under a unified human-approval gate for mutating actions.\n"
         "- **💬 Conversational Assistance**: Code writing, mathematical calculations, and conceptual explanations."
     )
 

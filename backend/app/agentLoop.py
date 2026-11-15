@@ -2250,6 +2250,10 @@ async def run_task(task_id: str) -> None:
                 is_email_dispatch_instruction,
                 handle_email_dispatch,
             )
+            from .mcp.coordinator import (
+                is_mcp_directive,
+                execute_mcp_directive,
+            )
 
             is_dispatch, dispatch_recip = is_email_dispatch_instruction(record.instruction)
 
@@ -2269,6 +2273,12 @@ async def run_task(task_id: str) -> None:
                     recipient=dispatch_recip,
                     chat_id=chat_id,
                     history=initial_memory.get("conversation_history", []),
+                )
+            elif is_mcp_directive(record.instruction):
+                answer = await execute_mcp_directive(
+                    record.instruction,
+                    record=record,
+                    chat_id=chat_id,
                 )
             elif is_capability_query(record.instruction):
                 answer = format_capability_overview()

@@ -160,6 +160,11 @@ async def scheduler_loop(stop: asyncio.Event, tick_seconds: float = 10.0) -> Non
 @asynccontextmanager
 async def monitoring_lifespan(_app):
     stop = asyncio.Event()
+    try:
+        from .mcp.api import discovery
+        discovery.rehydrate_from_db()
+    except Exception as exc:
+        logger.debug("MCP startup rehydration: %s", exc)
     task = asyncio.create_task(scheduler_loop(stop))
     try:
         yield

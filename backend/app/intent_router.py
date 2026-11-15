@@ -847,6 +847,19 @@ def classify_intent(
             operation_type=ResearchOperationType.NORMAL_CONVERSATION,
         )
 
+    # 4e. Check for MCP directive (database query, mcp tool, table inspection, schema, mutation)
+    try:
+        from .mcp.coordinator import is_mcp_directive
+        if is_mcp_directive(text):
+            return IntentClassification(
+                intent=TaskIntent.NON_BROWSER,
+                confidence=0.99,
+                reason="MCP capability directive",
+                operation_type=ResearchOperationType.NORMAL_CONVERSATION,
+            )
+    except Exception:
+        pass
+
     # 5. Check for explicit email / webmail directive (must route to browser, never refusal)
     if EMAIL_TRIGGER.search(text):
         return IntentClassification(

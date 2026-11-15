@@ -259,25 +259,124 @@ export async function mountControlView(index: number, content: HTMLElement, isCu
 }
 
 async function mountMcp(content: HTMLElement, isCurrent: () => boolean): Promise<void> {
-  const [servers, tools] = await Promise.all([request('/api/mcp/servers'), request('/api/mcp/tools')]);
+  const [servers, tools, presets] = await Promise.all([
+    request('/api/mcp/servers'),
+    request('/api/mcp/tools'),
+    request('/api/mcp/presets').catch(() => []),
+  ]);
   if (!isCurrent()) return;
-  content.innerHTML = card('Register a server', '<form id="mcpServerForm" class="cc-form cc-form--mcp"><label>Server name<input name="name" required pattern="[A-Za-z0-9_-]+" placeholder="trusted_tools"></label><label>Transport<select name="transport"><option value="sse">HTTPS / SSE</option><option value="stdio">Local executable</option></select></label><label>HTTPS URL or absolute executable path<input name="endpoint" required placeholder="https://tools.example.org/sse"></label><label>Read-only tools (comma separated)<input name="readOnlyTools" placeholder="lookup, search"></label><button class="cc-button">Register</button></form><p class="cc-note">Only register servers you trust. Tools are treated as mutating unless explicitly marked read-only.</p>', 'TRUSTED CONFIGURATION') +
-    card('Servers', servers.map((s: any) => '<article class="cc-row"><div><h3>' + safe(s.name) + '</h3><p>' + safe(s.transport) + ' · ' + safe(s.tools?.length || 0) + ' tools</p></div>' + button('Discover tools', 'discover', s.name) + '</article>').join('') || empty('No servers registered', 'Add a trusted server to discover its tools.'), 'DISCOVERY') +
-    card('Tool catalog', tools.map((t: any) => '<article class="cc-row"><div><small>' + safe(t.server) + '</small><h3>' + safe(t.name) + '</h3><p>' + safe(t.description || 'No description supplied') + '</p></div><div class="cc-row-actions">' + tag(t.mutating ? 'Approval required' : 'Read only') + button('Inspect', 'tool', t.name) + '</div></article>').join('') || empty('No tools discovered', 'Discover a server to inspect its schema and permissions.'), 'SCHEMA · PERMISSIONS') + '<div id="mcpToolDetail"></div>';
+
+  const presetsHtml = card('1-Click Starter Presets',
+    (presets && presets.length ? presets : []).map((p: any) =>
+      '<article class="cc-row"><div>' +
+      '<h3>' + safe(p.title) + '</h3>' +
+      '<p>' + safe(p.description) + '</p>' +
+      '<small style="color:#a5b4fc">Transport: ' + safe(p.transport) + ' · Tools: ' + safe((p.readOnlyTools || []).join(', ')) + '</small>' +
+      '</div><div class="cc-row-actions">' +
+      '<button class="cc-button" data-install-preset="' + safe(p.id) + '">Activate Preset ⚡</button>' +
+      '</div></article>'
+    ).join('') || empty('No presets available', 'Built-in presets will appear here.'),
+    'STARTER PACK'
+  );
+
+  const registerHtml = card('Register a server',
+    '<form id="mcpServerForm" class="cc-form cc-form--mcp">' +
+    '<label>Server name<input name="name" required pattern="[A-Za-z0-9_-]+" placeholder="trusted_tools"></label>' +
+    '<label>Transport<select name="transport"><option value="stdio">Local executable</option><option value="sse">HTTPS / SSE</option></select></label>' +
+    '<label>Executable path or HTTPS URL<input name="endpoint" required placeholder="C:\\path\\to\\executable or https://tools.example.org/sse"></label>' +
+    '<label>Read-only tools (comma separated)<input name="readOnlyTools" placeholder="lookup, search"></label>' +
+    '<label>Environment variables (optional JSON or KEY=VALUE lines)<textarea name="env" rows="2" placeholder=\'{"API_KEY": "..."} or DB_PATH=./data.db\'></textarea></label>' +
+    '<button class="cc-button">Register</button>' +
+    '</form><p class="cc-note">Only register servers you trust. Tools are treated as mutating unless explicitly marked read-only and verified non-destructive.</p>',
+    'TRUSTED CONFIGURATION'
+  );
+
+  const serversHtml = card('Servers',
+    servers.map((s: any) =>
+      '<article class="cc-row"><div><h3>' + safe(s.name) + '</h3><p>' + safe(s.transport) + ' · ' + safe(s.tools?.length || 0) + ' tools' +
+      (s.env && Object.keys(s.env).length ? ' · ' + Object.keys(s.env).length + ' env vars' : '') +
+      '</p></div><div class="cc-row-actions">' +
+      button('Discover tools', 'discover', s.name) +
+      '<button class="cc-button cc-button--outline" data-remove-server="' + safe(s.name) + '" style="color:#ff8888;border-color:#5c2424">Remove ✕</button>' +
+      '</div></article>'
+    ).join('') || empty('No servers registered', 'Add a trusted server or activate a starter preset above.'),
+    'DISCOVERY'
+  );
+
+  const catalogHtml = card('Tool catalog',
+    tools.map((t: any) =>
+      '<article class="cc-row"><div><small>' + safe(t.server) + '</small><h3>' + safe(t.name) + '</h3><p>' + safe(t.description || 'No description supplied') + '</p></div>' +
+      '<div class="cc-row-actions">' + tag(t.mutating ? 'Approval required' : 'Read only') + button('Inspect', 'tool', t.name) + '</div></article>'
+    ).join('') || empty('No tools discovered', 'Discover a server or activate a preset to inspect tools.'),
+    'SCHEMA · PERMISSIONS'
+  );
+
+  content.innerHTML = presetsHtml + registerHtml + serversHtml + catalogHtml + '<div id="mcpToolDetail"></div>';
+
   content.querySelector<HTMLFormElement>('#mcpServerForm')!.onsubmit = async event => {
     event.preventDefault(); const form = event.currentTarget as HTMLFormElement;
     const values = Object.fromEntries(new FormData(form)); const transport = String(values.transport);
     const endpoint = String(values.endpoint).trim();
-    try { await request('/api/mcp/servers', jsonOptions('POST', { name: values.name, transport,
-      ...(transport === 'stdio' ? { command: endpoint } : { url: endpoint }),
-      readOnlyTools: String(values.readOnlyTools || '').split(',').map(x => x.trim()).filter(Boolean) })); rerender(); }
-    catch (error) { showError(form, error); }
+    const rawEnv = String(values.env || '').trim();
+    let envObj: Record<string, string> = {};
+    if (rawEnv) {
+      if (rawEnv.startsWith('{')) {
+        try { envObj = JSON.parse(rawEnv); } catch { /* ignore */ }
+      } else {
+        rawEnv.split('\n').forEach(line => {
+          const idx = line.indexOf('=');
+          if (idx > 0) {
+            const k = line.slice(0, idx).trim();
+            const v = line.slice(idx + 1).trim();
+            if (k) envObj[k] = v;
+          }
+        });
+      }
+    }
+    try {
+      await request('/api/mcp/servers', jsonOptions('POST', {
+        name: values.name,
+        transport,
+        ...(transport === 'stdio' ? { command: endpoint } : { url: endpoint }),
+        env: envObj,
+        readOnlyTools: String(values.readOnlyTools || '').split(',').map(x => x.trim()).filter(Boolean),
+      }));
+      rerender();
+    } catch (error) { showError(form, error); }
   };
+
+  content.querySelectorAll<HTMLButtonElement>('[data-install-preset]').forEach(b => b.onclick = async () => {
+    b.disabled = true;
+    b.textContent = 'Activating...';
+    try {
+      await request('/api/mcp/presets/' + encodeURIComponent(b.dataset.installPreset || '') + '/install', { method: 'POST' });
+      rerender();
+    } catch (error) {
+      showError(b.closest('.cc-row') || content, error);
+      b.disabled = false;
+      b.textContent = 'Activate Preset ⚡';
+    }
+  });
+
+  content.querySelectorAll<HTMLButtonElement>('[data-remove-server]').forEach(b => b.onclick = async () => {
+    const sName = b.dataset.removeServer || '';
+    if (!window.confirm('Unregister MCP server "' + sName + '" and uncatalog its tools?')) return;
+    b.disabled = true;
+    try {
+      await request('/api/mcp/servers/' + encodeURIComponent(sName), { method: 'DELETE' });
+      rerender();
+    } catch (error) {
+      showError(b.closest('.cc-row') || content, error);
+      b.disabled = false;
+    }
+  });
+
   content.querySelectorAll<HTMLButtonElement>('[data-discover]').forEach(b => b.onclick = async () => {
     b.disabled = true;
     try { await request('/api/mcp/servers/' + encodeURIComponent(b.dataset.discover || '') + '/discover', { method: 'POST' }); rerender(); }
     catch (error) { showError(b.closest('.cc-row') || content, error); b.disabled = false; }
   });
+
   content.querySelectorAll<HTMLButtonElement>('[data-tool]').forEach(b => b.onclick = () => {
     const tool = tools.find((t: any) => t.name === b.dataset.tool);
     if (!tool) return;
