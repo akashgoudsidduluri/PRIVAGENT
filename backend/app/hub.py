@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any, Coroutine, Optional
 
 from fastapi import WebSocket
+from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 TERMINAL_STATES = {"completed", "failed", "cancelled"}
 MAX_RETAINED_TASKS = 200
@@ -179,8 +180,15 @@ class Hub:
             },
         }
         for ws in list(self.client_sockets):
+            if getattr(ws, "client_state", None) == WebSocketState.DISCONNECTED or getattr(ws, "application_state", None) == WebSocketState.DISCONNECTED:
+                if ws in self.client_sockets:
+                    self.client_sockets.remove(ws)
+                continue
             try:
                 await ws.send_json(payload)
+            except (WebSocketDisconnect, ConnectionResetError, BrokenPipeError, OSError):
+                if ws in self.client_sockets:
+                    self.client_sockets.remove(ws)
             except Exception:
                 if ws in self.client_sockets:
                     self.client_sockets.remove(ws)

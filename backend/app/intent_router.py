@@ -612,7 +612,19 @@ EMAIL_SCAN_MISSION_PATTERN = re.compile(
     r"\b(?:identify\s+unnecessary\s+emails?|remove\s+unnecessary|detect\s+important\s+emails?|email\s+monitoring)\b|"
     r"\b(?:what\s+did\s+you\s+delete|why\s+did\s+you\s+delete|show\s+me\s+important\s+emails?|emails?\s+i\s+haven'?t\s+replied|what\s+deadlines|today'?s?\s+email\s+summary|pause\s+email|resume\s+email)\b|"
     r"\b(?:what\s+is\s+my\s+(?:e-?mail|mail|account)|which\s+account\s+are\s+you\s+monitoring|are\s+you\s+(?:still\s+)?scanning|is\s+monitoring\s+active|are\s+(?:you|u)\s+deleting)\b|"
-    r"\b(?:check\s+now|i\s+have\s+connected|is\s+my\s+(?:e-?mail|mail)\s+connected|verify\s+(?:connection|e-?mail|mail))\b|"
+    r"\b(?:check\s+now|i\s+(?:have\s+)?connected(?:\s+ev[e]?rything)?|connected\s+ev[e]?rything|is\s+my\s+(?:e-?mail|mail)\s+connected|verify\s+(?:connection|e-?mail|mail))\b|"
+    r"\b(?:can\s+(?:you|u)|do\s+(?:you|u)|are\s+(?:you|u)\s+able\s+to|have\s+(?:you|u))\s+(?:access|see|read|check)\s+(?:my\s+)?(?:e-?mails?|mails?|inbox|gmail|outlook|account)\b|"
+    r"\b(?:do\s+(?:you|u)\s+have\s+access\s+to\s+(?:my\s+)?(?:e-?mails?|mails?|inbox|gmail|outlook|account))\b|"
+    r"\b(?:can\s+(?:you|u)|are\s+(?:you|u)\s+capable\s+of|capable\s+of)\s+(?:restoring|restore|untrashing|recover|bringing\s+back)\b.*?\b(?:e-?mails?|mails?|inbox)\b|"
+    r"\b(?:then\s+)?restore\s+(?:the\s+)?(?:last|lastly|most\s+recent|latest)?\s*(?:deleted|trashed)?\s*(?:e-?mail|mail)\b|"
+    r"\b(?:untrash|bring\s+back|recover)\s+(?:the\s+)?(?:last|lastly|most\s+recent|latest)?\s*(?:deleted|trashed)?\s*(?:e-?mail|mail)\b|"
+    r"\brestore\s+(?:lastly|last)\s+deleted\b|"
+    r"\b(?:can\s+(?:you|u)\s+)?(?:automatically\s+)?(?:delete|remove|clean\s*up|clear|trash)\s+(?:promotions?|promotional|unnecessary|marketing|spam|junk)\s*(?:e-?mails?|mails?)?\b|"
+    r"\b(?:auto[- ]?delete|automatic\s+deletion|delete\s+promotions?|clean\s+promotions?)\b|"
+    r"\b(?:ensure|make\s+sure|keep)\s+(?:they\s+are\s+not|them|emails\s+are\s+not)?\s*important\b|"
+    r"\b(?:protect|save|preserve|whitelist|lock)\s+important\s+(?:e-?mails?|mails?)\b|"
+    r"\b(?:it\s+is\s+connected|connected)[,\s]+(?:let'?s?\s+start|start|begin|go)\b|"
+    r"\b(?:let'?s?\s+start|start)\s+(?:cleaning|scanning|monitoring|cleanup|deleting)\b|"
     r"\b(?:remind|notify|alert)\s+(?:me\s+)?(?:if|when|about)\s+.*?\b(?:emails?|mails?|inbox)\b|"
     r"\b(?:emails?|mails?|inbox)\b.*?\b(?:notify|alert|remind)\s+me\b",
     re.IGNORECASE,
@@ -842,7 +854,7 @@ def classify_intent(
             confidence=0.99,
             reason="instruction requests email / webmail navigation",
             target_tab_hint="mail.google.com",
-            operation_type=ResearchOperationType.NEW_RESEARCH,
+            operation_type=None,
         )
 
     # 5b. Check for pure deliverable export / compilation directive (e.g. "bro generate a pdf man", "export the previous analysis as a pdf")

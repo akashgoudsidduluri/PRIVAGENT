@@ -170,6 +170,7 @@ interface ActiveTaskInfo {
   sessionId?: string | null;
   primaryTabId?: number | null;
   childTabIds?: number[];
+  steps?: ChatStepItem[];
 }
 
 interface ChatDetail {
@@ -550,6 +551,7 @@ async function syncActiveTask(taskId: string): Promise<boolean> {
       sessionId?: string | null;
       primaryTabId?: number | null;
       childTabIds?: number[] | null;
+      steps?: ChatStepItem[];
     };
     if (currentTaskId !== taskId) return false;
     lastProgressTime = Date.now();
@@ -570,6 +572,14 @@ async function syncActiveTask(taskId: string): Promise<boolean> {
     }
     if (t.screenshot) {
       updateVisualFrame(t.screenshot, t.message || "", t.taskState);
+    }
+    // Rehydrate intermediate execution steps if missing from the timeline
+    if (Array.isArray(t.steps) && t.steps.length > 0) {
+      t.steps.forEach(st => {
+        if (st && st.message) {
+          addStepItem(st.message, st.stepNum);
+        }
+      });
     }
     if (["completed", "failed", "cancelled"].includes(t.taskState)) {
       renderCompletion(t.taskState, t.message || "", true, t.stepsDone);
@@ -856,6 +866,17 @@ async function selectChat(chatId: string): Promise<void> {
       startFallbackPolling(currentTaskId);
       if (act.screenshot) {
         updateVisualFrame(act.screenshot, act.message || "", act.taskState);
+      }
+      // Rehydrate in-flight execution steps executed before tab was re-opened
+      if (Array.isArray(act.steps) && act.steps.length > 0) {
+        act.steps.forEach(st => {
+          if (st && st.message) {
+            addStepItem(st.message, st.stepNum);
+          }
+        });
+      }
+      if (act.message && !Array.from(stepsList?.children || []).some(n => (n as HTMLElement).dataset.eventKey?.endsWith(act.message))) {
+        addStepItem(act.message, act.stepsDone);
       }
       if (typeof act.stepsDone === "number" && act.stepsDone > 0) {
         updateStepsCount(act.stepsDone);

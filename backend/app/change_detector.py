@@ -89,13 +89,19 @@ def evaluate_observation(mission_id: str, observation: dict[str, Any], *,
 
 
 async def broadcast_event(event: dict[str, Any]) -> None:
+    from starlette.websockets import WebSocketDisconnect, WebSocketState
     from .hub import hub
     envelope = {"type": "MISSION_EVENT_TRIGGERED", "taskId": event.get("task_id"), "payload": event}
     delivered = False
     for ws in list(hub.client_sockets):
+        if getattr(ws, "client_state", None) == WebSocketState.DISCONNECTED or getattr(ws, "application_state", None) == WebSocketState.DISCONNECTED:
+            hub.client_sockets.remove(ws) if ws in hub.client_sockets else None
+            continue
         try:
             await ws.send_json(envelope)
             delivered = True
+        except (WebSocketDisconnect, ConnectionResetError, BrokenPipeError, OSError):
+            hub.client_sockets.remove(ws) if ws in hub.client_sockets else None
         except Exception:
             hub.client_sockets.remove(ws) if ws in hub.client_sockets else None
     if delivered:

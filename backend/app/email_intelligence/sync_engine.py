@@ -92,7 +92,33 @@ async def run_email_mission_tick(mission_id: str, db_path: Optional[str] = None)
             if mission.get("provider") == "gmail":
                 resp = connector.list_messages(limit=50)
                 msgs = resp.get("messages", [])
+
+                # Reconcile Trash state: check which messages are currently in Trash
+                try:
+                    trash_resp = connector.list_messages(query="in:trash", limit=100)
+                    live_trash_ids = {m["id"] for m in trash_resp.get("messages", [])}
+                    with db.get_connection(db_path) as conn:
+                        trashed_rows = conn.execute(
+                            "SELECT message_id FROM email_classifications WHERE mission_id = ? AND action_taken = 'moved_to_trash'",
+                            (mission_id,),
+                        ).fetchall()
+                        for tr in trashed_rows:
+                            mid_val = tr["message_id"]
+                            if mid_val not in live_trash_ids:
+                                conn.execute(
+                                    "UPDATE email_classifications SET action_taken = 'cleared_from_trash' WHERE mission_id = ? AND message_id = ?",
+                                    (mission_id, mid_val),
+                                )
+                        conn.commit()
+                except Exception as trash_err:
+                    logger.debug("Trash reconciliation skipped: %s", trash_err)
+
+                # Only download full message bodies for NEW, unclassified emails
                 for m in msgs:
+                    existing = db.get_email_classification_by_message_id(mission_id, m["id"], db_path=db_path)
+                    if existing:
+                        continue  # Already downloaded, classified, and stored in SQLite!
+
                     full = connector.get_message(m["id"])
                     headers = {h["name"].lower(): h["value"] for h in full.get("payload", {}).get("headers", [])}
                     email_items.append(
@@ -116,6 +142,9 @@ async def run_email_mission_tick(mission_id: str, db_path: Optional[str] = None)
                 # Outlook MS Graph
                 vals = connector.list_messages(limit=50)
                 for v in vals:
+                    msg_id = v.get("id")
+                    if msg_id and db.get_email_classification_by_message_id(mission_id, msg_id, db_path=db_path):
+                        continue
                     email_items.append(
                         EmailItem(
                             id=v.get("id"),

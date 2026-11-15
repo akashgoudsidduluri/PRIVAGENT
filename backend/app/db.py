@@ -305,6 +305,28 @@ def list_chats(db_path: Optional[str] = None) -> list[dict[str, Any]]:
         return [dict(r) for r in rows]
 
 
+def format_history_steps(hist: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    formatted = []
+    for idx, h in enumerate(hist):
+        if not isinstance(h, dict):
+            continue
+        if "role" in h and "action" not in h:
+            continue
+        action = h.get("action") or {}
+        act_type = action.get("type") or "step"
+        ev = h.get("evidence") or ""
+        narrative = h.get("narrative")
+        display = narrative or (f"Step {idx + 1}: {act_type} -> {ev}" if ev else f"Step {idx + 1}: {act_type}")
+        formatted.append({
+            "stepNum": idx + 1,
+            "message": display,
+            "action": action,
+            "status": h.get("status") or ("verified" if h.get("result_ok") else "failed"),
+            "result_ok": bool(h.get("result_ok")),
+        })
+    return formatted
+
+
 def get_chat(chat_id: str, db_path: Optional[str] = None) -> Optional[dict[str, Any]]:
     with get_connection(db_path) as conn:
         row = conn.execute(
@@ -317,22 +339,6 @@ def get_chat(chat_id: str, db_path: Optional[str] = None) -> Optional[dict[str, 
         messages = get_messages(chat_id, limit=100, db_path=db_path)
         checkpoints = get_checkpoints_for_chat(chat_id, db_path=db_path)
 
-        def _format_history_steps(hist: list[dict[str, Any]]) -> list[dict[str, Any]]:
-            formatted = []
-            for idx, h in enumerate(hist):
-                action = h.get("action") or {}
-                act_type = action.get("type") or "step"
-                ev = h.get("evidence") or ""
-                display = f"Step {idx + 1}: {act_type} -> {ev}" if ev else f"Step {idx + 1}: {act_type}"
-                formatted.append({
-                    "stepNum": idx + 1,
-                    "message": display,
-                    "action": action,
-                    "status": h.get("status") or ("verified" if h.get("result_ok") else "failed"),
-                    "result_ok": bool(h.get("result_ok")),
-                })
-            return formatted
-
         cp_by_task = {cp["task_id"]: cp for cp in checkpoints if cp.get("task_id")}
         agent_msgs = [m for m in messages if m.get("role") == "agent"]
         for idx, m in enumerate(agent_msgs):
@@ -342,7 +348,7 @@ def get_chat(chat_id: str, db_path: Optional[str] = None) -> Optional[dict[str, 
                 cp = checkpoints[idx]
             if cp:
                 hist = cp.get("history") or []
-                m["steps"] = _format_history_steps(hist)
+                m["steps"] = format_history_steps(hist)
                 if not m.get("task_id"):
                     m["task_id"] = cp.get("task_id")
 
@@ -1001,7 +1007,7 @@ def update_email_mission(mission_id: str, updates: dict[str, Any], db_path: Opti
         "cleanup_policy_json", "notification_policy_json", "last_sync_at",
         "next_run_at", "total_processed", "unnecessary_detected",
         "moved_to_trash", "important_detected", "neglected_detected",
-        "frequency_seconds",
+        "frequency_seconds", "account_email", "provider",
     }
     set_clauses = []
     params = []
@@ -1019,7 +1025,7 @@ def update_email_mission(mission_id: str, updates: dict[str, Any], db_path: Opti
 
     with get_connection(db_path) as conn:
         conn.execute(f"UPDATE email_monitoring_missions SET {', '.join(set_clauses)} WHERE id = ?", params)
-        if "status" in updates or "next_run_at" in updates or "frequency_seconds" in updates:
+        if "status" in updates or "next_run_at" in updates or "frequency_seconds" in updates or "account_email" in updates:
             m_set = []
             m_params = []
             if "status" in updates:
@@ -1031,6 +1037,12 @@ def update_email_mission(mission_id: str, updates: dict[str, Any], db_path: Opti
             if "frequency_seconds" in updates:
                 m_set.append("interval_seconds = ?")
                 m_params.append(updates["frequency_seconds"])
+            if "account_email" in updates:
+                acc = updates["account_email"]
+                m_set.append("title = ?")
+                m_params.append(f"Email Intelligence ({acc})")
+                m_set.append("target_url = ?")
+                m_params.append(f"email://{updates.get('provider', 'gmail')}/{acc}")
             if m_set:
                 m_params.append(mission_id)
                 conn.execute(f"UPDATE monitoring_missions SET {', '.join(m_set)} WHERE id = ?", m_params)

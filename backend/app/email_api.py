@@ -42,6 +42,12 @@ def list_missions():
 async def create_mission(body: EmailMissionSetupInput):
     """Register and start an email monitoring mission."""
     db.init_db()
+    existing_missions = [m for m in db.list_email_missions() if m.get("account_email") == body.account_email and m.get("status") == "active"]
+    if existing_missions:
+        mission = existing_missions[0]
+        await run_email_mission_tick(mission["id"])
+        return mission
+
     mission = db.create_email_mission(
         account_email=body.account_email,
         provider=body.provider,
