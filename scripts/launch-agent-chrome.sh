@@ -3,7 +3,7 @@
 # Never run agent work in your everyday Chrome profile: the agent profile
 # is a separate --user-data-dir with its own cookies/logins, and its state
 # is wiped on start by the extension (when the isolated-profile flag is set).
-# Usage: ./scripts/launch-agent-chrome.sh [extra chrome flags...]
+# Usage: bash scripts/launch-agent-chrome.sh [extra chrome flags...]
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROFILE_DIR="${PRIVAGENT_AGENT_PROFILE_DIR:-$REPO_ROOT/backend/data/agent-profile}"

@@ -14,7 +14,7 @@ does **not** do, and how to operate it.
 
 ```bash
 # macOS / Linux
-./scripts/launch-agent-chrome.sh
+bash scripts/launch-agent-chrome.sh
 # Windows
 scripts\launch-agent-chrome.bat
 ```
