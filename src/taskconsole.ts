@@ -1,5 +1,6 @@
 import "./styles/taskconsole.css";
 import { linkify } from "./sanitize";
+import { apiFetch, wsUrl } from "./auth";
 
 const API = "http://localhost:8000";
 
@@ -57,6 +58,12 @@ function renderTaskState(taskState: string, message: string): void {
   } else if (taskState === "failed" && summaryEl) {
     summaryEl.innerHTML = `<strong>✗ Blocked / Failed</strong> · ${formatSummary(message || "Task stopped.")}`;
     summaryEl.hidden = false;
+  } else if (taskState === "awaiting_takeover" && summaryEl) {
+    // Task 4: takeover is not a confirmation — the confirm modal posts
+    // to /confirm and must never be opened here. The operator completes
+    // the step in the browser tab and resumes from the agent workspace.
+    summaryEl.innerHTML = `<strong>🧑‍💻 Takeover — you're in control</strong> · ${formatSummary(message || "Complete the login / payment step in your browser tab, then resume from the agent workspace.")}`;
+    summaryEl.hidden = false;
   } else if (summaryEl) {
     summaryEl.hidden = true;
   }
@@ -93,12 +100,12 @@ function closeConfirm(decision: boolean): void {
 approveBtn?.addEventListener("click", () => {
   const id = currentTaskId;
   closeConfirm(true);
-  if (id) fetch(`${API}/api/task/${id}/confirm`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ decision: "approve" }) });
+  if (id) apiFetch(`${API}/api/task/${id}/confirm`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ decision: "approve" }) });
 });
 rejectBtn?.addEventListener("click", () => {
   const id = currentTaskId;
   closeConfirm(false);
-  if (id) fetch(`${API}/api/task/${id}/confirm`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ decision: "reject" }) });
+  if (id) apiFetch(`${API}/api/task/${id}/confirm`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ decision: "reject" }) });
 });
 
 input?.addEventListener("input", () => {
@@ -124,7 +131,7 @@ startBtn?.addEventListener("click", async () => {
   if (summaryEl) summaryEl.hidden = true;
   setState("planning");
   try {
-    const res = await fetch(`${API}/api/task`, {
+    const res = await apiFetch(`${API}/api/task`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ instruction: input.value.trim() }),
@@ -138,7 +145,7 @@ startBtn?.addEventListener("click", async () => {
     // the real task id exists instead of silently losing the request.
     if (cancelRequested) {
       try {
-        await fetch(`${API}/api/task/${currentTaskId}/cancel`, { method: "POST" });
+        await apiFetch(`${API}/api/task/${currentTaskId}/cancel`, { method: "POST" });
       } catch { /* offline */ }
       setState("cancelled");
       if (cancelBtn) cancelBtn.hidden = true;
@@ -147,7 +154,7 @@ startBtn?.addEventListener("click", async () => {
     }
 
     try {
-      const stRes = await fetch(`${API}/api/task/${currentTaskId}`);
+      const stRes = await apiFetch(`${API}/api/task/${currentTaskId}`);
       if (stRes.ok) {
         const t = (await stRes.json()) as { taskState: string; message: string };
         if (t.taskState && t.taskState !== "planning") {
@@ -173,7 +180,7 @@ cancelBtn?.addEventListener("click", async () => {
   if (cancelBtn) cancelBtn.hidden = true;
   if (id) {
     try {
-      await fetch(`${API}/api/task/${id}/cancel`, { method: "POST" });
+      await apiFetch(`${API}/api/task/${id}/cancel`, { method: "POST" });
     } catch {
       // Offline: keep the UI consistent with the user's intent.
     }
@@ -183,11 +190,11 @@ cancelBtn?.addEventListener("click", async () => {
 });
 
 function connectEvents(): void {
-  const ws = new WebSocket(`ws://localhost:8000/ws/client`);
+  const ws = new WebSocket(wsUrl(`ws://localhost:8000/ws/client`));
   ws.onopen = async () => {
     if (currentTaskId) {
       try {
-        const res = await fetch(`${API}/api/task/${currentTaskId}`);
+        const res = await apiFetch(`${API}/api/task/${currentTaskId}`);
         if (res.ok) {
           const t = (await res.json()) as { taskState: string; message: string };
           if (["completed", "failed", "cancelled"].includes(t.taskState)) {
@@ -226,9 +233,23 @@ function connectEvents(): void {
       }
       addStep(`[${p.stepsDone}] ${p.message}`);
       if (p.taskState === "awaiting_confirmation") {
-        fetch(`${API}/api/task/${env.taskId}`)
+        apiFetch(`${API}/api/task/${env.taskId}`)
           .then(r => r.json())
           .then(t => openConfirm(t.pending_confirmation?.message ?? "Confirm this action", t.pending_confirmation?.action ?? {}));
+      }
+      if (p.taskState === "awaiting_takeover") {
+        // Task 4: show the takeover reason in the summary; the resume /
+        // cancel buttons live in the agent workspace, not in this console.
+        apiFetch(`${API}/api/task/${env.taskId}/takeover`)
+          .then(r => r.json())
+          .then(t => {
+            const reason = (t.takeover as { reason?: string } | null)?.reason;
+            if (reason && summaryEl) {
+              summaryEl.innerHTML = `<strong>🧑‍💻 Takeover — you're in control</strong> · ${formatSummary(reason)}`;
+              summaryEl.hidden = false;
+            }
+          })
+          .catch(() => { /* offline — renderTaskState already showed the state */ });
       }
       if (["completed", "failed", "cancelled"].includes(p.taskState)) {
         startBtn && (startBtn.disabled = false);

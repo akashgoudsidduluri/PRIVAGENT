@@ -1,4 +1,4 @@
-import { accessibleName, queryAllWithShadow, perceptible, semanticElement, viewportBounds } from "./semantic";
+import { queryAllWithShadow, perceptible, rawAccessibleName, semanticElement, stripIconGlyphs, viewportBounds } from "./semantic";
 import type { BrowserObservation, InteractiveElement } from "./contracts";
 
 const SENSITIVE_INPUT_TYPES = new Set(["password", "hidden"]);
@@ -26,17 +26,38 @@ export function collectInteractiveElements(
     const input = el as HTMLInputElement;
     const inputType = el.tagName === "INPUT" ? input.type : undefined;
     const sensitive = inputType !== undefined && SENSITIVE_INPUT_TYPES.has(inputType);
+    // Task 7: element state for the accessibility tree, and the ref for
+    // this observation (position in the returned list — pruned nodes
+    // must not leave gaps in the refs).
+    const state: { checked?: boolean; selected?: boolean; expanded?: boolean } = {};
+    if (el.tagName === "INPUT" && (input.type === "checkbox" || input.type === "radio")) {
+      state.checked = Boolean(input.checked);
+    } else if (el.getAttribute("aria-checked") !== null) {
+      state.checked = el.getAttribute("aria-checked") === "true";
+    }
+    if (el.getAttribute("aria-selected") !== null) {
+      state.selected = el.getAttribute("aria-selected") === "true";
+    }
+    if (el.getAttribute("aria-expanded") !== null) {
+      state.expanded = el.getAttribute("aria-expanded") === "true";
+    }
+    const rawName = rawAccessibleName(el);
+    const name = stripIconGlyphs(rawName);
     out.push({
       targetId: el.id || "",
+      elementRef: `e${out.length}`,
       semantic: semanticElement(el, el.id || "") || undefined,
       role: explicitRole(el) || implicitRole(el),
-      name: accessibleName(el),
+      name,
+      // Debugging aid only: the pre-strip name, kept when it differs.
+      ...(rawName !== name ? { rawName } : {}),
       tag: el.tagName.toLowerCase(),
       inputType,
       value: sensitive ? undefined : trim(input?.value),
       visible: true,
       enabled: !(el as HTMLButtonElement).disabled,
       bounds: mapped,
+      state: Object.keys(state).length > 0 ? state : undefined,
     });
   }
   return out;

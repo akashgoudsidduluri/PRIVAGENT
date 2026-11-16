@@ -1,19 +1,34 @@
-fastapi>=0.110
-uvicorn[standard]>=0.29
-pydantic>=2.6
-websockets>=12.0
-google-genai>=1.0
-httpx[socks]>=0.27
-pytest>=8.0
-pytest-asyncio>=0.23
-python-dotenv>=1.0
-python-docx>=1.1.0
-reportlab>=4.0.7
-openpyxl>=3.1.5
-python-pptx>=1.0.2
-matplotlib>=3.10.0
-pillow>=11.0.0
-
-jsonschema>=4.23
-mcp>=1.0
-pypdf>=4.0
+# PrivAgent backend dependencies — all versions pinned to the exact versions
+# verified installed in backend/venv (Python 3.12.3).
+#
+# Regenerate the pins after intentionally upgrading a dependency:
+#   backend/venv/bin/pip install -U <package>
+#   backend/venv/bin/pip freeze | grep -i -E '^(fastapi|uvicorn|pydantic|websockets|google-genai|httpx|pytest|pytest-asyncio|python-dotenv|cryptography|python-docx|reportlab|openpyxl|python-pptx|matplotlib|pillow|jsonschema|mcp|pypdf)=='
+# then run the full test suite (`python -m pytest tests -q` from backend/)
+# before committing. Only the direct dependencies listed here are pinned;
+# transitive dependencies are resolved by pip from these pins.
+# The full frozen environment (74 packages) is NOT committed — reproduce it
+# from this file plus `pip freeze` if ever needed for debugging.
+#
+# Task 2: encrypted local secret store (Fernet + PBKDF2). `keyring` is
+# intentionally NOT a hard dependency: the store treats the OS keychain as
+# best-effort and falls back to a local key file when keyring is absent.
+fastapi==0.163.1
+uvicorn[standard]==0.54.0
+pydantic==2.14.3
+websockets==17.4
+google-genai==3.3.0
+httpx[socks]==0.28.1
+pytest==9.2.0
+pytest-asyncio==1.5.0
+python-dotenv==1.2.4
+cryptography==50.0.2
+python-docx==1.2.0
+reportlab==5.1.0
+openpyxl==3.1.5
+python-pptx==1.0.2
+matplotlib==3.11.2
+pillow==13.0.0
+jsonschema==4.26.0
+mcp==2.3.0
+pypdf==7.1.0

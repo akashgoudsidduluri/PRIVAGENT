@@ -39,7 +39,16 @@ def test_scenario_a_specified_website():
 
 
 def test_scenario_b_shopping_discovery_no_website_specified():
-    """When user does not specify a website for shopping, autonomously discover and rank retail sources."""
+    """When user does not specify a website for shopping, autonomously discover and rank retail sources.
+
+    Task 8: discovery is GENERIC — shopping is answered by general web
+    search hubs, never by per-retailer search URLs. The agent opens
+    whichever retailer the search results point at; no retailer is
+    baked into discovery. (This test still fails offline: the sandbox
+    has no DNS, so is_safe_public_url rejects every hub and zero
+    candidates are returned — the same pre-existing environment failure
+    as before Task 8.)
+    """
     instruction = "Find the cheapest laptop with an RTX 4060."
     context: dict = {}
     res = website_resolver.discover_websites_for_task(instruction, context=context)
@@ -62,11 +71,13 @@ def test_scenario_b_shopping_discovery_no_website_specified():
         assert cand["discoveredByQuery"] != ""
         assert not cand["isSpamOrAd"]
 
-    # Top selected sources must include independent domains
+    # Top selected sources must be independent generic search hubs — no
+    # per-retailer search URL is ever built by discovery.
     selected_domains = [s["domain"] for s in res["selected_sources"]]
     assert len(set(selected_domains)) >= 2  # Independent sources
-    assert any("amazon" in d for d in selected_domains)
-    assert any("flipkart" in d for d in selected_domains)
+    assert set(selected_domains) <= {"google.com", "duckduckgo.com", "en.wikipedia.org"}
+    for source in res["selected_sources"]:
+        assert "search" in source["url"].lower() or "duckduckgo.com" in source["url"]
 
     # Discovery decisions recorded in context
     assert "discovery_log" in context

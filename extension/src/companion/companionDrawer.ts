@@ -93,7 +93,7 @@ export function createDrawer(root: ShadowRoot, send: (message: object) => void) 
         banterTextEl.textContent = `"Analyzing this webpage right now..."`;
         send({ type: "COMPANION_DIRECTIVE", directive: `Summarize the current webpage: ${window.location.href}` });
       } else if (chip === "prices") {
-        banterTextEl.textContent = `"Searching and comparing prices across Amazon, Flipkart, and Croma... 🛍️"`;
+        banterTextEl.textContent = `"Searching and comparing prices across retailers... 🛍️"`;
         send({ type: "COMPANION_DIRECTIVE", directive: `Find and compare prices for products on ${window.location.hostname}` });
       } else if (chip === "monitor") {
         banterTextEl.textContent = `"Setting up continuous price tracking on your dashboard at localhost:5173... 🎯"`;
@@ -156,7 +156,15 @@ export function createDrawer(root: ShadowRoot, send: (message: object) => void) 
     drawer.querySelector(".state")!.textContent = snapshot.status.replaceAll("_", " ");
     drawer.querySelector(".directive")!.textContent = snapshot.directive.slice(0, 160);
     const timeline = drawer.querySelector(".timeline")!;
-    timeline.innerHTML = snapshot.timeline.map(step => `<li>${step}</li>`).join("");
+    // Task 12 XSS audit: timeline entries are step narratives built
+    // from page-derived evidence — they must never reach innerHTML.
+    // Build the list items with textContent instead.
+    timeline.replaceChildren();
+    for (const step of snapshot.timeline) {
+      const li = document.createElement("li");
+      li.textContent = step;
+      timeline.appendChild(li);
+    }
     const gate = drawer.querySelector(".gate") as HTMLElement;
     const gateMsg = drawer.querySelector(".gate-message") as HTMLElement;
     const isPaused = snapshot.status === "paused";

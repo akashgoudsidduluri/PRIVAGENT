@@ -30,6 +30,44 @@ describe("observer DOM walk", () => {
     document.body.innerHTML = "";
   });
 
+  it("assigns stable per-observation element refs in list order", () => {
+    const html = `<div>
+      <button id="b1">Search</button>
+      <input id="i1" type="text" value="hello" placeholder="Query">
+      <button id="b3" disabled>Off</button>
+    </div>`;
+    document.body.innerHTML = html;
+    const stubRect = (id: string, x: number, y: number) => {
+      const el = document.getElementById(id);
+      if (el) el.getBoundingClientRect = () => ({ x, y, left: x, top: y, right: x + 100, bottom: y + 30, width: 100, height: 30 } as DOMRect);
+    };
+    ["b1", "i1", "b3"].forEach((id, i) => stubRect(id, 10 + i * 20, 10));
+    const els = collectInteractiveElements(900, 600);
+    // Refs are e0, e1, ... in returned-list order with no gaps.
+    expect(els.map(e => e.elementRef)).toEqual(els.map((_, i) => `e${i}`));
+    expect(new Set(els.map(e => e.elementRef)).size).toBe(els.length);
+    document.body.innerHTML = "";
+  });
+
+  it("reports element state for checkable and ARIA controls", () => {
+    document.body.innerHTML = `<div>
+      <input id="c1" type="checkbox" checked>
+      <button id="b1" aria-expanded="true">Menu</button>
+      <div id="t1" role="tab" aria-selected="false">Tab</div>
+    </div>`;
+    const stubRect = (id: string) => {
+      const el = document.getElementById(id);
+      if (el) el.getBoundingClientRect = () => ({ x: 10, y: 10, left: 10, top: 10, right: 110, bottom: 40, width: 100, height: 30 } as DOMRect);
+    };
+    ["c1", "b1", "t1"].forEach(stubRect);
+    const els = collectInteractiveElements(900, 600);
+    const byId = Object.fromEntries(els.map(e => [e.targetId, e]));
+    expect(byId["c1"].state?.checked).toBe(true);
+    expect(byId["b1"].state?.expanded).toBe(true);
+    expect(byId["t1"].state?.selected).toBe(false);
+    document.body.innerHTML = "";
+  });
+
   it("skips elements not in the viewport", () => {
     document.body.innerHTML = `<button id="off" style="position:fixed;left:-9999px">Hidden</button>`;
     const els = collectInteractiveElements(900, 600);
@@ -54,5 +92,39 @@ describe("observer DOM walk", () => {
     // Injection text is PRESERVED (inert data — planner wraps in <page> tags), redaction only strips secrets
     expect(out.title).toContain("ignore previous instructions");
     expect(out.interactive.find(e => e.inputType === "password")?.value).toBeUndefined();
+  });
+
+  it("excludes hidden form inputs and strips icon glyphs from names (Moodle fix)", () => {
+    // Synthetic Moodle login block: visible username/password/Log in
+    // plus a hidden login-token field that must never be collected.
+    const html = `<form>
+      <input id="username" type="text" placeholder="Username">
+      <input id="password" type="password" placeholder="Password">
+      <input id="logintoken" type="hidden" value="tok-123">
+      <button id="loginbtn" type="submit">Log in</button>
+      <button id="searchbtn" type="button">Search courses</button>
+      <div style="display:none"><button id="ghost">Ghost</button></div>
+    </form>`;
+    document.body.innerHTML = html;
+    const glyph = String.fromCodePoint(0xf002);
+    document.getElementById("searchbtn")!.textContent = `${glyph} Search courses`;
+    const stubRect = (id: string, x: number, y: number) => {
+      const el = document.getElementById(id);
+      if (el) el.getBoundingClientRect = () => ({ x, y, left: x, top: y, right: x + 100, bottom: y + 30, width: 100, height: 30 } as DOMRect);
+    };
+    ["username", "password", "logintoken", "loginbtn", "searchbtn", "ghost"].forEach((id, i) => stubRect(id, 10 + i * 20, 10));
+    const els = collectInteractiveElements(900, 600);
+    const byId = Object.fromEntries(els.map(e => [e.targetId, e]));
+    expect(byId["logintoken"]).toBeUndefined();
+    expect(byId["ghost"]).toBeUndefined();
+    expect(byId["username"]).toBeDefined();
+    expect(byId["password"]).toBeDefined();
+    expect(byId["loginbtn"].name).toBe("Log in");
+    // The glyph-prefixed search button matches as "Search courses";
+    // the raw name survives only in rawName, for debugging.
+    expect(byId["searchbtn"].name).toBe("Search courses");
+    expect(byId["searchbtn"].rawName).toBe(`${glyph} Search courses`);
+    expect(byId["loginbtn"].rawName).toBeUndefined();
+    document.body.innerHTML = "";
   });
 });

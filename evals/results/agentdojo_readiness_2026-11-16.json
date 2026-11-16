@@ -1,0 +1,25 @@
+{
+  "suite": "agentdojo",
+  "full_name": "AgentDojo",
+  "status": "blocked",
+  "adapter": "not_implemented",
+  "present": [],
+  "missing": [
+    "python package 'agentdojo' not installed",
+    "env OPENAI_API_KEY not set",
+    "env ANTHROPIC_API_KEY not set",
+    "env GOOGLE_API_KEY not set",
+    "env COHERE_API_KEY not set",
+    "env TOGETHER_API_KEY not set",
+    "no local LLM server on 127.0.0.1:8000 (LOCAL_LLM_PORT)",
+    "PrivAgent backend not reachable at http://127.0.0.1:8000 (start it first)",
+    "PrivAgent adapter for this harness: not implemented"
+  ],
+  "needs": [
+    "agentdojo installed (pip install agentdojo) \u2014 verified installable here, version 0.1.35",
+    "LLM API key (OPENAI_API_KEY / ANTHROPIC_API_KEY / GOOGLE_API_KEY / COHERE_API_KEY / TOGETHER_API_KEY) OR a local OpenAI-compatible LLM server on localhost:$LOCAL_LLM_PORT (default 8000) with --model local",
+    "PrivAgent adapter: AgentDojo's AgentPipeline expects an LLM producing tool calls; PrivAgent's planner/loop is a browser agent, not that interface",
+    "Note: LOCAL_LLM_PORT defaults to 8000, which collides with the PrivAgent backend port \u2014 set LOCAL_LLM_PORT to a free port"
+  ],
+  "command": "pip install agentdojo && python -m agentdojo.scripts.benchmark --suite v1 --model gpt-4o-2024-05-13 --logdir evals/agentdojo  # with a PrivAgent agent adapter, not implemented yet; or --model local with a local LLM server on $LOCAL_LLM_PORT"
+}

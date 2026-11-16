@@ -55,7 +55,18 @@ def test_episodic_and_checkpoint_persistence_redacts_tokens_and_pii(tmp_path):
     assert "abcdefghijklmnopqrstuvwxyz" not in combined
     assert "base64-internal" not in combined
     assert "secretstuff" not in combined
-    assert "Hello" in combined
+    # Task 2: message/checkpoint payloads are Fernet-encrypted at rest, so
+    # the raw DB no longer contains benign plaintext either ("Hello" is
+    # ciphertext now). Redaction must still have removed the secrets above,
+    # and the content must still round-trip through the accessors.
+    assert "Hello" not in combined
+    cp_dec = db.get_task_checkpoint("task", db_path=path)
+    assert cp_dec is not None
+    assert cp_dec["working_memory"]["nested"]["note"] == "Hello"
+    assert "user@example.com" not in str(cp_dec)
+    assert "abcdefghijklmnopqrstuvwxyz" not in str(cp_dec)
+    assert "secretstuff" not in str(cp_dec)
+    assert "user@example.com" not in db.get_messages(chat["id"], db_path=path)[0]["content"]
     assert scrub_persistent({"password": "visible", "text": "safe"}) == {"password": "[REDACTED]", "text": "safe"}
 
 

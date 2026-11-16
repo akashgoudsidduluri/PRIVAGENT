@@ -1,0 +1,20 @@
+{
+  "suite": "privacylens",
+  "full_name": "PrivacyLens",
+  "status": "blocked",
+  "adapter": "not_implemented",
+  "present": [],
+  "missing": [
+    "env GEMINI_API_KEY not set",
+    "env GROQ_API_KEY not set",
+    "env OPENAI_API_KEY not set",
+    "PrivAgent backend not reachable at http://127.0.0.1:8000 (start it first)",
+    "PrivAgent adapter for this harness: not implemented"
+  ],
+  "needs": [
+    "PrivacyLens repo + benchmark data (https://github.com/privacy-lens/PrivacyLens)",
+    "LLM API key: GEMINI_API_KEY or GROQ_API_KEY or OPENAI_API_KEY",
+    "PrivAgent adapter mapping PrivacyLens tasks onto the PrivAgent loop"
+  ],
+  "command": "git clone https://github.com/privacy-lens/PrivacyLens && cd PrivacyLens && pip install -r requirements.txt && python run_privacylens.py --agent privagent  # adapter not implemented yet"
+}

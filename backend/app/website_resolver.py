@@ -118,219 +118,27 @@ class DiscoveredSource:
 
 
 # ---------------------------------------------------------------------------
-# Authoritative Known-Domain Registry
+# Known-Domain Directory (Task 8: DATA, not code)
 # ---------------------------------------------------------------------------
+# The registry of well-known public sites lives in known_domains.json next
+# to this module. Adding a site is a data edit, never a code change, and
+# never a behaviour playbook: the agent acts on ANY site via the
+# accessibility tree (Task 7); this directory only maps a name the user
+# spoke ("open X") to that site's canonical URL and verifies official
+# domains. The loader keeps the same in-memory shape, so every caller is
+# unchanged. Entries whose key starts with "_" are file metadata, not sites.
 
-KNOWN_DOMAINS_REGISTRY: dict[str, dict[str, Any]] = {
-    # Search & Knowledge
-    "google": {
-        "name": "Google",
-        "primary_domain": "google.com",
-        "allowed_domains": ["google.com", "google.co.in", "accounts.google.com"],
-        "regional_urls": {
-            "IN": "https://www.google.com",
-            "US": "https://www.google.com",
-            "GLOBAL": "https://www.google.com",
-        },
-        "patterns": [r"\bgoogle(?:\.co\.in|\.com)?\b"],
-        "category": "search",
-    },
-    "wikipedia": {
-        "name": "Wikipedia",
-        "primary_domain": "wikipedia.org",
-        "allowed_domains": ["wikipedia.org", "en.wikipedia.org", "wikimedia.org"],
-        "regional_urls": {
-            "GLOBAL": "https://en.wikipedia.org",
-        },
-        "patterns": [r"\bwikipedia(?:\.org)?\b"],
-        "category": "knowledge",
-    },
-    "arxiv": {
-        "name": "arXiv",
-        "primary_domain": "arxiv.org",
-        "allowed_domains": ["arxiv.org"],
-        "regional_urls": {
-            "GLOBAL": "https://arxiv.org",
-        },
-        "patterns": [r"\barxiv(?:\.org)?\b"],
-        "category": "academic",
-    },
-    "nature": {
-        "name": "Nature",
-        "primary_domain": "nature.com",
-        "allowed_domains": ["nature.com"],
-        "regional_urls": {
-            "GLOBAL": "https://www.nature.com",
-        },
-        "patterns": [r"\bnature(?:\.com)?\b", r"\bnature\s+(?:journal|publishing)\b"],
-        "category": "academic",
-    },
-    "youtube": {
-        "name": "YouTube",
-        "primary_domain": "youtube.com",
-        "allowed_domains": ["youtube.com", "youtu.be"],
-        "regional_urls": {
-            "GLOBAL": "https://www.youtube.com",
-        },
-        "patterns": [r"\byoutube(?:\.com)?\b"],
-        "category": "video",
-    },
-    "github": {
-        "name": "GitHub",
-        "primary_domain": "github.com",
-        "allowed_domains": ["github.com", "raw.githubusercontent.com"],
-        "regional_urls": {
-            "GLOBAL": "https://github.com",
-        },
-        "patterns": [r"\bgithub(?:\.com)?\b"],
-        "category": "code",
-    },
-    "reddit": {
-        "name": "Reddit",
-        "primary_domain": "reddit.com",
-        "allowed_domains": ["reddit.com", "old.reddit.com"],
-        "regional_urls": {
-            "GLOBAL": "https://www.reddit.com",
-        },
-        "patterns": [r"\breddit(?:\.com)?\b"],
-        "category": "social",
-    },
-    "leetcode": {
-        "name": "LeetCode",
-        "primary_domain": "leetcode.com",
-        "allowed_domains": ["leetcode.com"],
-        "regional_urls": {
-            "GLOBAL": "https://leetcode.com",
-        },
-        "patterns": [r"\bleetcode(?:\.com)?\b"],
-        "category": "coding",
-    },
+def _load_known_domains_registry() -> dict[str, dict[str, Any]]:
+    import json
+    from pathlib import Path
 
-    # Email & Communications
-    "gmail": {
-        "name": "Gmail",
-        "primary_domain": "mail.google.com",
-        "allowed_domains": ["mail.google.com", "accounts.google.com", "google.com"],
-        "regional_urls": {
-            "GLOBAL": "https://mail.google.com",
-        },
-        "patterns": [r"\bgmail\b", r"\bgoogle\s+mail\b", r"\bwebmail\b", r"^(?:open\s+)?(?:mail|email|inbox)$", r"\b(?:check|access|view)\s+(?:my\s+)?(?:mail|email|inbox)\b"],
-        "category": "email",
-    },
+    path = Path(__file__).with_name("known_domains.json")
+    with path.open(encoding="utf-8") as fh:
+        raw = json.load(fh)
+    return {k: v for k, v in raw.items() if not k.startswith("_")}
 
-    # Travel & Flights
-    "google_flights": {
-        "name": "Google Flights",
-        "primary_domain": "google.com",
-        "allowed_domains": ["google.com", "google.co.in"],
-        "regional_urls": {
-            "GLOBAL": "https://www.google.com/travel/flights",
-        },
-        "patterns": [r"\bgoogle\s+flights\b", r"\bflights\s+on\s+google\b"],
-        "category": "travel",
-    },
-    "google_hotels": {
-        "name": "Google Hotels",
-        "primary_domain": "google.com",
-        "allowed_domains": ["google.com", "google.co.in"],
-        "regional_urls": {
-            "GLOBAL": "https://www.google.com/travel/hotels",
-        },
-        "patterns": [r"\bgoogle\s+hotels\b", r"\bhotels\s+on\s+google\b"],
-        "category": "travel",
-    },
 
-    # E-Commerce & Retail
-    "amazon": {
-        "name": "Amazon",
-        "primary_domain": "amazon.in",
-        "allowed_domains": ["amazon.in", "amazon.com"],
-        "regional_urls": {
-            "IN": "https://www.amazon.in",
-            "US": "https://www.amazon.com",
-            "GLOBAL": "https://www.amazon.in",
-        },
-        "patterns": [r"\bamazon(?:\.in|\.com)?\b"],
-        "category": "retail",
-    },
-    "flipkart": {
-        "name": "Flipkart",
-        "primary_domain": "flipkart.com",
-        "allowed_domains": ["flipkart.com"],
-        "regional_urls": {
-            "IN": "https://www.flipkart.com",
-            "GLOBAL": "https://www.flipkart.com",
-        },
-        "patterns": [r"\bflipkart(?:\.com)?\b"],
-        "category": "retail",
-    },
-    "samsung": {
-        "name": "Samsung",
-        "primary_domain": "samsung.com",
-        "allowed_domains": ["samsung.com"],
-        "regional_urls": {
-            "IN": "https://www.samsung.com/in/",
-            "US": "https://www.samsung.com/us/",
-            "GLOBAL": "https://www.samsung.com",
-        },
-        "patterns": [r"\bsamsung(?:'s)?(?:\s+official)?\s+(?:store|shop|website|portal)\b", r"\bsamsung\.com\b"],
-        "category": "retail",
-    },
-    "croma": {
-        "name": "Croma",
-        "primary_domain": "croma.com",
-        "allowed_domains": ["croma.com"],
-        "regional_urls": {
-            "IN": "https://www.croma.com",
-            "GLOBAL": "https://www.croma.com",
-        },
-        "patterns": [r"\bcroma(?:\.com)?\b"],
-        "category": "retail",
-    },
-    "reliance_digital": {
-        "name": "Reliance Digital",
-        "primary_domain": "reliancedigital.in",
-        "allowed_domains": ["reliancedigital.in"],
-        "regional_urls": {
-            "IN": "https://www.reliancedigital.in",
-            "GLOBAL": "https://www.reliancedigital.in",
-        },
-        "patterns": [r"\breliance\s+digital\b", r"\breliancedigital(?:\.in)?\b"],
-        "category": "retail",
-    },
-    "best_buy": {
-        "name": "Best Buy",
-        "primary_domain": "bestbuy.com",
-        "allowed_domains": ["bestbuy.com"],
-        "regional_urls": {
-            "US": "https://www.bestbuy.com",
-            "GLOBAL": "https://www.bestbuy.com",
-        },
-        "patterns": [r"\bbest\s*buy(?:\.com)?\b"],
-        "category": "retail",
-    },
-    "walmart": {
-        "name": "Walmart",
-        "primary_domain": "walmart.com",
-        "allowed_domains": ["walmart.com"],
-        "regional_urls": {
-            "US": "https://www.walmart.com",
-            "GLOBAL": "https://www.walmart.com",
-        },
-        "patterns": [r"\bwalmart(?:\.com)?\b"],
-        "category": "retail",
-    },
-    "ebay": {
-        "name": "eBay",
-        "primary_domain": "ebay.com",
-        "allowed_domains": ["ebay.com", "ebay.in"],
-        "regional_urls": {
-            "GLOBAL": "https://www.ebay.com",
-        },
-        "patterns": [r"\bebay(?:\.com)?\b"],
-        "category": "retail",
-    },
-}
+KNOWN_DOMAINS_REGISTRY: dict[str, dict[str, Any]] = _load_known_domains_registry()
 
 
 # ---------------------------------------------------------------------------
@@ -1153,40 +961,39 @@ class WebsiteResolver:
         visited_domains = set((context or {}).get("visited_domains", []))
         reg_clean = (region or self.default_region).upper()
 
-        # Build candidate pools by category
+        # Build candidate pools by category.
+        #
+        # Task 8: hubs are GENERIC search endpoints, never per-retailer
+        # search URLs. Shopping used to build one search URL per retailer;
+        # that baked a site list into discovery. A shopping query is now
+        # answered by general web search, and the agent opens whichever
+        # retailer the results point at — or the one the user named, via
+        # resolve().
         primary_hubs: list[dict[str, Any]] = []
         if category == "shopping":
             primary_hubs = [
                 {
-                    "domain": "amazon.in" if reg_clean == "IN" else "amazon.com",
-                    "url_template": "https://www.amazon.in/s?k={query}" if reg_clean == "IN" else "https://www.amazon.com/s?k={query}",
-                    "name": "Amazon",
+                    "domain": "google.com",
+                    "url_template": "https://www.google.com/search?q={query}",
+                    "name": "Web Search (Google)",
                     "credibility": 0.95,
                     "suitability": 0.98,
-                    "is_primary": False,
+                    "is_primary": True,
                 },
                 {
-                    "domain": "flipkart.com",
-                    "url_template": "https://www.flipkart.com/search?q={query}",
-                    "name": "Flipkart",
-                    "credibility": 0.92,
-                    "suitability": 0.96,
-                    "is_primary": False,
-                },
-                {
-                    "domain": "croma.com",
-                    "url_template": "https://www.croma.com/searchB?q={query}",
-                    "name": "Croma",
-                    "credibility": 0.88,
+                    "domain": "duckduckgo.com",
+                    "url_template": "https://duckduckgo.com/?q={query}",
+                    "name": "Web Search (DuckDuckGo)",
+                    "credibility": 0.90,
                     "suitability": 0.90,
                     "is_primary": False,
                 },
                 {
-                    "domain": "reliancedigital.in",
-                    "url_template": "https://www.reliancedigital.in/search?q={query}",
-                    "name": "Reliance Digital",
-                    "credibility": 0.87,
-                    "suitability": 0.88,
+                    "domain": "en.wikipedia.org",
+                    "url_template": "https://en.wikipedia.org/wiki/Special:Search?search={query}",
+                    "name": "Wikipedia",
+                    "credibility": 0.92,
+                    "suitability": 0.85,
                     "is_primary": False,
                 },
             ]
@@ -1337,14 +1144,25 @@ class WebsiteResolver:
                     },
                 ]
         elif category == "travel":
+            # Task 8: no per-site travel URL template. Travel is answered
+            # by general web search; the agent opens the travel site the
+            # results (or the user) point at and works it via the AX tree.
             primary_hubs = [
                 {
                     "domain": "google.com",
-                    "url_template": "https://www.google.com/travel/flights?q={query}",
-                    "name": "Google Flights",
+                    "url_template": "https://www.google.com/search?q={query}",
+                    "name": "Web Search — travel",
                     "credibility": 0.95,
                     "suitability": 0.96,
                     "is_primary": True,
+                },
+                {
+                    "domain": "duckduckgo.com",
+                    "url_template": "https://duckduckgo.com/?q={query}",
+                    "name": "Web Search (DuckDuckGo)",
+                    "credibility": 0.90,
+                    "suitability": 0.90,
+                    "is_primary": False,
                 },
             ]
         else:
@@ -1524,7 +1342,7 @@ class WebsiteResolver:
 
         # SCENARIO B: User did NOT specify a website -> Autonomous Discovery
         clean_inst = instruction.lower()
-        if any(w in clean_inst for w in ("laptop", "iphone", "phone", "price", "buy", "shop", "cheapest", "under ₹", "under rs", "under $", "samsung", "smartphone")):
+        if any(w in clean_inst for w in ("laptop", "iphone", "phone", "price", "buy", "shop", "cheapest", "under ₹", "under rs", "under $", "smartphone")):
             category = "shopping"
         elif any(w in clean_inst for w in ("flight", "hotel", "travel", "ticket", "train")):
             category = "travel"

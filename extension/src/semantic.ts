@@ -3,8 +3,49 @@ import type { SemanticElement } from './contracts';
 const CONTROL_SELECTOR = 'button,input,textarea,select,a[href],[role],[tabindex],[contenteditable="true"]';
 const clip = (s: string | null | undefined, limit=120) => (s || '').replace(/\s+/g,' ').trim().slice(0,limit);
 
-/** Accessible-name precedence for controls, including open shadow roots. */
-export function accessibleName(el: Element): string {
+/** Icon glyphs that leak into accessible names: icon fonts (FontAwesome,
+ * Material Icons, ...) render glyphs from Unicode private-use areas, so
+ * a button's name arrives as " Search courses" (U+F002 + text) instead
+ * of "Search courses". Strip them from every *matching* name; the
+ * un-stripped text is kept separately (rawAccessibleName / rawName) for
+ * debugging only, never for matching. */
+// Ranges as [start, end] code-point pairs, so no literal private-use
+// character ever has to appear in source. BMP PUA covers FontAwesome
+// (U+F002 etc.) and other icon fonts; the supplementary PUAs and the
+// variation selectors cover the rest of the icon-glyph space.
+const ICON_GLYPH_RANGES: Array<[number, number]> = [
+  [0xe000, 0xf8ff],
+  [0xf0000, 0xffffd],
+  [0x100000, 0x10fffd],
+  [0xfe00, 0xfe0f],
+];
+// Built lazily inside a function, not at module scope: a top-level
+// `new RegExp(...)` call is a side effect, and a side-effectful
+// semantic.ts is retained in every entry's bundle — which makes Rollup
+// split it into a shared chunk that content.js imports, and the
+// vite config's IIFE wrapper around content.js cannot contain a
+// top-level import (build breaks). Lazy construction keeps the module
+// side-effect-free, so entries that never call stripIconGlyphs drop it.
+let ICON_GLYPH_RE: RegExp | null = null;
+function iconGlyphRe(): RegExp {
+  if (!ICON_GLYPH_RE) {
+    ICON_GLYPH_RE = new RegExp(
+      `[${ICON_GLYPH_RANGES.map(([a, b]) =>
+        `${String.fromCodePoint(a)}-${String.fromCodePoint(b)}`).join("")}]`,
+      "gu",
+    );
+  }
+  return ICON_GLYPH_RE;
+}
+export function stripIconGlyphs(text: string): string {
+  if (!text) return text;
+  return text.replace(iconGlyphRe(), '').replace(/\s+/g, ' ').trim();
+}
+
+/** Accessible-name precedence for controls, including open shadow roots.
+ * The returned name is canonical for matching: icon glyphs stripped.
+ * Use rawAccessibleName() for the un-stripped text (debugging only). */
+export function rawAccessibleName(el: Element): string {
  const root = el.getRootNode() as Document | ShadowRoot;
  const ids = (el.getAttribute('aria-labelledby')||'').split(/\s+/).filter(Boolean);
  const referenced = ids.map(id=>root.getElementById(id)?.textContent||'').join(' ');
@@ -12,6 +53,9 @@ export function accessibleName(el: Element): string {
  const wrapping = el.closest('label')?.textContent;
  return clip(referenced)||clip(el.getAttribute('aria-label'))||clip(labels)||clip(wrapping)||
         clip(el.getAttribute('placeholder'))||clip(el.getAttribute('title'))||clip(el.textContent);
+}
+export function accessibleName(el: Element): string {
+ return stripIconGlyphs(rawAccessibleName(el));
 }
 
 /** Same-origin frames and open shadow roots only. Cross-origin frames are opaque. */
@@ -82,7 +126,13 @@ export function semanticElement(el: Element, elementId: string): SemanticElement
  const bounds=viewportBounds(el);if(!bounds)return null;
  const visible=perceptible(el)&&bounds.width>0&&bounds.height>0;
  const style=getComputedStyle(el);
- return {elementId,role:semanticRole(el),semanticName:accessibleName(el),controlType:controlType(el),
+ const rawName=rawAccessibleName(el);
+ const name=stripIconGlyphs(rawName);
+ return {elementId,role:semanticRole(el),semanticName:name,
+  // Debugging aid only: the pre-strip name, kept when it differs.
+  // Never used for matching.
+  ...(rawName!==name?{rawSemanticName:rawName}:{}),
+  controlType:controlType(el),
   interactability:{bounds,visible,opacity:Number(style.opacity),pointerEvents:style.pointerEvents,occluded:visible&&isOccluded(el)},contextText:contextText(el)};
 }
 

@@ -11,9 +11,11 @@ here too, and screenshots are withheld unless explicitly opted in.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import IntEnum
 from threading import Lock
 from collections import deque
+import logging
 import time
 from typing import Any, Optional
 from urllib.parse import unquote_plus, urlsplit, urlunsplit
@@ -21,7 +23,9 @@ from urllib.parse import unquote_plus, urlsplit, urlunsplit
 from pydantic import BaseModel
 
 from . import config
-from .contracts import BrowserObservation, InteractiveElement, PrivacyDecision, PrivacyViolation
+from .contracts import AxNode, BrowserObservation, InteractiveElement, PrivacyDecision, PrivacyViolation
+
+logger = logging.getLogger("navigator.privacy")
 
 import re
 
@@ -145,13 +149,32 @@ def _has_sensitive_value(val: str) -> bool:
 
 
 def _redact_text(value: str, max_len: int) -> str:
-    """Mask known secret patterns in free text, then truncate."""
+    """Mask known secret patterns in free text, then truncate.
+
+    Credential placeholders (``{{CREDENTIAL:domain:kind:label}}``) are
+    protected: they are the *only* form a vault credential ever takes
+    in a planner payload, so redacting them would break vault
+    substitution and teach the planner to invent values instead. The
+    placeholder itself carries no secret — only a domain, a kind and
+    a label.
+    """
+    from .vault import CREDENTIAL_PLACEHOLDER_RE
+
     out = value
+    placeholders: list[str] = []
+
+    def _hold(match: "re.Match[str]") -> str:
+        placeholders.append(match.group(0))
+        return f"\x00CREDENTIAL_PLACEHOLDER_{len(placeholders) - 1}\x00"
+
+    out = CREDENTIAL_PLACEHOLDER_RE.sub(_hold, out)
     for name, pattern in PATTERNS.items():
         if name == "sensitive_kv":
             out = pattern.sub(r"\1: " + REDACTED, out)
         else:
             out = pattern.sub(REDACTED, out)
+    for index, original in enumerate(placeholders):
+        out = out.replace(f"\x00CREDENTIAL_PLACEHOLDER_{index}\x00", original)
     return out[:max_len]
 
 
@@ -286,6 +309,33 @@ class PrivacyFilteredPayload:
     tabs: list[dict[str, Any]] = field(default_factory=list)
     page_text: Optional[str] = None
     query_terms: set[str] = field(default_factory=set)
+    # Task 3: provenance — where this observation came from and when it
+    # was captured. Page content is untrusted data; the planner prompt
+    # carries these fields so a reader can tell provenance at a glance.
+    provenance_source: Optional[str] = None
+    provenance_captured_at: Optional[str] = None
+    # Task 7: grounded accessibility tree for this observation (refs
+    # e0, e1, ... — built from the redacted elements, so a ref never
+    # carries a secret). Empty for observations that predate grounding.
+    ax_tree: list[AxNode] = field(default_factory=list)
+    # Task 7: whether a screenshot survived redaction into this payload
+    # (recorded in the trajectory, not just used by the vision provider).
+    screenshot_attached: bool = False
+    # Task 7: OCR text extracted from the screenshot, when OCR is enabled
+    # and available. Untrusted by definition — OCR misreads, and the
+    # image may hold text the DOM redactor never saw.
+    ocr_text: Optional[str] = None
+    # Task 14: page-declared WebMCP tools for this observation,
+    # validated structurally at redaction time (see webmcp.py) — the
+    # planner sees names/descriptions/schemas only, and only tools
+    # this observation actually declared. Untrusted page content.
+    webmcp_tools: list[dict[str, Any]] = field(default_factory=list)
+    # Task 14: UCP profile URL the page declares (<link rel="ucp">),
+    # and the validated profile the loop fetched for it (None when the
+    # page declares nothing or the fetch failed). The profile lists
+    # capabilities only — no payment data.
+    ucp_profile_url: Optional[str] = None
+    ucp_profile: Optional[dict[str, Any]] = None
 
     def to_context_block(self) -> str:
         """Render as an UNTRUSTED-DATA block for the planner prompt."""
@@ -366,8 +416,17 @@ class PrivacyFilteredPayload:
                 return 5
             return 6
 
-        max_elements = int(getattr(config, "MAX_INTERACTIVE_ELEMENTS", 40))
+        max_elements = int(getattr(config, "MAX_INTERACTIVE_ELEMENTS", 200))
         sorted_els = sorted(self.interactive, key=_pri)
+        if len(sorted_els) > max_elements:
+            # Task 7: the cap is a real information loss — log it instead
+            # of silently dropping the tail of the page.
+            logger.warning(
+                "privacy: observation held %d elements; planner sees %d "
+                "(MAX_INTERACTIVE_ELEMENTS)",
+                len(sorted_els),
+                max_elements,
+            )
         seen_hrefs: set[str] = set()
         deduped_els: list[InteractiveElement] = []
         for el in sorted_els:
@@ -405,10 +464,69 @@ class PrivacyFilteredPayload:
             cleaned_text = re.sub(r"[ \t]+", " ", self.page_text)
             cleaned_text = re.sub(r"\n\s*\n+", "\n", cleaned_text).strip()
             if cleaned_text:
+                # Task 7: the context block used to hard-cut page text at
+                # 2,000 chars regardless of the configured limit; the
+                # slice now follows MAX_PAGE_TEXT_CHARS (the text was
+                # already truncated to it at redaction time).
+                max_text = int(getattr(config, "MAX_PAGE_TEXT_CHARS", 8000))
                 lines.append("\n<page-text>")
-                lines.append(quarantine_text(cleaned_text[:2000], "page"))
+                lines.append(quarantine_text(cleaned_text[:max_text], "page"))
                 lines.append("</page-text>")
         return "\n".join(lines)
+
+
+def _validated_webmcp_tools(obs: Any) -> list[dict[str, Any]]:
+    """Validate page-declared WebMCP tools from a raw observation.
+
+    Returns the tools as plain dicts (name/description/schemas/origin)
+    for the planner prompt. Malformed declarations are dropped here —
+    a bad tool never becomes callable. Never raises.
+    """
+    try:
+        from urllib.parse import urlsplit
+
+        from .webmcp import parse_webmcp_tools
+
+        raw = getattr(obs, "webmcp_tools", None)
+        if raw is None and isinstance(obs, dict):
+            raw = obs.get("webmcpTools")
+        page_url = getattr(obs, "url", "") or (obs.get("url") if isinstance(obs, dict) else "") or ""
+        parts = urlsplit(page_url)
+        # A tool's origin is the site that declared it (scheme://host),
+        # not the page URL — the loop compares it against the current
+        # page's origin when a call is validated.
+        origin = f"{parts.scheme}://{parts.hostname}" if parts.hostname else ""
+        tools, _dropped = parse_webmcp_tools(raw, origin)
+        return [t.to_dict() for t in tools]
+    except Exception:
+        return []
+
+
+def _ucp_profile_url(obs: Any) -> Optional[str]:
+    """The page-declared UCP profile URL, when it is same-origin.
+
+    A cross-origin profile URL is dropped: the profile must describe
+    the site being observed, not send the agent to a third host.
+    Never raises.
+    """
+    try:
+        from urllib.parse import urlsplit
+
+        raw = getattr(obs, "ucp_profile_url", None)
+        if raw is None and isinstance(obs, dict):
+            raw = obs.get("ucpProfileUrl")
+        if not isinstance(raw, str) or not raw:
+            return None
+        page_url = getattr(obs, "url", "") or (obs.get("url") if isinstance(obs, dict) else "") or ""
+        page_host = (urlsplit(page_url).hostname or "").lower()
+        parts = urlsplit(raw)
+        if parts.scheme not in ("http", "https"):
+            return None
+        if (parts.hostname or "").lower() != page_host:
+            return None
+        return raw[:500]
+    except Exception:
+        return None
 
 
 def classify_and_redact(
@@ -456,8 +574,73 @@ def classify_and_redact(
         raw_text = getattr(obs, "page_text", None) or (obs.get("pageText") if isinstance(obs, dict) else None)
         if raw_text:
             from .adversarial_guard import cleanse_untrusted
-            max_chars = int(getattr(config, "MAX_PAGE_TEXT_CHARS", 2500))
+            max_chars = int(getattr(config, "MAX_PAGE_TEXT_CHARS", 8000))
+            if len(str(raw_text)) > max_chars:
+                # Task 7: truncation is a real information loss — log it.
+                logger.warning(
+                    "privacy: page text truncated from %d to %d chars "
+                    "(MAX_PAGE_TEXT_CHARS)",
+                    len(str(raw_text)),
+                    max_chars,
+                )
             safe_page_text = cleanse_untrusted(_redact_text(redact_text_urls(str(raw_text)), max_chars), max_chars)
+        # Task 7: grounded accessibility tree, built from the REDACTED
+        # elements (a ref never carries a secret). Prefer the tree the
+        # extension shipped with the observation; derive a legacy tree
+        # from the element list when the extension predates grounding.
+        # A shipped tree is trusted only when its refs are well-formed
+        # and unique — otherwise it is discarded and re-derived, so a
+        # malformed observation can never plant a colliding ref.
+        from .grounding import AxTree, build_ax_tree, is_valid_ref, normalize_ax_node
+
+        shipped_tree = getattr(obs, "ax_tree", None)
+        ax_nodes: list[AxNode] = []
+        if shipped_tree:
+            _refs = [n.ref for n in shipped_tree]
+            if (
+                len(_refs) == len(set(_refs))
+                and all(is_valid_ref(r) for r in _refs)
+                and len(_refs) <= int(getattr(config, "MAX_AX_NODES", 300))
+            ):
+                # A shipped tree can still carry icon-glyph names (legacy
+                # extension builds); normalise them to the canonical form
+                # the validator checks, keeping the raw text in raw_name.
+                ax_nodes = [normalize_ax_node(n) for n in shipped_tree]
+            else:
+                logger.warning(
+                    "privacy: shipped ax tree failed validation "
+                    "(%d nodes); deriving a legacy tree instead",
+                    len(_refs),
+                )
+        if not ax_nodes:
+            max_ax = int(getattr(config, "MAX_AX_NODES", 300))
+            tree: AxTree = build_ax_tree(redacted, max_nodes=max_ax, source="legacy")
+            ax_nodes = [
+                AxNode(
+                    ref=n.ref, role=n.role, name=n.name, raw_name=n.raw_name, tag=n.tag,
+                    input_type=n.input_type, value=n.value, target_id=n.target_id,
+                    css_selector=n.css_selector, xpath=n.xpath, disabled=n.disabled,
+                    checked=n.checked, selected=n.selected, expanded=n.expanded,
+                    bounds=n.bounds, href=n.href, source=n.source,
+                )
+                for n in tree.nodes
+            ]
+        # Task 7: OCR over the surviving screenshot, only when the operator
+        # opted into screenshots AND OCR. Never raises — a failure means
+        # no OCR block, not a failed observation.
+        ocr_text = None
+        if safe_screenshot and getattr(config, "OCR_ENABLED", False):
+            try:
+                from .ocr import extract_ocr_text
+
+                ocr_text = extract_ocr_text(
+                    safe_screenshot,
+                    enabled=True,
+                    max_chars=int(getattr(config, "OCR_MAX_CHARS", 2000)),
+                )
+            except Exception as exc:  # noqa: BLE001 — OCR must never break planning
+                logger.warning("privacy: OCR failed (%s); continuing text-only", exc)
+                ocr_text = None
         payload = PrivacyFilteredPayload(
             tab_id=obs.tab_id,
             url=redact_url(obs.url),
@@ -471,6 +654,21 @@ def classify_and_redact(
             tabs=scrubbed_tabs,
             page_text=safe_page_text,
             query_terms=query_terms,
+            # Task 3: provenance is stamped at redaction time (the last
+            # point the raw observation is touched before planning).
+            provenance_source=redact_url(obs.url),
+            provenance_captured_at=datetime.now(timezone.utc).isoformat(),
+            ax_tree=ax_nodes,
+            screenshot_attached=safe_screenshot is not None,
+            ocr_text=ocr_text,
+            # Task 14: WebMCP tools are page declarations — validate
+            # them structurally here (name shape, bounded description,
+            # parseable JSON Schema) so a malformed declaration can
+            # never reach the planner as a callable tool. The UCP
+            # profile URL rides along; the loop fetches + validates the
+            # profile itself (redaction does no I/O).
+            webmcp_tools=_validated_webmcp_tools(obs),
+            ucp_profile_url=_ucp_profile_url(obs),
         )
         decision = PrivacyDecision(send=True, reason="redaction succeeded", violations=[])
         redacted_any = (payload.url != obs.url or payload.title != obs.title or

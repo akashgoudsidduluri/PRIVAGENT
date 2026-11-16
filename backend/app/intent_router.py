@@ -555,6 +555,33 @@ EXPLANATION_PATTERN = re.compile(
 )
 
 # 2. Explicit User Tab request patterns
+# Task 8: a "site token" is a registry name (DATA from known_domains.json,
+# never a hard-coded list in a regex), a domain-like token
+# (``example.com``), or a generic service word (mail, inbox, docs...).
+# Intent routing must never enumerate sites: any site the user names is a
+# site, whether or not this codebase has heard of it. Longest names first
+# so a two-word name wins over a one-word prefix in alternation.
+def _site_token_pattern() -> str:
+    try:
+        from .website_resolver import KNOWN_DOMAINS_REGISTRY
+
+        names = sorted(
+            {entry["name"].lower() for entry in KNOWN_DOMAINS_REGISTRY.values()}
+            | {key.replace("_", " ") for key in KNOWN_DOMAINS_REGISTRY},
+            key=len,
+            reverse=True,
+        )
+    except Exception:
+        names = []
+    service_words = {"mail", "gmail", "email", "inbox", "webmail", "docs", "drive", "calendar"}
+    parts = [re.escape(n) for n in names if n]
+    parts.extend(sorted(service_words))
+    parts.append(r"[a-z][a-z0-9\-]*(?:\.[a-z]{2,})+")
+    return "(?:" + "|".join(parts) + ")"
+
+
+_SITE_TOKEN = _site_token_pattern()
+
 USE_TAB_PATTERNS = [
     re.compile(r"\b(?:i\s+)?(?:have\s+)?opened\s+(?:a|the)\s+(?:new\s+)?tab\b", re.IGNORECASE),
     re.compile(r"\buse\s+(?:the|my)\s+(?:new\s+tab|tab\s+i\s+(?:just\s+)?opened)\b", re.IGNORECASE),
@@ -564,7 +591,7 @@ USE_TAB_PATTERNS = [
     re.compile(r"\b(?:in|on|use|attach\s+to|from)\s+(?:my\s+|the\s+)?(?:currently\s+open|currently\s+active|existing|active|current)\s+(?:browser\s+)?tab\b", re.IGNORECASE),
     re.compile(r"\buse\s+(?:the\s+)?(?:existing|current|active)\s+(?:user\s+)?tab\b", re.IGNORECASE),
     re.compile(r"\b(?:in|on)\s+the\s+(?:open|existing)\s+tab\s+(?:for|with|named|titled|at)\s+([^\.,;]+)", re.IGNORECASE),
-    re.compile(r"\bon\s+the\s+open\s+(?:amazon|wikipedia|youtube|google|flipkart|github|reddit)\s+tab\b", re.IGNORECASE),
+    re.compile(r"\bon\s+the\s+open\s+([a-z][a-z0-9\-]*(?:\.[a-z]{2,})?)\s+tab\b", re.IGNORECASE),
     # Current-tab page inspection patterns (e.g. "Summarize this webpage", "Read this page")
     re.compile(r"\b(?:summarize|read|explain|inspect|analyze|extract(?:\s+from)?|what\s+is\s+on)\s+(?:this|the\s+current)\s+(?:webpage|page|website|article|tab|screen)\b", re.IGNORECASE),
     re.compile(r"^(?:summarize|explain|inspect|read)\s+this\s+page[!.\s]*$", re.IGNORECASE),
@@ -593,10 +620,13 @@ CONTINUATION_PATTERNS = [
 ]
 
 # 4. Explicit browser task markers
+# Task 8: direct-site trigger is generic — any registry name, service
+# word, or domain-like token after open/visit/go to. (Email and calendar
+# words route to connectors; see Task 14.)
 DIRECT_SITE_TRIGGER = re.compile(
     r"\b(?:open|visit|go\s+to|navigate\s+to|browse\s+to)\s+"
     r"(?:the\s+)?(?:official\s+)?(?:website\s+|webpage\s+|site\s+|page\s+)?"
-    r"(?:google|youtube|amazon|wikipedia|flipkart|reddit|github|twitter|x|linkedin|facebook|instagram|netflix|bing|yahoo|duckduckgo|react|vue|angular|python|rust|golang|huggingface|arxiv|mdn|apple|microsoft|spotify|mail|gmail|email|outlook|webmail)"
+    + _SITE_TOKEN +
     r"(?:\s+(?:docs|documentation|homepage|website|search|site|store|app|portal|page|inbox))?\b",
     re.IGNORECASE,
 )
@@ -646,21 +676,21 @@ OFFICIAL_DOCS_TRIGGER = re.compile(
 )
 
 SEARCH_WEB_TRIGGER = re.compile(
-    r"\b(?:search\s+(?:google|amazon|wikipedia|youtube|bing|yahoo|duckduckgo|flipkart|reddit|github)\s+for\s+.+)\b"
-    r"|\b(?:search\s+for\s+.+\s+on\s+(?:google|amazon|wikipedia|youtube|bing|flipkart|reddit|github|the\s+web))\b"
+    r"\b(?:search\s+" + _SITE_TOKEN + r"\s+for\s+.+)\b"
+    r"|\b(?:search\s+for\s+.+\s+on\s+(?:" + _SITE_TOKEN + r"|the\s+web))\b"
     r"|\b(?:search|look\s+up|find)\s+.+\s+(?:online|on\s+the\s+web|on\s+the\s+internet)\b",
     re.IGNORECASE,
 )
 
 PRODUCT_SEARCH_TRIGGER = re.compile(
-    r"\b(?:find|search|check|look\s+up|buy|order|price\s+of)\s+.+\s+(?:on\s+|from\s+)(?:amazon|flipkart|ebay|walmart|bestbuy)\b"
-    r"|\b(?:find|check\s+price\s+of)\s+[a-zA-Z0-9\s-]+\s+(?:on\s+amazon|on\s+flipkart)\b",
+    r"\b(?:find|search|check|look\s+up|buy|order|price\s+of)\s+.+\s+(?:on\s+|from\s+)" + _SITE_TOKEN + r"\b"
+    r"|\b(?:find|check\s+price\s+of)\s+[a-zA-Z0-9\s-]+\s+(?:on\s+)" + _SITE_TOKEN + r"\b",
     re.IGNORECASE,
 )
 
 COMPARISON_BROWSER_TRIGGER = re.compile(
     r"\b(?:compare|comparison\s+of)\s+.*?\s+(?:prices?|costs?|rates?|deals?|specs?|features?|models?|options?|between|across|on\b|at\b|vs\.?|versus)\b"
-    r"|\b(?:compare|comparison)\s+(?:amazon|flipkart|ebay|walmart|croma|best\s*buy|google\s+flights|makemytrip)\b"
+    r"|\b(?:compare|comparison)\s+(?:on\s+|across\s+|between\s+)?" + _SITE_TOKEN + r"\b"
     r"|\b(?:compare|comparison)\s+.*?\s+(?:and|vs\.?|versus)\s+.*?\s+(?:prices?|costs?|on\b|at\b)",
     re.IGNORECASE,
 )
@@ -693,9 +723,9 @@ BROWSER_TRIGGERS = [
     SHOPPING_DISCOVERY_TRIGGER,
     TRAVEL_SEARCH_TRIGGER,
     re.compile(r"\b(?:navigate\s+to|go\s+to|open|browse\s+to|visit)\s+(?:the\s+)?(?:website\s+|site\s+)?(?:https?://|[a-zA-Z0-9-]+\.(?:com|org|in|net|edu|gov|io|co|ai|dev|app|info))\b", re.IGNORECASE),
-    re.compile(r"\b(?:search\s+(?:on\s+)?(?:amazon|google|wikipedia|youtube|flipkart|bing|github|reddit|twitter|ebay)|search\s+for\s+.*\s+on\s+[a-zA-Z0-9-]+)\b", re.IGNORECASE),
+    re.compile(r"\b(?:search\s+(?:on\s+)?" + _SITE_TOKEN + r"|search\s+for\s+.*\s+on\s+[a-zA-Z0-9-]+)\b", re.IGNORECASE),
     re.compile(r"\b(?:look\s+up|find\s+products?|find\s+prices?|check\s+weather|check\s+flights?)\s+on\b", re.IGNORECASE),
-    re.compile(r"\b(?:buy|order|purchase)\s+.*?\s+(?:from|on)\s+(?:amazon|flipkart|ebay)\b", re.IGNORECASE),
+    re.compile(r"\b(?:buy|order|purchase)\s+.*?\s+(?:from|on)\s+" + _SITE_TOKEN + r"\b", re.IGNORECASE),
 ]
 
 

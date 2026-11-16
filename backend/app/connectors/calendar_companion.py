@@ -22,6 +22,55 @@ def is_calendar_query(text: str) -> bool:
     return any(re.search(p, t) for p in patterns)
 
 
+_CREATE_RE = re.compile(
+    r"\b(?:schedule|create|add|book)\s+(?:an?\s+)?(?:event|meeting|appointment|call)\s+(?:called|titled|for)?\s*[\"']?([^\"'\n]+?)[\"']?\s+(?:on|at|for)\s+(.+)",
+    re.IGNORECASE,
+)
+
+
+def parse_calendar_create(instruction: str, account_email: str | None = None) -> dict[str, Any] | None:
+    """Parse a calendar-create instruction into its parts, or None.
+
+    REVIEW (Task 14 audit): the connector runner confirms a calendar
+    create BEFORE this module runs, so it must be able to tell — with
+    no side effects — whether the instruction actually parses as a
+    create and what will be created. Before this helper, an
+    unparseable create ("schedule a meeting with Priya tomorrow")
+    sailed through confirmation and silently returned a listing of
+    existing events instead of creating anything, and the operator
+    approved blind: the title/time were only computed after approval.
+
+    The parse is deliberately the same regex and the same default the
+    handler has always used (tomorrow 10:00 AM UTC, 1 hour): the
+    named time text is captured but NOT interpreted — there is no date
+    parser in this codebase — so the confirmation shows both the time
+    as written and the time that will actually be booked, and the
+    operator can decline when they differ.
+    """
+    m = _CREATE_RE.search(instruction or "")
+    if not m:
+        return None
+    title = m.group(1).strip()
+    time_text = m.group(2).strip()
+    if not title or not time_text:
+        return None
+    attendees = [
+        a for a in re.findall(r"[\w\.-]+@[\w\.-]+\.\w+", instruction or "")
+        if a != account_email
+    ]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    start_dt = now + datetime.timedelta(days=1)
+    start_dt = start_dt.replace(hour=10, minute=0, second=0, microsecond=0)
+    end_dt = start_dt + datetime.timedelta(hours=1)
+    return {
+        "title": title,
+        "time_text": time_text,
+        "attendees": attendees,
+        "start": start_dt,
+        "end": end_dt,
+    }
+
+
 async def handle_calendar_instruction(instruction: str, chat_id: Optional[str] = None) -> str:
     """Handle calendar listing or event creation requests via connected Google OAuth."""
     t = instruction.lower()
@@ -43,24 +92,12 @@ async def handle_calendar_instruction(instruction: str, chat_id: Optional[str] =
     connector = oauth_manager.connector("google_calendar")
 
     # 2. Check for Event Creation
-    create_match = re.search(
-        r"\b(?:schedule|create|add|book)\s+(?:an?\s+)?(?:event|meeting|appointment|call)\s+(?:called|titled|for)?\s*[\"']?([^\"'\n]+?)[\"']?\s+(?:on|at|for)\s+(.+)",
-        instruction,
-        re.IGNORECASE,
-    )
-    if create_match:
-        title = create_match.group(1).strip()
-        time_text = create_match.group(2).strip()
-
-        # Parse attendees if present
-        attendee_matches = re.findall(r"[\w\.-]+@[\w\.-]+\.\w+", instruction)
-        attendees = [a for a in attendee_matches if a != account_email]
-
-        # Default 1 hour from tomorrow 10:00 AM UTC if ambiguous
-        now = datetime.datetime.now(datetime.timezone.utc)
-        start_dt = now + datetime.timedelta(days=1)
-        start_dt = start_dt.replace(hour=10, minute=0, second=0, microsecond=0)
-        end_dt = start_dt + datetime.timedelta(hours=1)
+    parsed = parse_calendar_create(instruction, account_email)
+    if parsed is not None:
+        title = parsed["title"]
+        start_dt = parsed["start"]
+        end_dt = parsed["end"]
+        attendees = parsed["attendees"]
 
         try:
             invite = connector.create_invite(

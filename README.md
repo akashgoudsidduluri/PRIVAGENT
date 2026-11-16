@@ -1,7 +1,10 @@
 # NAVIGATOR — SIH 26171
 ## On-device Visual Perception for Lightweight Browser Agents
 
-NAVIGATOR is a privacy-first AI browser agent developed for **Smart India Hackathon (SIH 26171)**. It combines a zero-runtime-dependency landing page and agent workspace, a Chrome Manifest V3 extension, a local FastAPI orchestration backend with pluggable Gemini/Groq planners (plus an offline mock), local fail-closed privacy redaction, spatial bounding-box perception, bounded recovery, and a human confirmation gate.
+[![CI](https://github.com/Prateek2007-cmd/PRIVAGENT/actions/workflows/ci.yml/badge.svg)](https://github.com/Prateek2007-cmd/PRIVAGENT/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+NAVIGATOR is a privacy-first AI browser agent developed for **Smart India Hackathon (SIH 26171)**. It combines a zero-runtime-dependency landing page and agent workspace, a Chrome Manifest V3 extension, a local FastAPI orchestration backend with pluggable planners (Gemini, Groq, DeepAI Gateway, OpenAI-compatible, local Ollama, plus an offline mock), local fail-closed privacy redaction, spatial bounding-box perception, bounded recovery, and a human confirmation gate.
 
 ---
 
@@ -9,21 +12,61 @@ NAVIGATOR is a privacy-first AI browser agent developed for **Smart India Hackat
 
 | Subsystem | Implementation | Status & Evidence |
 |-----------|----------------|-------------------|
-| **Landing Page & Agent Workspace** | Vite + vanilla TypeScript + hand CSS | ✓ `npm test` — 25/25 checks pass (10 structure, 8 console, 7 sanitization) |
-| **Chrome MV3 Extension** | Relay worker + in-page script + action executor | ✓ Vitest 35/35, `tsc --noEmit` clean, production build |
-| **Backend Orchestration** | FastAPI hub + bounded agent loop | ✓ `pytest` 81/81, including 29 security-hardening tests |
+| **Landing Page & Agent Workspace** | Vite + vanilla TypeScript + hand CSS | ✓ `npm test` — 64 checks pass (10 structure, 8 console, 11 sanitization/security, 10 Task 12 UI, 4 Task 14 UI, 3 Task 15 UI, 18 recovery) |
+| **Chrome MV3 Extension** | Relay worker + in-page script + action executor | ✓ Vitest 180/180 (20 files), `tsc --noEmit` clean, production build |
+| **Backend Orchestration** | FastAPI hub + bounded agent loop | ✓ `pytest` — 1018 tests collected in 84 test files; latest full run 991 passed, 9 skipped, 18 failed (pre-existing failures in research/monitoring suites, unchanged since Task 1 — see `CHANGELOG.md`) |
 | **Shared Contracts** | TypeScript source mirrored as Pydantic models | ✓ Contract parity test (`test_contracts.py`) |
-| **Browser Action Control** | Navigate, click, type, press, scroll, zoom, wait, tabs | ✓ All 11 action types (`ACTION_TYPES`) |
+| **Browser Action Control** | Navigate, click, type, press, scroll, zoom, wait, observe, tabs, select_option, set_date, upload_file, webmcp_tool, ucp_checkout | ✓ All 17 action types (`ACTION_TYPES`) |
 | **Spatial Perception** | Bounding boxes (`bounds: {x,y,w,h}`), DPR grounding | ✓ `test_coordinates.py` and Test C |
+| **AX-Tree Grounding (Task 7)** | DOM-derived accessibility tree; planner targets elements by stable ref (`{"elementRef": "e12"}`); unknown refs / raw CSS selectors rejected; stale refs re-observe once then fail honestly | ✓ `test_grounding.py` (28 tests); see `docs/PERCEPTION.md` |
+| **Perception Limits (Task 7)** | `PRIVAGENT_MAX_ELEMENTS` 200 (was 50), `PRIVAGENT_MAX_PAGE_TEXT_CHARS` 8000 (was 2500), `PRIVAGENT_MAX_INSTRUCTION_CHARS` 8000 (was 4000), `PRIVAGENT_MAX_AX_NODES` 300; truncation logged | ✓ `test_grounding.py`; cost/latency trade-off in `docs/PERCEPTION.md` |
+| **OCR, opt-in (Task 7)** | Local tesseract adapter, disabled by default, gated on `ALLOW_SCREENSHOTS`; OCR text labelled untrusted in the prompt; degrades gracefully when tesseract is absent | ✓ `test_grounding.py`; tesseract not installed in this VM |
+| **Latency (Task 11)** | Per-step profiling (`LoopTimings`, readable via `GET /api/task/{id}` — durations + action types only, never names/values/page text); per-task in-memory observation cache (tab + URL + DOM fingerprint, invalidated on mutation/navigation/takeover/pause); batch execution of the valid plan prefix (ref-grounded non-submitting types + one terminator) — confirmation/takeover/allow-list/checker still run per step; `doType` reuses its candidate list for the submit lookup | ✓ `test_latency.py` + `test_latency_batch.py` (29 tests); measured on the scripted login+search benchmark: planner calls 7 → 4, observation calls 2 → 1, wall 1417.59 → 823.68 ms median (mock provider, 200 ms simulated planner delay); see `docs/LATENCY.md` |
+| **Plan preview (Task 12)** | Confirmation banner shows the planned steps in plain language (type + target name/role + risk) from structured fields only — host-only navigation, masked secret-named targets, vault placeholders, no planner free text; Approve / Approve-this-step-only / Reject reuse the existing confirmation gate (approval is a gate, not a new override; approve-step re-observes and re-plans) | ✓ `test_plan_preview.py` (24 tests); see `docs/UI.md` |
+| **Privacy Center (Task 12)** | One panel: planner status (local vs cloud, LOCAL_ONLY / zero-retention flags, read-only), audit log viewer (`GET /api/audit`, event filter + limit + chain status), 24 tracker hosts by category, DPIA summary + link | ✓ `test_privacy_status.py`; see `docs/UI.md` |
+| **Task timeline (Task 12)** | Task 11 timings joined to history: step, action, status, duration, batched / cache-hit / checker-skipped flags; textContent only | ✓ `tests/task12_ui.test.mjs`; see `docs/UI.md` |
+| **Responsive layout (Task 12)** | `@media (max-width: 480px)` layer: header, task list, plan preview, Privacy Center, timeline reflow; tap targets ≥ 44px | ✓ `tests/task12_ui.test.mjs`; layout NOT verified in a real browser — the VM's managed Chromium blocks all non-public navigation (see `docs/UI.md`); DOM smoke test `~/workspace/privagent-analysis/task12-verify-dom.mjs` (25 checks) |
+| **XSS audit (Task 12)** | All 66 `innerHTML` sites classified: 3 vulnerabilities fixed (drawer timeline, unescaped sessionId, raw format/artifact id), 9 empty clears, 57 proven safe by escaping/constants; 0 `outerHTML` / `document.write` / `insertAdjacentHTML` | ✓ Repo guard `test_no_innerhtml.py` (negative-tested); see `docs/UI.md` |
+| **Architecture (Task 13)** | God files split (`agentLoop.py` 3,883 → 2,876 lines, `planner.py` 2,044 → 873; new `loop_state` / `loop_gates` / `loop_checkpoints` / `loop_helpers` / `loop_research` / `planner_validation` modules, re-exported); `check_freshness` made real (fresh-tree comparison in batch + post-wait re-verification); per-entry vite builds (no shared chunks) with the glyph-strip dedup; undecryptable memory rows skipped + counted; structured JSON step logs (`navigator.observe`); dead code removed (see `docs/ARCHITECTURE.md`) | ✓ `test_task13_freshness.py` (13), `test_task13_encrypted_rows.py` (11), `test_task13_observability.py` (4); extension `tests/viteSelfContainedEntries.test.ts` (build proof) |
+| **Connectors & standards (Task 14)** | Gmail / Calendar / Drive auto-routing: a data-driven router detects connector intents ("check my inbox", "what's on my calendar tomorrow", "find the Q3 deck in Drive") and answers via the Google API connectors instead of driving the web UI; the routing decision is recorded on the task record and shown in the workspace ("via Gmail connector"); an unconfigured connector fails honestly with a named remedy and never silently falls back to the browser; writes (draft/trash/calendar-create) need confirmation first — calendar creates are a behaviour change, they used to execute immediately; connector results never reach the planner (answered directly, still scrubbed), egress is pinned to Google API hosts only, one metadata-only `connector_call` audit event per call, zero retention honoured. WebMCP: the extension collects page-declared tools (`document.modelContext`, capped/validated, provenance-tagged untrusted); the planner may call one through the gated pipeline (`webmcp_tool`, risk floor `write`); the checker scans descriptions + args, and credential/payment-asking tools force takeover. UCP: merchant profiles detected from `<link rel="ucp">` + `/.well-known/ucp` (same-origin https, supported versions only); checkout prefers the standard path but goes through the Task 4 payment path unchanged (cap, approval + takeover always, mock provider never charges, single attempt, never retried); wire shape unvalidated against a real merchant | ✓ `test_connector_router.py` (44), `test_connector_runner.py` (15), `test_webmcp.py` (16), `test_ucp.py` (18), `test_task14_loop.py` (17), `test_plan_preview.py` (+3), extension `tests/webmcpUcp.test.ts` (8); see `docs/CONNECTORS.md`, `docs/WEBMCP.md`, `docs/UCP.md` |
 | **Privacy Redaction** | Strips credentials, cards, SSNs, tokens, URL secrets locally | ✓ Fail-closed tests (`test_privacy_failclosed.py`, `test_security_hardening.py`) |
 | **Prompt Injection Defense** | Page text isolated as untrusted data; schema-validated plans | ✓ `test_planner_injection.py` |
 | **Human-in-the-Loop Gate** | Sensitive/auth/payment actions halt for approval | ✓ `test_confirmation.py` and Test H |
+| **Takeover Mode (Task 4)** | Login / payment / OTP / CAPTCHA / 2FA pauses the agent, hands the browser to you, observes nothing | ✓ `test_credentials_payments.py` (20 tests); see `docs/CREDENTIALS_PAYMENTS.md` |
+| **Credential Vault (Task 4)** | Encrypted per-domain credentials; planner sees only `{{CREDENTIAL:…}}` placeholders, substituted at execution | ✓ `test_credentials_payments.py`; vault API `POST/GET/DELETE /api/vault/credentials` |
+| **Payments, mock-first (Task 4)** | Every payment needs approval + takeover; blocked above `PRIVAGENT_MAX_PAYMENT_AMOUNT` (default 5000 INR); mock virtual card, last-4 only, no live Stripe | ✓ `test_credentials_payments.py`; `GET /api/payments/config`, `POST /api/payments/validate`, `GET /api/payments/audit` |
 | **Cancellation** | REST cancel propagates into the running loop and pending gate | ✓ `test_security_hardening.py` |
+| **Long-term Memory (Task 9)** | Facts, skills, and reference files in SQLite (encrypted at rest); deterministic keyword recall — top 5 facts / 800 chars, top 2 skills — into the planner prompt; files surface as a summary only, never content | ✓ `test_long_memory.py` (26 tests); Memory dialog in the workspace header; see `docs/MEMORY_LONG_HORIZON.md` |
+| **Memory provenance (Task 9)** | Only the operator (`source="user"`) or a confirmed task outcome (`source="task:<id>:confirmed"`) can write memory; page content can never create a fact/skill; write-back proposes candidates and stores them only after operator confirmation; credentials/PII rejected at write time; `DELETE /api/memory` forgets everything | ✓ `test_long_memory.py` (provenance + credential-guard tests) |
+| **Checkpoints & resume (Task 9)** | Checkpoint persisted after every step; `GET /api/task/{id}` exposes it; `POST /api/task/{id}/resume` continues from the checkpoint (history preserved, survives backend restart via SQLite restore); `POST /api/task/{id}/cancel` checkpoints first | ✓ `test_long_memory.py` (checkpoint + resume tests) |
+| **Step caps & compaction (Task 9)** | `PRIVAGENT_MAX_STEPS` default 50 (was 25), `PRIVAGENT_MAX_LONG_STEPS` default 100 for `long_horizon=true`; long tasks get a compact summary every 25 steps and the planner then sees summary + last 2 entries, not the full history | ✓ `test_long_memory.py` (cap + compaction tests) |
+| **Multi-tab (Task 9)** | Task-owned tab registry (`tab_id` / URL / title / active) in the checkpoint; new `switch_tab` action (`select_tab` kept for back-compat); planner lists the task's tabs and may only switch to a listed one; unknown tabs rejected before the extension is contacted; tabs are handed back, not closed, at task end | ✓ `test_long_memory.py` + `extension/tests/actionExecutor.test.ts` (`switch_tab` suite) |
+| **Background & scheduled tasks (Task 9)** | `background=true` tasks run without a live WebSocket and are pollable via `GET /api/task/{id}`; in-process SQLite-backed scheduler (`POST/GET/DELETE /api/scheduled`, `POST /api/scheduled/{id}/run-now`) with `"every 6h"` / `"daily 09:00"` / cron schedules; scheduled runs go through the same allow-list, confirmation, takeover, and payment gates — they halt for the operator, never self-approve | ✓ `test_scheduler.py` (10 tests); see `docs/MEMORY_LONG_HORIZON.md` |
 | **Bounded Agent Loop** | 25-step task budget, 3 retries, max 3 steps per plan | ✓ `test_agentLoop.py` and Test F |
-| **Benchmark Scenarios A–H** | All 8 directive tasks in the mock harness | ✓ 8/8 via `benchmark_eval.py` |
-| **Planner Providers** | Gemini (`gemini-3.8-flash`), Groq (`openai/gpt-oss-120b`), or `mock` | ✓ Provider tests; live key required for remote calls |
+| **Benchmark Scenarios A–H** | All 8 directive tasks in the mock harness | ✓ 8/8 mock fixtures via `benchmark_eval.py` — fixture-only, explicitly **not** live metrics. Measured evals (Task 6, `docs/EVALS.md`): checker ASR 0.50 overall, privacy leak rate 0.2609. The 12-category live runner stands at 12 blocked, 0 attempted (see `docs/PHASE8_STATUS.md`) |
+| **Planner Providers** | Gemini (`gemini-3.8-flash`), Groq (`openai/gpt-oss-120b`), DeepAI Gateway (`deepseek-v4.1-flash`), OpenAI-compatible (Antseed), **Ollama (Task 10, local — `qwen2.5:7b` default, no data leaves the machine)**, or `mock` | ✓ Provider tests; live key required for remote calls. Default priority (no `NAVIGATOR_PROVIDER` set): `deepai` → `groq` → `gemini` → `mock` (see `backend/app/config.py`). Ollama joins only when explicitly selected (`PRIVAGENT_PLANNER=ollama` / local-first / local-only); see `docs/LOCAL_PLANNER.md` |
+| **Zero retention (Task 10)** | `PRIVAGENT_ZERO_RETENTION=true`: no checkpoints (tasks cannot resume after restart), no screenshots to the planner, in-memory history pruned to the last 3 steps, provider telemetry silenced, trajectory records scrubbed | ✓ `test_zero_retention.py`; see `docs/PRIVACY.md` |
+| **Audit log (Task 10)** | Append-only, hash-chained `backend/data/audit.log` (0600) for auth failures, allow-list denials, confirmation decisions, takeover, payments, memory writes/deletes, scheduler claims; `GET /api/audit` with `?event=` / `?limit=`; `verify_chain()` detects tampering | ✓ `test_audit_log.py`; see `docs/PRIVACY.md` |
+| **DPIA (Task 10)** | Data protection impact assessment: data inventory, per-provider data flows, measured risks (checker ASR 0.50, leak rate 0.2609), mitigations, residual risks stated honestly | See `docs/DPIA.md` |
 
 ---
+
+## What Changed in Tasks 1–10 (Security Hardening, Foundations, Proof, Perception, Generalisation, Memory, Privacy)
+
+Full history in [`CHANGELOG.md`](CHANGELOG.md); branch `muse/task1-security-auth`.
+
+- **Task 1 — Local operator auth.** Every `/api/*` route except `/api/health` requires a bearer token; the unauthenticated `POST /api/test/execute_action` backdoor was removed; the Origin guard no longer lets a missing `Origin` bypass it.
+- **Task 2 — Encrypted secrets at rest.** OAuth tokens, client secrets, LLM keys and the local token live in a Fernet store (`backend/data/secrets.enc.json`), never plaintext in `.env`. SQLite files are permission-hardened and sensitive columns encrypted at the accessor layer — full SQLCipher encryption is **not** achieved yet (see "SQLite at rest" below).
+- **Task 3 — Isolation & injection defence.** Isolated agent Chrome profile, domain + egress allow-lists enforced in code, a web-blind injection checker with provenance tags, tracker blocking + wipe-on-start for the agent profile.
+- **Task 4 — Safe credential / payment path.** Takeover mode (agent stops observing and hands you the browser), an encrypted credential vault (planner sees placeholders only), and mock-first payments (approval + takeover, blocked above 5000 INR, no live Stripe). Account creation / permanent deletion are blocked outright.
+- **Task 5 — Foundations.** CI (`.github/workflows/ci.yml`), Docker + docker-compose, MIT LICENSE, pinned dependencies, CHANGELOG.md. First CI run happens on push/PR (Task 15); Docker images were not built in this VM.
+- **Task 6 — Proof (measured evals).** Eval harness + `docs/EVALS.md`: checker ASR **0.50** overall (canonical 0.25, evasions 1.0), privacy leak rate **0.2609**, mock benchmark 8/8 (fixture-only). WebArena / OSWorld / PrivacyLens / AgentDojo are harness-ready but not run (no LLM key, no Chrome/VM, adapter missing).
+- **Task 7 — Perception (AX-tree grounding).** DOM-derived accessibility tree (CDP `getFullAXTree` is not viable from a MV3 content script — see `docs/PERCEPTION.md`); the planner targets elements by stable ref (`{"elementRef": "e12"}`), unknown refs and raw CSS selectors are rejected, stale refs re-observe once then fail honestly. Limits raised: 50 → 200 elements, 2,500 → 8,000 page-text chars, 4,000 → 8,000 instruction chars (all configurable, with a documented token-cost trade-off). OCR is a local tesseract adapter, disabled by default and gated on `ALLOW_SCREENSHOTS`; tesseract is not installed in this VM, so OCR is unavailable here. Cross-origin iframes stay opaque.
+- **Task 8 — Generalisation (works on any site).** The per-site playbooks are gone: the planner now works from one general "HOW TO ACT ON ANY SITE" section (read the AX tree, find the element by role + accessible name, act by ref, verify from the new observation) and the extension collects elements by role/name/text only — no site classes, data-testids, or input ids (`._2KpZ6l`, `.ytp-*`, `twotabsearchtextbox` all removed). The genuinely useful site knowledge survives as an optional, data-driven hints layer (`backend/app/site_hints.json`, prose only — the loader rejects anything selector-like; disable with `PRIVAGENT_SITE_HINTS=false` for pure-general mode). The site registry is now data (`backend/app/known_domains.json`), the resolver builds no per-retailer search URLs (shopping/travel go through generic web search), intent routing is domain-agnostic, and comparison-site resolution works for sites the registry never heard of. What stays site-specific on purpose: the lookalike brand list (phishing defence), identity-provider hosts, and the mail connector route (Task 14). See `docs/GENERALISATION.md`. No live Chrome run on real sites yet — generalisation is unit-tested on synthetic pages only.
+- **Task 9 — Memory & long-horizon.** Durable long-term memory (facts/skills/files, encrypted at rest, provenance-enforced: only the operator or a confirmed task outcome can write), checkpoints + resume, step caps 50/100, compaction every 25 steps, multi-tab (`switch_tab`), background tasks and an in-process scheduler whose runs go through the same gates and never self-approve. See `docs/MEMORY_LONG_HORIZON.md`.
+- **Task 10 — Privacy beyond redaction.** Local Ollama planner (BYOM, loopback-only, `PRIVAGENT_PLANNER_LOCAL_ONLY=true` fails honestly instead of falling back to cloud); zero-retention mode (`PRIVAGENT_ZERO_RETENTION=true`: no checkpoints, no screenshots to the planner, pruned history, silenced telemetry); append-only hash-chained audit log (`backend/data/audit.log`, `GET /api/audit`); DPIA (`docs/DPIA.md`); tracker blocklist extended 12 → 24 hosts plus agent-profile launch flags. See `docs/LOCAL_PLANNER.md`, `docs/PRIVACY.md`, `docs/DPIA.md`.
+- **Task 11 — Latency.** Per-step loop profiling (`LoopTimings` via `GET /api/task/{id}`), per-task in-memory observation cache (DOM fingerprint), batch execution of the valid plan prefix. Measured on the scripted login+search benchmark (mock provider): planner calls 7 → 4, observation calls 2 → 1, wall 1417.59 → 823.68 ms median. See `docs/LATENCY.md`.
+- **Task 12 — UI enhancement.** Plan preview in the confirmation banner (structured fields only; Approve / Approve-this-step-only / Reject reuse the existing gate); Privacy Center (planner status, audit viewer, 24 tracker hosts, DPIA); task timeline from Task 11 timings; responsive layout at 480px; XSS audit of all 66 `innerHTML` sites (3 vulnerabilities fixed, repo guard test added). Layout was NOT verified in a real browser — the VM's managed Chromium blocks all non-public navigation; see `docs/UI.md` for the honest verification record.
 
 ## Architecture Overview
 
@@ -38,7 +81,9 @@ NAVIGATOR is a privacy-first AI browser agent developed for **Smart India Hackat
                       │    FastAPI Orchestration Hub   │
                       │    http://localhost:8000       │
                       │  - Local privacy redaction     │
-                      │  - Planner (Gemini/Groq/mock)  │
+                      │  - Planner (Gemini / Groq /    │
+                      │    DeepAI / OpenAI-compat /    │
+                      │    mock)                       │
                       │  - Schema + URL validation     │
                       │  - Confirmation decision gate  │
                       └───────────────┬────────────────┘
@@ -58,6 +103,20 @@ The backend binds to loopback and only accepts browser origins from `localhost`/
 
 ## Security & Privacy Defaults
 
+- **Local operator auth.** Every `/api/*` route except `/api/health` requires `Authorization: Bearer <token>`. The token comes from `PRIVAGENT_LOCAL_TOKEN` in `backend/.env`, or — if unset — is generated once on first startup (32 random bytes) and stored **encrypted** in the secret store (`backend/app/secrets.py`, `backend/data/secrets.enc.json`, mode `0600`); the old plaintext `backend/data/.local_token` file is migrated into the store and deleted on first use. The token value is never logged. A missing `Origin` header no longer bypasses anything: non-browser clients must present the token. Disallowed origins are rejected with 403 even when a token is present, and state-changing browser requests need an allow-listed Origin/Referer or a valid token. `GET` requests may alternatively carry `?token=` — only because plain `<a href>` artifact preview/download links cannot send headers. The OAuth callback (`/api/connectors/*/callback`) is exempt because it is a top-level browser redirect from the provider; its `state` parameter is validated server-side instead.
+- **How the clients get the token.** Web UI: on the first 401 the workspace prompts once for the token and stores it in `localStorage` (`privagentLocalToken`); get it with `backend/venv/bin/python backend/scripts/print_local_token.py` (or your `PRIVAGENT_LOCAL_TOKEN` value) — treat the output like a password. Extension: the service worker reads the same token from `chrome.storage.local` (`privagentLocalToken`) and sends it as `?token=` on the backend WebSocket URLs; until a token is stored there it connects without one (backend logs a warning). Set it once from the extension service-worker console: `chrome.storage.local.set({ privagentLocalToken: "<token>" })`. A token-entry UI for the extension is follow-up work.
+- **Encrypted secret store (Task 2).** OAuth access/refresh tokens, OAuth client secrets, LLM API keys (`GEMINI_API_KEY`, `GROQ_API_KEY`, `ANTSEED_API_KEY`, `DEEPAI_GATEWAY_KEY`), runtime keys set via `POST /api/llm/config`, and the local operator token are stored encrypted with Fernet (AES-128-CBC + HMAC-SHA256), the key derived via PBKDF2-HMAC-SHA256 (600,000 iterations) from a master key. Master-key priority: `PRIVAGENT_MASTER_KEY` in the environment (recommended — a Fernet key or passphrase), else the OS keychain via `keyring` if installed, else a generated key in `backend/data/.master.key` (mode `0600`). The generated-key path is **local-only protection, not hardware-backed security**: anyone who can read the whole `backend/data/` directory can decrypt the store. Set `PRIVAGENT_MASTER_KEY` (and back it up — losing it makes every stored secret unrecoverable). On first startup after the upgrade, any plaintext secrets still in `backend/.env` are encrypted into the store, verified by round-trip, and then blanked from `.env` (never deleted without being stored first); client IDs are not secrets and stay in `.env`. Never log secret values or keys.
+- **SQLite at rest (Task 2).** Full-database encryption via SQLCipher is **not** achieved: `pysqlcipher3` cannot build in this environment (`sqlcipher/sqlite3.h` is missing — no `libsqlcipher-dev`), so the database file itself is still plaintext SQLite. What Task 2 does instead: the database directory is mode `0700` and the `.db`, `-wal` and `-shm` files are forced to mode `0600`, and the most sensitive columns are Fernet-encrypted at the accessor layer — message content/evidence, chat-memory values, semantic-fact values, task-checkpoint history/working-memory, research-package payloads, and email classification/notification content. Rows written before Task 2 (legacy plaintext) still read. Monitoring state is already scrubbed before storage, and table structure, IDs, timestamps, titles and URLs are **not** encrypted — a stolen `.db` file still reveals that a chat exists and its metadata. Follow-up: `apt install libsqlcipher-dev && pip install pysqlcipher3`, switch `db.get_connection()` to `pysqlcipher3.dbapi2`, run `PRAGMA key = '<master key>'` before any other statement, and migrate the existing DB once with `sqlcipher_export`.
+- **Test endpoint removed.** The former unauthenticated `POST /api/test/execute_action` endpoint — which drove the extension directly, bypassing the planner, privacy redaction, and confirmation gate — has been removed from the production app. Do not re-add an unauthenticated action-execution endpoint.
+- **Isolated agent profile (Task 3).** The agent must not run in your everyday Chrome profile, where it would inherit your cookies, saved logins, and history. Launch Chrome for agent work only with `--user-data-dir=<repo>/backend/data/agent-profile` (see `scripts/launch-agent-chrome.sh` / `scripts/launch-agent-chrome.bat`, or set `PRIVAGENT_AGENT_PROFILE_DIR`), then in the extension service-worker console run `chrome.storage.local.set({ privagentIsolatedProfile: true })`. Check `GET /api/isolation/status` — `profileVerified` is true only when the extension self-reports that flag. Honest limit: Chrome does not expose the profile directory to extensions, so the backend cannot *prove* isolation; it is operator-attested. This is a local isolated-profile mode, **not** a cloud VM sandbox — there is none.
+- **Domain allow-list (Task 3).** Set `PRIVAGENT_ALLOWED_DOMAINS` (comma-separated, `*.example.com` wildcards supported) or pass `allowedDomains` per task on `POST /api/task`. It is enforced in code, not just in the prompt: the planner rejects disallowed navigations, the agent loop blocks them and halts for human confirmation (approving allows that one navigation as a logged override), and the extension refuses them as defence in depth. With no list configured, task creation logs a warning and navigation is unrestricted (back-compat).
+- **Web-blind checker + provenance (Task 3).** `backend/app/checker.py` scans page text for instruction-like language ("ignore previous instructions", "send your password/OTP", "navigate to <attacker domain>", download-and-run lures) and checks the *plan* — actions, targets, domains, your directive — against those findings without ever seeing page prose as instructions. A flag halts the task for human confirmation (or fails it if no gate is available). Page content entering the planner is tagged with its source URL and capture time (`<page-context untrusted="true" source="…" captured="…">`). The checker is a deterministic heuristic, not a model: it catches loud injection shapes, not paraphrased or encoded ones, and no attack-success rate has been measured for it — do not claim one.
+- **Tracker hygiene for the agent profile (Task 3, best-effort).** The extension ships a `declarativeNetRequest` ruleset (`extension/rules/trackers.json`) blocking 12 well-known tracker hosts, and wipes the agent profile's cookies/cache/storage on start when the isolated-profile flag is set. Third-party cookies are partitioned by Chrome's default storage partitioning. There is no fingerprint randomisation and no full tracker blocklist — the agent profile is hardened, not anonymous.
+- **Egress allow-list (Task 3).** Backend outbound calls go only to loopback gateways, the pinned planner hosts (`api.groq.com`, `generativelanguage.googleapis.com`), or hosts on the domain allow-list. A remote OpenAI-compatible gateway that is not listed is rejected before the request is sent, so it never receives the API key.
+- **Takeover mode (Task 4).** When the loop reaches a login / payment / OTP / CAPTCHA / 2FA surface it pauses the agent, sets the task state to `awaiting_takeover`, and hands the browser to you — and **stops observing**: no screenshots, no DOM snapshots, no page text to the planner while you have the browser. The workspace shows a Takeover banner with Resume / Cancel; Resume re-observes from scratch and its first post-takeover observation carries no screenshot. At most 2 takeovers per task (configurable via `PRIVAGENT_MAX_TAKEOVERS_PER_TASK`), 600 s timeout (`PRIVAGENT_TAKEOVER_TIMEOUT_S`), and a surface already taken over once is not taken over again. See `docs/CREDENTIALS_PAYMENTS.md`.
+- **Credential vault (Task 4).** Saved logins live in the encrypted store (`backend/app/vault.py` on top of Task 2's `secrets.py`); the planner sees only a `{{CREDENTIAL:domain:kind:label}}` placeholder, and the real value is substituted in the loop just before the action is sent to the extension — never in prompts, logs, screenshots, or history. Cards store the last 4 digits only (a full card number is rejected, not truncated); OTP/TOTP kinds are rejected outright. The agent never asks for a password in chat, and you can use Chrome's built-in password manager / autofill instead. Manage credentials from the workspace header **Vault** button (`POST/GET/DELETE /api/vault/credentials`, metadata only).
+- **Payments, mock-first (Task 4).** No real card processing and no live Stripe integration. Every payment requires explicit approval **and** takeover regardless of amount, and payments above `PRIVAGENT_MAX_PAYMENT_AMOUNT` (default 5000, `PRIVAGENT_PAYMENT_CURRENCY` default INR) are blocked outright — no currency conversion is performed. `backend/app/payments.py` defines the provider interface (Stripe Link-style one-time virtual card: `create_virtual_card`, `approve_virtual_card`, last-4 only) with a `MockPaymentProvider` by default whose `charge` always raises. Payment attempts are audited (amount, merchant, last-4, approval id — never card details) in `backend/data/payments_audit.jsonl`. See `docs/CREDENTIALS_PAYMENTS.md`.
+- **Blocked outright (Task 4).** The agent never creates an account for you and never permanently deletes/closes one — those actions fail the task honestly, with no gate and no override.
 - **Screenshots are local-only.** `ALLOW_SCREENSHOTS=false` by default. A rendered screenshot is sent to a remote model only when the operator opts in *and* no sensitive field (password, hidden, payment/credential markers) is present. Invalid, oversized (>4 MB), or non-raster images are dropped.
 - **Fail-closed redaction.** If any redaction step throws, the payload is discarded with `PrivacyViolation`; a partial payload is never sent.
 - **URL hygiene.** Userinfo (`user:pass@`), sensitive query/fragment values (`token`, `key`, `session`, `password`, …), and secret patterns are masked before planning or display. Navigation rejects non-`http(s)` schemes, embedded credentials, and CR/LF/backslash injection.
@@ -65,7 +124,7 @@ The backend binds to loopback and only accepts browser origins from `localhost`/
 - **Single activation.** A click resolves to exactly one activation; a typed submit follows exactly one path (Send button → Enter → form submit), never all three. A partially delivered CDP click/keypress is treated as attempted so no duplicate fallback fires.
 - **Cancellation is real.** `POST /api/task/{id}/cancel` marks the loop for stop, wakes a pending confirmation, aborts any in-flight extension action slot, and no further actions execute. A cancel racing the task-create request is replayed once the task id exists.
 - **Retry safety.** Only idempotent actions (`observe`, `scroll`, `wait`, `zoom`, `select_tab`) are retried after a timeout; a click/type/press/navigate timeout is reported instead of risking a duplicate side effect.
-- **No committed secrets.** API keys come from `backend/.env` (gitignored) or the environment.
+- **No committed secrets.** API keys come from the environment or the encrypted secret store (see above) — never from a committed file. `backend/.env` is gitignored; keys placed there are migrated into the encrypted store on first startup and blanked from `.env`. `backend/data/` (store, master key, salt, SQLite DB) is gitignored.
 
 ---
 
@@ -81,22 +140,40 @@ npm run dev
 ### 2. Start the Backend Hub
 ```bash
 cd backend
-# Activate the Python 3.12+ venv
-venv\Scripts\activate
+# Create and activate the Python 3.12+ venv
+python -m venv venv
+source venv/bin/activate          # Linux / macOS
+# venv\Scripts\activate           # Windows
 uvicorn app.main:app --port 8000 --reload --reload-dir app
 # Running on http://localhost:8000
 ```
 
+### 2b. Or run with Docker (Task 5)
+```bash
+cp backend/.env.example backend/.env   # fill in provider keys first
+docker compose up --build
+# Frontend: http://localhost:5173   Backend: http://localhost:8000
+```
+The backend is published on the host loopback only (`127.0.0.1:8000`) — do not
+expose it on your network. State (encrypted secret store, SQLite DB, master
+key) lives in the `privagent-data` volume. The Chrome extension is not
+containerised: load it unpacked from `extension/dist` as in step 3.
+See `docker-compose.yml` and `backend/Dockerfile` for details.
+
 Configure providers in `backend/.env` (only one key is required; with no key the deterministic `mock` provider is used):
 
 ```env
-# Choose groq | gemini | mock (otherwise auto-detected from the keys)
+# Provider selection (otherwise auto-detected from the keys present).
+# Default priority: deepai -> groq -> gemini -> mock (backend/app/config.py).
 NAVIGATOR_PROVIDER=gemini
 GEMINI_API_KEY=your_gemini_api_key_here
 # GROQ_API_KEY=your_groq_api_key_here
+# DEEPAI_GATEWAY_KEY=your_deepai_gateway_key_here
+# ANTSEED_API_KEY=your_antseed_key_here
 # Optional primary-model overrides
 # GEMINI_MODEL=gemini-3.8-flash
 # GROQ_MODEL=openai/gpt-oss-120b
+# DEEPAI_GATEWAY_MODEL=deepseek-v4.1-flash
 
 MAX_STEPS=25
 ALLOW_SCREENSHOTS=false
@@ -148,34 +225,78 @@ observation-cache saving is measured in-process.
 
 ## Test & Benchmark Battery
 
+CI runs all of this on every push and pull request (`.github/workflows/ci.yml`:
+backend pytest on Python 3.12, frontend tests + typecheck on Node 22, extension
+Vitest + typecheck + build, and a gitleaks secret scan). Test counts below were
+recounted from the code at this commit — the old README figures (25 / 35 / 81)
+were stale since long before Tasks 1–4.
+
 The 12-category live runner is at `backend/scripts/realworld_benchmark.py`. It needs an active local backend, connected Chrome extension, and configured test sites; it reports blocked scenarios rather than treating mock tests as live completions. See `docs/PHASE8_STATUS.md` for the command and current gate status.
 
 ```bash
-# 1. Frontend structure, console, and sanitization tests (25 checks)
+# 1. Frontend structure, console, sanitization/security, and recovery tests (64 checks)
 npm test
 
-# 2. Extension Vitest suite (35 tests) + typecheck + build
+# 2. Extension Vitest suite (180 tests, 20 files) + typecheck + build
 cd extension
 npm test
 npx tsc --noEmit
 npm run build
 cd ..
 
-# 3. Backend Pytest suite (81 tests)
+# 3. Backend Pytest suite (914 test functions, 84 files)
 cd backend
-venv\Scripts\python.exe -m pytest tests -q
+source venv/bin/activate          # Linux / macOS
+# venv\Scripts\activate           # Windows
+python -m pytest tests -q
 cd ..
 
 # 4. Benchmark evaluation suite (Tasks A through H, mock harness)
-backend\venv\Scripts\python.exe backend/scripts/benchmark_eval.py
+backend/venv/bin/python backend/scripts/benchmark_eval.py
+
+# 4b. Measured evals (Task 6): checker ASR, privacy leak rate, mock benchmark
+#     with trajectories — offline, mock provider, deterministic.
+backend/venv/bin/python backend/scripts/eval_live.py --suite all
+
+# 4c. External-suite readiness (WebArena / OSWorld / PrivacyLens / AgentDojo)
+#     — reports what is missing; exits 2 while blocked.
+backend/venv/bin/python backend/scripts/eval_external.py webarena
 
 # 5. Live provider smoke test (requires GEMINI_API_KEY)
-backend\venv\Scripts\python.exe backend/scripts/check_gemini.py
+backend/venv/bin/python backend/scripts/check_gemini.py
 ```
+
+> **Proxy note (local runs).** `httpx` reads proxy settings from the environment
+> at import time, and a malformed proxy / `no_proxy` value makes the backend
+> test suite fail at collection with `httpx.InvalidURL`. If you run pytest in
+> an environment with proxy variables set, strip them first:
+> `env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy python -m pytest tests -q`
+> CI does this for the backend job.
 
 ### Benchmark Metrics
 
 `benchmark_eval.py` runs eight deterministic fixture smoke tests and reports only test passes and fixture duration. It does not establish live autonomy accuracy or zero privacy leakage. The 12-category runner in `backend/scripts/realworld_benchmark.py` computes evidence-backed task and action metrics from a connected runtime; its current live readiness status is documented in `docs/PHASE8_STATUS.md`.
+
+Measured numbers now exist for what can be measured offline — see
+`docs/EVALS.md` for the full report, fixtures, and limitations. Run on
+2026-11-16 with the mock provider: checker ASR **0.50 overall**
+(canonical 0.25, evasion 1.0 — the regex checker is blind to
+paraphrase); privacy leak rate **0.2609** (6 of 23 synthetic PII tokens
+reached the planner prompt; every pattern-covered type leaked 0, the
+leaks are bare OTPs, unlabelled passwords, addresses, and a phone in an
+element value); mock benchmark **8/8** fixtures. WebArena-Verified,
+OSWorld 2.0, PrivacyLens and AgentDojo have **not** run — the readiness
+checker (`backend/scripts/eval_external.py`) and exact run commands are
+in `docs/EVALS.md`; all four are blocked on an LLM key and a PrivAgent
+adapter that does not exist yet.
+
+### Dependency Pins
+
+`backend/requirements.txt` pins every direct dependency to the exact version
+verified in `backend/venv`; `package.json` / `extension/package.json` (and their
+lockfiles) pin exact versions too. To upgrade a dependency intentionally,
+bump the pin, reinstall, run the full test suite, and commit the pin together
+with the lockfile change — see the header comment in `backend/requirements.txt`.
 
 ---
 
@@ -199,8 +320,10 @@ sih-26171-landing/
 │   │   ├── privacy.py               # Fail-closed redaction + URL sanitizing
 │   │   ├── hub.py                   # Task registry and socket routing
 │   │   ├── contracts.py             # Mirrored Pydantic schemas
-│   │   └── providers/               # Gemini, Groq, and mock planners
-│   ├── tests/                       # 81 tests (contracts, privacy, loop, A–H, security, latency)
+│   │   └── providers/               # Gemini, Groq, DeepAI, OpenAI-compat, Ollama (local), mock
+│   ├── tests/                       # 586 test functions, 62 files (contracts, privacy, loop, A–H, security, latency)
+│   ├── requirements.txt             # Pinned direct dependencies (see header comment)
+│   ├── Dockerfile                   # Python 3.12-slim, non-root, /api/health check
 │   └── scripts/
 │       ├── check_gemini.py          # Live provider smoke test
 │       └── benchmark_eval.py        # Benchmark metrics runner
@@ -214,7 +337,12 @@ sih-26171-landing/
 │   │   ├── background.ts            # Serialized action queue + WS relay
 │   │   └── relay.ts                 # Pure WebSocket framing
 │   ├── lib/content.ts               # Programmatically injected in-page agent
-│   └── tests/                       # 35 Vitest unit tests
+│   └── tests/                       # 137 Vitest cases, 15 files
+├── .github/workflows/ci.yml         # Backend + frontend + extension + secret scan
+├── docker-compose.yml               # Frontend (5173) + backend (8000), loopback-only
+├── Dockerfile                       # Vite frontend build + preview
+├── LICENSE                          # MIT
+├── CHANGELOG.md                     # Tasks 1–4 and Unreleased (Task 5)
 ├── .claude/
 │   ├── agents/                      # 8 specialist agents
 │   └── skills/                      # 9 project skills

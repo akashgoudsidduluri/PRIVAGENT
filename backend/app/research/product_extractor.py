@@ -98,7 +98,7 @@ def parse_price(text: str) -> tuple[Optional[str], float, str]:
     return formatted, val, currency
 
 
-def parse_emi_details(text: str, price_num: float = 0.0) -> tuple[bool, str]:
+def parse_emi_details(text: str) -> tuple[bool, str]:
     """Extract EMI availability and detailed monthly instalment terms."""
     if not text:
         return False, "Not advertised"
@@ -155,7 +155,7 @@ def extract_product_listings(text: str, domain: str, url: str) -> list[dict[str,
             if not price_str or price_val < 500:  # Filter accessories and noise
                 continue
 
-            emi_avail, emi_info = parse_emi_details(block, price_val)
+            emi_avail, emi_info = parse_emi_details(block)
             rat_m = RATING_RE.search(block)
             rating_val = float(rat_m.group(1)) if rat_m else None
 

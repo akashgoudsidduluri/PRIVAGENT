@@ -149,6 +149,13 @@ class OpenAICompatibleProvider:
     ) -> None:
         self._api_key = api_key or ""
         self.base_url = validate_base_url(base_url)
+        # Task 3: the egress gate lives in _completion (the actual HTTP
+        # call site), not here: construction must stay free so tests can
+        # build a provider with a mock host and patch _completion, and so
+        # a misconfigured gateway fails at first use, before any key is
+        # sent. The base URL is operator-configurable, so at call time it
+        # must be loopback (a local gateway), a pinned provider host, or
+        # a host on the domain allow-list (PRIVAGENT_ALLOWED_DOMAINS).
         self._model = (model or "").strip()
         self._timeout_s = timeout_s
         self.provider_name = provider_name
@@ -284,7 +291,7 @@ class OpenAICompatibleProvider:
         history: list[dict[str, Any]],
         working_memory: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        prompt = build_prompt(instruction, payload, history, working_memory=working_memory)
+        prompt = build_prompt(instruction, payload, history, working_memory=working_memory, allowed_domains=(working_memory or {}).get("allowed_domains"))
         base_payload = {
             "model": self._model,
             "messages": [
@@ -315,6 +322,18 @@ class OpenAICompatibleProvider:
         """
         if not self._model:
             raise ProviderUnavailable(f"{context}: no model id is configured.")
+        # Task 3 egress gate: runs before any request is sent, so a remote
+        # gateway whose host is not on the allow-list never receives the
+        # API key. (Deliberately here, not in __init__: tests construct a
+        # provider with a mock host and patch this method.)
+        from .. import config as _config
+        from ..allowlist import egress_allowed
+
+        if not egress_allowed(self.base_url, allowed_domains=getattr(_config, "ALLOWED_DOMAINS", [])):
+            raise ValueError(
+                f"Base URL host for {self.base_url!r} is not on the egress allow-list: "
+                "use a loopback gateway or add the host to PRIVAGENT_ALLOWED_DOMAINS."
+            )
         started = time.perf_counter()
 
         try:

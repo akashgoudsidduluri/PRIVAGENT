@@ -32,11 +32,28 @@ class TaskRecord:
     pending_confirmation: Optional[dict[str, Any]] = None
     confirm_event: asyncio.Event = field(default_factory=asyncio.Event)
     confirm_decision: Optional[bool] = None
+    # Task 12: set by POST /api/task/{id}/confirm when the operator
+    # chooses "approve this step only". The loop reads it through the
+    # confirm gate and consumes it in the batch gate; it never
+    # overrides a refusal or any safety gate.
+    confirm_step_only: bool = False
+    # Task 4: takeover — the operator has the browser while the agent
+    # observes nothing. ``takeover`` is the operator-facing record
+    # (kind/reason/url/started_at only — never a secret); the event +
+    # decision live here so the REST takeover endpoints and the loop
+    # share exactly one wait.
+    takeover: Optional[dict[str, Any]] = None
+    takeover_event: asyncio.Event = field(default_factory=asyncio.Event)
+    takeover_decision: Optional[bool] = None
     screenshot: Optional[str] = None
     # Phase timings for the UI telemetry (milliseconds).
     planner_ms: Optional[int] = None
     observe_ms: Optional[int] = None
     act_ms: Optional[int] = None
+    # Task 11: per-step loop timings summary (durations, counts,
+    # action types only — never page text, names, or values).
+    # In-memory only; never persisted to a checkpoint.
+    timings: Optional[dict[str, Any]] = None
     created_at: float = field(default_factory=time.monotonic)
     # P5.2 Task Intent & Browser Session Management
     intent: Optional[str] = None
@@ -45,6 +62,28 @@ class TaskRecord:
     child_tab_ids: list[int] = field(default_factory=list)
     terminal_emitted: bool = False
     last_observation: Any = None
+    # Task 3: domain allow-list for this task (None = not configured,
+    # navigation allowed everywhere with a warning at task creation).
+    allowed_domains: Optional[list[str]] = None
+    # Task 9: long-horizon tasks get the 100-step cap + history
+    # compaction; background tasks run without a live WebSocket client
+    # and are pollable via GET /api/task/{id}. Neither flag weakens
+    # any gate — allow-list, confirmation, takeover and payment limits
+    # apply identically.
+    long_horizon: bool = False
+    background: bool = False
+    # Task 9: the task's own tabs. Each entry is
+    # {"tab_id", "url", "title", "active"}; the primary tab is the
+    # first entry. The planner prompt lists them; switch_tab /
+    # select_tab may only target a tab in this registry (unknown tabs
+    # are rejected before anything is sent to the extension).
+    tabs: list[dict[str, Any]] = field(default_factory=list)
+    # Task 14: how this task is being executed — {"via", "connector",
+    # "operation", "mutating", "reason"} for a connector-routed task,
+    # or {"via": "webmcp_tool", "tool": ...} / {"via": "ucp_checkout",
+    # "merchant": ...} once the loop uses a standard tool. Names and
+    # reasons only, never content — safe for the UI and the API.
+    route: Optional[dict[str, Any]] = None
 
 
 class ActionResultSlot:
@@ -66,6 +105,14 @@ class Hub:
         self._action_results: dict[str, ActionResultSlot] = {}
         self._bg_tasks: set[asyncio.Task] = set()
         self._max_retained_tasks = max_retained_tasks
+        # Task 3: operator-attested profile report from the extension
+        # (see /api/isolation/status). Chrome does not expose the profile
+        # directory to extensions, so this is a self-report, not proof.
+        self.extension_profile: dict[str, Any] = {}
+
+    def set_extension_profile(self, info: dict[str, Any]) -> None:
+        if isinstance(info, dict):
+            self.extension_profile = dict(info)
 
     @property
     def extension_ws(self) -> Optional[WebSocket]:
@@ -79,6 +126,8 @@ class Hub:
     def drop_extension(self, ws: WebSocket) -> None:
         if ws in self.extension_sockets:
             self.extension_sockets.remove(ws)
+            if not self.extension_sockets:
+                self.extension_profile = {}
 
     def spawn(self, coro: Coroutine[Any, Any, Any]) -> "asyncio.Task[Any]":
         """Keep a strong reference to fire-and-forget broadcasts so the
@@ -88,11 +137,41 @@ class Hub:
         task.add_done_callback(self._bg_tasks.discard)
         return task
 
-    def new_task(self, instruction: str, chat_id: Optional[str] = None) -> TaskRecord:
+    def new_task(self, instruction: str, chat_id: Optional[str] = None, allowed_domains: Optional[list[str]] = None, long_horizon: bool = False, background: bool = False) -> TaskRecord:
         self._prune_tasks()
-        task = TaskRecord(task_id=uuid.uuid4().hex, instruction=instruction, chat_id=chat_id)
+        task = TaskRecord(task_id=uuid.uuid4().hex, instruction=instruction, chat_id=chat_id, allowed_domains=allowed_domains, long_horizon=long_horizon, background=background)
         self.tasks[task.task_id] = task
         return task
+
+    # -- Task 9: multi-tab registry --------------------------------------
+    # NOTE (Task 9 review): the loop's registry lives in the loop's
+    # working memory (agentLoop._register_tab_in_memory) and is mirrored
+    # onto the record by run_task's progress handler — the helpers below
+    # are NOT called by the loop. They exist for tests and for any future
+    # caller that owns a record directly; do not assume the loop uses them.
+    def register_tab(self, task_id: str, tab_id: int, url: str = "", title: str = "", active: bool = False) -> None:
+        record = self.tasks.get(task_id)
+        if record is None:
+            return
+        for tab in record.tabs:
+            if tab.get("tab_id") == tab_id:
+                tab["url"] = url or tab.get("url", "")
+                tab["title"] = title or tab.get("title", "")
+                break
+        else:
+            record.tabs.append({"tab_id": tab_id, "url": url, "title": title, "active": bool(active)})
+        if active:
+            self.set_active_tab(task_id, tab_id)
+
+    def set_active_tab(self, task_id: str, tab_id: int) -> bool:
+        record = self.tasks.get(task_id)
+        if record is None:
+            return False
+        found = False
+        for tab in record.tabs:
+            tab["active"] = tab.get("tab_id") == tab_id
+            found = found or tab.get("tab_id") == tab_id
+        return found
 
     def _prune_tasks(self) -> None:
         """Bound memory: drop the oldest terminal task records once the
@@ -119,7 +198,14 @@ class Hub:
         action_id = uuid.uuid4().hex
         slot = ActionResultSlot(task_id)
         self._action_results[action_id] = slot
-        message = {"type": "EXECUTE_ACTION", "taskId": action_id, "payload": action}
+        message: dict[str, Any] = {"type": "EXECUTE_ACTION", "taskId": action_id, "payload": action}
+        # Task 3: pass the task's allow-list to the extension so it can
+        # refuse a disallowed navigation itself (defence in depth). The
+        # backend loop is the authoritative gate; the extension check
+        # only matters if a bad action somehow reaches it.
+        _record = self.tasks.get(task_id)
+        if _record is not None and _record.allowed_domains:
+            message["allowedDomains"] = list(_record.allowed_domains)
 
         # Prefer the newest socket, but fall back to older live ones if a
         # send fails (e.g. a half-closed socket still in the registry).
@@ -151,6 +237,21 @@ class Hub:
             # Never leak result slots: every action must clean up exactly once.
             self._action_results.pop(action_id, None)
 
+    async def notify_extension(self, message: dict[str, Any]) -> None:
+        """Fire-and-forget message to the extension (e.g. TAKEOVER_START).
+
+        Unlike :meth:`send_action` this expects no RESULT: takeover
+        notifications must not block the loop waiting on a browser the
+        operator is currently using. Dead sockets are dropped.
+        """
+        if not isinstance(message, dict):
+            return
+        for ws in list(self.extension_sockets):
+            try:
+                await ws.send_json(message)
+            except Exception:
+                self.drop_extension(ws)
+
     async def broadcast_progress(self, task: TaskRecord) -> None:
         from .privacy import scrub_persistent
         if task.state in TERMINAL_STATES:
@@ -172,10 +273,24 @@ class Hub:
                 "plannerMs": task.planner_ms,
                 "observeMs": task.observe_ms,
                 "actMs": task.act_ms,
+                # Task 11: per-step loop timings (durations + counts +
+                # action types only).
+                "timings": task.timings,
                 "intent": task.intent,
                 "sessionId": task.session_id,
                 "primaryTabId": task.primary_tab_id,
                 "childTabIds": task.child_tab_ids,
+                # Task 4: the UI shows the takeover banner from this
+                # field (kind/reason/url only — never a secret).
+                "takeover": task.takeover,
+                # Task 9: long-horizon / background flags and the
+                # task's tab registry (tab ids + urls only).
+                "longHorizon": task.long_horizon,
+                "background": task.background,
+                "tabs": task.tabs,
+                # Task 14: routing decision (connector / browser /
+                # webmcp tool / ucp checkout) — names only.
+                "route": task.route,
                 "isBrowserTask": task.intent != "NON_BROWSER" if task.intent else True,
             },
         }

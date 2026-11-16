@@ -1,0 +1,306 @@
+{
+  "_meta": {
+    "description": "Known-domain directory for website resolution (Task 8). DATA, not code: adding a site means editing this file, never a playbook. Entries are well-known public sites used to resolve \"open X\" requests and to verify official domains. This is NOT a behaviour playbook \u2014 the agent acts on any site via the accessibility tree; this file only maps names to canonical URLs.",
+    "format_version": 1
+  },
+  "amazon": {
+    "allowed_domains": [
+      "amazon.in",
+      "amazon.com"
+    ],
+    "category": "retail",
+    "name": "Amazon",
+    "patterns": [
+      "\\bamazon(?:\\.in|\\.com)?\\b"
+    ],
+    "primary_domain": "amazon.in",
+    "regional_urls": {
+      "GLOBAL": "https://www.amazon.in",
+      "IN": "https://www.amazon.in",
+      "US": "https://www.amazon.com"
+    }
+  },
+  "arxiv": {
+    "allowed_domains": [
+      "arxiv.org"
+    ],
+    "category": "academic",
+    "name": "arXiv",
+    "patterns": [
+      "\\barxiv(?:\\.org)?\\b"
+    ],
+    "primary_domain": "arxiv.org",
+    "regional_urls": {
+      "GLOBAL": "https://arxiv.org"
+    }
+  },
+  "best_buy": {
+    "allowed_domains": [
+      "bestbuy.com"
+    ],
+    "category": "retail",
+    "name": "Best Buy",
+    "patterns": [
+      "\\bbest\\s*buy(?:\\.com)?\\b"
+    ],
+    "primary_domain": "bestbuy.com",
+    "regional_urls": {
+      "GLOBAL": "https://www.bestbuy.com",
+      "US": "https://www.bestbuy.com"
+    }
+  },
+  "croma": {
+    "allowed_domains": [
+      "croma.com"
+    ],
+    "category": "retail",
+    "name": "Croma",
+    "patterns": [
+      "\\bcroma(?:\\.com)?\\b"
+    ],
+    "primary_domain": "croma.com",
+    "regional_urls": {
+      "GLOBAL": "https://www.croma.com",
+      "IN": "https://www.croma.com"
+    }
+  },
+  "ebay": {
+    "allowed_domains": [
+      "ebay.com",
+      "ebay.in"
+    ],
+    "category": "retail",
+    "name": "eBay",
+    "patterns": [
+      "\\bebay(?:\\.com)?\\b"
+    ],
+    "primary_domain": "ebay.com",
+    "regional_urls": {
+      "GLOBAL": "https://www.ebay.com"
+    }
+  },
+  "flipkart": {
+    "allowed_domains": [
+      "flipkart.com"
+    ],
+    "category": "retail",
+    "name": "Flipkart",
+    "patterns": [
+      "\\bflipkart(?:\\.com)?\\b"
+    ],
+    "primary_domain": "flipkart.com",
+    "regional_urls": {
+      "GLOBAL": "https://www.flipkart.com",
+      "IN": "https://www.flipkart.com"
+    }
+  },
+  "github": {
+    "allowed_domains": [
+      "github.com",
+      "raw.githubusercontent.com"
+    ],
+    "category": "code",
+    "name": "GitHub",
+    "patterns": [
+      "\\bgithub(?:\\.com)?\\b"
+    ],
+    "primary_domain": "github.com",
+    "regional_urls": {
+      "GLOBAL": "https://github.com"
+    }
+  },
+  "gmail": {
+    "allowed_domains": [
+      "mail.google.com",
+      "accounts.google.com",
+      "google.com"
+    ],
+    "category": "email",
+    "name": "Gmail",
+    "patterns": [
+      "\\bgmail\\b",
+      "\\bgoogle\\s+mail\\b",
+      "\\bwebmail\\b",
+      "^(?:open\\s+)?(?:mail|email|inbox)$",
+      "\\b(?:check|access|view)\\s+(?:my\\s+)?(?:mail|email|inbox)\\b"
+    ],
+    "primary_domain": "mail.google.com",
+    "regional_urls": {
+      "GLOBAL": "https://mail.google.com"
+    }
+  },
+  "google": {
+    "allowed_domains": [
+      "google.com",
+      "google.co.in",
+      "accounts.google.com"
+    ],
+    "category": "search",
+    "name": "Google",
+    "patterns": [
+      "\\bgoogle(?:\\.co\\.in|\\.com)?\\b"
+    ],
+    "primary_domain": "google.com",
+    "regional_urls": {
+      "GLOBAL": "https://www.google.com",
+      "IN": "https://www.google.com",
+      "US": "https://www.google.com"
+    }
+  },
+  "google_flights": {
+    "allowed_domains": [
+      "google.com",
+      "google.co.in"
+    ],
+    "category": "travel",
+    "name": "Google Flights",
+    "patterns": [
+      "\\bgoogle\\s+flights\\b",
+      "\\bflights\\s+on\\s+google\\b"
+    ],
+    "primary_domain": "google.com",
+    "regional_urls": {
+      "GLOBAL": "https://www.google.com/travel/flights"
+    }
+  },
+  "google_hotels": {
+    "allowed_domains": [
+      "google.com",
+      "google.co.in"
+    ],
+    "category": "travel",
+    "name": "Google Hotels",
+    "patterns": [
+      "\\bgoogle\\s+hotels\\b",
+      "\\bhotels\\s+on\\s+google\\b"
+    ],
+    "primary_domain": "google.com",
+    "regional_urls": {
+      "GLOBAL": "https://www.google.com/travel/hotels"
+    }
+  },
+  "leetcode": {
+    "allowed_domains": [
+      "leetcode.com"
+    ],
+    "category": "coding",
+    "name": "LeetCode",
+    "patterns": [
+      "\\bleetcode(?:\\.com)?\\b"
+    ],
+    "primary_domain": "leetcode.com",
+    "regional_urls": {
+      "GLOBAL": "https://leetcode.com"
+    }
+  },
+  "nature": {
+    "allowed_domains": [
+      "nature.com"
+    ],
+    "category": "academic",
+    "name": "Nature",
+    "patterns": [
+      "\\bnature(?:\\.com)?\\b",
+      "\\bnature\\s+(?:journal|publishing)\\b"
+    ],
+    "primary_domain": "nature.com",
+    "regional_urls": {
+      "GLOBAL": "https://www.nature.com"
+    }
+  },
+  "reddit": {
+    "allowed_domains": [
+      "reddit.com",
+      "old.reddit.com"
+    ],
+    "category": "social",
+    "name": "Reddit",
+    "patterns": [
+      "\\breddit(?:\\.com)?\\b"
+    ],
+    "primary_domain": "reddit.com",
+    "regional_urls": {
+      "GLOBAL": "https://www.reddit.com"
+    }
+  },
+  "reliance_digital": {
+    "allowed_domains": [
+      "reliancedigital.in"
+    ],
+    "category": "retail",
+    "name": "Reliance Digital",
+    "patterns": [
+      "\\breliance\\s+digital\\b",
+      "\\breliancedigital(?:\\.in)?\\b"
+    ],
+    "primary_domain": "reliancedigital.in",
+    "regional_urls": {
+      "GLOBAL": "https://www.reliancedigital.in",
+      "IN": "https://www.reliancedigital.in"
+    }
+  },
+  "samsung": {
+    "allowed_domains": [
+      "samsung.com"
+    ],
+    "category": "retail",
+    "display_name": "Samsung Store",
+    "name": "Samsung",
+    "patterns": [
+      "\\bsamsung(?:'s)?(?:\\s+official)?\\s+(?:store|shop|website|portal)\\b",
+      "\\bsamsung\\.com\\b"
+    ],
+    "primary_domain": "samsung.com",
+    "regional_urls": {
+      "GLOBAL": "https://www.samsung.com",
+      "IN": "https://www.samsung.com/in/",
+      "US": "https://www.samsung.com/us/"
+    }
+  },
+  "walmart": {
+    "allowed_domains": [
+      "walmart.com"
+    ],
+    "category": "retail",
+    "name": "Walmart",
+    "patterns": [
+      "\\bwalmart(?:\\.com)?\\b"
+    ],
+    "primary_domain": "walmart.com",
+    "regional_urls": {
+      "GLOBAL": "https://www.walmart.com",
+      "US": "https://www.walmart.com"
+    }
+  },
+  "wikipedia": {
+    "allowed_domains": [
+      "wikipedia.org",
+      "en.wikipedia.org",
+      "wikimedia.org"
+    ],
+    "category": "knowledge",
+    "name": "Wikipedia",
+    "patterns": [
+      "\\bwikipedia(?:\\.org)?\\b"
+    ],
+    "primary_domain": "wikipedia.org",
+    "regional_urls": {
+      "GLOBAL": "https://en.wikipedia.org"
+    }
+  },
+  "youtube": {
+    "allowed_domains": [
+      "youtube.com",
+      "youtu.be"
+    ],
+    "category": "video",
+    "name": "YouTube",
+    "patterns": [
+      "\\byoutube(?:\\.com)?\\b"
+    ],
+    "primary_domain": "youtube.com",
+    "regional_urls": {
+      "GLOBAL": "https://www.youtube.com"
+    }
+  }
+}

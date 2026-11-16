@@ -137,10 +137,10 @@ async def test_continuous_monitoring_execution(tmp_path):
 
 
 def test_email_dispatch_detection():
-    p1 = "Email this comparison summary to b21650406@gmail.com"
+    p1 = "Email this comparison summary to operator@example.com"
     is_d, recip = is_email_dispatch_instruction(p1)
     assert is_d is True
-    assert recip == "b21650406@gmail.com"
+    assert recip == "operator@example.com"
 
     # Non-email dispatch
     is_d2, _ = is_email_dispatch_instruction("What is on my calendar today?")
@@ -151,15 +151,15 @@ def test_email_dispatch_detection():
 async def test_email_dispatch_execution_when_connected(monkeypatch):
     # Mock oauth_manager to simulate connected account
     from app.connectors.oauth import oauth_manager
-    monkeypatch.setattr(oauth_manager, "verify_connection", lambda p: {"connected": True, "account": "b21650406@gmail.com", "access_token": "mock_token"})
+    monkeypatch.setattr(oauth_manager, "verify_connection", lambda p: {"connected": True, "account": "operator@example.com", "access_token": "mock_token"})
 
     resp = await handle_email_dispatch(
-        instruction="Email this comparison summary to b21650406@gmail.com",
-        recipient="b21650406@gmail.com",
+        instruction="Email this comparison summary to operator@example.com",
+        recipient="operator@example.com",
         chat_id="chat-123",
         history=[],
     )
-    assert "b21650406@gmail.com" in resp
+    assert "operator@example.com" in resp
     assert "Connected Account" in resp
 
 

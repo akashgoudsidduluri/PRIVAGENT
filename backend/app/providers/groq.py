@@ -54,6 +54,14 @@ class GroqProvider:
         self._api_key = api_key
         self._model = model or config.GROQ_MODEL or self.DEFAULT_MODEL
         self._timeout_s = timeout_s
+        # Task 3: egress gate. The Groq endpoint is a pinned constant,
+        # so this always passes in practice — the check exists so a
+        # future change of the endpoint cannot silently send the key
+        # somewhere the allow-list forbids, and so the gate is tested.
+        from ..allowlist import egress_allowed
+
+        if not egress_allowed("https://api.groq.com/openai/v1/chat/completions"):
+            raise ProviderUnavailable("egress blocked: api.groq.com is not on the egress allow-list")
         self._client = httpx.Client(timeout=timeout_s)
         # Telemetry for the UI and audit logs
         self.last_usage: dict[str, Any] = {}
@@ -119,7 +127,7 @@ class GroqProvider:
         history: list[dict[str, Any]],
         working_memory: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        prompt = build_prompt(instruction, payload, history, working_memory=working_memory)
+        prompt = build_prompt(instruction, payload, history, working_memory=working_memory, allowed_domains=(working_memory or {}).get("allowed_domains"))
         models_to_try = [self._model] + [m for m in self.FALLBACK_MODELS if m != self._model]
         last_exc: Exception | None = None
         quota_hint = ""

@@ -1,0 +1,61 @@
+# PrivAgent — local Docker setup (frontend + backend).
+#
+#   cp backend/.env.example backend/.env   # fill in provider keys first
+#   docker compose up --build
+#
+# Frontend: http://localhost:5173   Backend: http://localhost:8000
+#
+# The backend is published on the host loopback only (127.0.0.1:8000).
+# Do not change this to 0.0.0.0:8000 — the backend is a single-user local
+# tool with a local operator token, not a network service (see README).
+# The workspace runs in your browser and talks to the backend at
+# http://localhost:8000, which is why the loopback publish is enough.
+#
+# State: backend/data/ (encrypted secret store, SQLite DB, master key,
+# payments audit log) lives in the named volume `privagent-data` and
+# survives `docker compose down` / rebuilds. Remove it only if you intend
+# to lose every stored secret — losing the master key makes stored secrets
+# unrecoverable (see README, "Encrypted secret store").
+# The Chrome extension is not containerised: load it unpacked from
+# extension/dist as before (see README) and point it at localhost:8000.
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    image: privagent-backend
+    container_name: privagent-backend
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    env_file:
+      - backend/.env
+    environment:
+      # The gateway / planner hosts are loopback by default; keep them that
+      # way unless you run a gateway elsewhere on your own machine.
+      DEEPAI_GATEWAY_BASE_URL: http://127.0.0.1:8787/v1
+    volumes:
+      - privagent-data:/app/backend/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=4)); raise SystemExit(0 if d.get('status')=='ok' else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: privagent-frontend
+    container_name: privagent-frontend
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5173:5173"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  privagent-data:

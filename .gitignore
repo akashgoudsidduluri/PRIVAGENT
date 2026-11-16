@@ -37,3 +37,14 @@ artifact_proof
 *.db-wal
 *.db-shm
 
+# Secret material (Task 2/5): already covered by backend/data/ above, but
+# listed explicitly so a future move of these files out of backend/data/
+# does not silently start tracking them. Never commit a real value.
+backend/data/.master.key
+backend/data/.local_token
+backend/data/secrets.enc.json
+backend/data/payments_audit.jsonl
+.local_token
+.master.key
+secrets.enc.json
+

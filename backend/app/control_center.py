@@ -13,6 +13,7 @@ from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field, HttpUrl
 
 from . import db
+from . import secrets as secrets_store
 from .monitoring_scheduler import next_due_at
 from .hub import hub
 
@@ -195,7 +196,8 @@ def activity():
     with db.get_connection() as conn:
         for row in conn.execute("SELECT task_id,updated_at,history FROM task_checkpoints ORDER BY updated_at DESC LIMIT 40"):
             try:
-                history = json.loads(row["history"] or "[]")
+                # Task 2: checkpoint history is Fernet-encrypted at rest.
+                history = json.loads(secrets_store.decrypt_text(row["history"] or "[]") or "[]")
             except (ValueError, TypeError):
                 continue
             for step_index, item in enumerate(history[-20:]):
@@ -271,9 +273,60 @@ def benchmark_receipts(task_id: str):
 def privacy_status():
     from . import config
     from .privacy import privacy_counters, privacy_events
+    # Task 12: the Privacy Center view. Planner status, zero-retention
+    # and local-only flags are backend env vars — read-only here; the
+    # UI says so and never pretends a toggle changes the server.
+    # Tracker hosts mirror extension/rules/trackers.json (see
+    # tracker_hosts.py); the DPIA summary is static text with a link
+    # to the full document, not a live evaluation.
+    from .providers import provider_settings
+    from .tracker_hosts import tracker_hosts
+    from .zero_retention import is_enabled as zero_retention_enabled
+
+    planner = provider_settings.public_state()
+    # Task 14: connector configuration status for the Privacy Center.
+    # `configured()` is a local check (credentials present in the
+    # encrypted store) — it makes no network call, unlike
+    # `verify_connection`, which hits the live API. "Configured" here
+    # means credentials exist; liveness is only known when a call is
+    # made, and the router fails honestly when it is not.
+    try:
+        from .oauth import oauth_manager
+
+        _connectors = {
+            "google": {"configured": bool(oauth_manager.configured("google"))},
+        }
+    except Exception:
+        _connectors = {"google": {"configured": False}}
     return {"screenshotsAllowed": bool(config.ALLOW_SCREENSHOTS),
             "counters": privacy_counters(), "events": privacy_events(),
-            "policy": "Detected credentials and PII are redacted before model input."}
+            "policy": "Detected credentials and PII are redacted before model input.",
+            "planner": {
+                "provider": planner.get("provider"),
+                "model": planner.get("model"),
+                "keyConfigured": bool(planner.get("keyConfigured")),
+                "local": planner.get("provider") == "ollama",
+                "localOnly": bool(config.PLANNER_LOCAL_ONLY),
+            },
+            "zeroRetention": bool(zero_retention_enabled()),
+            "connectors": _connectors,
+            "trackerHosts": tracker_hosts(),
+            "trackerNote": (
+                "The agent profile blocks these 24 known tracker, ad, session-replay "
+                "and fingerprinting hosts with a declarativeNetRequest ruleset. It is "
+                "a named list, not a maintained subscription like EasyList — new "
+                "trackers outside the list are not blocked."
+            ),
+            "dpia": {
+                "summary": (
+                    "PrivAgent redacts credentials and PII before any page text reaches "
+                    "a planner, keeps secrets encrypted at rest, and never lets page "
+                    "content write memory or approve itself. Measured risks: the "
+                    "injection checker misses paraphrased attacks (evasion ASR 1.0), "
+                    "and the SQLite file itself is plaintext — see docs/DPIA.md."
+                ),
+                "url": "https://github.com/Prateek2007-cmd/PRIVAGENT/blob/main/docs/DPIA.md",
+            }}
 
 
 class ScreenshotConsent(BaseModel):

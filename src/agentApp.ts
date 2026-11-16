@@ -1,5 +1,9 @@
 import "./styles/agent.css";
 import { escapeHtml, linkify, linkLabel, renderMarkdown, safeHttpUrl, safeImageSrc } from "./sanitize";
+import { taskRouteLabel } from "./routeLabel";
+import { apiFetch, artifactUrl, wsUrl } from "./auth";
+import { formatPlanStep, planPreviewTitle, type PlanPreviewStep } from "./planPreview";
+import { buildTimelineRows, formatDuration, timelineSummary } from "./timeline";
 
 const API = "http://localhost:8000";
 
@@ -55,7 +59,7 @@ async function loadArtifacts(taskId?: string | null, chatId?: string | null): Pr
   }
 
   try {
-    const res = await fetch(targetUrl);
+    const res = await apiFetch(targetUrl);
     if (!res.ok) {
       artifactsCard.hidden = true;
       return;
@@ -73,9 +77,16 @@ async function loadArtifacts(taskId?: string | null, chatId?: string | null): Pr
     list.forEach(art => {
       const itemEl = document.createElement("div");
       itemEl.className = "artifact-item";
-      const fmt = (art.file_format || "file").toLowerCase();
+      // Task 12 XSS audit: file_format is backend-supplied metadata, so
+      // it must never be interpolated raw into a class attribute. Only
+      // a known format token is used; anything else falls back to "file".
+      const KNOWN_FORMATS = new Set(["pdf", "docx", "pptx", "xlsx", "csv", "html", "md", "txt", "png", "jpg", "jpeg"]);
+      const fmt = KNOWN_FORMATS.has((art.file_format || "").toLowerCase()) ? (art.file_format || "file").toLowerCase() : "file";
       const badgeCls = `artifact-format-badge artifact-format-badge--${fmt}`;
       const sizeStr = formatBytes(art.file_size_bytes || 0);
+      // artifact_id is backend-generated hex, but encode it anyway so a
+      // compromised/compromising id can never break out of the href.
+      const artId = encodeURIComponent(art.artifact_id || "");
 
       itemEl.innerHTML = `
         <div class="artifact-info">
@@ -86,8 +97,8 @@ async function loadArtifacts(taskId?: string | null, chatId?: string | null): Pr
           </div>
         </div>
         <div class="artifact-actions">
-          <a href="${API}/api/artifacts/${art.artifact_id}/preview" target="_blank" rel="noopener noreferrer" class="btn-artifact btn-artifact--preview">Preview</a>
-          <a href="${API}/api/artifacts/${art.artifact_id}/download" class="btn-artifact btn-artifact--download" download>Download</a>
+          <a href="${artifactUrl(`${API}/api/artifacts/${artId}/preview`)}" target="_blank" rel="noopener noreferrer" class="btn-artifact btn-artifact--preview">Preview</a>
+          <a href="${artifactUrl(`${API}/api/artifacts/${artId}/download`)}" class="btn-artifact btn-artifact--download" download>Download</a>
         </div>
       `;
       artifactsList.appendChild(itemEl);
@@ -101,7 +112,21 @@ async function loadArtifacts(taskId?: string | null, chatId?: string | null): Pr
 const humanGate = document.getElementById("humanGate") as HTMLElement | null;
 const humanGateMsg = document.getElementById("humanGateMsg") as HTMLElement | null;
 const btnGateApprove = document.getElementById("btnGateApprove") as HTMLButtonElement | null;
+const btnGateApproveStep = document.getElementById("btnGateApproveStep") as HTMLButtonElement | null;
 const btnGateReject = document.getElementById("btnGateReject") as HTMLButtonElement | null;
+const planPreview = document.getElementById("planPreview") as HTMLElement | null;
+const planPreviewTitleEl = document.getElementById("planPreviewTitle") as HTMLElement | null;
+const planPreviewList = document.getElementById("planPreviewList") as HTMLOListElement | null;
+const taskTimelineCard = document.getElementById("taskTimelineCard") as HTMLElement | null;
+const taskTimelineList = document.getElementById("taskTimelineList") as HTMLOListElement | null;
+const timelineSummaryEl = document.getElementById("timelineSummary") as HTMLElement | null;
+
+// Takeover Banner (Task 4: the agent is paused and not watching)
+const takeoverBanner = document.getElementById("takeoverBanner") as HTMLElement | null;
+const takeoverMsg = document.getElementById("takeoverMsg") as HTMLElement | null;
+const takeoverMeta = document.getElementById("takeoverMeta") as HTMLElement | null;
+const btnTakeoverResume = document.getElementById("btnTakeoverResume") as HTMLButtonElement | null;
+const btnTakeoverCancel = document.getElementById("btnTakeoverCancel") as HTMLButtonElement | null;
 
 // Inspector
 const inspectorUrl = document.getElementById("inspectorUrl") as HTMLAnchorElement | null;
@@ -171,6 +196,8 @@ interface ActiveTaskInfo {
   primaryTabId?: number | null;
   childTabIds?: number[];
   steps?: ChatStepItem[];
+  // Task 4: the active takeover request, if any (kind/reason/url only).
+  takeover?: { kind?: string; reason?: string; url?: string } | null;
 }
 
 interface ChatDetail {
@@ -200,6 +227,11 @@ function setTaskState(state: string): void {
   } else if (state === "completed") {
     stateBadge.style.color = "#34d399";
     stateBadge.style.background = "rgba(52, 211, 153, 0.2)";
+  } else if (state === "awaiting_takeover") {
+    // Task 4: takeover is not an error — amber, distinct from the
+    // confirmation gate's default styling.
+    stateBadge.style.color = "#fbbf24";
+    stateBadge.style.background = "rgba(251, 191, 36, 0.2)";
   } else if (["failed", "cancelled"].includes(state)) {
     stateBadge.style.color = "#f87171";
     stateBadge.style.background = "rgba(248, 113, 113, 0.2)";
@@ -222,7 +254,7 @@ function renderStepBudget(): void {
 
 async function loadTelemetryConfig(): Promise<void> {
   try {
-    const res = await fetch(`${API}/api/health`);
+    const res = await apiFetch(`${API}/api/health`);
     if (!res.ok) return;
     const h = (await res.json()) as { maxSteps?: number; allowScreenshots?: boolean };
     if (typeof h.maxSteps === "number" && h.maxSteps > 0) stepBudget = h.maxSteps;
@@ -371,7 +403,10 @@ function formatResultHtml(rawMessage: string): string {
       <span class="suggested-moves__label">Suggested Next Moves:</span>
       <div class="suggested-moves__chips">
         <button class="suggested-chip" data-prompt="Export this comparison into a formatted Excel spreadsheet">📊 Export to Excel</button>
-        <button class="suggested-chip" data-prompt="Email this comparison summary to b21650406@gmail.com">📧 Email this to me</button>
+        <!-- "Email this to me": no address is baked in here. The operator's
+             address is resolved at runtime from the connected Gmail account
+             (or asked for); a personal address must never ship in source. -->
+        <button class="suggested-chip" data-prompt="Email this comparison summary to me">📧 Email this to me</button>
         <button class="suggested-chip" data-prompt="Continuously monitor this product price and notify me if it drops">🔔 Monitor price for drops</button>
         <button class="suggested-chip" data-prompt="What is on my calendar this week?">📅 Check Google Calendar</button>
       </div>
@@ -532,7 +567,7 @@ function addCompletionStepItem(taskState: string, message: string): void {
 
 async function syncActiveTask(taskId: string): Promise<boolean> {
   try {
-    const res = await fetch(`${API}/api/task/${taskId}`);
+    const res = await apiFetch(`${API}/api/task/${taskId}`);
     if (!res.ok) {
       if (res.status === 404 && currentTaskId === taskId) {
         stopFallbackPolling();
@@ -552,6 +587,10 @@ async function syncActiveTask(taskId: string): Promise<boolean> {
       primaryTabId?: number | null;
       childTabIds?: number[] | null;
       steps?: ChatStepItem[];
+      timings?: {
+        steps?: Array<{ step: number; action: string; batched: boolean; cache: string; checker_skipped: boolean; total_ms: number; overhead_ms: number }>;
+        overhead_ms?: number;
+      } | null;
     };
     if (currentTaskId !== taskId) return false;
     lastProgressTime = Date.now();
@@ -563,7 +602,15 @@ async function syncActiveTask(taskId: string): Promise<boolean> {
       } else if (t.sessionId) {
         const tabInfo = t.primaryTabId ? ` · Tab #${t.primaryTabId}` : "";
         const childInfo = t.childTabIds && t.childTabIds.length > 0 ? ` (+${t.childTabIds.length} child tabs)` : "";
-        missionSubtext.innerHTML = `<span style="color: #38bdf8; font-weight: 500;">🌐 Session: ${t.sessionId.slice(0, 8)}${tabInfo}${childInfo}</span>`;
+        missionSubtext.innerHTML = `<span style="color: #38bdf8; font-weight: 500;">🌐 Session: ${escapeHtml(t.sessionId.slice(0, 8))}${tabInfo}${childInfo}</span>`;
+      }
+      // Task 14: routing decision ("via Gmail connector" / "via
+      // WebMCP tool X" / "via UCP checkout"). The label is built from
+      // names only and escaped; the set above resets innerHTML on
+      // every poll, so appending here cannot accumulate.
+      const routeText = taskRouteLabel((t as any).route);
+      if (routeText) {
+        missionSubtext.innerHTML += ` <span style="color: #34d399; font-weight: 500;">${escapeHtml(routeText)}</span>`;
       }
     }
 
@@ -581,6 +628,8 @@ async function syncActiveTask(taskId: string): Promise<boolean> {
         }
       });
     }
+    // Task 12: task timeline from the loop timings + history steps.
+    renderTaskTimeline(t);
     if (["completed", "failed", "cancelled"].includes(t.taskState)) {
       renderCompletion(t.taskState, t.message || "", true, t.stepsDone);
       loadChatList();
@@ -623,6 +672,7 @@ function renderCompletion(taskState: string, message: string, appendToTimeline =
   setButtonWorking(false);
   if (btnCancelMission) btnCancelMission.hidden = true;
   if (humanGate) humanGate.hidden = true;
+  if (takeoverBanner) takeoverBanner.hidden = true;
   if (typeof stepsDone === "number" && stepsDone > 0) {
     updateStepsCount(stepsDone);
   }
@@ -665,15 +715,102 @@ function renderCompletion(taskState: string, message: string, appendToTimeline =
   }
 }
 
-function showHumanGate(msg: string): void {
+function showHumanGate(msg: string, plan?: PlanPreviewStep[] | null): void {
   if (!humanGate) return;
   if (humanGateMsg) humanGateMsg.textContent = msg || "Sign-in or authentication required to continue.";
+  // Task 12: plan preview — the whole validated plan, in plain
+  // language, before the operator decides. Each line is rendered
+  // with textContent (never innerHTML): a target name may echo page
+  // text, and page text is untrusted.
+  if (planPreview && planPreviewList && planPreviewTitleEl) {
+    if (Array.isArray(plan) && plan.length > 0) {
+      planPreviewTitleEl.textContent = planPreviewTitle(plan);
+      planPreviewList.replaceChildren();
+      for (const step of plan) {
+        const li = document.createElement("li");
+        li.textContent = formatPlanStep(step);
+        planPreviewList.appendChild(li);
+      }
+      planPreview.hidden = false;
+    } else {
+      planPreview.hidden = true;
+    }
+  }
   humanGate.hidden = false;
   humanGate.scrollIntoView({ behavior: "smooth", block: "center" });
 }
 
 function hideHumanGate(): void {
   if (humanGate) humanGate.hidden = true;
+  if (planPreview) planPreview.hidden = true;
+}
+
+// Task 12: task timeline — one row per executed step from the Task 11
+// loop timings joined to the checkpoint history (status). Timings
+// carry action types and durations only, so every cell is text.
+function renderTaskTimeline(t: {
+  timings?: { steps?: Array<{ step: number; action: string; batched: boolean; cache: string; checker_skipped: boolean; total_ms: number; overhead_ms: number }>; overhead_ms?: number } | null;
+  steps?: Array<{ stepNum: number; message?: string; status?: string; result_ok?: boolean }> | null;
+}): void {
+  if (!taskTimelineCard || !taskTimelineList || !timelineSummaryEl) return;
+  const rows = buildTimelineRows(t.timings?.steps, t.steps);
+  if (rows.length === 0) {
+    taskTimelineCard.hidden = true;
+    return;
+  }
+  timelineSummaryEl.textContent = timelineSummary(rows, t.timings?.overhead_ms);
+  taskTimelineList.replaceChildren();
+  for (const row of rows) {
+    const li = document.createElement("li");
+    li.className = "task-timeline__row";
+    const step = document.createElement("span");
+    step.className = "task-timeline__step";
+    step.textContent = `#${row.step}`;
+    const action = document.createElement("span");
+    action.className = "task-timeline__action";
+    action.textContent = row.action;
+    const status = document.createElement("span");
+    status.className = `task-timeline__status task-timeline__status--${row.status}`;
+    status.textContent = row.status;
+    const dur = document.createElement("span");
+    dur.className = "task-timeline__duration";
+    dur.textContent = formatDuration(row.durationMs);
+    const flags = document.createElement("span");
+    flags.className = "task-timeline__flags";
+    flags.textContent = [
+      row.batched ? "batched" : null,
+      row.cache !== "n/a" ? `cache ${row.cache}` : null,
+      row.checkerSkipped ? "checker skipped" : null,
+    ].filter(Boolean).join(" · ") || "—";
+    li.append(step, action, status, dur, flags);
+    taskTimelineList.appendChild(li);
+  }
+  taskTimelineCard.hidden = false;
+}
+
+// ----------------------------------------------------
+// Takeover (Task 4)
+// ----------------------------------------------------
+// While takeover is active the agent is paused and observes nothing:
+// no screenshots, no DOM snapshots, no page text to the planner. The
+// banner tells the operator what to do in the tab and offers Resume /
+// Cancel. The reason and URL shown here come from the backend's
+// takeover record (kind/reason/url only — never a secret).
+function showTakeover(takeover: { kind?: string; reason?: string; url?: string } | null | undefined): void {
+  if (!takeoverBanner) return;
+  const kind = takeover?.kind || "login";
+  const reason = takeover?.reason || "A login / payment step needs you to complete it in the browser.";
+  if (takeoverMsg) takeoverMsg.textContent = reason;
+  if (takeoverMeta) {
+    const where = takeover?.url ? ` · ${takeover.url}` : "";
+    takeoverMeta.textContent = `Takeover: ${kind}${where} — the agent is not watching the page while you do this.`;
+  }
+  takeoverBanner.hidden = false;
+  takeoverBanner.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+function hideTakeover(): void {
+  if (takeoverBanner) takeoverBanner.hidden = true;
 }
 
 // ----------------------------------------------------
@@ -683,7 +820,7 @@ function hideHumanGate(): void {
 async function loadChatList(): Promise<void> {
   if (!chatHistoryList) return;
   try {
-    const res = await fetch(`${API}/api/chats`);
+    const res = await apiFetch(`${API}/api/chats`);
     if (!res.ok) return;
     const chats = (await res.json()) as ChatSummary[];
 
@@ -780,7 +917,7 @@ async function selectChat(chatId: string): Promise<void> {
   }
 
   try {
-    const res = await fetch(`${API}/api/chat/${chatId}`);
+    const res = await apiFetch(`${API}/api/chat/${chatId}`);
     if (!res.ok) return;
     const detail = (await res.json()) as ChatDetail;
     // /api/chat/{id} returns a FLAT shape (chat fields + messages + memory),
@@ -857,7 +994,7 @@ async function selectChat(chatId: string): Promise<void> {
     }
 
     // Check if there is an active in-flight task for this chat to reconnect to
-    if (detail.active_task && ["planning", "running", "awaiting_confirmation"].includes(detail.active_task.taskState)) {
+    if (detail.active_task && ["planning", "running", "awaiting_confirmation", "awaiting_takeover"].includes(detail.active_task.taskState)) {
       const act = detail.active_task;
       currentTaskId = act.taskId;
       setButtonWorking(true);
@@ -883,13 +1020,23 @@ async function selectChat(chatId: string): Promise<void> {
       }
       if (resultCard) resultCard.hidden = true;
       if (act.taskState === "awaiting_confirmation") {
-        fetch(`${API}/api/task/${act.taskId}`)
+        apiFetch(`${API}/api/task/${act.taskId}`)
           .then(r => r.json())
           .then(t => {
             const m = t.pending_confirmation?.message ?? "Authentication / Sign-in required";
-            showHumanGate(m);
+            showHumanGate(m, t.pending_confirmation?.plan ?? null);
           })
           .catch(() => showHumanGate("Authentication / Sign-in required"));
+      }
+      if (act.taskState === "awaiting_takeover") {
+        if (act.takeover) {
+          showTakeover(act.takeover);
+        } else {
+          apiFetch(`${API}/api/task/${act.taskId}/takeover`)
+            .then(r => r.json())
+            .then(t => showTakeover(t.takeover))
+            .catch(() => showTakeover(null));
+        }
       }
     } else if (!isPendingUserTurn && lastAgentMsg) {
       activeInstruction = lastUserMsg;
@@ -913,7 +1060,7 @@ async function deleteChat(chatId: string): Promise<void> {
     // Storage restricted
   }
   try {
-    await fetch(`${API}/api/chat/${chatId}`, { method: "DELETE" });
+    await apiFetch(`${API}/api/chat/${chatId}`, { method: "DELETE" });
   } catch {
     // Offline
   }
@@ -1088,7 +1235,7 @@ btnStartMission?.addEventListener("click", async () => {
         reader.onerror = () => reject(new Error("Could not read attachment"));
         reader.readAsDataURL(selectedFile);
       });
-      const uploadResponse = await fetch(`${API}/api/attachments`, {
+      const uploadResponse = await apiFetch(`${API}/api/attachments`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ fileName: selectedFile.name, base64: encoded }),
       });
@@ -1097,13 +1244,13 @@ btnStartMission?.addEventListener("click", async () => {
     }
     let res: Response;
     if (activeChatId) {
-      res = await fetch(`${API}/api/chat/${activeChatId}/message`, {
+      res = await apiFetch(`${API}/api/chat/${activeChatId}/message`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ instruction, fileToken }),
       });
     } else {
-      res = await fetch(`${API}/api/task`, {
+      res = await apiFetch(`${API}/api/task`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ instruction, fileToken }),
@@ -1122,7 +1269,7 @@ btnStartMission?.addEventListener("click", async () => {
     // Cancel clicked while POST was in flight
     if (cancelRequested && currentTaskId) {
       try {
-        await fetch(`${API}/api/task/${currentTaskId}/cancel`, { method: "POST" });
+        await apiFetch(`${API}/api/task/${currentTaskId}/cancel`, { method: "POST" });
       } catch { /* offline */ }
       setTaskState("cancelled");
       if (btnCancelMission) btnCancelMission.hidden = true;
@@ -1133,7 +1280,7 @@ btnStartMission?.addEventListener("click", async () => {
     // Start background sync / polling for active task
     if (currentTaskId) {
       startFallbackPolling(currentTaskId);
-      const stRes = await fetch(`${API}/api/task/${currentTaskId}`).catch(() => null);
+      const stRes = await apiFetch(`${API}/api/task/${currentTaskId}`).catch(() => null);
       if (stRes && stRes.ok) {
         const t = (await stRes.json()) as { taskState: string; message: string; stepsDone?: number; screenshot?: string | null };
         if (t.taskState && t.taskState !== "planning") {
@@ -1169,7 +1316,7 @@ btnCancelMission?.addEventListener("click", async () => {
   hideHumanGate();
   if (id) {
     try {
-      await fetch(`${API}/api/task/${id}/cancel`, { method: "POST" });
+      await apiFetch(`${API}/api/task/${id}/cancel`, { method: "POST" });
     } catch {
       // Offline
     }
@@ -1181,21 +1328,50 @@ btnCancelMission?.addEventListener("click", async () => {
 btnGateApprove?.addEventListener("click", async () => {
   if (!currentTaskId) return;
   hideHumanGate();
-  await fetch(`${API}/api/task/${currentTaskId}/confirm`, {
+  await apiFetch(`${API}/api/task/${currentTaskId}/confirm`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ decision: "approve" }),
   });
 });
 
+// Task 12: approve this step only — the backend runs the pending step
+// and then re-plans, so the next step gets its own preview instead of
+// running on as part of the pinned batch. This is a gate decision,
+// not an override: the loop still enforces every safety gate.
+btnGateApproveStep?.addEventListener("click", async () => {
+  if (!currentTaskId) return;
+  hideHumanGate();
+  await apiFetch(`${API}/api/task/${currentTaskId}/confirm`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ decision: "approve_step" }),
+  });
+});
+
 btnGateReject?.addEventListener("click", async () => {
   if (!currentTaskId) return;
   hideHumanGate();
-  await fetch(`${API}/api/task/${currentTaskId}/confirm`, {
+  await apiFetch(`${API}/api/task/${currentTaskId}/confirm`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ decision: "reject" }),
   });
+});
+
+// Task 4: takeover resume / cancel. Resume tells the backend the
+// operator finished the manual step; the loop re-observes from scratch
+// (its first post-takeover observation carries no screenshot).
+btnTakeoverResume?.addEventListener("click", async () => {
+  if (!currentTaskId) return;
+  hideTakeover();
+  await apiFetch(`${API}/api/task/${currentTaskId}/takeover/resume`, { method: "POST" });
+});
+
+btnTakeoverCancel?.addEventListener("click", async () => {
+  if (!currentTaskId) return;
+  hideTakeover();
+  await apiFetch(`${API}/api/task/${currentTaskId}/takeover/cancel`, { method: "POST" });
 });
 
 // ----------------------------------------------------
@@ -1203,7 +1379,7 @@ btnGateReject?.addEventListener("click", async () => {
 // ----------------------------------------------------
 
 function connectWebSocket(): void {
-  const ws = new WebSocket(`ws://localhost:8000/ws/client`);
+  const ws = new WebSocket(wsUrl(`ws://localhost:8000/ws/client`));
 
   ws.onopen = () => {
     setConnectionStatus(true, "Online");
@@ -1231,6 +1407,8 @@ function connectWebSocket(): void {
           sessionId?: string | null;
           primaryTabId?: number | null;
           childTabIds?: number[] | null;
+          // Task 4: the active takeover request, if any.
+          takeover?: { kind?: string; reason?: string; url?: string } | null;
         };
       };
       if (env.type !== "PROGRESS") return;
@@ -1257,6 +1435,11 @@ function connectWebSocket(): void {
           const childInfo = p.childTabIds && p.childTabIds.length > 0 ? ` (+${p.childTabIds.length} child tabs)` : "";
           missionSubtext.innerHTML = `<span style="color: #38bdf8; font-weight: 500;">🌐 Session: ${escapeHtml(p.sessionId.slice(0, 8))}${tabInfo}${childInfo}</span>`;
         }
+        // Task 14: routing decision — see the polling path above.
+        const routeText = taskRouteLabel((p as any).route);
+        if (routeText) {
+          missionSubtext.innerHTML += ` <span style="color: #34d399; font-weight: 500;">${escapeHtml(routeText)}</span>`;
+        }
       }
 
       if (["completed", "failed", "cancelled"].includes(p.taskState)) {
@@ -1274,12 +1457,27 @@ function connectWebSocket(): void {
       }
 
       if (p.taskState === "awaiting_confirmation") {
-        fetch(`${API}/api/task/${env.taskId}`)
+        apiFetch(`${API}/api/task/${env.taskId}`)
           .then(r => r.json())
           .then(t => {
             const msg = t.pending_confirmation?.message ?? "Authentication / Sign-in required";
-            showHumanGate(msg);
+            showHumanGate(msg, t.pending_confirmation?.plan ?? null);
           });
+      }
+
+      if (p.taskState === "awaiting_takeover") {
+        // The broadcast already carries the takeover record; fetch only
+        // as a fallback (e.g. a reconnect that missed the first frame).
+        if (p.takeover) {
+          showTakeover(p.takeover);
+        } else {
+          apiFetch(`${API}/api/task/${env.taskId}/takeover`)
+            .then(r => r.json())
+            .then(t => showTakeover(t.takeover))
+            .catch(() => showTakeover(null));
+        }
+      } else if (takeoverBanner && !takeoverBanner.hidden) {
+        hideTakeover();
       }
     } catch {
       // non-JSON frame
@@ -1300,6 +1498,349 @@ function connectWebSocket(): void {
 connectWebSocket();
 loadChatList();
 initLlmSettings();
+initVaultSettings();
+
+// ---------------------------------------------------------------------------
+// Credential vault (Task 4) — /api/vault/credentials.
+// Values are password-typed, sent once over the authenticated API, and
+// never rendered back: the list endpoint returns metadata (domain /
+// kind / label / placeholder) only, and the value field is cleared
+// after every save. OTP / one-time-code kinds are rejected by the
+// backend vault, not here.
+// ---------------------------------------------------------------------------
+
+interface VaultCredentialMeta {
+  domain: string;
+  kind: string;
+  label: string;
+  username?: string | null;
+  placeholder: string;
+}
+
+async function refreshVaultList(): Promise<void> {
+  const list = $("vaultList") as HTMLUListElement | null;
+  if (!list) return;
+  list.innerHTML = "";
+  try {
+    const res = await apiFetch(`${API}/api/vault/credentials`);
+    if (!res.ok) return;
+    const data = (await res.json()) as { credentials: VaultCredentialMeta[] };
+    for (const cred of data.credentials || []) {
+      const li = document.createElement("li");
+      li.textContent = `${cred.domain} · ${cred.kind} · ${cred.label} — ${cred.placeholder}`;
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "btn btn--sm btn--ghost";
+      del.textContent = "Delete";
+      del.addEventListener("click", async () => {
+        await apiFetch(
+          `${API}/api/vault/credentials/${encodeURIComponent(cred.domain)}/${encodeURIComponent(cred.kind)}/${encodeURIComponent(cred.label)}`,
+          { method: "DELETE" },
+        );
+        await refreshVaultList();
+      });
+      li.appendChild(del);
+      list.appendChild(li);
+    }
+    if (list.children.length === 0) {
+      const li = document.createElement("li");
+      li.textContent = "No saved credentials yet.";
+      list.appendChild(li);
+    }
+  } catch {
+    // Offline: leave the list empty rather than showing stale data.
+  }
+}
+
+async function saveVaultCredential(): Promise<void> {
+  const status = $("vaultSaveStatus");
+  const domain = ($("vaultDomain") as HTMLInputElement | null)?.value.trim() || "";
+  const kind = ($("vaultKind") as HTMLSelectElement | null)?.value || "login";
+  const label = ($("vaultLabel") as HTMLInputElement | null)?.value.trim() || "";
+  const username = ($("vaultUsername") as HTMLInputElement | null)?.value.trim() || "";
+  const valueInput = $("vaultValue") as HTMLInputElement | null;
+  const value = valueInput?.value || "";
+  if (!domain || !label || !value) {
+    if (status) status.textContent = "Domain, label, and the secret are all required.";
+    return;
+  }
+  if (status) status.textContent = "Saving…";
+  try {
+    const res = await apiFetch(`${API}/api/vault/credentials`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ domain, kind, label, username: username || null, value }),
+    });
+    if (!res.ok) {
+      const detail = await res.json().catch(() => null) as { detail?: string } | null;
+      if (status) status.textContent = detail?.detail || `Could not save (backend ${res.status}).`;
+      return;
+    }
+    if (status) status.textContent = "Saved — the value is encrypted and will never be shown again.";
+    // The secret must not linger in the page: clear the field at once.
+    if (valueInput) valueInput.value = "";
+    await refreshVaultList();
+  } catch {
+    if (status) status.textContent = "Backend offline — could not save.";
+  }
+}
+
+function initVaultSettings(): void {
+  const overlay = $("vaultOverlay");
+  const openBtn = $("btnVaultSettings");
+  const closeBtn = $("btnVaultClose");
+  if (!overlay || !openBtn || !closeBtn) return;
+
+  openBtn.addEventListener("click", () => { overlay.hidden = false; void refreshVaultList(); });
+  closeBtn.addEventListener("click", () => { overlay.hidden = true; });
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.hidden = true; });
+  $("btnVaultSave")?.addEventListener("click", () => { void saveVaultCredential(); });
+}
+
+initMemorySettings();
+
+// ---------------------------------------------------------------------------
+// Long-term memory (Task 9) — /api/memory/long/*.
+// Facts / skills / files, all operator-owned: the list endpoints return
+// metadata and text the operator wrote (never secrets — the backend
+// rejects credentials and PII at write time), and file listings never
+// include file content. All rendering uses textContent, never innerHTML.
+// Proposals from a finished task appear only after the operator opens
+// this dialog; accepting one stores it as a confirmed fact/skill.
+// ---------------------------------------------------------------------------
+
+interface MemoryFact { id: string; text: string; category: string; source: string; }
+interface MemorySkill { id: string; name: string; version: number; success_count: number; }
+interface MemoryFileMeta { id: string; file_name: string; summary: string; size_bytes: number; }
+interface MemoryProposal { kind: string; text?: string; name?: string; steps?: string; }
+
+function memoryListItem(label: string, onDelete: () => void): HTMLLIElement {
+  const li = document.createElement("li");
+  li.textContent = label;
+  const del = document.createElement("button");
+  del.type = "button";
+  del.className = "btn btn--sm btn--ghost";
+  del.textContent = "Delete";
+  del.addEventListener("click", () => { void onDelete(); });
+  li.appendChild(del);
+  return li;
+}
+
+async function refreshMemoryLists(): Promise<void> {
+  const factsList = $("memoryFactsList") as HTMLUListElement | null;
+  const skillsList = $("memorySkillsList") as HTMLUListElement | null;
+  const filesList = $("memoryFilesList") as HTMLUListElement | null;
+  const proposalsSection = $("memoryProposalsSection");
+  const proposalsList = $("memoryProposalsList") as HTMLUListElement | null;
+  try {
+    const [factsRes, skillsRes, filesRes] = await Promise.all([
+      apiFetch(`${API}/api/memory/long/facts`),
+      apiFetch(`${API}/api/memory/long/skills`),
+      apiFetch(`${API}/api/memory/long/files`),
+    ]);
+    if (factsList) {
+      factsList.innerHTML = "";
+      if (factsRes.ok) {
+        const data = (await factsRes.json()) as { facts: MemoryFact[] };
+        for (const fact of data.facts || []) {
+          factsList.appendChild(memoryListItem(
+            `${fact.text} — ${fact.category} · ${fact.source}`,
+            async () => {
+              await apiFetch(`${API}/api/memory/long/facts/${encodeURIComponent(fact.id)}`, { method: "DELETE" });
+              await refreshMemoryLists();
+            },
+          ));
+        }
+        if (factsList.children.length === 0) {
+          const li = document.createElement("li");
+          li.textContent = "No saved facts yet.";
+          factsList.appendChild(li);
+        }
+      }
+    }
+    if (skillsList) {
+      skillsList.innerHTML = "";
+      if (skillsRes.ok) {
+        const data = (await skillsRes.json()) as { skills: MemorySkill[] };
+        for (const skill of data.skills || []) {
+          skillsList.appendChild(memoryListItem(
+            `${skill.name} — v${skill.version} · ${skill.success_count} success${skill.success_count === 1 ? "" : "es"}`,
+            async () => {
+              await apiFetch(`${API}/api/memory/long/skills/${encodeURIComponent(skill.id)}`, { method: "DELETE" });
+              await refreshMemoryLists();
+            },
+          ));
+        }
+        if (skillsList.children.length === 0) {
+          const li = document.createElement("li");
+          li.textContent = "No learned skills yet.";
+          skillsList.appendChild(li);
+        }
+      }
+    }
+    if (filesList) {
+      filesList.innerHTML = "";
+      if (filesRes.ok) {
+        const data = (await filesRes.json()) as { files: MemoryFileMeta[] };
+        for (const file of data.files || []) {
+          filesList.appendChild(memoryListItem(
+            `${file.file_name} — ${file.summary} (${Math.round(file.size_bytes / 1024)} KB)`,
+            async () => {
+              await apiFetch(`${API}/api/memory/long/files/${encodeURIComponent(file.id)}`, { method: "DELETE" });
+              await refreshMemoryLists();
+            },
+          ));
+        }
+        if (filesList.children.length === 0) {
+          const li = document.createElement("li");
+          li.textContent = "No reference files yet.";
+          filesList.appendChild(li);
+        }
+      }
+    }
+    // Pending proposals from the current task's checkpoint, if any.
+    if (proposalsSection && proposalsList) {
+      proposalsList.innerHTML = "";
+      proposalsSection.hidden = true;
+      if (currentTaskId) {
+        const taskRes = await apiFetch(`${API}/api/task/${encodeURIComponent(currentTaskId)}`);
+        if (taskRes.ok) {
+          const task = (await taskRes.json()) as { checkpoint?: { proposals?: MemoryProposal[] } | null };
+          const proposals = task.checkpoint?.proposals || [];
+          if (proposals.length > 0) {
+            proposalsSection.hidden = false;
+            proposals.forEach((proposal, index) => {
+              const label = proposal.kind === "fact"
+                ? `Fact: ${proposal.text || ""}`
+                : `Skill: ${proposal.name || ""}`;
+              const li = document.createElement("li");
+              li.textContent = label;
+              const accept = document.createElement("button");
+              accept.type = "button";
+              accept.className = "btn btn--sm btn--primary";
+              accept.textContent = "Remember";
+              accept.addEventListener("click", async () => {
+                // REVIEW (Task 9 audit): this used to send
+                // {accepted_indices: [index]} while the backend only
+                // reads "accepted" — pydantic silently dropped the
+                // unknown field, so "Remember" did nothing at all.
+                await apiFetch(`${API}/api/memory/long/proposals/${encodeURIComponent(currentTaskId as string)}/confirm`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ accepted: [index] }),
+                });
+                await refreshMemoryLists();
+              });
+              li.appendChild(accept);
+              proposalsList.appendChild(li);
+            });
+          }
+        }
+      }
+    }
+  } catch {
+    // Offline: leave the lists empty rather than showing stale data.
+  }
+}
+
+async function saveMemoryFact(): Promise<void> {
+  const status = $("memoryFactStatus");
+  const text = ($("memoryFactText") as HTMLInputElement | null)?.value.trim() || "";
+  const category = ($("memoryFactCategory") as HTMLSelectElement | null)?.value || "general";
+  if (!text) {
+    if (status) status.textContent = "Write the fact first.";
+    return;
+  }
+  if (status) status.textContent = "Saving…";
+  try {
+    const res = await apiFetch(`${API}/api/memory/long/facts`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, category }),
+    });
+    if (!res.ok) {
+      const detail = await res.json().catch(() => null) as { detail?: string } | null;
+      if (status) status.textContent = detail?.detail || `Could not save (backend ${res.status}).`;
+      return;
+    }
+    if (status) status.textContent = "Saved.";
+    const input = $("memoryFactText") as HTMLInputElement | null;
+    if (input) input.value = "";
+    await refreshMemoryLists();
+  } catch {
+    if (status) status.textContent = "Backend offline — could not save.";
+  }
+}
+
+async function uploadMemoryFile(): Promise<void> {
+  const status = $("memoryFileStatus");
+  const input = $("memoryFileInput") as HTMLInputElement | null;
+  const file = input?.files?.[0];
+  const summary = ($("memoryFileSummary") as HTMLInputElement | null)?.value.trim() || "";
+  if (!file) {
+    if (status) status.textContent = "Choose a file first.";
+    return;
+  }
+  if (status) status.textContent = "Uploading…";
+  try {
+    const base64 = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = String(reader.result || "");
+        resolve(result.includes(",") ? result.split(",").pop() || "" : result);
+      };
+      reader.onerror = () => reject(new Error("could not read file"));
+      reader.readAsDataURL(file);
+    });
+    const res = await apiFetch(`${API}/api/memory/long/files`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fileName: file.name, base64, summary, taskId: currentTaskId || "" }),
+    });
+    if (!res.ok) {
+      const detail = await res.json().catch(() => null) as { detail?: string } | null;
+      if (status) status.textContent = detail?.detail || `Could not attach (backend ${res.status}).`;
+      return;
+    }
+    if (status) status.textContent = "Attached — the planner will see the summary only.";
+    if (input) input.value = "";
+    const summaryInput = $("memoryFileSummary") as HTMLInputElement | null;
+    if (summaryInput) summaryInput.value = "";
+    await refreshMemoryLists();
+  } catch {
+    if (status) status.textContent = "Could not read or upload that file.";
+  }
+}
+
+async function forgetAllMemory(): Promise<void> {
+  const status = $("memoryForgetStatus");
+  if (!window.confirm("Forget everything the agent remembers about you — all facts, skills, and reference files? This cannot be undone.")) return;
+  try {
+    const res = await apiFetch(`${API}/api/memory`, { method: "DELETE" });
+    if (!res.ok) {
+      if (status) status.textContent = `Could not forget (backend ${res.status}).`;
+      return;
+    }
+    if (status) status.textContent = "Forgotten — all memory tiers are empty.";
+    await refreshMemoryLists();
+  } catch {
+    if (status) status.textContent = "Backend offline — could not forget.";
+  }
+}
+
+function initMemorySettings(): void {
+  const overlay = $("memoryOverlay");
+  const openBtn = $("btnMemorySettings");
+  const closeBtn = $("btnMemoryClose");
+  if (!overlay || !openBtn || !closeBtn) return;
+
+  openBtn.addEventListener("click", () => { overlay.hidden = false; void refreshMemoryLists(); });
+  closeBtn.addEventListener("click", () => { overlay.hidden = true; });
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.hidden = true; });
+  $("btnMemorySaveFact")?.addEventListener("click", () => { void saveMemoryFact(); });
+  $("btnMemoryUploadFile")?.addEventListener("click", () => { void uploadMemoryFile(); });
+  $("btnMemoryForgetAll")?.addEventListener("click", () => { void forgetAllMemory(); });
+}
 
 // ---------------------------------------------------------------------------
 // LLM provider settings — runtime provider/model selection via /api/llm/*.
@@ -1361,7 +1902,7 @@ async function initLlmSettings(): Promise<void> {
 
 async function refreshLlmSettings(): Promise<void> {
   try {
-    const res = await fetch(`${API}/api/llm/config`);
+    const res = await apiFetch(`${API}/api/llm/config`);
     if (!res.ok) return;
     const cfg = (await res.json()) as LlmConfig;
     const providerSelect = $("llmProviderSelect") as HTMLSelectElement | null;
@@ -1428,7 +1969,7 @@ async function discoverLlmModels(): Promise<void> {
     return;
   }
   try {
-    const res = await fetch(`${API}/api/llm/models`);
+    const res = await apiFetch(`${API}/api/llm/models`);
     if (!res.ok) {
       if (status) status.textContent = `Discovery failed (HTTP ${res.status}). Manual entry still available.`;
       return;
@@ -1473,7 +2014,7 @@ async function saveLlmSettings(opts: { silentStatus?: boolean } = {}): Promise<b
     if (apiKey.trim()) body.apiKey = apiKey.trim();
   }
   try {
-    const res = await fetch(`${API}/api/llm/config`, {
+    const res = await apiFetch(`${API}/api/llm/config`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),

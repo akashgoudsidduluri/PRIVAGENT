@@ -556,7 +556,6 @@ def extract_page_images(
     title: str,
     domain: str,
     source_id: str,
-    topic_keywords: Optional[list[str]] = None,
     interactive_elements: Optional[list[dict]] = None,
 ) -> list[VisualAsset]:
     """Extract authentic substantive images from web page content, filtering trackers/ads/logos.

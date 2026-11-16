@@ -1,7 +1,22 @@
 import type { ElementTarget } from "./contracts";
+import { stripIconGlyphs } from "./semantic";
+
+// Task 13: the icon-glyph strip is imported from ./semantic now —
+// the local copy (TARGET_GLYPH_RANGES / targetGlyphRe /
+// stripIconGlyphsForTarget) is gone. It existed only because the old
+// multi-input vite config split semantic.ts into a shared chunk that
+// content.js imported at the top level, and the IIFE wrapper around
+// content.js cannot contain a top-level import (the Moodle-fix
+// landmine, which broke the build twice). The per-entry vite config
+// inlines every import into its own entry, so the cross-entry import
+// is safe; tests/viteSelfContainedEntries.test.ts proves it, and
+// tests/semanticPerception.test.ts pins the strip itself. The ranges
+// must stay identical to _ICON_GLYPH_RE in backend/app/grounding.py.
 
 export interface Candidate {
   targetId: string;
+  /** Task 7: element reference from the observation's accessibility tree. */
+  elementRef?: string;
   role: string;
   name: string;
   cssSelector: string;
@@ -31,6 +46,18 @@ export interface TargetResolutionOptions {
 
 const norm = (s: string | undefined) => (s ?? "").trim().toLowerCase();
 const cleanId = (s: string | undefined) => (s ?? "").replace(/^#/, "").trim();
+
+/** Details of the last ambiguity failure, for an honest error message.
+ * Reset on every findTarget call; set only when a name-only target
+ * matches several elements exactly and no ref disambiguated it. */
+export interface TargetAmbiguity {
+  name: string;
+  count: number;
+}
+let lastAmbiguity: TargetAmbiguity | null = null;
+export function getLastTargetAmbiguity(): TargetAmbiguity | null {
+  return lastAmbiguity;
+}
 const SEARCH_WORD_RE = /\b(search|query|keywords?|find)\b/i;
 const NON_TEXT_INPUT_TYPES = new Set([
   "button", "submit", "reset", "checkbox", "radio", "file", "image", "range", "color", "hidden",
@@ -106,7 +133,8 @@ export function classifySearchTarget(
   if (norm(target.role) === "searchbox") return true;
   if (SEARCH_WORD_RE.test(norm(target.name))) return true;
   const tid = cleanId(target.targetId).toLowerCase();
-  return /^(q|query|search|searchbox|searchinput|keyword|keywords|field-keywords|twotabsearchtextbox)$/.test(tid);
+  // Generic search-field ids only (Task 8): no per-retailer ids.
+  return /^(q|query|search|searchbox|searchinput|keyword|keywords)$/.test(tid);
 }
 
 /** Resolve an action target against the current observation's element list.
@@ -120,22 +148,50 @@ export function findTarget(
   options: TargetResolutionOptions = {}
 ): Candidate | null {
   const tid = cleanId(target.targetId || (target as any).id || (target as any).target_id);
-  const wantedName = norm(target.name);
+  // Review (Moodle fix): the wanted name must be glyph-stripped like
+  // the candidate names are. A glyph in the target name otherwise
+  // defeats the exact match AND the ambiguity guard below, and the
+  // reverse-substring fallback then returns the FIRST duplicate.
+  const wantedName = norm(stripIconGlyphs(target.name ?? ""));
   const stem = (s: string) => norm(s).replace(/s$/, "");
   const stemWanted = stem(wantedName);
   const strict = options.strictIdentity === true || interaction === "type";
   const searchIntent = options.searchIntent === true || classifySearchTarget(target);
+  lastAmbiguity = null;
 
   const usable = (c: Candidate, kind: "click" | "type" | "none") => {
     if (kind !== "none" && !c.enabled) return false;
-    // A type action must land in an editable control. Flipkart exposes its
-    // search input and search-icon button under the same accessible name; the
-    // button sorts first, so without this guard typing resolves to it.
+    // A type action must land in an editable control. Some sites expose
+    // their search input and search-icon button under the same accessible
+    // name; the button sorts first, so without this guard typing resolves
+    // to it.
     if (kind === "type" && (isButtonLike(c) || tagOf(c) === "a" || roleOf(c) === "link")) return false;
     return true;
   };
 
-  // 0. A caller-supplied CSS selector is a stable identity when it is a real
+  // 0. Task 7: element reference. Refs are scoped to one observation,
+  //    so a ref match is the strongest identity — but only when the
+  //    live element still agrees on name/role. A re-render can shift
+  //    indices, so a ref that now points at a different control must
+  //    NOT be trusted: fall through to name matching instead.
+  const wantedRef = typeof target.elementRef === "string" ? target.elementRef.trim() : "";
+  if (/^e\d+$/.test(wantedRef)) {
+    const byRef = candidates.find(c => c.elementRef === wantedRef);
+    if (byRef) {
+      // Trust the ref only when every identity hint the caller supplied
+      // still agrees. A name that moved means the ref now points at a
+      // different control after a re-render — fall through to name
+      // matching, which fails honestly when nothing matches.
+      const nameAgrees = !wantedName || norm(byRef.name) === wantedName;
+      const roleAgrees = !target.role || norm(byRef.role) === norm(target.role);
+      if (nameAgrees && roleAgrees && usable(byRef, interaction)) return byRef;
+      // Ref points at a different element now: do not trust it, and do
+      // not silently click the wrong control — fall through to name
+      // matching, which fails honestly when nothing matches.
+    }
+  }
+
+  // 0b. A caller-supplied CSS selector is a stable identity when it is a real
   //    selector, not a synthetic session registry marker.
   const wantedCss = norm(target.cssSelector);
   if (wantedCss && !wantedCss.includes("data-navigator-id") && !wantedCss.includes("nav-el-")) {
@@ -153,6 +209,32 @@ export function findTarget(
 
   // 2. Match by accessible name / label if provided.
   if (wantedName) {
+    // Moodle fix: an exact name shared by several usable elements is
+    // ambiguous — guessing the first would click an arbitrary one
+    // (e.g. "I-SEM" eight times on a Moodle course list, or a course
+    // title on both its image link and its title link). Fail honestly
+    // instead; the caller reports the count and the planner re-plans
+    // quoting the element ref. A supplied role narrows the count, but
+    // only when it matches exactly one of the duplicates: a role that
+    // matches NONE of them is not a disambiguator, and falling through
+    // to the role-blind matches below would click the first duplicate.
+    // The reported count is the name-only count, matching the
+    // backend validator's error. A ref (step 0) already bypassed this
+    // branch.
+    const nameMatches = candidates.filter(c => {
+      if (!usable(c, interaction)) return false;
+      return norm(c.name) === wantedName;
+    });
+    if (nameMatches.length > 1) {
+      const roleMatches = target.role
+        ? nameMatches.filter(c => norm(c.role) === norm(target.role))
+        : nameMatches;
+      if (roleMatches.length === 1) return roleMatches[0];
+      lastAmbiguity = { name: wantedName, count: nameMatches.length };
+      return null;
+    }
+    if (nameMatches.length === 1) return nameMatches[0];
+
     // 2a. Exact match or stem match (group vs groups)
     const exact = candidates.find(c => (norm(c.name) === wantedName || (stemWanted.length >= 4 && stem(c.name) === stemWanted)) && usable(c, interaction));
     if (exact) return exact;

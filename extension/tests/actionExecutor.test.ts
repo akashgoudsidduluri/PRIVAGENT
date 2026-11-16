@@ -3,6 +3,8 @@ import {
   cdpKeySequence,
   clearExtensionSessions,
   executeAction,
+  isTakeoverActive,
+  setTakeoverActive,
   extensionSessions,
   getOrCreateActiveTab,
   initSession,
@@ -701,5 +703,141 @@ describe("browser session management and tab identity pinning", () => {
 
     const res = await resolveSessionTab(action);
     expect("tabId" in res && res.tabId).toBe(75);
+  });
+});
+
+describe("takeover mode (Task 4)", () => {
+  afterEach(() => {
+    setTakeoverActive(false);
+  });
+
+  it("refuses every action while takeover is active", async () => {
+    setTakeoverActive(true);
+    expect(isTakeoverActive()).toBe(true);
+    const result = await executeAction(
+      { type: "observe", risk: "read", verify: "fresh observation", timeoutMs: 5000 } as BrowserAction,
+      "task-takeover",
+    );
+    expect(result.ok).toBe(false);
+    expect(result.error?.code).toBe("TAKEOVER_ACTIVE");
+    expect(result.error?.recoverable).toBe(true);
+  });
+
+  it("observe returns an empty observation while takeover is active", async () => {
+    const executeScript = vi.fn(async () => {
+      throw new Error("must not be called during takeover");
+    });
+    vi.stubGlobal("chrome", {
+      tabs: {
+        get: vi.fn(async (id: number) => ({ id, url: "https://example.com/login", title: "Sign in", windowId: 1 })),
+        update: vi.fn(async () => ({})),
+      },
+      scripting: { executeScript },
+    });
+    setTakeoverActive(true);
+    const obs = await observe(11);
+    expect(obs.url).toBe("https://example.com/login");
+    expect(obs.interactive).toEqual([]);
+    expect(obs.pageText).toBeUndefined();
+    expect(obs.screenshot).toBeUndefined();
+    expect(executeScript).not.toHaveBeenCalled();
+  });
+
+  it("restores normal execution after TAKEOVER_END", async () => {
+    setTakeoverActive(true);
+    setTakeoverActive(false);
+    expect(isTakeoverActive()).toBe(false);
+    vi.stubGlobal("chrome", {
+      tabs: {
+        query: vi.fn(async () => []),
+        create: vi.fn(async () => ({ id: 99, url: "about:blank" })),
+        get: vi.fn(async (id: number) => ({ id, url: "about:blank", title: "", windowId: 1 })),
+        update: vi.fn(async () => ({})),
+      },
+      scripting: { executeScript: vi.fn() },
+    });
+    const result = await executeAction(
+      { type: "observe", risk: "read", verify: "fresh observation", timeoutMs: 5000 } as BrowserAction,
+      "task-takeover",
+    );
+    expect(result.ok).toBe(true);
+  });
+});
+
+describe("switch_tab (Task 9)", () => {
+  function installSwitchChrome() {
+    const update = vi.fn(async () => ({}));
+    const executeScript = vi.fn();
+    vi.stubGlobal("chrome", {
+      tabs: {
+        create: vi.fn(async () => ({ id: 50, url: "about:blank" })),
+        get: vi.fn(async (id: number) => ({ id, url: "about:blank", title: "", windowId: 1, status: "complete" })),
+        update,
+        query: vi.fn(async () => []),
+      },
+      scripting: { executeScript },
+    });
+    return { update, executeScript };
+  }
+
+  it("activates a child tab and moves the session's active marker", async () => {
+    const { update, executeScript } = installSwitchChrome();
+    await initSession({ sessionId: "sess-sw-1" });
+    extensionSessions.get("sess-sw-1")?.childTabIds.add(51);
+
+    const result = await executeAction(
+      { type: "switch_tab", risk: "read", verify: "switched", timeoutMs: 200, sessionId: "sess-sw-1", params: { tabId: 51 } } as BrowserAction,
+      "task-sw-1",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(update).toHaveBeenCalledWith(51, { active: true });
+    expect(extensionSessions.get("sess-sw-1")?.activeTabId).toBe(51);
+    // The observation that comes back belongs to the switched-to tab.
+    expect(result.observation?.tabId).toBe(51);
+    // about:blank is observed metadata-only; no injection is attempted.
+    expect(executeScript).not.toHaveBeenCalled();
+  });
+
+  it("refuses a tab outside the session with TAB_UNAUTHORIZED", async () => {
+    const { update } = installSwitchChrome();
+    await initSession({ sessionId: "sess-sw-2" });
+
+    const result = await executeAction(
+      { type: "switch_tab", risk: "read", verify: "switched", timeoutMs: 200, sessionId: "sess-sw-2", params: { tabId: 999 } } as BrowserAction,
+      "task-sw-2",
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error?.code).toBe("TAB_UNAUTHORIZED");
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it("switches without a session (no authorization scope to check)", async () => {
+    const { update } = installSwitchChrome();
+
+    const result = await executeAction(
+      { type: "switch_tab", risk: "read", verify: "switched", timeoutMs: 200, params: { tabId: 7 } } as BrowserAction,
+      "task-sw-3",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(update).toHaveBeenCalledWith(7, { active: true });
+    expect(result.observation?.tabId).toBe(7);
+  });
+
+  it("select_tab behaves identically to switch_tab", async () => {
+    const { update } = installSwitchChrome();
+    await initSession({ sessionId: "sess-sw-4" });
+    extensionSessions.get("sess-sw-4")?.childTabIds.add(52);
+
+    const result = await executeAction(
+      { type: "select_tab", risk: "read", verify: "switched", timeoutMs: 200, sessionId: "sess-sw-4", params: { tabId: 52 } } as BrowserAction,
+      "task-sw-4",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(update).toHaveBeenCalledWith(52, { active: true });
+    expect(extensionSessions.get("sess-sw-4")?.activeTabId).toBe(52);
   });
 });

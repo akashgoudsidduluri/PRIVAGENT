@@ -4,17 +4,41 @@ import type {
   BrowserAction,
   BrowserObservation,
   TabInfo,
+  WebMCPTool,
 } from "./contracts";
 import { validateAction } from "./contracts";
-import { classifySearchTarget, findTarget, type Candidate } from "./targeting";
+import { isAllowedNavigationUrl } from "./allowlist";
+import { classifySearchTarget, findTarget, getLastTargetAmbiguity, type Candidate } from "./targeting";
 import { sanitizeObservation } from "./observer";
+
+// --- Task 4: takeover ------------------------------------------------------
+// While the operator is completing a login / OTP / payment step in the
+// tab, the agent must not observe anything: no DOM list, no page text,
+// no screenshot, and no action may execute. The backend sends
+// TAKEOVER_START / TAKEOVER_END over the relay (background.ts sets this
+// flag); the backend loop is the authoritative gate — this flag is the
+// extension's defence in depth, so a stray observe during takeover
+// returns an empty observation instead of page data.
+let takeoverActive = false;
+
+export function setTakeoverActive(active: boolean): void {
+  takeoverActive = active;
+}
+
+export function isTakeoverActive(): boolean {
+  return takeoverActive;
+}
 
 /** Injected content-script API shape (see lib/content.ts). */
 interface AgentElement {
   targetId: string;
+  /** Task 7: element reference for this observation's accessibility tree. */
+  elementRef: string;
   semantic?: import("./contracts").SemanticElement;
   role: string;
   name: string;
+  /** Pre-glyph-strip accessible name, when it differs. Debugging only. */
+  rawName?: string;
   tag: string;
   inputType?: string;
   search?: boolean;
@@ -23,6 +47,8 @@ interface AgentElement {
   visible: boolean;
   bounds?: { x: number; y: number; width: number; height: number };
   href?: string;
+  /** Task 7: element state (checked/selected/expanded). */
+  state?: { checked?: boolean; selected?: boolean; expanded?: boolean };
 }
 
 interface ValueProbe {
@@ -586,9 +612,12 @@ async function pageStatus(tabId: number): Promise<PageSettlement | null> {
         return {
           ready: document.readyState !== "loading",
           interactiveCount: document.querySelectorAll(
-            'button, input, textarea, a[href], [role="button"], [contenteditable], [data-testid], ytd-thumbnail'
+            'button, input, textarea, a[href], [role="button"], [contenteditable], [data-testid]'
           ).length,
-          isConnecting: text.includes("Connecting to WhatsApp") || text.includes("Loading your chats"),
+          // Generic "still connecting" text: a chat app that shows a
+          // connecting/loading state is not settled yet (Task 8: no
+          // per-app strings).
+          isConnecting: /connecting|loading your chats|loading chats/i.test(text),
         };
       },
     }, 1_500);
@@ -771,7 +800,7 @@ export function isBlockedUrl(url: string): boolean {
   return BLOCKED_SCHEMES.some(s => u.startsWith(s));
 }
 
-export async function executeAction(action: BrowserAction, taskId: string): Promise<ActionResult> {
+export async function executeAction(action: BrowserAction, taskId: string, allowedDomains?: string[]): Promise<ActionResult> {
   const raw = action as any;
   if (raw?.type === "init_session") {
     return await initSession(raw);
@@ -788,11 +817,26 @@ export async function executeAction(action: BrowserAction, taskId: string): Prom
   if (!v.ok) {
     return { ok: false, error: { code: "PLAN_INVALID", message: `invalid action: ${v.error}`, recoverable: false } };
   }
+  // Task 4: while the operator has the browser (takeover), no agent
+  // action may execute — not even a read. Recoverable: the action was
+  // not executed, and the loop retries or fails honestly once the
+  // takeover resolves.
+  if (takeoverActive) {
+    return err("TAKEOVER_ACTIVE", "takeover in progress — the operator is completing a login / payment step in the browser", true);
+  }
+  // Task 3: defence-in-depth allow-list. The backend loop is the
+  // authoritative gate; this refuses a disallowed navigation here too,
+  // without executing it. An empty/undefined list means "not configured".
+  if ((action.type === "navigate" || action.type === "new_tab") && action.params?.url) {
+    if (!isAllowedNavigationUrl(action.params.url, allowedDomains)) {
+      return err("NAVIGATION_FAILED", `blocked by domain allow-list: ${action.params.url}`, false);
+    }
+  }
   try {
     if (action.type === "new_tab") {
       return await doNewTab(action);
     }
-    if (action.type === "select_tab") {
+    if (action.type === "select_tab" || action.type === "switch_tab") {
       if (action.sessionId) {
         const session = extensionSessions.get(action.sessionId);
         if (session) {
@@ -868,6 +912,12 @@ export async function executeAction(action: BrowserAction, taskId: string): Prom
       case "observe": {
         return { ok: true, observation: await observe(tabId) };
       }
+      case "webmcp_tool": return await doWebMCPTool(action, tabId);
+      case "ucp_checkout":
+        // Task 14: a UCP checkout is executed by the backend and must
+        // never reach the extension. If one does, reject it outright
+        // rather than guessing at a checkout in the page.
+        return err("UNKNOWN", "ucp_checkout must be executed by the backend, never by the extension", false);
     }
   } catch (e) {
     return err("UNKNOWN", String(e), true);
@@ -882,7 +932,7 @@ async function doSpecialInput(
   await ensureTabActive(tabId);
   const agent = await withAgent(tabId);
   const target = findTarget(action.target, await agent.list(), "click");
-  if (!target) return err("STALE_TARGET", "special input target missing or ambiguous", true);
+  if (!target) return err("STALE_TARGET", `special input target missing or ambiguous${ambiguitySuffix()}`, true);
   const p = action.params as any;
   const result = method === "selectOption" ? await agent.selectOption(target.targetId, p.option, target.name)
     : method === "setDate" ? await agent.setDate(target.targetId, p.date, target.name)
@@ -896,6 +946,75 @@ async function doSpecialInput(
 
 function err(code: AgentError["code"], message: string, recoverable: boolean): ActionResult {
   return { ok: false, error: { code, message, recoverable } };
+}
+
+/** Task 14: call a page-declared WebMCP tool in the tab.
+ *
+ * The call runs inside the tab (injected function) because the
+ * background worker cannot see the page's `document.modelContext`.
+ * The tool name and arguments were already validated by the backend
+ * against this observation's declared tools — this function trusts
+ * nothing and fails honestly (WEBMCP_UNAVAILABLE, recoverable) when
+ * the API is absent, the method shape differs, or the tool throws.
+ * The tool's return value is truncated and reported as evidence
+ * text only; it is never executed as code. */
+async function doWebMCPTool(
+  action: Extract<BrowserAction, { type: "webmcp_tool" }>,
+  tabId: number,
+): Promise<ActionResult> {
+  await ensureTabActive(tabId);
+  const tool = action.params.tool;
+  const args = action.params.arguments ?? {};
+  let outcome: { ok: boolean; result?: string; error?: string } | undefined;
+  try {
+    const [r] = await execScript({
+      target: { tabId },
+      func: async (toolName: string, toolArgs: Record<string, unknown>) => {
+        const mc = (document as unknown as Record<string, unknown>).modelContext
+          ?? (navigator as unknown as Record<string, unknown>).modelContext;
+        if (!mc) return { ok: false, error: "this page exposes no WebMCP modelContext API" };
+        try {
+          const m = mc as Record<string, unknown>;
+          let out: unknown;
+          if (typeof m.callTool === "function") {
+            out = await (m.callTool as (n: string, a: Record<string, unknown>) => Promise<unknown>)(toolName, toolArgs);
+          } else if (typeof m.invokeTool === "function") {
+            out = await (m.invokeTool as (n: string, a: Record<string, unknown>) => Promise<unknown>)(toolName, toolArgs);
+          } else if (typeof m.executeTool === "function") {
+            out = await (m.executeTool as (n: string, a: Record<string, unknown>) => Promise<unknown>)(toolName, toolArgs);
+          } else {
+            return { ok: false, error: "the page's modelContext API has no tool-call method this build knows (callTool/invokeTool/executeTool)" };
+          }
+          const text = typeof out === "string" ? out : JSON.stringify(out ?? null);
+          return { ok: true, result: (text ?? "").slice(0, 4000) };
+        } catch (e) {
+          return { ok: false, error: `WebMCP tool ${toolName} failed: ${String(e)}` };
+        }
+      },
+      args: [tool, args],
+    });
+    outcome = r?.result as { ok: boolean; result?: string; error?: string } | undefined;
+  } catch (e) {
+    return err("WEBMCP_UNAVAILABLE", `could not invoke WebMCP tool ${tool}: ${String(e)}`, true);
+  }
+  if (!outcome) return err("WEBMCP_UNAVAILABLE", `no result from WebMCP tool ${tool}`, true);
+  if (!outcome.ok) return err("WEBMCP_UNAVAILABLE", outcome.error ?? `WebMCP tool ${tool} failed`, true);
+  await settleDom(tabId);
+  return {
+    ok: true,
+    observation: await observe(tabId),
+    evidence: `WebMCP tool ${tool} returned: ${(outcome.result ?? "").slice(0, 500)}`,
+  };
+}
+
+/** Honest ambiguity detail for a failed target resolution (Moodle fix):
+ * " — 8 elements are named 'I-SEM'; quote the element ref instead".
+ * Empty when the last resolution failed for another reason. */
+function ambiguitySuffix(): string {
+  const amb = getLastTargetAmbiguity();
+  return amb
+    ? ` — ${amb.count} elements are named '${amb.name}'; quote the element ref from the accessibility tree instead of the bare name`
+    : "";
 }
 
 async function doNavigate(action: Extract<BrowserAction, { type: "navigate" }>, tabId: number): Promise<ActionResult> {
@@ -1347,7 +1466,9 @@ async function cdpPressKey(tabId: number, key: string): Promise<boolean> {
 
 /**
  * Detect visible modal/dialog overlays and dismiss them if an unambiguous
- * safe close control (e.g. '✕', aria-label="Close", button.close, button._2doB4z) is present.
+ * safe close control (e.g. '✕', aria-label="Close", button.close) is
+ * present. Close detection is by accessible name / generic class only
+ * (Task 8: no per-site classes).
  */
 export async function dismissObstructiveModalIfPresent(tabId: number): Promise<boolean> {
   if (typeof chrome === "undefined" || !chrome.scripting) return false;
@@ -1355,7 +1476,7 @@ export async function dismissObstructiveModalIfPresent(tabId: number): Promise<b
     const [r] = await execScript({
       target: { tabId },
       func: () => {
-        const modal = document.querySelector('[role="dialog"], [aria-modal="true"], .modal, ._2KpZ6l, [class*="dialog" i], [class*="modal" i], [class*="overlay" i], [class*="popup" i]') as HTMLElement | null;
+        const modal = document.querySelector('[role="dialog"], [aria-modal="true"], .modal, [class*="dialog" i], [class*="modal" i], [class*="overlay" i], [class*="popup" i]') as HTMLElement | null;
         if (!modal) return false;
 
         const rect = modal.getBoundingClientRect();
@@ -1364,8 +1485,6 @@ export async function dismissObstructiveModalIfPresent(tabId: number): Promise<b
         if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
 
         const closeSelectors = [
-          'button._2doB4z',
-          'button._2KpZ6l._2doB4z',
           'button[aria-label*="close" i]',
           'button.close',
           '[data-testid*="close"]',
@@ -1426,6 +1545,15 @@ async function doClick(action: Extract<BrowserAction, { type: "click" }>, taskId
   }
 
   if (!target && action.target.coords) {
+    // Review (Moodle fix): never fall back to coordinates after an
+    // ambiguity failure. The coords come from an older observation; if
+    // the name is shared by N elements, clicking at stale coordinates
+    // is exactly the guess the ambiguity guard exists to prevent.
+    // A plain not-found (no ambiguity recorded) still recovers via
+    // coordinates, as before.
+    if (getLastTargetAmbiguity()) {
+      return err("STALE_TARGET", `no matching element for ${JSON.stringify(action.target)}${ambiguitySuffix()}`, true);
+    }
     // Exactly one click: trusted CDP input, with a single in-page fallback.
     const p = action.target.coords;
     const clicked = await cdpClick(tabId, p.x, p.y);
@@ -1464,7 +1592,7 @@ async function doClick(action: Extract<BrowserAction, { type: "click" }>, taskId
   }
 
   if (!target) {
-    return err("STALE_TARGET", `no matching element for ${JSON.stringify(action.target)}`, true);
+    return err("STALE_TARGET", `no matching element for ${JSON.stringify(action.target)}${ambiguitySuffix()}`, true);
   }
 
   const targetId = target.targetId;
@@ -1579,7 +1707,7 @@ export function searchTransitionChanged(
 
 /**
  * Give a search submit time to take effect. Real navigations land immediately,
- * but SPAs (Flipkart) may route several seconds after the form event. Poll URL
+ * but SPAs may route several seconds after the form event. Poll URL
  * and page state instead of failing on the first quiet sample.
  */
 async function waitForSearchOutcome(
@@ -1641,7 +1769,7 @@ async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: 
     target = resolveType(cands);
   }
   if (!target) {
-    return err("STALE_TARGET", `no safely identifiable element for ${JSON.stringify(action.target)}`, true);
+    return err("STALE_TARGET", `no safely identifiable element for ${JSON.stringify(action.target)}${ambiguitySuffix()}`, true);
   }
   const targetId = target.targetId;
   const targetName = target.name || action.target.name || "";
@@ -1659,11 +1787,14 @@ async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: 
   }
 
   const findSubmitPoint = async (): Promise<FocusPoint | null> => {
-    // Poll for the Send/Search button instead of sleeping a fixed 150ms: exit
-    // as soon as React/DOM exposes it, capped so a missing control still falls
-    // back to Enter.
+    // Task 11: reuse the candidate list already collected for target
+    // resolution — the submit control is usually on the same page, so
+    // re-collecting it first is a wasted round trip. Poll for the
+    // Send/Search button with fresh lists only if it is not there yet
+    // (React may expose it a moment later), capped so a missing
+    // control still falls back to Enter.
     const renderDeadline = Date.now() + 400;
-    let sendBtn = findSubmitControl(await agent.list());
+    let sendBtn = findSubmitControl(cands);
     while (!sendBtn && Date.now() < renderDeadline) {
       await sleep(40);
       sendBtn = findSubmitControl(await agent.list());
@@ -1970,6 +2101,9 @@ async function waitForStable(tabId: number, timeoutMs: number, expectedUrl?: str
 }
 
 async function captureScreenshot(tabId: number): Promise<string | undefined> {
+  // Task 4: never screenshot while the operator is completing a login /
+  // OTP / payment step — the screen may show a password, card, or code.
+  if (takeoverActive) return undefined;
   if (typeof chrome === "undefined" || !chrome.tabs?.captureVisibleTab) return undefined;
   try {
     const tab = await chrome.tabs.get(tabId);
@@ -2013,6 +2147,13 @@ export async function observe(tabId: number, sessionId?: string): Promise<Browse
   const url = tab.url ?? "";
   const title = tab.title ?? "";
 
+  // Task 4: during takeover, observe nothing — not even the tab's own
+  // DOM list or page text. Only the URL/title metadata is returned so
+  // the caller still knows which tab it holds.
+  if (takeoverActive) {
+    return emptyObservation(tabId, url, title);
+  }
+
   if (!isScriptableUrl(url)) {
     return emptyObservation(tabId, url, title);
   }
@@ -2053,6 +2194,66 @@ export async function observe(tabId: number, sessionId?: string): Promise<Browse
     return emptyObservation(tabId, url, title);
   }
 
+    // Task 14: page-declared standards — WebMCP tools + UCP profile
+    // link. Collected in the tab via an injected function (the
+    // background worker's own `document` is not the page's). The
+    // function runs in the tab's isolated world, where a spec'd
+    // WebIDL `document.modelContext` is visible; a page-JS expando
+    // is not, and is treated as "no tools declared". Never throws:
+    // a missing API is an empty list, not an observation failure.
+    let webmcpTools: WebMCPTool[] = [];
+    let ucpProfileUrl: string | undefined;
+    try {
+      const [std] = await execScript({
+        target: { tabId },
+        func: async () => {
+          const mc = (document as unknown as Record<string, unknown>).modelContext
+            ?? (navigator as unknown as Record<string, unknown>).modelContext;
+          let raw: unknown = undefined;
+          try {
+            if (mc && Array.isArray((mc as Record<string, unknown>).tools)) {
+              raw = (mc as Record<string, unknown>).tools;
+            } else if (mc && typeof (mc as Record<string, unknown>).listTools === "function") {
+              raw = await ((mc as Record<string, unknown>).listTools as () => Promise<unknown>)();
+            }
+          } catch { raw = undefined; }
+          const tools = (Array.isArray(raw) ? raw : []).slice(0, 50).map((t) => {
+            const d = (t ?? {}) as Record<string, unknown>;
+            // REVIEW (Task 14 audit): the bounds here are one past the
+            // backend's limits on purpose — the backend DROPS (never
+            // truncates) a name over 64 chars or a description over
+            // 2000, because a truncated description could cut a
+            // credential lure mid-sentence and change what the checker
+            // sees. Slicing exactly at the limit would silently
+            // truncate a 5,000-char description into a valid 2,000-char
+            // one and defeat that rule; one past the limit keeps the
+            // wire bounded while the over-long value still arrives
+            // over-long and gets dropped.
+            return {
+              name: String(d.name ?? "").slice(0, 65),
+              description: String(d.description ?? "").slice(0, 2001),
+              inputSchema: (d.inputSchema ?? {}) as Record<string, unknown>,
+              outputSchema: d.outputSchema as Record<string, unknown> | undefined,
+            };
+          }).filter((t) => t.name.length > 0);
+          let ucp: string | undefined;
+          try {
+            const link = document.querySelector('link[rel~="ucp"]') as HTMLLinkElement | null;
+            if (link?.href) {
+              const u = new URL(link.href, location.href);
+              if (u.origin === location.origin) ucp = u.href;
+            }
+          } catch { /* no UCP link */ }
+          return { tools, ucpProfileUrl: ucp };
+        },
+      });
+      const r = std?.result as { tools?: WebMCPTool[]; ucpProfileUrl?: string } | undefined;
+      if (r) {
+        webmcpTools = Array.isArray(r.tools) ? r.tools : [];
+        ucpProfileUrl = r.ucpProfileUrl;
+      }
+    } catch { /* standards collection is best-effort */ }
+
   const screenshot = await captureScreenshot(tabId);
 
   let openTabs: TabInfo[] | undefined;
@@ -2089,10 +2290,18 @@ export async function observe(tabId: number, sessionId?: string): Promise<Browse
     title,
     tabs: openTabs,
     pageText,
+    // Task 14: page-declared standards for this observation (only
+    // when the page actually declares them — an empty list / missing
+    // URL is the normal case and is omitted from the wire payload by
+    // the backend's optional fields).
+    ...(webmcpTools.length > 0 ? { webmcpTools } : {}),
+    ...(ucpProfileUrl ? { ucpProfileUrl } : {}),
     interactive: list.map(e => ({
       targetId: e.targetId,
+      elementRef: e.elementRef,
       role: e.role,
       name: e.name,
+      rawName: e.rawName,
       tag: e.tag || "el",
       inputType: e.inputType,
       search: e.search,
@@ -2103,7 +2312,33 @@ export async function observe(tabId: number, sessionId?: string): Promise<Browse
       // a second line of defense.
       value: undefined,
       bounds: e.bounds,
+      state: e.state,
+      cssSelector: e.cssSelector,
       semantic: e.semantic,
+    })),
+    // Task 7: the grounded accessibility tree for this observation —
+    // the same refs the planner quotes, with the live locator for each.
+    // The backend re-validates the refs and falls back to deriving the
+    // tree from `interactive` if this block is ever malformed.
+    axTree: list.map(e => ({
+      ref: e.elementRef,
+      role: e.role,
+      name: e.name,
+      rawName: e.rawName,
+      tag: e.tag || "el",
+      inputType: e.inputType,
+      targetId: e.targetId,
+      cssSelector: e.cssSelector,
+      xpath: e.targetId && !e.targetId.startsWith("nav-el-")
+        ? `//*[@id="${e.targetId.replace(/"/g, "")}"]`
+        : "",
+      disabled: !e.enabled,
+      checked: e.state?.checked,
+      selected: e.state?.selected,
+      expanded: e.state?.expanded,
+      bounds: e.bounds,
+      href: e.href,
+      source: "dom-ax",
     })),
     scroll: { y: meta.y, viewport: { w: meta.w, h: meta.h } },
     dpr: meta.dpr,

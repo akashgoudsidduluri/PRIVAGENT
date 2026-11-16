@@ -3,6 +3,9 @@
  * backend/app/contracts.py mirrors these; a parity test pins drift.
  */
 
+// Task 14: standards actions. webmcp_tool calls a page-declared
+// WebMCP tool in the tab; ucp_checkout runs a UCP checkout session
+// — executed by the backend, never sent to the extension.
 export const ACTION_TYPES = [
   "navigate",
   "click",
@@ -13,11 +16,14 @@ export const ACTION_TYPES = [
   "wait",
   "observe",
   "select_tab",
+  "switch_tab",
   "new_tab",
   "close_tab",
   "select_option",
   "set_date",
   "upload_file",
+  "webmcp_tool",
+  "ucp_checkout",
 ] as const;
 
 export type ActionType = (typeof ACTION_TYPES)[number];
@@ -38,15 +44,28 @@ export const TYPE_ACTION_RISK_FLOOR: Record<ActionType, RiskClass> = {
   wait: "read",
   observe: "read",
   select_tab: "read",
+  // Task 9: switch_tab is the planner-facing tab-switch action; it
+  // behaves exactly like select_tab (kept for back-compat).
+  switch_tab: "read",
   new_tab: "write",
   close_tab: "write",
   select_option: "write",
   set_date: "write",
   upload_file: "sensitive",
+  // Task 14: a WebMCP tool call can change site state (the page's own
+  // description of "read-only" is untrusted), so it floors at write;
+  // a UCP checkout moves money, so it floors at sensitive.
+  webmcp_tool: "write",
+  ucp_checkout: "sensitive",
 };
 
 export interface ElementTarget {
   targetId: string;
+  /** Task 7: element reference from the observation's accessibility
+   * tree (e.g. "e12"). The planner quotes it; the backend resolves it
+   * to a live target just before execution. A raw CSS selector is
+   * never an address — the planner must not invent one. */
+  elementRef?: string;
   /** Semantic anchor — accessible name the observer reported. */
   name?: string;
   /** ARIA role hint (planner may pass it; used only as a tiebreaker). */
@@ -113,6 +132,11 @@ export interface SelectTabAction extends ActionBase {
   params: { tabId: number };
 }
 
+export interface SwitchTabAction extends ActionBase {
+  type: "switch_tab";
+  params: { tabId: number };
+}
+
 export interface NewTabAction extends ActionBase {
   type: "new_tab";
   params: { url: string };
@@ -141,6 +165,23 @@ export interface UploadFileAction extends ActionBase {
   params: { fileName: string; base64: string }; // user-provided, approval gated, max 5 MiB
 }
 
+/** Task 14: call a page-declared WebMCP tool (name + JSON arguments).
+ * The backend validates the tool against the current observation and
+ * the checker scans its description before this is ever dispatched. */
+export interface WebMCPToolAction extends ActionBase {
+  type: "webmcp_tool";
+  params: { tool: string; arguments?: Record<string, unknown> };
+}
+
+/** Task 14: run a UCP checkout session. Executed by the backend, never
+ * sent to the extension — present in the union so the contract stays
+ * byte-identical with the backend; the executor rejects it if it ever
+ * arrives here. Amount is a decimal string; the backend parses it. */
+export interface UCPCheckoutAction extends ActionBase {
+  type: "ucp_checkout";
+  params: { merchant: string; amount: string; currency: string };
+}
+
 export type BrowserAction =
   | NavigateAction
   | ClickAction
@@ -151,16 +192,21 @@ export type BrowserAction =
   | WaitAction
   | ObserveAction
   | SelectTabAction
+  | SwitchTabAction
   | NewTabAction
   | CloseTabAction
   | SelectOptionAction
   | SetDateAction
-  | UploadFileAction;
+  | UploadFileAction
+  | WebMCPToolAction
+  | UCPCheckoutAction;
 
 export interface SemanticElement {
   elementId: string;
   role: string;
   semanticName: string;
+  /** Pre-glyph-strip accessible name, when it differs. Debugging only. */
+  rawSemanticName?: string;
   controlType: "search_input" | "custom_dropdown" | "calendar_picker" | "file_uploader" |
     "toggle_switch" | "checkbox" | "radio" | "modal" | "generic";
   interactability: {
@@ -176,8 +222,13 @@ export interface SemanticElement {
 export interface InteractiveElement {
   semantic?: SemanticElement;
   targetId: string;
+  /** Task 7: element reference from this observation's accessibility
+   * tree (e.g. "e12"), assigned in observation order. */
+  elementRef?: string;
   role: string;
   name: string;
+  /** Pre-glyph-strip accessible name, when it differs. Debugging only. */
+  rawName?: string;
   tag: string;
   inputType?: string;
   /** Explicit search semantic from the observer (not a DOM attribute change). */
@@ -188,6 +239,32 @@ export interface InteractiveElement {
   visible: boolean;
   enabled: boolean;
   bounds?: { x: number; y: number; width: number; height: number };
+  /** Task 7: element state (checked/selected/expanded) from ARIA/DOM. */
+  state?: { checked?: boolean; selected?: boolean; expanded?: boolean };
+  /** Task 7: observer's stable locator (author id or data-navigator-id). */
+  cssSelector?: string;
+}
+
+/** Task 7: one grounded accessibility-tree node, mirroring backend/app/contracts.py AxNode. */
+export interface AxNode {
+  ref: string;
+  role: string;
+  name: string;
+  /** Pre-glyph-strip accessible name, when it differs. Debugging only. */
+  rawName?: string;
+  tag: string;
+  inputType?: string;
+  value?: string;
+  targetId: string;
+  cssSelector: string;
+  xpath: string;
+  disabled: boolean;
+  checked?: boolean;
+  selected?: boolean;
+  expanded?: boolean;
+  bounds?: { x: number; y: number; width: number; height: number };
+  href?: string;
+  source: string;
 }
 
 export interface TabInfo {
@@ -207,6 +284,25 @@ export interface BrowserObservation {
   screenshot?: string;
   tabs?: TabInfo[];
   pageText?: string;
+  /** Task 7: grounded accessibility tree for this observation. The
+   * backend derives the same tree when an older extension omits it. */
+  axTree?: AxNode[];
+  /** Task 14: page-declared WebMCP tools for this observation (raw
+   * declarations — the backend validates them before the planner
+   * sees them). */
+  webmcpTools?: WebMCPTool[];
+  /** Task 14: UCP profile URL the page declares via <link rel="ucp">,
+   * if any (same-origin only). */
+  ucpProfileUrl?: string;
+}
+
+/** Task 14: one page-declared WebMCP tool, mirroring
+ * backend/app/webmcp.py WebMCPTool. */
+export interface WebMCPTool {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  outputSchema?: Record<string, unknown>;
 }
 
 export interface ActionResult {
@@ -230,29 +326,11 @@ export type TaskState =
   | "awaiting_confirmation"
   | "running"
   | "awaiting_input"
+  | "awaiting_takeover"
   | "completed"
   | "failed"
   | "cancelled"
   | "paused";
-
-export interface TaskProgress {
-  taskId: string;
-  taskState: TaskState;
-  stepsDone: number;
-  message: string;
-}
-
-export interface PrivacyDecision {
-  send: boolean;
-  reason: string;
-  violations: string[];
-}
-
-export interface PermissionRequest {
-  kind: "confirmation";
-  action: BrowserAction;
-  message: string;
-}
 
 export interface AgentError {
   code:
@@ -263,10 +341,17 @@ export interface AgentError {
     | "PLAN_INVALID"
     | "BUDGET_EXCEEDED"
     | "CANCELLED"
+    // Task 4: the operator has the browser (takeover); the action was not
+    // executed and is recoverable once the takeover resolves.
+    | "TAKEOVER_ACTIVE"
     | "EXTENSION_DISCONNECTED"
     | "TAB_UNAVAILABLE"
     | "TAB_UNAUTHORIZED"
     | "AMBIGUOUS_TAB"
+    // Task 14: the page exposes no usable WebMCP API, or the tool
+    // call failed inside the page. Recoverable — the loop re-plans
+    // and can fall back to driving the UI.
+    | "WEBMCP_UNAVAILABLE"
     | "UNKNOWN";
   message: string;
   recoverable: boolean;
@@ -275,17 +360,6 @@ export interface AgentError {
 export interface PlannedStep {
   action: BrowserAction;
   why: string;
-}
-
-export interface TaskPlan {
-  goal: string;
-  steps: PlannedStep[];
-}
-
-export interface UserTask {
-  id: string;
-  instruction: string;
-  status: TaskState;
 }
 
 export function validateAction(
@@ -338,6 +412,7 @@ export function validateAction(
 
   const hasTarget = !!target && (
     typeof target.targetId === "string" && target.targetId.length > 0
+    || typeof target.elementRef === "string" && /^e\d+$/.test(target.elementRef)
     || typeof target.name === "string" && target.name.length > 0
     || (!!targetCoords
       && typeof targetCoords.x === "number" && Number.isFinite(targetCoords.x)
@@ -427,6 +502,7 @@ export function validateAction(
       break;
     }
     case "select_tab":
+    case "switch_tab":
     case "close_tab": {
       const tabId = params?.tabId;
       if (typeof tabId !== "number" || !Number.isInteger(tabId) || tabId < 0) {

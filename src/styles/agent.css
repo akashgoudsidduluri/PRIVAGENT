@@ -262,6 +262,97 @@
 .human-gate__buttons {
   display: flex;
   gap: 12px;
+  flex-wrap: wrap;
+}
+
+/* Task 12: plan preview inside the confirmation gate. Steps are plain
+   text (textContent), so long target names wrap instead of overflowing. */
+.plan-preview {
+  margin: 0 0 14px;
+  padding: 14px 16px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(251, 191, 36, 0.35);
+}
+
+.plan-preview h5 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #fbbf24;
+}
+
+.plan-preview__list {
+  margin: 0 0 8px;
+  padding-left: 20px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #fef3c7;
+  overflow-wrap: anywhere;
+}
+
+.plan-preview__note {
+  margin: 0;
+  font-size: 12px;
+  color: rgba(254, 243, 199, 0.7);
+}
+
+/* Task 12: per-step task timeline (type, status, duration, flags). */
+.agent-timeline-card {
+  margin-top: 16px;
+  padding: 22px;
+  border-radius: 16px;
+  background: var(--panel, rgba(14, 24, 64, 0.7));
+  border: 1px solid var(--line, rgba(70, 215, 255, 0.15));
+}
+
+.task-timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.task-timeline__row {
+  display: grid;
+  grid-template-columns: 44px 1fr auto auto auto;
+  gap: 12px;
+  align-items: center;
+  padding: 10px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.task-timeline__row:first-child {
+  border-top: 0;
+}
+
+.task-timeline__step {
+  font-family: var(--font-display, monospace);
+  opacity: 0.6;
+}
+
+.task-timeline__status--verified {
+  color: #34d399;
+}
+
+.task-timeline__status--failed {
+  color: #f87171;
+}
+
+.task-timeline__status--completed_unverified {
+  color: #fbbf24;
+}
+
+.task-timeline__duration {
+  font-family: var(--font-display, monospace);
+  opacity: 0.75;
+}
+
+.task-timeline__flags {
+  font-size: 12px;
+  opacity: 0.6;
 }
 
 /* Execution Feed */
@@ -1520,3 +1611,74 @@
 .agent-attachment { display: flex; align-items: center; gap: .7rem; margin: .6rem 0 1rem; color: #a8bfda; font-size: .8rem; }
 .agent-attachment input { max-width: 15rem; color: #d8e9f9; font: inherit; }
 .agent-attachment input::file-selector-button { border: 1px solid #2e5c77; border-radius: .55rem; background: #102943; color: #d8f6ff; padding: .4rem .7rem; cursor: pointer; margin-right: .5rem; }
+
+/* Task 12: small-phone layout (~390px). The workspace must reflow with
+   no horizontal scroll, tap targets >= 44px, and no clipped controls.
+   Verified headlessly at 390px and 820px (see docs/UI.md). */
+@media (max-width: 480px) {
+  .agent-timeline {
+    padding: 16px 12px;
+  }
+  .agent-input-card,
+  .agent-feed-card,
+  .agent-timeline-card {
+    padding: 16px 12px;
+  }
+  .agent-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .agent-actions .btn {
+    min-height: 44px;
+    justify-content: center;
+  }
+  .agent-presets {
+    flex-wrap: wrap;
+  }
+  .preset-chip {
+    min-height: 44px;
+  }
+  .human-gate {
+    flex-direction: column;
+    gap: 10px;
+    padding: 16px 12px;
+  }
+  .human-gate__buttons {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .human-gate__buttons .btn {
+    min-height: 44px;
+    justify-content: center;
+  }
+  .plan-preview__list {
+    padding-left: 18px;
+  }
+  .task-timeline__row {
+    grid-template-columns: 36px 1fr auto;
+    grid-template-areas:
+      "step action status"
+      "step duration flags";
+    row-gap: 4px;
+  }
+  .task-timeline__step { grid-area: step; }
+  .task-timeline__action { grid-area: action; }
+  .task-timeline__status { grid-area: status; }
+  .task-timeline__duration { grid-area: duration; }
+  .task-timeline__flags { grid-area: flags; }
+  .agent-step-item__text {
+    overflow-wrap: anywhere;
+  }
+  .agent-result-card__body {
+    overflow-wrap: anywhere;
+  }
+  .comparison-grid {
+    grid-template-columns: 1fr;
+  }
+  .suggested-moves__chips {
+    flex-wrap: wrap;
+  }
+  .suggested-chip {
+    min-height: 44px;
+  }
+}

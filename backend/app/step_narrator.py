@@ -59,17 +59,6 @@ def _extract_site_and_query(url: str) -> tuple[str, str]:
         return "the website", ""
 
 
-def _extract_clean_product_name(text: str) -> str:
-    """Extract product or subject name from title or path."""
-    if not text:
-        return ""
-    # Remove URL slug characters
-    clean = re.sub(r"[-_/]+", " ", text).strip()
-    # Strip common suffixes
-    clean = re.sub(r"\b(p|itm|pid|lid|dp|ref|keywords|search)\b.*", "", clean, flags=re.IGNORECASE).strip()
-    return clean[:40] if clean else ""
-
-
 def generate_step_narrative(
     step_num: int,
     action: dict[str, Any],
