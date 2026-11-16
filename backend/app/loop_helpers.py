@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import re
+import time
 from typing import Any, Callable, Optional
 from urllib.parse import urlsplit
 
@@ -239,12 +240,24 @@ def _enforce_date_integrity(action: dict[str, Any], instruction: str) -> None:
             params["url"] = params["url"].replace("2027", "2026")
 
 
+class PlannerCancelledError(Exception):
+    """A queued planner job was picked up after its deadline.
+
+    ``asyncio.wait_for`` cannot cancel work already submitted to a
+    ThreadPoolExecutor, so a timed-out job would otherwise still run the
+    planner (wasting an LLM call) long after the loop gave up on it.
+    Checking the deadline here — in the worker thread, at pickup time —
+    is what actually stops queued jobs from running.
+    """
+
+
 def _call_planner(
     planner: Callable[..., dict[str, Any]],
     instruction: str,
     payload: dict[str, Any],
     history: list[dict[str, Any]],
     working_memory: dict[str, Any],
+    deadline: Optional[float] = None,
 ) -> dict[str, Any]:
     """Call the planner with working_memory only when it declares support.
 
@@ -252,6 +265,10 @@ def _call_planner(
     a planner must surface instead of silently replaying the call without
     working memory (which could duplicate side effects).
     """
+    if deadline is not None and time.monotonic() > deadline:
+        raise PlannerCancelledError(
+            "planner job picked up after its deadline; skipping the call"
+        )
     try:
         params = inspect.signature(planner).parameters
     except (TypeError, ValueError):

@@ -759,6 +759,7 @@ async def _run_loop(
                         payload_dict,
                         h_view,
                         working_memory,
+                        plan_deadline,
                     ),
                     timeout=max(0.001, time_left),
                 )

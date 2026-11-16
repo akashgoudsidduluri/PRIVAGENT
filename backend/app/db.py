@@ -83,9 +83,28 @@ def _enforce_db_file_permissions(path: str) -> None:
             pass
 
 
+class _ClosingConnection(sqlite3.Connection):
+    """A connection that closes when its ``with`` block exits.
+
+    ``sqlite3.Connection.__exit__`` only commits (or rolls back) — it
+    never closes the handle. Every ``with get_connection(...)`` site in
+    the codebase therefore leaked its handle until the GC collected it.
+    On Linux that is invisible (an open file can still be unlinked), but
+    on Windows the open handle locks the file: deleting a temp DB at
+    test teardown then fails with ``PermissionError: [WinError 32]``.
+    Closing on exit makes the handle lifetime match the block.
+    """
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
     path = _get_db_path(db_path)
-    conn = sqlite3.connect(path, timeout=10.0)
+    conn = sqlite3.connect(path, timeout=10.0, factory=_ClosingConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")

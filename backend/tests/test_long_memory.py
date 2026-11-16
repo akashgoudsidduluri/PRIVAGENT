@@ -291,6 +291,23 @@ def test_build_prompt_without_memory_has_no_block():
 # Checkpoints: cancel checkpoints, resume restores history
 # ---------------------------------------------------------------------------
 
+def test_get_connection_closes_when_with_block_exits(tmp_path):
+    # Regression test for the Windows WinError 32 failure of
+    # test_save_cancel_checkpoint_writes_only_when_missing:
+    # ``with get_connection(...)`` never closed the handle (sqlite3's
+    # __exit__ only commits), so the temp DB file stayed locked and
+    # TemporaryDirectory cleanup could not unlink it. On Linux the
+    # unlink succeeds against an open file, so only this assertion —
+    # the handle is closed after the block — catches it here.
+    import sqlite3
+
+    path = str(tmp_path / "close.db")
+    with db.get_connection(path) as conn:
+        conn.execute("CREATE TABLE t (a)")
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT 1")
+
+
 def test_save_cancel_checkpoint_writes_only_when_missing(monkeypatch):
     # save_cancel_checkpoint writes to the default DB path; point that at
     # a temp file so the test does not pollute the shared test DB.
