@@ -68,7 +68,20 @@ describe("vite self-contained entries (Task 13)", () => {
         "companion.js",
         "content.js",
         "manifest.json",
+        "rules",
       ]);
+      // The manifest's declarative_net_request.rule_resources points
+      // at rules/trackers.json, so the build must ship it byte-identical
+      // to the source — without it Chrome refuses to load the unpacked
+      // extension ("The provided path 'rules/trackers.json' is invalid").
+      const rulesOut = JSON.parse(
+        readFileSync(join(outDir, "rules", "trackers.json"), "utf-8"),
+      );
+      const rulesSrc = JSON.parse(
+        readFileSync(join(EXT_ROOT, "rules", "trackers.json"), "utf-8"),
+      );
+      expect(rulesOut).toEqual(rulesSrc);
+      expect(rulesOut.length).toBeGreaterThan(0);
       for (const entry of ["background.js", "content.js", "companion.js"]) {
         const code = readFileSync(join(outDir, entry), "utf-8");
         expect(code).not.toMatch(TOP_LEVEL_IMPORT);

@@ -1,4 +1,4 @@
-import { cpSync } from "node:fs";
+import { cpSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { Plugin } from "vite";
 
@@ -25,7 +25,14 @@ export function copyManifest(): Plugin {
     // self-contained-entries test does) used to copy the manifest
     // into dist/ instead, leaving the temp dist unloadable.
     writeBundle(options) {
-      cpSync("manifest.json", join(options.dir ?? "dist", "manifest.json"));
+      const outDir = options.dir ?? "dist";
+      cpSync("manifest.json", join(outDir, "manifest.json"));
+      // The manifest's declarative_net_request.rule_resources points
+      // at rules/trackers.json, so the rules file must ship in the
+      // output too — without it Chrome refuses to load the unpacked
+      // extension ("The provided path 'rules/trackers.json' is invalid").
+      mkdirSync(join(outDir, "rules"), { recursive: true });
+      cpSync("rules/trackers.json", join(outDir, "rules", "trackers.json"));
     },
   };
 }
