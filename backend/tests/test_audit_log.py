@@ -197,6 +197,9 @@ def test_memory_write_events_cover_file_save_and_skill_update(authed_client, log
     assert any("skill success recorded" in s for s in writes), writes
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="Unix file modes are not meaningful on Windows"
+)
 def test_log_file_and_dir_permissions(log_path):
     audit.append_event("confirmation_approved", "ok", log_path=log_path)
     assert stat.S_IMODE(os.stat(log_path).st_mode) == 0o600

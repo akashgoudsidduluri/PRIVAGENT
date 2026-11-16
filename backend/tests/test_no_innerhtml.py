@@ -724,12 +724,12 @@ def test_no_outer_html_document_write_or_insert_adjacent_html():
     bad = []
     for base in SCAN_DIRS:
         for path in sorted(base.rglob("*.ts")):
-            text = path.read_text()
+            text = path.read_text(encoding="utf-8")
             for pat in ("outerHTML", "document.write", "insertAdjacentHTML"):
                 if pat in text:
                     bad.append(f"{path.relative_to(REPO_ROOT)}: {pat}")
     for path in SCAN_FILES:
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
         for pat in ("outerHTML", "document.write", "insertAdjacentHTML"):
             if pat in text:
                 bad.append(f"{path.relative_to(REPO_ROOT)}: {pat}")
@@ -743,14 +743,14 @@ def test_every_innerhtml_assignment_is_proven_safe():
         for path in sorted(base.rglob("*.ts")):
             rel = str(path.relative_to(REPO_ROOT))
             safe_ids = SAFE_IDENTIFIERS.get(rel, set())
-            text = path.read_text()
+            text = path.read_text(encoding="utf-8")
             for line_no, rhs, _ in _find_innerhtml_sites(text):
                 sites += 1
                 ctx = f"{rel}:{line_no}"
                 for reason in _check_rhs(rhs, safe_ids, ctx):
                     violations.append(f"{ctx}: {reason}")
     for path in SCAN_FILES:
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
         for line_no, rhs, _ in _find_innerhtml_sites(text):
             sites += 1
             ctx = f"{path.relative_to(REPO_ROOT)}:{line_no}"

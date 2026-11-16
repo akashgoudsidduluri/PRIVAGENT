@@ -148,7 +148,8 @@ def test_generated_token_is_persisted_encrypted_with_mode_0600(tmp_path, monkeyp
         assert not token_file.exists()
         store_file = store_dir / "secrets.enc.json"
         assert store_file.exists()
-        assert stat.S_IMODE(store_file.stat().st_mode) == 0o600
+        if os.name != "nt":  # Windows has no Unix mode bits (stat reports 0o666)
+            assert stat.S_IMODE(store_file.stat().st_mode) == 0o600
         assert token not in store_file.read_text(encoding="utf-8")
         # Second call reuses the stored token; it is not regenerated.
         auth.reset_for_tests()

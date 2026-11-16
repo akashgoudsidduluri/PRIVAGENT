@@ -88,7 +88,8 @@ def test_store_file_contains_no_plaintext_secret(isolated_store):
     secrets_store.set_secret("oauth:google:access_token", "super-secret-token-123")
     raw = _store_file(isolated_store).read_text(encoding="utf-8")
     assert "super-secret-token-123" not in raw
-    assert stat.S_IMODE(_store_file(isolated_store).stat().st_mode) == 0o600
+    if os.name != "nt":  # Windows has no Unix mode bits (stat reports 0o666)
+        assert stat.S_IMODE(_store_file(isolated_store).stat().st_mode) == 0o600
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +254,9 @@ def test_generated_token_is_stored_encrypted_not_plaintext(tmp_path, isolated_st
 # SQLite at rest: 0600 files + encrypted columns
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="Unix file modes are not meaningful on Windows"
+)
 def test_db_files_are_mode_0600(tmp_path, isolated_store):
     db_path = str(tmp_path / "perm.db")
     db.init_db(db_path)
