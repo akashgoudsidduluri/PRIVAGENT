@@ -169,6 +169,14 @@ async def security_guard(request, call_next):
             except Exception:
                 pass
             return JSONResponse({"detail": "referer not allowed"}, status_code=403)
+    if request.method == "OPTIONS":
+        # CORS preflight: browsers never send Authorization on a
+        # preflight, so it cannot pass the token check below. Let
+        # CORSMiddleware answer it — it only echoes allow-listed
+        # origins, so a disallowed origin still gets no ACAO header
+        # and the browser blocks the real request. Without this the
+        # web UI is blocked by CORS on every authenticated call.
+        return await call_next(request)
     path = request.url.path
     if path.startswith("/api/") and not _auth_exempt(path):
         token: Optional[str] = None

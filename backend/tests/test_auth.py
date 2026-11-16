@@ -26,6 +26,26 @@ def test_no_token_returns_401(disable_auto_auth):
         assert r.headers.get("www-authenticate") == "Bearer"
 
 
+def test_cors_preflight_without_token_succeeds(disable_auto_auth):
+    """A real browser preflight carries no Authorization header, so the
+    auth gate must not 401 it — CORSMiddleware has to answer. Without
+    this the workspace at localhost:5173 is blocked by CORS on every
+    authenticated call (the preflight fails, so the real request never
+    fires), even though the token itself is fine. The existing
+    preflight test passes only because the suite's TestClient injects
+    the token automatically — a real browser never does."""
+    with TestClient(app) as client:
+        r = client.options(
+            "/api/chats",
+            headers={
+                "Origin": "http://localhost:5173",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        assert r.status_code == 200
+        assert r.headers.get("access-control-allow-origin") == "http://localhost:5173"
+
+
 def test_wrong_token_returns_401(disable_auto_auth):
     with TestClient(app) as client:
         r = client.get(
