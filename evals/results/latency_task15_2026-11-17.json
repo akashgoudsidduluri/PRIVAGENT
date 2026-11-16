@@ -1,0 +1,1 @@
+{"task": "log in (type username, type password, click Log in) + search (type query, click Search)", "runs": 3, "planner_delay_ms": 200.0, "planner_calls": 4, "observation_calls": 1, "actions_dispatched": 5, "steps": 5, "wall_ms_median": 846.19}
