@@ -71,6 +71,7 @@ from .loop_helpers import (
     _is_messaging_host,
     _is_redundant_completed_action,
     _is_whatsapp_qr,
+    _normalize_loop_error,
     _plan_tree_and_refs,
     _same_failure,
     _state_digest,
@@ -1238,19 +1239,24 @@ async def _run_loop(
         # with this same error; three in a row stops the task, one
         # earns a warning penalty — mirroring the success-path
         # thresholds above. Runs on every iteration, regardless of
-        # the last step's outcome.
+        # the last step's outcome. Errors are compared by normalized
+        # cause, not raw text: the extension embeds the changing
+        # target (refs, ids, coords) in the message, so two failures
+        # with the same cause never share a raw string.
         failed_repeats = 0
         if history and history[-1].get("result_ok") is False and history[-1].get("error"):
             _last_err = history[-1].get("error")
-            for _h in reversed(history):
-                if (
-                    _h.get("result_ok") is False
-                    and _actions_match(_h.get("action", {}), action)
-                    and _h.get("error") == _last_err
-                ):
-                    failed_repeats += 1
-                else:
-                    break
+            _last_key = _normalize_loop_error(_last_err)
+            if _last_key:
+                for _h in reversed(history):
+                    if (
+                        _h.get("result_ok") is False
+                        and _actions_match(_h.get("action", {}), action)
+                        and _normalize_loop_error(_h.get("error")) == _last_key
+                    ):
+                        failed_repeats += 1
+                    else:
+                        break
             if failed_repeats >= 3:
                 return {
                     "final": "budget_exceeded",

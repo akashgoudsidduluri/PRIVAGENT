@@ -52,6 +52,8 @@ __all__ = [
     "_is_messaging_host",
     "_is_redundant_completed_action",
     "_is_whatsapp_qr",
+    "_normalize_loop_error",
+    "_normalize_loop_name",
     "_plan_tree_and_refs",
     "_same_failure",
     "_state_digest",
@@ -283,6 +285,40 @@ def _call_planner(
     return planner(instruction, payload, history)
 
 
+def _normalize_loop_name(name: Any) -> str:
+    """Case/punctuation-insensitive target name, for loop matching.
+
+    Refs and ids churn on every re-render, so the accessible name is
+    the stable identity of a control — but only cosmetically: case,
+    punctuation and symbols (the '✕' in a close button) must not
+    defeat the match. Returns '' when nothing alphanumeric survives
+    (an icon-only control has no usable name; callers must not treat
+    two empty names as a match).
+    """
+    if not isinstance(name, str):
+        return ""
+    return re.sub(r"[^a-z0-9]+", "", name.lower())
+
+
+def _normalize_loop_error(error: Any) -> str:
+    """Stable key for a step error, for loop matching.
+
+    Extension errors embed the changing target in the message — e.g.
+    STALE_TARGET 'no matching element for
+    {"elementRef":"e12","targetId":"...","name":"Close"}' — so the raw
+    strings are never equal twice even when the cause is identical.
+    Strip JSON blobs, ref-like tokens and numbers; what survives is
+    the cause phrase. Returns '' when nothing survives.
+    """
+    if not isinstance(error, str):
+        return ""
+    text = re.sub(r"\{[^}]*\}", " ", error)
+    text = re.sub(r"\be\d+\b", " ", text)
+    text = re.sub(r"[0-9]+", " ", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text.lower())
+    return " ".join(text.split())
+
+
 def _actions_match(a1: dict[str, Any], a2: dict[str, Any]) -> bool:
     if a1.get("type") != a2.get("type"):
         return False
@@ -291,7 +327,9 @@ def _actions_match(a1: dict[str, Any], a2: dict[str, Any]) -> bool:
     p1 = a1.get("params") or {}
     p2 = a2.get("params") or {}
     if t1 and t2:
-        if t1.get("name") and t1.get("name") == t2.get("name"):
+        n1 = _normalize_loop_name(t1.get("name"))
+        n2 = _normalize_loop_name(t2.get("name"))
+        if n1 and n1 == n2:
             return True
         if t1.get("targetId") and t1.get("targetId") == t2.get("targetId"):
             return True
@@ -480,10 +518,17 @@ def _summary(obs: Any, history: list[dict[str, Any]]) -> str:
 
 
 def _same_failure(history: list[dict[str, Any]], entry: dict[str, Any]) -> Optional[str]:
+    # Errors are compared by normalized cause, not raw text: the
+    # extension embeds the changing target (refs, ids, coords) in the
+    # message, so two failures with the same cause never share a raw
+    # string. An empty normalized key matches nothing.
+    err_key = _normalize_loop_error(entry.get("error"))
+    if not err_key:
+        return None
     for prev in reversed(history):
         if prev.get("result_ok"):
             return None
-        if prev.get("error") == entry.get("error") and prev["action"].get("type") == entry["action"].get("type"):
+        if _normalize_loop_error(prev.get("error")) == err_key and prev["action"].get("type") == entry["action"].get("type"):
             return f"repeated failure: {entry['error']} on {entry['action'].get('type')}"
     return None
 

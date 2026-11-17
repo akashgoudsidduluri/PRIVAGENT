@@ -302,13 +302,37 @@ def test_repeated_failure_loop_detection_stops_stale_clicks():
     popup-close clicks, each failing STALE_TARGET as the page
     re-rendered, because loop detection only ran when the last step
     SUCCEEDED. The task ran to the 50-step cap with 1/3 sites done.
+
+    Production shape matters here: the extension embeds the changing
+    target in every STALE_TARGET message ('no matching element for
+    {"elementRef":"e12","targetId":"...","name":"Close"}'), so the raw
+    error strings are never equal twice — and the planner re-targets
+    with a fresh id on every attempt. Matching must therefore be by
+    normalized cause and normalized name, not raw strings. A second
+    live run (2026-11-18, after the first fix was pulled + the backend
+    restarted) looped 32 more times for exactly this reason.
     """
-    hub = FakeHub({"click": [{"ok": False, "error": {"code": "STALE_TARGET", "message": "STALE_TARGET", "recoverable": True}, "msg": "STALE_TARGET", "fail_n": 50}]})
+    # 60 distinct failures: the list must never run out mid-run, or the
+    # hub would start repeating its last entry and the old exact-match
+    # check would stop the loop by accident. In production every
+    # failure carries a fresh ref, so no two messages are ever equal.
+    failures = [
+        {"ok": False, "error": {
+            "code": "STALE_TARGET",
+            "message": 'no matching element for {"elementRef":"e%d","targetId":"popup-close-%d","name":"Close"}' % (12 + 3 * i, i + 1),
+            "recoverable": True,
+        }}
+        for i in range(60)
+    ]
+    hub = FakeHub({"click": failures})
     plans: list[dict] = []
+    calls = {"n": 0}
 
     class Planner:
         def __call__(self, i, p, h):
             plans.append(h)
+            calls["n"] += 1
+            n = calls["n"]
             return {
                 "goal": "dismiss popup",
                 "steps": [{
@@ -318,16 +342,18 @@ def test_repeated_failure_loop_detection_stops_stale_clicks():
                         "risk": "write",
                         "verify": "v",
                         "timeoutMs": 100,
-                        "target": {"targetId": "popup-close", "name": "Close"},
+                        "target": {"targetId": f"popup-close-{n}", "name": "Close"},
                     },
                 }],
             }
 
     state = asyncio.run(agentLoop.run_with_injection(
         hub, planner=Planner(),
+        # Empty tree: nothing to re-ground against, so the stale-ref
+        # recovery finds no fresh target and each step fails cleanly.
         obs_factory=lambda: {
             "tabId": 1, "url": "https://www.flipkart.com/search?q=logitech", "title": "Search",
-            "interactive": [{"targetId": "popup-close", "role": "button", "name": "Close", "tag": "button", "visible": True, "enabled": True}],
+            "interactive": [],
             "scroll": {}, "dpr": 1,
         },
     ))
