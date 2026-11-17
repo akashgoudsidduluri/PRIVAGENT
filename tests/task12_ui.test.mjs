@@ -145,3 +145,28 @@ test("480px rules reflow the workspace without horizontal scroll", () => {
   assert.ok(refreshCss.includes(".cc-audit-controls"), "no audit controls layout");
   assert.ok(refreshCss.includes("overflow-wrap:anywhere"), "tracker hosts can overflow");
 });
+
+// ---------------------------------------------------------------------------
+// Pinned composer: the mission input must stay at the bottom of the
+// timeline column while the feed scrolls, so the operator never has to
+// scroll back up to type the next mission (ChatGPT/Gemini-style).
+// ---------------------------------------------------------------------------
+
+test("mission composer is pinned to the bottom of the timeline", () => {
+  const agentCss = read("src/styles/agent.css");
+  const card = agentCss.match(/\.agent-input-card\s*\{([\s\S]*?)\}/);
+  assert.ok(card, "no .agent-input-card rule in agent.css");
+  const rules = card[1];
+  assert.ok(/position:\s*sticky/.test(rules), "composer is not sticky");
+  assert.ok(/bottom:\s*\d+px/.test(rules), "composer has no bottom offset");
+  const order = rules.match(/order:\s*(\d+)/);
+  assert.ok(order && Number(order[1]) > 0, "composer does not sort after the feed cards");
+  assert.ok(/z-index:\s*\d+/.test(rules), "composer has no z-index (feed would paint over it)");
+  // The timeline is a flex column, so order actually moves the card.
+  const timeline = agentCss.match(/\.agent-timeline\s*\{([\s\S]*?)\}/);
+  assert.ok(
+    timeline && /display:\s*flex/.test(timeline[1]) && /flex-direction:\s*column/.test(timeline[1]),
+    "timeline is not a flex column, so order cannot move the composer",
+  );
+  assert.ok(read("agent.html").includes('id="missionInput"'), "composer textarea missing from agent.html");
+});

@@ -162,6 +162,18 @@
   background: var(--panel, rgba(14, 24, 64, 0.7));
   border: 1px solid var(--line, rgba(70, 215, 255, 0.15));
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+  /* Pinned composer (ChatGPT/Gemini-style): the mission input sits at
+     the BOTTOM of the timeline column and stays visible while the
+     execution feed scrolls above it. It used to sit at the top of the
+     column, so the operator had to scroll back up to type the next
+     mission. order: 10 moves it after the feed/result cards in the
+     flex column; sticky bottom pins it to the viewport bottom. Its own
+     background + shadow keep feed text sliding underneath readable.
+     z-index stays below the sticky header (50). */
+  order: 10;
+  position: sticky;
+  bottom: 12px;
+  z-index: 20;
 }
 
 .agent-input-label {
