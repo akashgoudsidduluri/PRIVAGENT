@@ -19,7 +19,7 @@ const RECONNECT_MS = 2000;
 // every /api/* route and accepts ?token= on its websocket endpoints.
 // The token is stored in chrome.storage.local under TOKEN_STORAGE_KEY.
 // Manual first-run step: open the extension service worker console and run:
-//   chrome.storage.local.set({ privagentLocalToken: "<token from backend/data/.local_token>" })
+//   chrome.storage.local.set({ privagentLocalToken: "<token from backend/scripts/print_local_token.py>" })
 // (A token-entry UI in the extension is follow-up work.) Until a token
 // is stored, the extension connects without one and the backend accepts
 // the websocket with a warning log; REST calls without a token get 401.

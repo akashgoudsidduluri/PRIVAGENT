@@ -8,8 +8,6 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=IBM+Plex+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/src/styles/main.css" />
-  <link rel="stylesheet" href="/src/styles/agent.css" />
 </head>
 <body class="agent-body">
   <!-- Top App Bar -->
@@ -52,6 +50,11 @@
   <!-- Workspace Split Grid -->
   <nav id="controlNav" class="control-nav" aria-label="Control center"></nav>
   <div id="controlPage" class="control-page"></div>
+  <!-- Agent workspace (UI flicker fix): kept inert inside a <template> —
+       template content is never painted, so the first paint is the
+       control center only. controlCenter mounts it (once) when the
+       operator opens the Agent Workspace, Inspector, or Activity view. -->
+  <template id="workspaceTemplate">
   <main class="agent-workspace" id="agentWorkspace">
     <!-- Left: Collapsible Missions History Sidebar -->
     <aside class="agent-chat-sidebar" id="chatSidebar" aria-label="Mission History Sidebar">
@@ -284,6 +287,7 @@
       </div>
     </aside>
   </main>
+  </template>
 
   <!-- LLM Provider Settings Dialog -->
   <div class="llm-settings-overlay" id="llmSettingsOverlay" hidden>

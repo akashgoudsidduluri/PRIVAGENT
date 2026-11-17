@@ -1,4 +1,29 @@
 /* NAVIGATOR Agent Workspace Stylesheet */
+
+/* Control-center shell base rules (UI flicker fix): agent.html no longer
+   loads the landing stylesheet (main.css), so the buttons and brand the
+   static header uses need their base rules here. Values copied verbatim
+   from src/styles/main.css; .btn--primary / .btn--ghost variants are
+   already provided by control-center.css / control-center-refresh.css,
+   which win on equal specificity as the later-loaded stylesheets. */
+.agent-body .btn {
+  display: inline-flex; align-items: center; gap: 0.55rem;
+  font-family: var(--font-display, "Chakra Petch", sans-serif); font-weight: 600; letter-spacing: 0.04em;
+  border-radius: 999px; padding: 0.8rem 1.7rem; cursor: pointer;
+  border: 1px solid transparent; transition: transform .2s ease, box-shadow .2s ease, background .2s ease, border-color .2s ease;
+}
+.agent-body .btn--sm { padding: 0.5rem 1.1rem; font-size: 0.85rem; }
+.agent-body .nav__brand { display: flex; align-items: center; gap: 0.6rem; color: var(--ink, #e8eeff); }
+.agent-body .nav__logo { display: grid; place-items: center; width: 36px; height: 36px; border: 1px solid rgba(70, 215, 255, 0.4); border-radius: 10px; background: rgba(70, 215, 255, 0.08); }
+.agent-body .nav__wordmark { font-weight: 700; font-size: 1.02rem; }
+.agent-body .nav__wordmark sup { font-size: 0.6rem; letter-spacing: 0.1em; margin-left: 2px; }
+/* Base resets main.css used to provide for this page (copied verbatim,
+   scoped to the agent page so the landing page is untouched). Without
+   these, dropping main.css would flip box-sizing to content-box and
+   restore browser bullets/padding on the vault/memory lists. */
+.agent-body *, .agent-body *::before, .agent-body *::after { box-sizing: border-box; }
+.agent-body ul, .agent-body ol { margin: 0; padding: 0; list-style: none; }
+
 .agent-body {
   margin: 0;
   padding: 0;
@@ -6,6 +31,8 @@
   background: var(--bg, #060b1e);
   color: var(--text, #e6ecff);
   font-family: var(--font-body, system-ui, sans-serif);
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
   display: flex;
   flex-direction: column;
 }

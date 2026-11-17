@@ -116,6 +116,33 @@ async def execute_monitor(mission: dict) -> None:
                 conn.execute("UPDATE email_monitoring_missions SET last_sync_at=? WHERE id=?", (time.time(), mission["id"]))
         return
 
+    # Task 2 live monitoring: a plain public http(s) watch does not
+    # need a live Chrome extension. When no extension is connected,
+    # check the page over HTTP instead of failing with
+    # EXTENSION_DISCONNECTED; when one IS connected, keep the
+    # existing browser path (it sees rendered/JS content the HTTP
+    # fetch cannot). Either way the check is read-only.
+    if target_url.startswith(("http://", "https://")) and hub.extension_ws is None:
+        from .monitor_check import _validate_monitor_url, check_monitor_http
+
+        ok, reason = _validate_monitor_url(target_url)
+        if not ok:
+            logger.warning("monitor %s: HTTP check refused (%s)", mission["id"], reason)
+            with db.get_connection() as conn:
+                conn.execute("UPDATE monitoring_missions SET status='failed',last_run_at=? WHERE id=?",
+                             (time.time(), mission["id"]))
+            return
+        try:
+            event = await asyncio.to_thread(check_monitor_http, mission["id"], target_url)
+            if event:
+                await broadcast_event(event)
+        except Exception as exc:
+            logger.warning("monitor %s: HTTP check failed: %s", mission["id"], exc)
+            with db.get_connection() as conn:
+                conn.execute("UPDATE monitoring_missions SET status='failed',last_run_at=? WHERE id=?",
+                             (time.time(), mission["id"]))
+        return
+
     record = hub.new_task(f"Open {target_url} and observe its public visible page text and price. Report only observed facts.",
                           chat_id=mission["conversation_id"])
     record.state = "planning"

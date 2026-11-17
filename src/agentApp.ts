@@ -8,29 +8,29 @@ import { buildTimelineRows, formatDuration, timelineSummary } from "./timeline";
 const API = "http://localhost:8000";
 
 // Workspace & Sidebar Elements
-const agentWorkspace = document.getElementById("agentWorkspace") as HTMLElement | null;
+let agentWorkspace: HTMLElement | null = null;
 const btnToggleSidebarHeader = document.getElementById("btnToggleSidebarHeader") as HTMLButtonElement | null;
-const btnCollapseSidebar = document.getElementById("btnCollapseSidebar") as HTMLButtonElement | null;
-const btnNewMissionSidebar = document.getElementById("btnNewMissionSidebar") as HTMLButtonElement | null;
-const chatHistoryList = document.getElementById("chatHistoryList") as HTMLUListElement | null;
+let btnCollapseSidebar: HTMLButtonElement | null = null;
+let btnNewMissionSidebar: HTMLButtonElement | null = null;
+let chatHistoryList: HTMLUListElement | null = null;
 
 // Directive & Timeline Elements
-const missionInput = document.getElementById("missionInput") as HTMLTextAreaElement | null;
-const missionAttachment = document.getElementById("missionAttachment") as HTMLInputElement | null;
-const btnStartMission = document.getElementById("btnStartMission") as HTMLButtonElement | null;
-const btnCancelMission = document.getElementById("btnCancelMission") as HTMLButtonElement | null;
+let missionInput: HTMLTextAreaElement | null = null;
+let missionAttachment: HTMLInputElement | null = null;
+let btnStartMission: HTMLButtonElement | null = null;
+let btnCancelMission: HTMLButtonElement | null = null;
 const btnNewSession = document.getElementById("btnNewSession") as HTMLButtonElement | null;
-const missionSubtext = document.getElementById("missionSubtext") as HTMLElement | null;
-const stateBadge = document.getElementById("missionStateBadge") as HTMLElement | null;
-const stepsList = document.getElementById("agentStepsList") as HTMLOListElement | null;
-const stepsCount = document.getElementById("feedStepsCount") as HTMLElement | null;
-const resultCard = document.getElementById("agentResultCard") as HTMLElement | null;
-const resultContent = document.getElementById("resultContent") as HTMLElement | null;
-const resultBadge = document.getElementById("resultBadge") as HTMLElement | null;
-const resultTimestamp = document.getElementById("resultTimestamp") as HTMLElement | null;
-const artifactsCard = document.getElementById("agentArtifactsCard") as HTMLElement | null;
-const artifactsList = document.getElementById("agentArtifactsList") as HTMLElement | null;
-const artifactsCount = document.getElementById("artifactsCount") as HTMLElement | null;
+let missionSubtext: HTMLElement | null = null;
+let stateBadge: HTMLElement | null = null;
+let stepsList: HTMLOListElement | null = null;
+let stepsCount: HTMLElement | null = null;
+let resultCard: HTMLElement | null = null;
+let resultContent: HTMLElement | null = null;
+let resultBadge: HTMLElement | null = null;
+let resultTimestamp: HTMLElement | null = null;
+let artifactsCard: HTMLElement | null = null;
+let artifactsList: HTMLElement | null = null;
+let artifactsCount: HTMLElement | null = null;
 
 interface ArtifactItem {
   artifact_id: string;
@@ -101,7 +101,7 @@ async function loadArtifacts(taskId?: string | null, chatId?: string | null): Pr
           <a href="${artifactUrl(`${API}/api/artifacts/${artId}/download`)}" class="btn-artifact btn-artifact--download" download>Download</a>
         </div>
       `;
-      artifactsList.appendChild(itemEl);
+      artifactsList?.appendChild(itemEl);
     });
   } catch {
     artifactsCard.hidden = true;
@@ -109,39 +109,325 @@ async function loadArtifacts(taskId?: string | null, chatId?: string | null): Pr
 }
 
 // Human Gate
-const humanGate = document.getElementById("humanGate") as HTMLElement | null;
-const humanGateMsg = document.getElementById("humanGateMsg") as HTMLElement | null;
-const btnGateApprove = document.getElementById("btnGateApprove") as HTMLButtonElement | null;
-const btnGateApproveStep = document.getElementById("btnGateApproveStep") as HTMLButtonElement | null;
-const btnGateReject = document.getElementById("btnGateReject") as HTMLButtonElement | null;
-const planPreview = document.getElementById("planPreview") as HTMLElement | null;
-const planPreviewTitleEl = document.getElementById("planPreviewTitle") as HTMLElement | null;
-const planPreviewList = document.getElementById("planPreviewList") as HTMLOListElement | null;
-const taskTimelineCard = document.getElementById("taskTimelineCard") as HTMLElement | null;
-const taskTimelineList = document.getElementById("taskTimelineList") as HTMLOListElement | null;
-const timelineSummaryEl = document.getElementById("timelineSummary") as HTMLElement | null;
+let humanGate: HTMLElement | null = null;
+let humanGateMsg: HTMLElement | null = null;
+let btnGateApprove: HTMLButtonElement | null = null;
+let btnGateApproveStep: HTMLButtonElement | null = null;
+let btnGateReject: HTMLButtonElement | null = null;
+let planPreview: HTMLElement | null = null;
+let planPreviewTitleEl: HTMLElement | null = null;
+let planPreviewList: HTMLOListElement | null = null;
+let taskTimelineCard: HTMLElement | null = null;
+let taskTimelineList: HTMLOListElement | null = null;
+let timelineSummaryEl: HTMLElement | null = null;
 
 // Takeover Banner (Task 4: the agent is paused and not watching)
-const takeoverBanner = document.getElementById("takeoverBanner") as HTMLElement | null;
-const takeoverMsg = document.getElementById("takeoverMsg") as HTMLElement | null;
-const takeoverMeta = document.getElementById("takeoverMeta") as HTMLElement | null;
-const btnTakeoverResume = document.getElementById("btnTakeoverResume") as HTMLButtonElement | null;
-const btnTakeoverCancel = document.getElementById("btnTakeoverCancel") as HTMLButtonElement | null;
+let takeoverBanner: HTMLElement | null = null;
+let takeoverMsg: HTMLElement | null = null;
+let takeoverMeta: HTMLElement | null = null;
+let btnTakeoverResume: HTMLButtonElement | null = null;
+let btnTakeoverCancel: HTMLButtonElement | null = null;
 
 // Inspector
-const inspectorUrl = document.getElementById("inspectorUrl") as HTMLAnchorElement | null;
-const inspectorTitle = document.getElementById("inspectorTitle") as HTMLElement | null;
-const inspectorEvidence = document.getElementById("inspectorEvidence") as HTMLElement | null;
-const telStepsDone = document.getElementById("telStepsDone") as HTMLElement | null;
-const telRemoteVision = document.getElementById("telRemoteVision") as HTMLElement | null;
-const telPlannerLatency = document.getElementById("telPlannerLatency") as HTMLElement | null;
-const obstacleBadge = document.getElementById("obstacleBadge") as HTMLElement | null;
-const inspectorScreenshot = document.getElementById("inspectorScreenshot") as HTMLImageElement | null;
-const inspectorScreenshotPlaceholder = document.getElementById("inspectorScreenshotPlaceholder") as HTMLElement | null;
+let inspectorUrl: HTMLAnchorElement | null = null;
+let inspectorTitle: HTMLElement | null = null;
+let inspectorEvidence: HTMLElement | null = null;
+let telStepsDone: HTMLElement | null = null;
+let telRemoteVision: HTMLElement | null = null;
+let telPlannerLatency: HTMLElement | null = null;
+let obstacleBadge: HTMLElement | null = null;
+let inspectorScreenshot: HTMLImageElement | null = null;
+let inspectorScreenshotPlaceholder: HTMLElement | null = null;
 
 // WS status
 const wsDot = document.getElementById("wsDot") as HTMLElement | null;
 const wsText = document.getElementById("wsText") as HTMLElement | null;
+// ---------------------------------------------------------------------------
+// Lazy workspace mount (UI flicker fix).
+// The workspace markup lives inert inside <template id="workspaceTemplate">
+// in agent.html, so it is never painted until the operator opens the Agent
+// Workspace, Browser Inspector, or Activity view. No workspace node may be
+// resolved at module load: every workspace ref above starts null and is
+// resolved here, once, on first mount, before any listener wiring or data
+// load that touches those nodes. The static header (sidebar toggle, New
+// Mission, connection status) is wired at module load and stays live.
+// ---------------------------------------------------------------------------
+let workspaceMounted = false;
+
+export function ensureWorkspaceMounted(): HTMLElement | null {
+  if (workspaceMounted) return agentWorkspace;
+  const tpl = document.getElementById("workspaceTemplate") as HTMLTemplateElement | null;
+  if (!tpl) return null;
+  const frag = tpl.content.cloneNode(true) as DocumentFragment;
+  if (!frag.querySelector("#agentWorkspace")) return null;
+  // Replace the inert template with its live clone, in place.
+  tpl.replaceWith(frag);
+  workspaceMounted = true;
+  initWorkspaceElements();
+  return agentWorkspace;
+}
+
+function initWorkspaceElements(): void {
+  agentWorkspace = document.getElementById("agentWorkspace") as HTMLElement | null;
+  btnCollapseSidebar = document.getElementById("btnCollapseSidebar") as HTMLButtonElement | null;
+  btnNewMissionSidebar = document.getElementById("btnNewMissionSidebar") as HTMLButtonElement | null;
+  chatHistoryList = document.getElementById("chatHistoryList") as HTMLUListElement | null;
+  missionInput = document.getElementById("missionInput") as HTMLTextAreaElement | null;
+  missionAttachment = document.getElementById("missionAttachment") as HTMLInputElement | null;
+  btnStartMission = document.getElementById("btnStartMission") as HTMLButtonElement | null;
+  btnCancelMission = document.getElementById("btnCancelMission") as HTMLButtonElement | null;
+  missionSubtext = document.getElementById("missionSubtext") as HTMLElement | null;
+  stateBadge = document.getElementById("missionStateBadge") as HTMLElement | null;
+  stepsList = document.getElementById("agentStepsList") as HTMLOListElement | null;
+  stepsCount = document.getElementById("feedStepsCount") as HTMLElement | null;
+  resultCard = document.getElementById("agentResultCard") as HTMLElement | null;
+  resultContent = document.getElementById("resultContent") as HTMLElement | null;
+  resultBadge = document.getElementById("resultBadge") as HTMLElement | null;
+  resultTimestamp = document.getElementById("resultTimestamp") as HTMLElement | null;
+  artifactsCard = document.getElementById("agentArtifactsCard") as HTMLElement | null;
+  artifactsList = document.getElementById("agentArtifactsList") as HTMLElement | null;
+  artifactsCount = document.getElementById("artifactsCount") as HTMLElement | null;
+  humanGate = document.getElementById("humanGate") as HTMLElement | null;
+  humanGateMsg = document.getElementById("humanGateMsg") as HTMLElement | null;
+  btnGateApprove = document.getElementById("btnGateApprove") as HTMLButtonElement | null;
+  btnGateApproveStep = document.getElementById("btnGateApproveStep") as HTMLButtonElement | null;
+  btnGateReject = document.getElementById("btnGateReject") as HTMLButtonElement | null;
+  planPreview = document.getElementById("planPreview") as HTMLElement | null;
+  planPreviewTitleEl = document.getElementById("planPreviewTitle") as HTMLElement | null;
+  planPreviewList = document.getElementById("planPreviewList") as HTMLOListElement | null;
+  taskTimelineCard = document.getElementById("taskTimelineCard") as HTMLElement | null;
+  taskTimelineList = document.getElementById("taskTimelineList") as HTMLOListElement | null;
+  timelineSummaryEl = document.getElementById("timelineSummary") as HTMLElement | null;
+  takeoverBanner = document.getElementById("takeoverBanner") as HTMLElement | null;
+  takeoverMsg = document.getElementById("takeoverMsg") as HTMLElement | null;
+  takeoverMeta = document.getElementById("takeoverMeta") as HTMLElement | null;
+  btnTakeoverResume = document.getElementById("btnTakeoverResume") as HTMLButtonElement | null;
+  btnTakeoverCancel = document.getElementById("btnTakeoverCancel") as HTMLButtonElement | null;
+  inspectorUrl = document.getElementById("inspectorUrl") as HTMLAnchorElement | null;
+  inspectorTitle = document.getElementById("inspectorTitle") as HTMLElement | null;
+  inspectorEvidence = document.getElementById("inspectorEvidence") as HTMLElement | null;
+  telStepsDone = document.getElementById("telStepsDone") as HTMLElement | null;
+  telRemoteVision = document.getElementById("telRemoteVision") as HTMLElement | null;
+  telPlannerLatency = document.getElementById("telPlannerLatency") as HTMLElement | null;
+  obstacleBadge = document.getElementById("obstacleBadge") as HTMLElement | null;
+  inspectorScreenshot = document.getElementById("inspectorScreenshot") as HTMLImageElement | null;
+  inspectorScreenshotPlaceholder = document.getElementById("inspectorScreenshotPlaceholder") as HTMLElement | null;
+
+  // Workspace listeners — wired once, on first mount. The handlers below
+  // are unchanged from the old module-top-level wiring; they only moved.
+  btnCollapseSidebar?.addEventListener("click", () => {
+    agentWorkspace?.classList.add("sidebar-collapsed");
+  });
+
+  btnNewMissionSidebar?.addEventListener("click", () => {
+    createNewChat();
+  });
+
+  // Non-null assertions below: each handler is attached only when
+  // missionInput was non-null (the `?.` receiver), and the ref is never
+  // cleared afterwards — the element exists for the page's lifetime.
+  missionInput?.addEventListener("input", () => {
+    if (btnStartMission && !isWorking) btnStartMission.disabled = !missionInput!.value.trim();
+  });
+
+  missionInput?.addEventListener("keydown", (e: KeyboardEvent) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      if (!isWorking && missionInput!.value.trim() && btnStartMission && !btnStartMission.disabled) {
+        btnStartMission.click();
+      }
+    }
+  });
+
+  // Preset Chips & Suggested Action Pills
+  document.querySelectorAll(".preset-chip").forEach(chip => {
+    chip.addEventListener("click", () => {
+      const prompt = chip.getAttribute("data-prompt");
+      if (prompt && missionInput) {
+        missionInput.value = prompt;
+        if (btnStartMission && !isWorking) btnStartMission.disabled = false;
+        missionInput.focus();
+      }
+    });
+  });
+
+  btnStartMission?.addEventListener("click", async () => {
+    if (isWorking || !missionInput || !btnStartMission || !missionInput.value.trim()) return;
+    const instruction = missionInput.value.trim();
+    activeInstruction = instruction;
+
+    setButtonWorking(true);
+    if (btnCancelMission) btnCancelMission.hidden = false;
+    if (resultCard) resultCard.hidden = true;
+    hideHumanGate();
+    currentTaskId = null;
+    renderedTerminalTaskId = null;
+    cancelRequested = false;
+
+    // Append user instruction bubble immediately
+    addUserMessageItem(instruction);
+    missionInput.value = "";
+    if (btnStartMission) btnStartMission.disabled = true;
+
+    if (telPlannerLatency) telPlannerLatency.textContent = "—";
+    setTaskState("planning");
+
+    try {
+      let fileToken: string | undefined;
+      const selectedFile = missionAttachment?.files?.[0];
+      if (selectedFile) {
+        if (selectedFile.size > 5 * 1024 * 1024 || !/\.(pdf|png|jpe?g|txt|csv|docx|xlsx)$/i.test(selectedFile.name)) {
+          throw new Error("Attachment must be an allowed file under 5 MiB");
+        }
+        const encoded = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
+          reader.onerror = () => reject(new Error("Could not read attachment"));
+          reader.readAsDataURL(selectedFile);
+        });
+        const uploadResponse = await apiFetch(`${API}/api/attachments`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ fileName: selectedFile.name, base64: encoded }),
+        });
+        if (!uploadResponse.ok) throw new Error(`Attachment rejected (HTTP ${uploadResponse.status})`);
+        fileToken = ((await uploadResponse.json()) as { fileToken: string }).fileToken;
+      }
+      let res: Response;
+      if (activeChatId) {
+        res = await apiFetch(`${API}/api/chat/${activeChatId}/message`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ instruction, fileToken }),
+        });
+      } else {
+        res = await apiFetch(`${API}/api/task`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ instruction, fileToken }),
+        });
+      }
+
+      if (!res.ok) throw new Error(`Backend response HTTP ${res.status}`);
+      const data = (await res.json()) as { task_id?: string; taskId?: string; chat_id?: string; chatId?: string };
+      currentTaskId = data.task_id || data.taskId || null;
+      if (missionAttachment) missionAttachment.value = "";
+      activeChatId = activeChatId || data.chat_id || data.chatId || null;
+
+      // Refresh chat list to show active title and timestamp
+      loadChatList();
+
+      // Cancel clicked while POST was in flight
+      if (cancelRequested && currentTaskId) {
+        try {
+          await apiFetch(`${API}/api/task/${currentTaskId}/cancel`, { method: "POST" });
+        } catch { /* offline */ }
+        setTaskState("cancelled");
+        if (btnCancelMission) btnCancelMission.hidden = true;
+        setButtonWorking(false);
+        return;
+      }
+
+      // Start background sync / polling for active task
+      if (currentTaskId) {
+        startFallbackPolling(currentTaskId);
+        const stRes = await apiFetch(`${API}/api/task/${currentTaskId}`).catch(() => null);
+        if (stRes && stRes.ok) {
+          const t = (await stRes.json()) as { taskState: string; message: string; stepsDone?: number; screenshot?: string | null };
+          if (t.taskState && t.taskState !== "planning") {
+            setTaskState(t.taskState);
+          }
+          if (t.screenshot) {
+            updateVisualFrame(t.screenshot, t.message || "", t.taskState);
+          }
+          if (["completed", "failed", "cancelled"].includes(t.taskState)) {
+            stopFallbackPolling();
+            renderCompletion(t.taskState, t.message || "", true, t.stepsDone);
+            loadChatList();
+          }
+        }
+      }
+    } catch (err) {
+      stopFallbackPolling();
+      clearStalledNotice();
+      setTaskState("failed");
+      addStepItem(`⚠️ Backend connection failed: ${err}`);
+      setButtonWorking(false);
+      cancelRequested = false;
+      if (btnCancelMission) btnCancelMission.hidden = true;
+    }
+  });
+
+  btnCancelMission?.addEventListener("click", async () => {
+    const id = currentTaskId;
+    cancelRequested = true;
+    stopFallbackPolling();
+    clearStalledNotice();
+    if (btnCancelMission) btnCancelMission.hidden = true;
+    hideHumanGate();
+    if (id) {
+      try {
+        await apiFetch(`${API}/api/task/${id}/cancel`, { method: "POST" });
+      } catch {
+        // Offline
+      }
+    }
+    setTaskState("cancelled");
+    setButtonWorking(false);
+  });
+
+  btnGateApprove?.addEventListener("click", async () => {
+    if (!currentTaskId) return;
+    hideHumanGate();
+    await apiFetch(`${API}/api/task/${currentTaskId}/confirm`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "approve" }),
+    });
+  });
+
+  // Task 12: approve this step only — the backend runs the pending step
+  // and then re-plans, so the next step gets its own preview instead of
+  // running on as part of the pinned batch. This is a gate decision,
+  // not an override: the loop still enforces every safety gate.
+  btnGateApproveStep?.addEventListener("click", async () => {
+    if (!currentTaskId) return;
+    hideHumanGate();
+    await apiFetch(`${API}/api/task/${currentTaskId}/confirm`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "approve_step" }),
+    });
+  });
+
+  btnGateReject?.addEventListener("click", async () => {
+    if (!currentTaskId) return;
+    hideHumanGate();
+    await apiFetch(`${API}/api/task/${currentTaskId}/confirm`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "reject" }),
+    });
+  });
+
+  // Task 4: takeover resume / cancel. Resume tells the backend the
+  // operator finished the manual step; the loop re-observes from scratch
+  // (its first post-takeover observation carries no screenshot).
+  btnTakeoverResume?.addEventListener("click", async () => {
+    if (!currentTaskId) return;
+    hideTakeover();
+    await apiFetch(`${API}/api/task/${currentTaskId}/takeover/resume`, { method: "POST" });
+  });
+
+  btnTakeoverCancel?.addEventListener("click", async () => {
+    if (!currentTaskId) return;
+    hideTakeover();
+    await apiFetch(`${API}/api/task/${currentTaskId}/takeover/cancel`, { method: "POST" });
+  });
+
+  // Now that the nodes exist, load the data that renders into them.
+  void loadChatList();
+  void loadTelemetryConfig();
+}
 
 // Session & Task State
 let activeChatId: string | null = null;
@@ -860,7 +1146,7 @@ async function loadChatList(): Promise<void> {
         deleteChat(chat.id);
       });
 
-      chatHistoryList.appendChild(li);
+      chatHistoryList?.appendChild(li);
     });
 
     if (!activeChatId) {
@@ -1126,48 +1412,19 @@ function createNewChat(): void {
 }
 
 // ----------------------------------------------------
-// UI Events & Directive Execution
+// UI Events — static header + document-level handlers.
+// The header buttons and the delegated document handler are wired at
+// module load (their targets exist from the first paint). Every listener
+// that touches a workspace node lives in initWorkspaceElements() above
+// and is wired once, when the workspace template is first mounted.
 // ----------------------------------------------------
 
 btnToggleSidebarHeader?.addEventListener("click", () => {
   agentWorkspace?.classList.toggle("sidebar-collapsed");
 });
 
-btnCollapseSidebar?.addEventListener("click", () => {
-  agentWorkspace?.classList.add("sidebar-collapsed");
-});
-
-btnNewMissionSidebar?.addEventListener("click", () => {
-  createNewChat();
-});
-
 btnNewSession?.addEventListener("click", () => {
   createNewChat();
-});
-
-missionInput?.addEventListener("input", () => {
-  if (btnStartMission && !isWorking) btnStartMission.disabled = !missionInput.value.trim();
-});
-
-missionInput?.addEventListener("keydown", (e: KeyboardEvent) => {
-  if (e.key === "Enter" && !e.shiftKey) {
-    e.preventDefault();
-    if (!isWorking && missionInput.value.trim() && btnStartMission && !btnStartMission.disabled) {
-      btnStartMission.click();
-    }
-  }
-});
-
-// Preset Chips & Suggested Action Pills
-document.querySelectorAll(".preset-chip").forEach(chip => {
-  chip.addEventListener("click", () => {
-    const prompt = chip.getAttribute("data-prompt");
-    if (prompt && missionInput) {
-      missionInput.value = prompt;
-      if (btnStartMission && !isWorking) btnStartMission.disabled = false;
-      missionInput.focus();
-    }
-  });
 });
 
 // Delegated click handler for Deliverable Export & Suggested Next Moves
@@ -1201,178 +1458,11 @@ document.addEventListener("click", event => {
   }
 });
 
-btnStartMission?.addEventListener("click", async () => {
-  if (isWorking || !missionInput || !btnStartMission || !missionInput.value.trim()) return;
-  const instruction = missionInput.value.trim();
-  activeInstruction = instruction;
 
-  setButtonWorking(true);
-  if (btnCancelMission) btnCancelMission.hidden = false;
-  if (resultCard) resultCard.hidden = true;
-  hideHumanGate();
-  currentTaskId = null;
-  renderedTerminalTaskId = null;
-  cancelRequested = false;
 
-  // Append user instruction bubble immediately
-  addUserMessageItem(instruction);
-  missionInput.value = "";
-  if (btnStartMission) btnStartMission.disabled = true;
 
-  if (telPlannerLatency) telPlannerLatency.textContent = "—";
-  setTaskState("planning");
 
-  try {
-    let fileToken: string | undefined;
-    const selectedFile = missionAttachment?.files?.[0];
-    if (selectedFile) {
-      if (selectedFile.size > 5 * 1024 * 1024 || !/\.(pdf|png|jpe?g|txt|csv|docx|xlsx)$/i.test(selectedFile.name)) {
-        throw new Error("Attachment must be an allowed file under 5 MiB");
-      }
-      const encoded = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
-        reader.onerror = () => reject(new Error("Could not read attachment"));
-        reader.readAsDataURL(selectedFile);
-      });
-      const uploadResponse = await apiFetch(`${API}/api/attachments`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ fileName: selectedFile.name, base64: encoded }),
-      });
-      if (!uploadResponse.ok) throw new Error(`Attachment rejected (HTTP ${uploadResponse.status})`);
-      fileToken = ((await uploadResponse.json()) as { fileToken: string }).fileToken;
-    }
-    let res: Response;
-    if (activeChatId) {
-      res = await apiFetch(`${API}/api/chat/${activeChatId}/message`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ instruction, fileToken }),
-      });
-    } else {
-      res = await apiFetch(`${API}/api/task`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ instruction, fileToken }),
-      });
-    }
 
-    if (!res.ok) throw new Error(`Backend response HTTP ${res.status}`);
-    const data = (await res.json()) as { task_id?: string; taskId?: string; chat_id?: string; chatId?: string };
-    currentTaskId = data.task_id || data.taskId || null;
-    if (missionAttachment) missionAttachment.value = "";
-    activeChatId = activeChatId || data.chat_id || data.chatId || null;
-
-    // Refresh chat list to show active title and timestamp
-    loadChatList();
-
-    // Cancel clicked while POST was in flight
-    if (cancelRequested && currentTaskId) {
-      try {
-        await apiFetch(`${API}/api/task/${currentTaskId}/cancel`, { method: "POST" });
-      } catch { /* offline */ }
-      setTaskState("cancelled");
-      if (btnCancelMission) btnCancelMission.hidden = true;
-      setButtonWorking(false);
-      return;
-    }
-
-    // Start background sync / polling for active task
-    if (currentTaskId) {
-      startFallbackPolling(currentTaskId);
-      const stRes = await apiFetch(`${API}/api/task/${currentTaskId}`).catch(() => null);
-      if (stRes && stRes.ok) {
-        const t = (await stRes.json()) as { taskState: string; message: string; stepsDone?: number; screenshot?: string | null };
-        if (t.taskState && t.taskState !== "planning") {
-          setTaskState(t.taskState);
-        }
-        if (t.screenshot) {
-          updateVisualFrame(t.screenshot, t.message || "", t.taskState);
-        }
-        if (["completed", "failed", "cancelled"].includes(t.taskState)) {
-          stopFallbackPolling();
-          renderCompletion(t.taskState, t.message || "", true, t.stepsDone);
-          loadChatList();
-        }
-      }
-    }
-  } catch (err) {
-    stopFallbackPolling();
-    clearStalledNotice();
-    setTaskState("failed");
-    addStepItem(`⚠️ Backend connection failed: ${err}`);
-    setButtonWorking(false);
-    cancelRequested = false;
-    if (btnCancelMission) btnCancelMission.hidden = true;
-  }
-});
-
-btnCancelMission?.addEventListener("click", async () => {
-  const id = currentTaskId;
-  cancelRequested = true;
-  stopFallbackPolling();
-  clearStalledNotice();
-  if (btnCancelMission) btnCancelMission.hidden = true;
-  hideHumanGate();
-  if (id) {
-    try {
-      await apiFetch(`${API}/api/task/${id}/cancel`, { method: "POST" });
-    } catch {
-      // Offline
-    }
-  }
-  setTaskState("cancelled");
-  setButtonWorking(false);
-});
-
-btnGateApprove?.addEventListener("click", async () => {
-  if (!currentTaskId) return;
-  hideHumanGate();
-  await apiFetch(`${API}/api/task/${currentTaskId}/confirm`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ decision: "approve" }),
-  });
-});
-
-// Task 12: approve this step only — the backend runs the pending step
-// and then re-plans, so the next step gets its own preview instead of
-// running on as part of the pinned batch. This is a gate decision,
-// not an override: the loop still enforces every safety gate.
-btnGateApproveStep?.addEventListener("click", async () => {
-  if (!currentTaskId) return;
-  hideHumanGate();
-  await apiFetch(`${API}/api/task/${currentTaskId}/confirm`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ decision: "approve_step" }),
-  });
-});
-
-btnGateReject?.addEventListener("click", async () => {
-  if (!currentTaskId) return;
-  hideHumanGate();
-  await apiFetch(`${API}/api/task/${currentTaskId}/confirm`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ decision: "reject" }),
-  });
-});
-
-// Task 4: takeover resume / cancel. Resume tells the backend the
-// operator finished the manual step; the loop re-observes from scratch
-// (its first post-takeover observation carries no screenshot).
-btnTakeoverResume?.addEventListener("click", async () => {
-  if (!currentTaskId) return;
-  hideTakeover();
-  await apiFetch(`${API}/api/task/${currentTaskId}/takeover/resume`, { method: "POST" });
-});
-
-btnTakeoverCancel?.addEventListener("click", async () => {
-  if (!currentTaskId) return;
-  hideTakeover();
-  await apiFetch(`${API}/api/task/${currentTaskId}/takeover/cancel`, { method: "POST" });
-});
 
 // ----------------------------------------------------
 // WebSocket Client
@@ -1496,6 +1586,8 @@ function connectWebSocket(): void {
 
 // Initial Load
 connectWebSocket();
+// loadChatList() no-ops until the workspace mounts; initWorkspaceElements()
+// re-runs it once the nodes exist.
 loadChatList();
 initLlmSettings();
 initVaultSettings();

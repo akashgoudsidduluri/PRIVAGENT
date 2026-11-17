@@ -1,0 +1,82 @@
+{
+  "demo": "live monitoring (Task 2)",
+  "date": "2026-11-17",
+  "extension_connected": false,
+  "check_path": "http",
+  "fixture_base": "http://127.0.0.1:42043",
+  "cycles": [
+    {
+      "cycle": 1,
+      "label": "baseline",
+      "claimed": 2,
+      "events": 0,
+      "alerted": false
+    },
+    {
+      "cycle": 2,
+      "label": "no change",
+      "claimed": 2,
+      "events": 0,
+      "alerted": false
+    },
+    {
+      "cycle": 3,
+      "label": "content + price change",
+      "claimed": 2,
+      "events": 2,
+      "alerted": true,
+      "alerts": [
+        {
+          "mission": "Field Notes watch",
+          "summary": "Observed public page content changed",
+          "before": "Field Notes Field Notes On-device perception keeps page text local. Updated",
+          "after": "Field Notes Field Notes On-device perception now ships with a local planner. Updated"
+        },
+        {
+          "mission": "Widget Pro price watch",
+          "summary": "Price changed from 1299 to 999",
+          "old_price": 1299.0,
+          "new_price": 999.0,
+          "before": "Gadget Store Widget Pro The Widget Pro is in stock. Price: ₹1,299 Buy now",
+          "after": "Gadget Store Widget Pro The Widget Pro is in stock. Price: ₹999 Buy now"
+        }
+      ]
+    }
+  ],
+  "real_public_page": {
+    "url": "https://example.org",
+    "ok": true,
+    "text_excerpt": "Example Domain This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.",
+    "element_count": 0,
+    "elements_sample": []
+  },
+  "ui_list_check": {
+    "missions_listed": 2,
+    "watch_listed": true,
+    "events_listed": 1,
+    "alert_listed": true,
+    "renders_from": [
+      "/api/control/missions",
+      "/api/control/missions/{id}/events"
+    ]
+  },
+  "notes": [
+    "No live Chrome in this VM: the browser observation path was never taken; extension-path monitoring still needs the operator's real browser."
+  ],
+  "watches": [
+    {
+      "id": "f36b846c-da40-43a3-b358-6d41d8fb33c2",
+      "title": "Field Notes watch",
+      "target_url": "http://127.0.0.1:42043/notes",
+      "condition": "text_change"
+    },
+    {
+      "id": "2affcbb1-4b9a-4d9f-815d-809cb24f2b31",
+      "title": "Widget Pro price watch",
+      "target_url": "http://127.0.0.1:42043/gadget",
+      "condition": "price_drop",
+      "min_percent": 10
+    }
+  ],
+  "duration_seconds": 0.75
+}

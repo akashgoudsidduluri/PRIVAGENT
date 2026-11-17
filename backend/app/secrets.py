@@ -281,6 +281,21 @@ def _fernet():
     return fernet
 
 
+def warm_key() -> None:
+    """Derive (and cache) the Fernet key now, with no writes.
+
+    Task 4 (latency): the first :func:`encrypt_text` in a process pays
+    the full PBKDF2 derivation (~140-175 ms measured) inside whatever
+    step happens to encrypt first — in practice the first checkpoint,
+    which then looks ~50x slower than every later one (~3 ms). Deriving
+    once up front (server boot, loop entry) moves that one-time cost
+    out of the first task step. The iteration count is unchanged; this
+    only changes *when* the derivation runs. Safe to call repeatedly:
+    a cached key returns immediately.
+    """
+    _fernet()
+
+
 def reset_for_tests() -> None:
     """Clear in-process key caches (tests only)."""
     global _ephemeral_material

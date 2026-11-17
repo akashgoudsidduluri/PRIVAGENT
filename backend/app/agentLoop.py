@@ -81,6 +81,7 @@ from .loop_helpers import (
     extract_mission_facts,
     fresh_tree_for_observation,
     ref_freshness,
+    warm_loop_caches,
 )
 from .loop_research import (
     _finalize_research_artifacts,
@@ -98,6 +99,12 @@ from .loop_state import (
     request_resume,
 )
 from .obs_cache import ObservationCache, observation_fingerprint, observation_tab_id, observation_url
+from .outcome import (
+    is_dialog_error,
+    is_stale_target_error,
+    resolve_fresh_ref,
+    verify_step_outcome,
+)
 from .planner import plan_from_observation
 from .privacy import classify_and_redact, redact_text_urls, redact_url
 from .providers.errors import ProviderUnavailable
@@ -245,6 +252,12 @@ async def _run_loop(
     long_horizon: bool = False,
     timings: Optional[LoopTimings] = None,
 ) -> dict[str, Any]:
+    # Task 4 (latency): pay the loop's one-time per-process costs now —
+    # Fernet key derivation + the redaction modules' first imports —
+    # before the first step, so step 1 does not look ~200 ms slower
+    # than every later step. Best-effort and ~0 ms once warm; a failure
+    # just means the first step pays the cost as before.
+    warm_loop_caches()
     history: list[dict[str, Any]] = []
     if initial_memory and initial_memory.get("prior_checkpoint_history"):
         history = list(initial_memory["prior_checkpoint_history"])
@@ -1842,6 +1855,136 @@ async def _run_loop(
             # config.MAX_RETRIES for direct callers.
             result = await _execute_with_retries(ext_hub, execution_action, task_id, session_id=session_id, max_retries=MAX_RETRIES)
             metrics("act", action_started)
+        # Task 1 (automation): one bounded execution-time recovery.
+        # A ref that was fresh at plan time can still go stale in the
+        # window between planning and execution (the page re-rendered,
+        # or a popup/dialog moved the target): the extension reports
+        # STALE_TARGET (or a dialog error) and the step fails. Failing
+        # the step and replanning from scratch loses the step's place
+        # in the plan; instead, re-observe ONCE, resolve the same
+        # control again in the fresh tree (same target id, else same
+        # role + name, unambiguous only — never a guess), and retry
+        # the step once with the fresh ref. Exactly one retry per
+        # step: a second failure is recorded honestly and the loop
+        # replans next iteration, as before. UCP checkouts never
+        # retry (a payment step runs exactly once). The recovery is
+        # attached to the step record below (entry["recovery"]) and
+        # to working_memory["automation_recoveries"].
+        _recovery: Optional[dict[str, Any]] = None
+        # The raw observation the recovery re-observed with. When the
+        # step still fails, the next iteration plans from THIS
+        # observation (it is already the freshest page state) instead
+        # of spending another observation round trip on the same page.
+        _recovery_raw_obs: Any = None
+        if action.get("type") != "ucp_checkout" and (
+            is_stale_target_error(result) or is_dialog_error(result)
+        ):
+            _err_code = str((result.get("error") or {}).get("code") or "")
+            _kind = "dialog_retry" if is_dialog_error(result) else "stale_ref_retry"
+            _fresh_raw: Any = None
+            try:
+                _maybe_recover = obs_factory()
+                _fresh_raw = await _maybe_recover if asyncio.iscoroutine(_maybe_recover) else _maybe_recover
+                timings.note_observation_call()
+            except Exception:
+                _fresh_raw = None
+            _recovery_raw_obs = _fresh_raw
+            _built_recover = fresh_tree_for_observation(_fresh_raw, instruction) if _fresh_raw is not None else None
+            _old_ref = (
+                _verified_ref
+                or (action.get("target") or {}).get("elementRef")
+                or (action.get("target") or {}).get("element_ref")
+            )
+            if _built_recover is None:
+                _recovery = {
+                    "kind": _kind, "trigger": _err_code,
+                    "old_ref": _old_ref, "new_ref": None,
+                    "result_ok": False,
+                    "note": "fresh observation unavailable; no retry attempted",
+                }
+            else:
+                _fresh_ref, _fresh_node = resolve_fresh_ref(
+                    _verified_node, _built_recover[0],
+                    target=action.get("target") if isinstance(action.get("target"), dict) else None,
+                )
+                # A retry is warranted when the control moved: a new
+                # ref, a new stable target id, or both. (Refs are
+                # positional — build_ax_tree assigns e0, e1, ... in
+                # list order — so a re-render that only re-assigns the
+                # target id leaves the ref unchanged; the retry still
+                # matters, because the executor resolves by id.)
+                _old_target_id = (
+                    (_verified_node.target_id if _verified_node is not None else None)
+                    or (action.get("target") or {}).get("targetId")
+                )
+                _moved = (
+                    _fresh_ref is not None and _fresh_node is not None
+                    and (
+                        str(_fresh_ref) != str(_old_ref or "")
+                        or str(_fresh_node.target_id or "") != str(_old_target_id or "")
+                    )
+                )
+                # A stale ref retries only when the control actually
+                # moved (same ref + same id means nothing changed, so
+                # a retry would just repeat the failure). A dialog
+                # error is different: the target never moved — the
+                # popup did — so re-attempting the same ref on the
+                # freshly observed page (dialog gone or dismissed) is
+                # the recovery.
+                _should_retry = (
+                    _moved if _kind == "stale_ref_retry"
+                    else (_fresh_ref is not None and _fresh_node is not None)
+                )
+                if _should_retry:
+                    from .grounding import node_center as _node_center_recover
+
+                    _retry_target = dict(action.get("target") or {})
+                    _retry_target["elementRef"] = _fresh_ref
+                    if _fresh_node.target_id:
+                        _retry_target["targetId"] = _fresh_node.target_id
+                    _retry_target["name"] = _fresh_node.name
+                    if _fresh_node.role:
+                        _retry_target["role"] = _fresh_node.role
+                    _center_r = _node_center_recover(_fresh_node)
+                    if _center_r:
+                        _retry_target["coords"] = _center_r
+                    _retry_action = dict(execution_action)
+                    _retry_action["target"] = _retry_target
+                    obs_cache.invalidate()
+                    _retry_result = await _execute_with_retries(
+                        ext_hub, _retry_action, task_id,
+                        session_id=session_id, max_retries=MAX_RETRIES)
+                    _recovery = {
+                        "kind": _kind, "trigger": _err_code,
+                        "old_ref": _old_ref, "new_ref": _fresh_ref,
+                        "new_target_id": _fresh_node.target_id,
+                        "result_ok": bool(_retry_result.get("ok")),
+                    }
+                    if _retry_result.get("ok"):
+                        result = _retry_result
+                        action["target"] = _retry_target
+                        grounding_stale_retries = 0
+                        logger.warning(
+                            "task %s: %s recovered: ref %r -> %r; retry succeeded",
+                            task_id, _kind, _old_ref, _fresh_ref,
+                        )
+                    else:
+                        logger.warning(
+                            "task %s: %s retried with fresh ref %r but still failed; replanning next iteration",
+                            task_id, _kind, _fresh_ref,
+                        )
+                else:
+                    _recovery = {
+                        "kind": _kind, "trigger": _err_code,
+                        "old_ref": _old_ref, "new_ref": None,
+                        "result_ok": False,
+                        "note": (
+                            "target found in the fresh observation but it did not move; "
+                            "retrying the same ref would repeat the failure"
+                            if _fresh_ref is not None
+                            else "no unambiguous fresh ref for the target in the fresh observation; no retry attempted"
+                        ),
+                    }
         # REVIEW (Task 14 audit): a WebMCP tool result is untrusted
         # page content, and the extension reports it as evidence text
         # — which the loop copies into the history entry the planner
@@ -1940,6 +2083,21 @@ async def _run_loop(
                 pass
         if not result.get("ok") or zero_change_repeats > 0:
             cached_obs = None
+        if _recovery_raw_obs is not None and not result.get("ok"):
+            # Task 1 (automation): the step still failed after the
+            # recovery attempt, but the recovery re-observation is
+            # already the freshest page state. Plan the next iteration
+            # from it instead of spending another observation round
+            # trip on the same page — a failed action must still force
+            # a fresh observation, and this one already is fresh.
+            try:
+                _recovery_obs = _to_obs(_recovery_raw_obs)
+                cached_obs = _recovery_obs
+                obs_cache.store(_recovery_obs)
+                last_obs_url = observation_url(_recovery_obs)
+                last_obs_tab_id = observation_tab_id(_recovery_obs)
+            except Exception:
+                pass
 
         evidence: Any = result.get("evidence")
         if not evidence:
@@ -1986,10 +2144,18 @@ async def _run_loop(
         if action_ok:
             from .completion_verifier import verify_action_receipt
             receipt = verify_action_receipt(action, result, before=raw_obs, goal=instruction)
-            action_status = "verified" if receipt["verified"] else "completed_unverified"
+            # Task 1 (automation): verify the outcome actually
+            # happened (URL/title/text/digest change, or the receipt)
+            # before the loop advances on this step. A step that
+            # reported ok but changed nothing is a silent no-op, not
+            # progress — see the handling after history.append.
+            outcome = verify_step_outcome(action, result, before=raw_obs, receipt=receipt)
+            action_status = "verified" if (receipt["verified"] or outcome["verified"]) else "completed_unverified"
         else:
             receipt = None
+            outcome = verify_step_outcome(action, result, before=raw_obs, receipt=None)
             action_status = "failed"
+        _outcome_unverified = action_ok and not outcome["verified"]
 
         entry = {
             "action": action,
@@ -1997,6 +2163,13 @@ async def _run_loop(
             "status": action_status,
             "evidence": safe_evidence,
             "verification": receipt,
+            # Task 1 (automation): the outcome verdict for this step
+            # (verified / reason / observable signals / dialog flag),
+            # and the recovery if the step was retried with a fresh
+            # ref. Both ride the step record, so the timeline and any
+            # later audit can show exactly what happened and why.
+            "outcome": outcome,
+            "recovery": _recovery,
             "narrative": step_narrative,
             # Task 7: trajectory grounding — which element ref this step
             # acted on (if any), and whether the observation the step was
@@ -2023,6 +2196,37 @@ async def _run_loop(
             if penalty:
                 penalties.append(penalty)
         history.append(entry)
+        if _recovery is not None:
+            working_memory.setdefault("automation_recoveries", []).append(
+                {"step": steps_done, **_recovery}
+            )
+        if _outcome_unverified:
+            # Task 1 (automation): a step that reported ok but changed
+            # nothing is a silent no-op, not progress. Never pin the
+            # next batch step on it (see the batch gate below) and
+            # never plan from its cached observation — the next
+            # iteration re-observes fresh and replans, with a penalty
+            # telling the planner the action had no effect. The step
+            # still counts against the budget (a no-op is not free),
+            # and the task is NOT failed here: the planner gets one
+            # honest chance to try a different target or strategy,
+            # and the loop-detection / step-budget guards still bound
+            # a planner that keeps repeating it.
+            obs_cache.invalidate()
+            cached_obs = None
+            penalties.append(
+                f"Outcome unverified: the {action.get('type')} step reported success but "
+                f"{outcome['reason']}. Re-observing and replanning — do not repeat the same "
+                "action on the same target without a new strategy."
+                + (" A dialog/popup is covering the page." if outcome.get("dialog_detected") else "")
+            )
+            working_memory.setdefault("automation_recoveries", []).append({
+                "kind": "outcome_noop",
+                "step": steps_done,
+                "action": action.get("type"),
+                "reason": outcome["reason"],
+                "dialog_detected": bool(outcome.get("dialog_detected")),
+            })
         # Task 10: zero retention — the in-memory history is pruned to
         # the last few steps, stripped to the fields loop detection
         # needs; evidence/narratives (which can quote page text) are
@@ -2087,6 +2291,10 @@ async def _run_loop(
                 and cached_obs is not None
                 and observation_url(cached_obs) == plan_url
                 and _dom_unchanged
+                # Task 1 (automation): an unverified outcome is a
+                # silent no-op — never pin the next batch step on it.
+                # The next iteration re-observes and replans instead.
+                and not _outcome_unverified
                 # Task 12: the operator approved this step only — do
                 # not pin the rest of the batch. The next iteration
                 # re-observes and re-plans, so the next step gets its

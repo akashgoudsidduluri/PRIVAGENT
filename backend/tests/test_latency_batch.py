@@ -309,15 +309,22 @@ def test_batch_stops_on_failed_step_and_replans_from_fresh_observation():
     # Only the username type succeeded; the password type failed, the
     # batch stopped, the loop re-observed and re-planned (empty plan).
     # steps counts dispatched actions, so the failed attempt counts
-    # too — but the click after it was never dispatched. (The password
-    # type is dispatched 1 + MAX_RETRIES times: _execute_with_retries
-    # re-tries a recoverable failure inside the same step — pre-existing
-    # behaviour, not batching.)
+    # too — but the click after it was never dispatched.
+    # Task 4 (latency): the password type is dispatched exactly ONCE,
+    # not 1 + MAX_RETRIES times. _execute_with_retries returns
+    # immediately on STALE_TARGET for non-idempotent actions — the
+    # element is gone, so re-sending the identical type against the
+    # identical target can never succeed; only the loop's fresh-ref
+    # recovery (re-observe, resolve a fresh ref, retry once) can fix
+    # it, and this hub's fresh observation carries no fresh ref for
+    # the password field, so no recovery retry is attempted either.
+    # Total "type" dispatches: the username type + the one failed
+    # password type = 2.
     assert result["steps"] == 2
     assert result["final"] == "completed"
     assert planner_calls == 2
     assert "click" not in hub.dispatched
-    assert hub.dispatched.count("type") == agentLoop.MAX_RETRIES + 2
+    assert hub.dispatched.count("type") == 2
     # The failure forced a live re-observation (the cache was invalidated).
     assert obs_calls == 2
 

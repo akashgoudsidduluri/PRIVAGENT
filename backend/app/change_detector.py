@@ -13,10 +13,46 @@ from .privacy import _redact_text
 
 _PRICE = re.compile(r"(?:₹|\b(?:Rs\.?|INR|USD)\s*|\$)\s*([\d,]+(?:\.\d{1,2})?)", re.I)
 
+# Task 2 live monitoring: volatile noise that must NOT alert. Each
+# match is replaced by a single space before hashing/diffing, so a
+# page whose only change is a timestamp, a "5 minutes ago" label or a
+# view counter keeps the same state hash. Real content and prices are
+# untouched — a price is never part of these patterns, and a content
+# change next to a timestamp still changes the hash.
+_MONTHS = r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+_VOLATILE_RES = [
+    # ISO datetimes: 2026-11-17, 2026-11-17T09:28:00Z
+    re.compile(r"\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)?,?(?!\w)"),
+    # Month-name dates: "17 November 2026", "November 17, 2026"
+    re.compile(rf"\b\d{{1,2}}\s+{_MONTHS}\s+\d{{4}},?(?!\w)", re.I),
+    re.compile(rf"\b{_MONTHS}\s+\d{{1,2}},?\s+\d{{4}},?(?!\w)", re.I),
+    # Numeric dates: 17/11/2026, 11-17-2026
+    re.compile(r"\b\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4},?(?!\w)"),
+    # Relative time: "5 minutes ago", "an hour ago", "just now"
+    re.compile(r"\b\d+\s+(?:seconds?|minutes?|hours?|days?|weeks?|months?|years?)\s+ago,?(?!\w)", re.I),
+    re.compile(r"\b(?:a|an)\s+(?:second|minute|hour|day|week|month|year)\s+ago,?(?!\w)", re.I),
+    re.compile(r"\bjust now,?(?!\w)", re.I),
+    re.compile(r"\bmoments? ago,?(?!\w)", re.I),
+    # Rapidly-changing counters: "1,234 views", "57 people online"
+    re.compile(r"\b[\d,]+\s+(?:views?|visitors?|likes?|comments?|shares?|followers?|subscribers?|downloads?|plays?),?(?!\w)", re.I),
+    re.compile(r"\b[\d,]+\s+people\s+(?:online|viewing|reading|here),?(?!\w)", re.I),
+    re.compile(r"\b[\d,]+\s+online,?(?!\w)", re.I),
+    # Clock times: 09:28, 09:28:14, 9:28 AM
+    re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\s*(?:[AP]M|am|pm)?,?(?!\w)"),
+]
+
+
+def _normalise_volatile(text: str) -> str:
+    """Strip volatile timestamps/counters so noise cannot alert."""
+    out = text
+    for pattern in _VOLATILE_RES:
+        out = pattern.sub(" ", out)
+    return re.sub(r"\s+", " ", out).strip()
+
 
 def _state(observation: dict[str, Any]) -> dict[str, Any]:
-    text = _redact_text(re.sub(r"\s+", " ", str(observation.get("text") or "")).strip(), 4000)
-    names = [_redact_text(str(name), 120) for name in (observation.get("elements") or [])[:100]]
+    text = _redact_text(_normalise_volatile(re.sub(r"\s+", " ", str(observation.get("text") or "")).strip()), 4000)
+    names = [_redact_text(_normalise_volatile(str(name)), 120) for name in (observation.get("elements") or [])[:100]]
     match = _PRICE.search(text)
     price = float(match.group(1).replace(",", "")) if match else None
     return {"text": text, "elements": names, "price": price}

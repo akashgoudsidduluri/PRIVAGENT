@@ -47,6 +47,18 @@ async def _lifespan(app_instance):
             secrets_store.migrate_env_file()
     except Exception as exc:
         logger.warning("Secret migration from .env failed (continuing): %s", exc)
+    # Task 4 (latency): warm the loop's one-time costs at boot — Fernet
+    # key derivation + redaction modules' first imports — so the first
+    # task after a (re)start does not pay ~200 ms extra on its first
+    # step. Best-effort; a failure just means the first task pays the
+    # cost as before. _run_loop warms again per task as a backstop for
+    # paths that never went through this lifespan (~0 ms once warm).
+    try:
+        from .loop_helpers import warm_loop_caches
+
+        warm_loop_caches()
+    except Exception as exc:
+        logger.warning("Loop warm-up failed (continuing): %s", exc)
     # Task 3: one-time setup for the isolated agent profile. The
     # directory is created (with a marker file so /api/isolation/status
     # can report that it exists); Chrome itself must still be launched

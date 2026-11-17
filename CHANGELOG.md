@@ -5,6 +5,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — UI flicker: first paint showed the old workspace, then the new UI
+
+- The old workspace is no longer painted HTML: `agent.html` keeps
+  `<main id="agentWorkspace">` inert inside
+  `<template id="workspaceTemplate">` (template content is never painted),
+  and `src/controlCenter.ts` mounts it — once — only when the Agent
+  Workspace, Browser Inspector, or Activity view needs its live nodes.
+  Fresh loads paint the control-center shell only; there is no
+  hide-it-with-CSS anywhere in the fix.
+- `src/agentApp.ts` resolves its 44 workspace element refs lazily
+  (`ensureWorkspaceMounted()` / `initWorkspaceElements()`): refs start
+  null, are resolved on first mount, and all workspace listeners
+  (Start Mission, plan preview approve-this-step-only, takeover,
+  preset chips, sidebar) wire then. The static header (sidebar toggle,
+  New Mission, connection status) and the vault/memory/LLM dialogs stay
+  live from load; the WebSocket starts at load as before.
+- `agent.html` no longer loads the landing stylesheet (`main.css`) and
+  no longer double-loads `agent.css` (exactly once, via the
+  `agentApp.ts` import). The header button/brand rules and the base
+  resets `main.css` used to provide now live in `src/styles/agent.css`,
+  scoped to `.agent-body`; the built agent CSS carries no landing
+  selectors (verified: no `.hero__title`, `.console__panel`, `100deg`).
+- New `tests/ui_flicker.test.mjs` (8 checks, in `npm test`, needs
+  `npm run build` first): first-paint DOM has the control-center shell
+  and none of the workspace nodes; template clone produces the Missions
+  nodes (`#missionInput`, `#btnStartMission`, `#agentStepsList`,
+  `#planPreview`, `#taskTimelineList`); built JS carries the mount code
+  and no painted workspace markup. Frontend `npm test` green;
+  backend suite **1025 passed, 9 skipped, 18 failed** — the 18 are the
+  pre-existing set, identical to the Task 2 baseline. No live Chrome
+  exists in this VM: the no-flicker claim is proven at build/DOM level,
+  not by watching a real browser paint — reload the preview to confirm.
+
 ### Added — Task 15: Final verification, live smoke, docs pass (PR)
 
 - Final verification gate, re-measured before any change and after:

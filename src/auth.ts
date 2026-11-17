@@ -7,9 +7,10 @@
  * section. It is NOT a user account and must never be committed.
  *
  * First run (manual step, once):
- *   1. Start the backend, then read the token:
- *        cat backend/data/.local_token
- *      (or set PRIVAGENT_LOCAL_TOKEN in backend/.env before starting)
+ *   1. Start the backend, then read the token from the backend dir:
+ *        venv\Scripts\python.exe scripts\print_local_token.py   (Windows)
+ *        ./venv/bin/python scripts/print_local_token.py          (Linux/macOS)
+ *      (or use the PRIVAGENT_LOCAL_TOKEN value in backend/.env)
  *   2. Open the workspace once; on the first 401 the UI prompts for
  *      the token and stores it in localStorage. Paste it there.
  * The token lives in localStorage under `privagentLocalToken` and is
@@ -47,7 +48,7 @@ function promptForToken(): string | null {
   promptShown = true;
   const entered = window.prompt(
     "This workspace now needs the local operator token.\n" +
-      "Find it with: cat backend/data/.local_token\n" +
+      "Find it with (from backend/): venv\\Scripts\\python.exe scripts\\print_local_token.py\n" +
       "(or the PRIVAGENT_LOCAL_TOKEN value in backend/.env)",
   );
   if (entered && entered.trim()) {

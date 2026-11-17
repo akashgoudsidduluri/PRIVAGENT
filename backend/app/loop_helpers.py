@@ -18,6 +18,7 @@ reads this module's constant directly.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import inspect
 import re
 import time
@@ -59,6 +60,7 @@ __all__ = [
     "_to_obs",
     "canonical_format_map",
     "extract_mission_facts",
+    "warm_loop_caches",
 ]
 
 MAX_HISTORY_TEXT_CHARS = 400
@@ -513,6 +515,52 @@ def _history_view(history: list[dict[str, Any]], penalties: list[str], working_m
     return out
 
 
+def warm_loop_caches() -> None:
+    """Pay the loop's one-time per-process costs up front, outside any step.
+
+    Task 4 (latency) — measured, not assumed. In a fresh process the
+    first step costs ~200-250 ms more than every later step, and the
+    excess is two one-time costs, not per-step work:
+
+    * the first checkpoint encrypts, which derives the Fernet key with
+      PBKDF2-HMAC-SHA256 at 600,000 iterations (~140-175 ms); later
+      encrypts take ~0.1 ms (key cached in memory);
+    * the first redaction lazily imports ``grounding`` / ``vault`` /
+      ``adversarial_guard`` and — via ``_validated_webmcp_tools``,
+      which runs on every redaction — ``webmcp`` plus ``jsonschema``
+      (~60-80 ms); later redactions take ~0.3 ms.
+
+    Schema init is NOT the cause (fresh ``init_db`` measured ~5 ms)
+    and neither is the first write/fsync (a warmed first checkpoint
+    measured ~1.3 ms). So the fix is warm-up, not a faster write path:
+    derive the key and import the lazily-loaded redaction modules once
+    here. Repeat calls cost ~0 ms (cached key, cached imports).
+
+    Best-effort by design: it never raises (a failure just means the
+    first step pays the cost as before), never writes anything, and
+    derives the key in memory only — zero retention is unaffected and
+    no security parameter (iteration count, redaction, allow-list)
+    changes. Callers: server boot (:mod:`app.main` lifespan) and the
+    top of :func:`app.agentLoop._run_loop`, so every task path warms.
+    """
+    try:
+        from . import secrets as _secrets
+
+        _secrets.warm_key()
+    except Exception:
+        pass
+    # Lazily imported by classify_and_redact on first use (privacy.py):
+    # grounding on every call, vault when a value is redacted,
+    # adversarial_guard when page text is present, webmcp (plus
+    # jsonschema) on every call via _validated_webmcp_tools.
+    for _module in ("app.grounding", "app.vault", "app.adversarial_guard",
+                    "app.webmcp"):
+        try:
+            importlib.import_module(_module)
+        except Exception:
+            pass
+
+
 async def _execute_with_retries(
     ext_hub: Any,
     action: dict[str, Any],
@@ -527,6 +575,21 @@ async def _execute_with_retries(
     patches ``agentLoop.MAX_RETRIES`` still controls the retry count
     after this function moved here. Direct callers omit it and get
     ``config.MAX_RETRIES``.
+
+    Task 4 (latency): a ``STALE_TARGET`` failure is returned
+    immediately for non-idempotent actions (click / type / ...), with
+    no retry and no backoff sleep. The element the action targeted is
+    gone — re-sending the identical action against the identical
+    target cannot succeed, so the old behaviour burned
+    ``MAX_RETRIES`` dispatches plus 0.2 + 0.4 + 0.6 = 1.2 s of backoff
+    (measured in the automation demo's stale-click step) before the
+    loop's fresh-ref recovery even ran. Only the loop's recovery —
+    re-observe, resolve the same control to a fresh ref, retry once
+    with the fresh ref — can fix a stale target, and it runs on the
+    returned failure exactly as before. Idempotent actions (observe /
+    scroll / wait / zoom / select_tab) carry no element target, so a
+    stale report there is treated as transient and still retried,
+    exactly like the pre-existing TIMEOUT rule below.
     """
     if max_retries is None:
         max_retries = config.MAX_RETRIES
@@ -554,6 +617,12 @@ async def _execute_with_retries(
             return res
         err = res.get("error") or {}
         if err.get("code") == "TIMEOUT" and act.get("type") not in _IDEMPOTENT_RETRY_TYPES:
+            return res
+        # Task 4 (latency): STALE_TARGET on a non-idempotent action can
+        # never succeed on an identical retry — the element is gone.
+        # Return at once (no backoff sleep) so the loop's fresh-ref
+        # recovery runs instead of burning MAX_RETRIES dispatches.
+        if err.get("code") == "STALE_TARGET" and act.get("type") not in _IDEMPOTENT_RETRY_TYPES:
             return res
         if not err.get("recoverable", False) or attempt == max_retries:
             return res

@@ -1,0 +1,143 @@
+{
+  "task": "automation-demo",
+  "instruction": "Research across 2 sites and summarise: read the field notes on the Research Hub, then read the summary on the Reference Library, and summarise what on-device perception means for a light-weight browser agent.",
+  "date": "2026-11-17",
+  "final": "completed",
+  "steps_done": 3,
+  "summary": "Summary across 2 sites. Field notes (Research Hub): a light-weight browser agent must do real work without sending the page to a server; on-device grounding keeps interaction private, and verification after every step is what makes a multi-step job trustworthy. Summary (Reference Library): on-device perception means the agent reads the page where the page lives \u2014 element detection and text extraction run locally, sensitive data is redacted before reaching a model, and every action is verified against the live page afterwards.",
+  "provenance": {
+    "loop": "app.agentLoop.run_with_injection (the real _run_loop; production run_task executes the same loop)",
+    "planner": "scripted deterministic planner (grounds refs from each observation; NOT a live LLM)",
+    "extension": "fixture extension stub implementing the hub send_action contract (NOT live Chrome)",
+    "sites": "two fixture sites served by this script on 127.0.0.1 (ephemeral ports); no live external site",
+    "live_chrome": false
+  },
+  "sites": {
+    "hub": "http://127.0.0.1:38985/hub",
+    "article": "http://127.0.0.1:38985/article",
+    "library": "http://127.0.0.1:33197/library",
+    "summary": "http://127.0.0.1:33197/library/summary"
+  },
+  "counts": {
+    "planner_calls": 4,
+    "observation_calls": 2,
+    "actions_dispatched": 7,
+    "steps": 3
+  },
+  "wall_ms": 2006.8,
+  "steps": [
+    {
+      "step": 1,
+      "action": "click",
+      "target_name": "Field notes on light-weight agents",
+      "ref_used": "e1",
+      "target_id": "article-link",
+      "result_ok": true,
+      "status": "verified",
+      "outcome_verified": true,
+      "outcome_reason": "page changed after the action (url_changed, title_changed, text_changed, digest_changed)",
+      "recovery": null
+    },
+    {
+      "step": 2,
+      "action": "click",
+      "target_name": "Open the reference library",
+      "ref_used": "e1",
+      "target_id": "library-link",
+      "result_ok": true,
+      "status": "verified",
+      "outcome_verified": true,
+      "outcome_reason": "page changed after the action (url_changed, title_changed, text_changed, digest_changed)",
+      "recovery": null
+    },
+    {
+      "step": 3,
+      "action": "click",
+      "target_name": "Summary: on-device perception",
+      "ref_used": "e1",
+      "target_id": "summary-link-v2",
+      "result_ok": true,
+      "status": "verified",
+      "outcome_verified": true,
+      "outcome_reason": "page changed after the action (url_changed, title_changed, text_changed, digest_changed)",
+      "recovery": {
+        "kind": "stale_ref_retry",
+        "trigger": "STALE_TARGET",
+        "old_ref": "e0",
+        "new_ref": "e1",
+        "new_target_id": "summary-link-v2",
+        "result_ok": true
+      }
+    }
+  ],
+  "recoveries": [
+    {
+      "step": 3,
+      "kind": "stale_ref_retry",
+      "trigger": "STALE_TARGET",
+      "old_ref": "e0",
+      "new_ref": "e1",
+      "new_target_id": "summary-link-v2",
+      "result_ok": true
+    }
+  ],
+  "per_step_timings": [
+    {
+      "step": 1,
+      "action": "click",
+      "batched": false,
+      "cache": "miss",
+      "checker_skipped": false,
+      "observe_ms": 0,
+      "redact_ms": 117,
+      "plan_ms": 0,
+      "checker_ms": 0,
+      "confirm_wait_ms": 0,
+      "takeover_wait_ms": 0,
+      "execute_ms": 0,
+      "checkpoint_ms": 208,
+      "total_ms": 344,
+      "overhead_ms": 325
+    },
+    {
+      "step": 2,
+      "action": "click",
+      "batched": false,
+      "cache": "n/a",
+      "checker_skipped": false,
+      "observe_ms": 0,
+      "redact_ms": 1,
+      "plan_ms": 0,
+      "checker_ms": 0,
+      "confirm_wait_ms": 0,
+      "takeover_wait_ms": 0,
+      "execute_ms": 0,
+      "checkpoint_ms": 3,
+      "total_ms": 6,
+      "overhead_ms": 4
+    },
+    {
+      "step": 3,
+      "action": "click",
+      "batched": false,
+      "cache": "n/a",
+      "checker_skipped": false,
+      "observe_ms": 0,
+      "redact_ms": 0,
+      "plan_ms": 0,
+      "checker_ms": 0,
+      "confirm_wait_ms": 0,
+      "takeover_wait_ms": 0,
+      "execute_ms": 1201,
+      "checkpoint_ms": 4,
+      "total_ms": 1208,
+      "overhead_ms": 1205
+    }
+  ],
+  "timings_summary": {
+    "steps_executed": 3,
+    "batched_steps": 0,
+    "planner_calls": 4,
+    "observation_calls": 2
+  }
+}

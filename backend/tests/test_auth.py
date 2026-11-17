@@ -10,7 +10,11 @@ from __future__ import annotations
 
 import os
 import stat
+import subprocess
+import sys
+from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app import auth
@@ -194,3 +198,45 @@ def test_env_token_wins_over_file_token(tmp_path, monkeypatch):
     finally:
         auth.reset_for_tests()
         monkeypatch.setenv(auth.ENV_VAR, TEST_TOKEN)
+
+
+def test_print_local_token_script_prints_env_token():
+    """The operator's supported way to read the token back is
+    backend/scripts/print_local_token.py. With PRIVAGENT_LOCAL_TOKEN
+    set it must print exactly that value — the token the running
+    backend accepts — without touching the encrypted store."""
+    backend_dir = Path(__file__).resolve().parents[1]
+    env_file = backend_dir / ".env"
+    if env_file.exists():
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            if line.strip().startswith(f"{auth.ENV_VAR}="):
+                pytest.skip(
+                    "repo backend/.env sets PRIVAGENT_LOCAL_TOKEN, "
+                    "which the script correctly prefers over the env var"
+                )
+    sentinel = "print-script-test-token-0123456789abcdef"
+    env = dict(os.environ)
+    env[auth.ENV_VAR] = sentinel
+    result = subprocess.run(
+        [sys.executable, str(backend_dir / "scripts" / "print_local_token.py")],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == sentinel
+
+
+def test_print_local_token_script_loads_dotenv():
+    """Guard: the script must load backend/.env before reading the
+    token, mirroring app.config. Without it, it prints the encrypted
+    store token while the backend honours PRIVAGENT_LOCAL_TOKEN (or
+    the master key) from .env — a silent mismatch that hands the
+    operator a token the backend rejects."""
+    backend_dir = Path(__file__).resolve().parents[1]
+    text = (backend_dir / "scripts" / "print_local_token.py").read_text(
+        encoding="utf-8"
+    )
+    assert "load_dotenv" in text
+    assert text.index("load_dotenv") < text.index("print(get_local_token())")
