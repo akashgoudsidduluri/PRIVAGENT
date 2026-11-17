@@ -38,15 +38,16 @@ def database(tmp_path, monkeypatch):
     return path
 
 
-def _insert_mission(db_path, target_url, condition="text_change", params=None, status="active"):
+def _insert_mission(db_path, target_url, condition="text_change", params=None, status="active",
+                    trigger="interval", cron=None, interval=60):
     mission_id = str(uuid.uuid4())
     with db.get_connection(db_path) as conn:
         conn.execute(
             """INSERT INTO monitoring_missions
-               (id, title, target_url, trigger_type, interval_seconds,
+               (id, title, target_url, trigger_type, schedule_cron, interval_seconds,
                 condition_type, condition_params, status, created_at, next_run_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?)""",
-            (mission_id, "Live watch", target_url, "interval", 60,
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (mission_id, "Live watch", target_url, trigger, cron, interval,
              condition, json.dumps(params or {}), status, time.time(), time.time() - 1))
     return mission_id
 
@@ -303,3 +304,25 @@ def test_http_check_redacts_sensitive_text_before_storing(database, fixture_serv
         state = conn.execute(
             "SELECT last_state_json FROM monitoring_missions WHERE id=?", (mission,)).fetchone()[0]
     assert "someone@example.org" not in state
+
+
+def test_daily_price_digest_reports_every_run(database):
+    """A daily_price mission reports the current price on EVERY run —
+    including the first run (no baseline yet) and runs where the price
+    has not changed — because it is a scheduled report, not a change
+    alert. A page with no price reports nothing."""
+    mission = _insert_mission(database, "https://example.org/fit3", condition="daily_price",
+                              trigger="cron", cron="30 3 * * *", interval=86400)
+    first = evaluate_observation(mission, {"text": "Samsung Galaxy Fit3 ₹3,899 only"},
+                                 observed_at=100, db_path=database)
+    assert first is not None
+    assert "3899" in first["summary"]
+    assert first["diff_data"]["new_price"] == 3899
+    # Same price, unchanged page: a digest still reports.
+    second = evaluate_observation(mission, {"text": "Samsung Galaxy Fit3 ₹3,899 only"},
+                                  observed_at=200, db_path=database)
+    assert second is not None
+    assert len(_events(database, mission)) == 2
+    # No price on the page: nothing to report.
+    assert evaluate_observation(mission, {"text": "Samsung Galaxy Fit3 — out of stock"},
+                                observed_at=300, db_path=database) is None

@@ -12,9 +12,9 @@ NAVIGATOR is a privacy-first AI browser agent developed for **Smart India Hackat
 
 | Subsystem | Implementation | Status & Evidence |
 |-----------|----------------|-------------------|
-| **Landing Page & Agent Workspace** | Vite + vanilla TypeScript + hand CSS | ✓ `npm test` — 64 checks pass (10 structure, 8 console, 11 sanitization/security, 10 Task 12 UI, 4 Task 14 UI, 3 Task 15 UI, 18 recovery) |
+| **Landing Page & Agent Workspace** | Vite + vanilla TypeScript + hand CSS | ✓ `npm test` — 73 checks pass, 1 skipped (Task 15 breakdown: 10 structure, 8 console, 11 sanitization/security, 10 Task 12 UI, 4 Task 14 UI, 3 Task 15 UI, 18 recovery; UI first-paint fix added checks after Task 15) |
 | **Chrome MV3 Extension** | Relay worker + in-page script + action executor | ✓ Vitest 180/180 (20 files), `tsc --noEmit` clean, production build |
-| **Backend Orchestration** | FastAPI hub + bounded agent loop | ✓ `pytest` — 1018 tests collected in 84 test files; latest full run 991 passed, 9 skipped, 18 failed (pre-existing failures in research/monitoring suites, unchanged since Task 1 — see `CHANGELOG.md`) |
+| **Backend Orchestration** | FastAPI hub + bounded agent loop | ✓ `pytest` — 1073 tests collected; latest full run 1046 passed, 9 skipped, 18 failed (pre-existing failures in research/monitoring suites, unchanged since Task 1 — see `CHANGELOG.md`) |
 | **Shared Contracts** | TypeScript source mirrored as Pydantic models | ✓ Contract parity test (`test_contracts.py`) |
 | **Browser Action Control** | Navigate, click, type, press, scroll, zoom, wait, observe, tabs, select_option, set_date, upload_file, webmcp_tool, ucp_checkout | ✓ All 17 action types (`ACTION_TYPES`) |
 | **Spatial Perception** | Bounding boxes (`bounds: {x,y,w,h}`), DPR grounding | ✓ `test_coordinates.py` and Test C |
@@ -48,10 +48,16 @@ NAVIGATOR is a privacy-first AI browser agent developed for **Smart India Hackat
 | **Zero retention (Task 10)** | `PRIVAGENT_ZERO_RETENTION=true`: no checkpoints (tasks cannot resume after restart), no screenshots to the planner, in-memory history pruned to the last 3 steps, provider telemetry silenced, trajectory records scrubbed | ✓ `test_zero_retention.py`; see `docs/PRIVACY.md` |
 | **Audit log (Task 10)** | Append-only, hash-chained `backend/data/audit.log` (0600) for auth failures, allow-list denials, confirmation decisions, takeover, payments, memory writes/deletes, scheduler claims; `GET /api/audit` with `?event=` / `?limit=`; `verify_chain()` detects tampering | ✓ `test_audit_log.py`; see `docs/PRIVACY.md` |
 | **DPIA (Task 10)** | Data protection impact assessment: data inventory, per-provider data flows, measured risks (checker ASR 0.50, leak rate 0.2609), mitigations, residual risks stated honestly | See `docs/DPIA.md` |
+| **Automation (review-prep)** | Outcome verification after every step + stale-ref recovery: the loop re-grounds a stale element instead of failing, and stops a repeated failure instead of looping it (see "Loop fixes" below). Scripted demo: a 3-step research task across 2 sites, 1 recovery | ✓ `backend/scripts/demo_automation.py`; suite 1033/9/18 at the time |
+| **Live monitoring (review-prep)** | HTTP check path for watched pages (no Chrome needed), volatile-noise filtering (timestamps, counters, "x minutes ago" never alert), interval + cron missions, price-drop conditions, and a **daily price digest**: a cron mission reports the current price every morning (e.g. 9:00 AM IST) even when the price has not changed | ✓ `backend/scripts/demo_monitoring.py`; `test_live_monitoring.py`, `test_continuous_monitoring.py` |
+| **Loop fixes (review-prep)** | Repeated-failure loop detection: the same action failing with the same *normalised* error 3× in a row stops the task with "Loop detected" (raw error strings embed a changing target id, so they never match — the first fix compared raw strings and the live Flipkart popup loop ran 32× through it). Success-path detection was already sound | ✓ `test_agentLoop.py` regression test with 60 distinct production-shaped failures |
+| **Tab registry (review-prep)** | Tabs opened by a click (or a PDF in a new tab) now register from the *observed* tab, so the next `switch_tab` works; the gate still rejects tabs the task has never observed, so the operator's personal tabs stay out of reach | ✓ `test_tab_opened_by_click_registers_and_can_be_selected` |
+| **Document export (review-prep)** | A multi-site comparison task now produces a real document: "give the comparison in a xcel" (also docx/pdf/pptx) renders a Store/Price/Variant/Link table from the verified per-site prices, downloadable via `GET /api/tasks/{id}/artifacts` | ✓ `test_comparison_package_renders_xlsx_from_tracker` (opens the .xlsx, checks headers/rows) |
+| **Email sweep (review-prep)** | "Scan email every 60 minutes; delete unnecessary promotion emails; notify me of urgent mail" becomes one mission: the instruction's frequency is honoured (60 min, not the old hardcoded 300 s), an explicit "delete" authorises autonomous cleanup, and "urgent" becomes a notification keyword so urgent mail alerts immediately instead of waiting for a neglect threshold | ✓ `test_sixty_minute_sweep_deletes_promos_notifies_urgent` (demo sandbox mailbox) |
 
 ---
 
-## What Changed in Tasks 1–10 (Security Hardening, Foundations, Proof, Perception, Generalisation, Memory, Privacy)
+## What Changed in Tasks 1–15 (and the SIH review-prep work after Task 15)
 
 Full history in [`CHANGELOG.md`](CHANGELOG.md); branch `muse/task1-security-auth`.
 
@@ -67,6 +73,21 @@ Full history in [`CHANGELOG.md`](CHANGELOG.md); branch `muse/task1-security-auth
 - **Task 10 — Privacy beyond redaction.** Local Ollama planner (BYOM, loopback-only, `PRIVAGENT_PLANNER_LOCAL_ONLY=true` fails honestly instead of falling back to cloud); zero-retention mode (`PRIVAGENT_ZERO_RETENTION=true`: no checkpoints, no screenshots to the planner, pruned history, silenced telemetry); append-only hash-chained audit log (`backend/data/audit.log`, `GET /api/audit`); DPIA (`docs/DPIA.md`); tracker blocklist extended 12 → 24 hosts plus agent-profile launch flags. See `docs/LOCAL_PLANNER.md`, `docs/PRIVACY.md`, `docs/DPIA.md`.
 - **Task 11 — Latency.** Per-step loop profiling (`LoopTimings` via `GET /api/task/{id}`), per-task in-memory observation cache (DOM fingerprint), batch execution of the valid plan prefix. Measured on the scripted login+search benchmark (mock provider): planner calls 7 → 4, observation calls 2 → 1, wall 1417.59 → 823.68 ms median. See `docs/LATENCY.md`.
 - **Task 12 — UI enhancement.** Plan preview in the confirmation banner (structured fields only; Approve / Approve-this-step-only / Reject reuse the existing gate); Privacy Center (planner status, audit viewer, 24 tracker hosts, DPIA); task timeline from Task 11 timings; responsive layout at 480px; XSS audit of all 66 `innerHTML` sites (3 vulnerabilities fixed, repo guard test added). Layout was NOT verified in a real browser — the VM's managed Chromium blocks all non-public navigation; see `docs/UI.md` for the honest verification record.
+- **Task 13 — Architecture.** God files split (`agentLoop.py` 3,883 → 2,876 lines, `planner.py` 2,044 → 873; new `loop_state` / `loop_gates` / `loop_checkpoints` / `loop_helpers` / `loop_research` / `planner_validation` modules, re-exported); `check_freshness` made real; per-entry vite builds; undecryptable memory rows skipped + counted; structured JSON step logs; dead code removed. See `docs/ARCHITECTURE.md`.
+- **Task 14 — Connectors & standards.** Gmail / Calendar / Drive auto-routing (a data-driven router detects connector intents and answers via the Google API connectors instead of driving the web UI; unconfigured connectors fail honestly, zero network calls); WebMCP tools (capped 50, validated, gated); UCP checkout via the Task 4 payment path (cap, single attempt, mock provider fails honestly). Calendar creates require confirmation. See `docs/CONNECTORS.md`, `docs/WEBMCP.md`, `docs/UCP.md`.
+- **Task 15 — Final verification.** Full gates re-run: backend 991/9/18 (same pre-existing 18), extension 180/180, frontend 64 checks; bench planner 4, obs 1, wall median ~825 ms; evals as Task 6. Live smoke: health ok, unauthenticated `/api/tasks` → 401, Gmail fails honestly, shopping fails `EXTENSION_DISCONNECTED`. Known finding: `backend/data/privagent.db` ships as a 5-byte `dummy` file — delete it or set `PRIVAGENT_DB_PATH` or the server cannot boot against it.
+
+### After Task 15 — SIH review prep (live-tested in the operator's own Chrome, 2026-11-17/18)
+
+- **Automation + live monitoring demos.** Scripted `demo_automation.py` (outcome verification + stale-ref recovery) and `demo_monitoring.py` (HTTP check path, noise filtering, price-drop alert with before/after). Both are fixture/scripted runs, not live Chrome — no live external-site timings are claimed.
+- **UI first-paint fix.** The workspace used to flash the old UI before the new one; it now mounts from an inert template so the first paint is the control center.
+- **Latency.** STALE short-circuit + warm-up: step-1 total 435 → 219 ms, redact 60 → 0 ms, checkpoint 179 → 23 ms; wall median ~828 ms unchanged, dominated by the simulated planner delay.
+- **Loop fixes (two rounds).** First fix: loop detection only ran when the last step *succeeded* — a repeatedly *failing* action never triggered it, so the Flipkart popup loop ran 32×. Second fix: error strings embed a changing target id, so raw-string comparison never matched either; the check now compares *normalised* errors (JSON blobs, refs, numbers stripped). Live-confirmed: the same price-hunt task went from a 44-step loop to 7 steps, no loop.
+- **Tab-registry fix.** Tabs opened by a click never registered, so the next `switch_tab` was rejected ("unknown tab … not in this task's tab registry"). The observed tab now registers (membership only; the active marker stays owned by the post-action sync).
+- **Document export.** Comparison tasks now produce a real Excel/Word/PDF/PowerPoint deliverable from the verified per-site prices ("xcel" is recognised as xlsx).
+- **Email sweep.** A 60-minute Gmail mission deletes promotion mail autonomously and notifies on urgent mail (see the table above).
+- **Daily 9 AM price digest.** "Every day at 9am, notify me the prices" creates a cron mission (`03:30 UTC` = 9:00 AM IST) with a `daily_price` condition that reports the current price every morning, even unchanged; the product is read from the suggestion history, never a hardcoded fallback.
+- **Own Antseed gateway.** The operator's own always-on gateway (`akash-antseed.duckdns.org`, Azure B1ms VM, India South Central) is a supported planner via `PRIVAGENT_PLANNER=antseed` + `ANTSEED_BASE_URL` + `ANTSEED_MODEL`; the gateway host must be on `PRIVAGENT_ALLOWED_DOMAINS` or the Task 3 egress gate rejects the planner call before any request is sent.
 
 ## Architecture Overview
 
@@ -234,7 +255,7 @@ were stale since long before Tasks 1–4.
 The 12-category live runner is at `backend/scripts/realworld_benchmark.py`. It needs an active local backend, connected Chrome extension, and configured test sites; it reports blocked scenarios rather than treating mock tests as live completions. See `docs/PHASE8_STATUS.md` for the command and current gate status.
 
 ```bash
-# 1. Frontend structure, console, sanitization/security, and recovery tests (64 checks)
+# 1. Frontend structure, console, sanitization/security, and recovery tests (73 checks pass, 1 skipped)
 npm test
 
 # 2. Extension Vitest suite (180 tests, 20 files) + typecheck + build
@@ -244,7 +265,7 @@ npx tsc --noEmit
 npm run build
 cd ..
 
-# 3. Backend Pytest suite (914 test functions, 84 files)
+# 3. Backend Pytest suite (1073 test functions; latest full run 1046 passed, 9 skipped, 18 failed — the 18 are pre-existing, unchanged since Task 1)
 cd backend
 source venv/bin/activate          # Linux / macOS
 # venv\Scripts\activate           # Windows

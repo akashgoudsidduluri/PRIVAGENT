@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import pytest
 
+from app import db
 from app.step_narrator import generate_step_narrative, _extract_site_and_query
 from app.continuous_monitoring_companion import (
     is_continuous_monitoring_directive,
     handle_continuous_monitoring_instruction,
+    parse_daily_time,
 )
 from app.email_dispatch import (
     is_email_dispatch_instruction,
@@ -245,3 +247,64 @@ def test_promotional_and_safety_queries(monkeypatch):
 
 
 
+
+
+def test_daily_9am_price_digest_directive():
+    # The user's exact follow-up after the fitness-band suggestion.
+    follow_up = "yes every day in the mrng at 9am just notify me the prizes"
+    assert is_continuous_monitoring_directive(follow_up) is True
+    # 9:00 AM IST is 03:30 UTC (IST is UTC+5:30, no daylight saving).
+    assert parse_daily_time(follow_up) == ("30 3 * * *", "9:00 AM IST")
+    assert parse_daily_time("every day at 9:30am tell me the price") == ("0 4 * * *", "9:30 AM IST")
+    assert parse_daily_time("every morning at 8 tell me the prices") == ("30 2 * * *", "8:00 AM IST")
+    # A price-drop ask with no daily time is not a daily schedule.
+    assert parse_daily_time("notify me if the price drops") is None
+    # A plain price question is still not a monitoring directive.
+    assert is_continuous_monitoring_directive("What is the price of iPhone 16") is False
+
+
+@pytest.mark.asyncio
+async def test_daily_9am_digest_execution(tmp_path):
+    """The user's exact flow: after the Fit3 suggestion, "yes every
+    day at 9am notify me the prices" creates a CRON mission (not a
+    5-minute interval one) for the Fit3 — never the old hardcoded
+    phone fallback."""
+    test_db = str(tmp_path / "test_monitor.db")
+    history = [
+        {"role": "assistant", "content": "1. **Samsung Galaxy Fit3** — ₹3,899 — https://www.flipkart.com/samsung-galaxy-fit3/p/itm123 — best overall"},
+        {"role": "user", "content": "I want like this"},
+    ]
+    resp = await handle_continuous_monitoring_instruction(
+        instruction="yes every day in the mrng at 9am just notify me the prizes",
+        chat_id="chat-123",
+        history=history,
+        db_path=test_db,
+    )
+    assert "9:00 AM IST" in resp
+    assert "Fit3" in resp
+    assert "A27" not in resp
+    assert "Every 5 minutes" not in resp
+    with db.get_connection(test_db) as conn:
+        row = conn.execute(
+            "SELECT trigger_type, schedule_cron, condition_type, title, target_url FROM monitoring_missions"
+        ).fetchone()
+    assert row["trigger_type"] == "cron"
+    assert row["schedule_cron"] == "30 3 * * *"
+    assert row["condition_type"] == "daily_price"
+    assert "Fit3" in row["title"]
+    assert "flipkart" in row["target_url"]
+
+
+@pytest.mark.asyncio
+async def test_no_hardcoded_phone_fallback(tmp_path):
+    """A product the extractor has never seen is watched as itself —
+    the old 'Samsung Galaxy A27' fallback is gone."""
+    test_db = str(tmp_path / "test_monitor2.db")
+    resp = await handle_continuous_monitoring_instruction(
+        instruction="Monitor price of iPhone 16 on Amazon",
+        chat_id="chat-123",
+        history=[],
+        db_path=test_db,
+    )
+    assert "A27" not in resp
+    assert "Iphone 16" in resp

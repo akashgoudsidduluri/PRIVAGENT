@@ -59,6 +59,15 @@ def _state(observation: dict[str, Any]) -> dict[str, Any]:
 
 
 def _triggered(condition: str, params: dict, before: dict, after: dict) -> tuple[bool, str]:
+    if condition == "daily_price":
+        # Daily price digest (e.g. "every morning at 9am, tell me the
+        # price"): reports the current price on EVERY scheduled run,
+        # even when it has not changed since yesterday. This is a
+        # report, not a change alert — so it never depends on `before`.
+        new = after.get("price")
+        if new is None:
+            return False, "Price unavailable"
+        return True, f"Price today: ₹{new:g}"
     if condition == "price_drop":
         old, new = before.get("price"), after.get("price")
         threshold = float(params.get("min_percent", 0))
@@ -103,10 +112,24 @@ def evaluate_observation(mission_id: str, observation: dict[str, Any], *,
             raise ValueError("unknown mission")
         before = json.loads(row["last_state_json"] or "{}")
         changed = bool(row["last_state_hash"] and row["last_state_hash"] != digest)
-        should_alert, summary = _triggered(row["condition_type"], json.loads(row["condition_params"] or "{}"),
-                                           before, state) if changed else (False, "Unchanged")
+        # A daily-price digest reports on every scheduled run, even when
+        # nothing changed (and even on the first run, when there is no
+        # baseline yet). Every other condition only fires on a change,
+        # and is deduplicated by the alert hash.
+        is_digest = row["condition_type"] == "daily_price"
+        if is_digest:
+            should_alert, summary = _triggered(row["condition_type"], json.loads(row["condition_params"] or "{}"),
+                                               before, state)
+            fire = should_alert
+        elif changed:
+            should_alert, summary = _triggered(row["condition_type"], json.loads(row["condition_params"] or "{}"),
+                                               before, state)
+            fire = should_alert and digest != row["last_alert_hash"]
+        else:
+            should_alert, summary = False, "Unchanged"
+            fire = False
         event = None
-        if changed and should_alert and digest != row["last_alert_hash"]:
+        if fire:
             event = {"id": str(uuid.uuid4()), "mission_id": mission_id, "task_id": task_id,
                      "detected_at": now, "title": row["title"], "summary": summary,
                      "diff_data": {"before": before.get("text", "")[:250], "after": state["text"][:250],
