@@ -1090,6 +1090,8 @@ def create_email_mission(
     notification_policy: Optional[dict[str, Any]] = None,
     conversation_id: Optional[str] = None,
     mission_id: Optional[str] = None,
+    policy_authorized: bool = False,
+    dry_run: bool = True,
     db_path: Optional[str] = None,
 ) -> dict[str, Any]:
     """Create or register an email monitoring mission in SQLite."""
@@ -1117,9 +1119,10 @@ def create_email_mission(
                 status, policy_authorized, dry_run, cleanup_policy_json,
                 notification_policy_json, next_run_at, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, 'active', 0, 1, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)
             """,
             (ident, conversation_id, account_email, provider.lower(), frequency_seconds,
+             1 if policy_authorized else 0, 1 if dry_run else 0,
              clean_pol, notif_pol, now, now, now),
         )
         # Mirror into monitoring_missions so the shared continuous monitoring loop claims it

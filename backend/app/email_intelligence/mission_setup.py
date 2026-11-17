@@ -37,6 +37,80 @@ def extract_custom_topics(text: str) -> list[str]:
     return []
 
 
+FREQUENCY_RE = re.compile(
+    r"\bevery\s+(\d+)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?)\b", re.IGNORECASE
+)
+# An explicit deletion authorization in the setup instruction itself:
+# "delete them", "trash promotional emails", "move to trash". "Remove"
+# is deliberately NOT in this list — it is ambiguous (remove from my
+# attention / flag for review), and the original two-step design keeps
+# setup in dry-run until a separate authorization. "Delete"/"trash"
+# are unambiguous, so they authorize in one step.
+DELETE_DIRECTIVE_RE = re.compile(
+    r"(?:\b(?:delete|trash)\b[^.]{0,80}"
+    r"\b(?:them|those|unnecessary|promotion(?:al)?|newsletters?|junk|spam|emails?|mails?)\b"
+    r"|\bmove\s+(?:them\s+)?to\s+trash\b"
+    r"|\b(?:them|those)\b[^.]{0,30}\bto\s+trash\b)",
+    re.IGNORECASE,
+)
+DELETE_NEGATION_RE = re.compile(
+    r"\b(?:don't|do not|never|not)\s+(?:delete|trash)\b", re.IGNORECASE
+)
+
+
+def parse_frequency_seconds(text: str) -> int | None:
+    """Parse 'every N minutes/hours/seconds' into seconds, or None.
+
+    Clamped to the mission table's CHECK (min 60s) and to 24h max.
+    """
+    m = FREQUENCY_RE.search(text or "")
+    if not m:
+        return None
+    n = int(m.group(1))
+    unit = m.group(2).lower()
+    if unit.startswith("hour") or unit.startswith("hr"):
+        secs = n * 3600
+    elif unit.startswith("min"):
+        secs = n * 60
+    else:
+        secs = n
+    return max(60, min(secs, 86400))
+
+
+def format_frequency_seconds(text: str, seconds: int) -> str:
+    """Human frequency line, echoing the user's own phrasing when one
+    was stated ('every 60 minutes' stays '60 minutes', not '1 hour')."""
+    m = FREQUENCY_RE.search(text or "")
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2).lower()
+        if unit.startswith("hour") or unit.startswith("hr"):
+            word = "hour" if n == 1 else "hours"
+        elif unit.startswith("min"):
+            word = "minute" if n == 1 else "minutes"
+        else:
+            word = "second" if n == 1 else "seconds"
+        return f"Every {n} {word} ({seconds} seconds)"
+    if seconds % 3600 == 0:
+        h = seconds // 3600
+        return f"Every {h} hour{'s' if h > 1 else ''} ({seconds} seconds)"
+    if seconds % 60 == 0:
+        mnt = seconds // 60
+        return f"Every {mnt} minute{'s' if mnt > 1 else ''} ({seconds} seconds)"
+    return f"Every {seconds} seconds"
+
+
+def has_explicit_delete_directive(text: str) -> bool:
+    """True when the setup instruction itself authorizes deletion.
+
+    A negated directive ("don't delete anything") is not authorization.
+    """
+    t = text or ""
+    if DELETE_NEGATION_RE.search(t):
+        return False
+    return bool(DELETE_DIRECTIVE_RE.search(t))
+
+
 def is_email_mission_setup_instruction(text: str) -> bool:
     """Return True if user is instructing PrivAgent to configure continuous email monitoring."""
     t = (text or "").strip()
@@ -111,6 +185,16 @@ async def handle_email_intelligence_instruction(
 
     # Extract custom alert topics from the user instruction (e.g. internships, jobs)
     custom_topics = extract_custom_topics(instruction)
+    # The instruction's own schedule and authorization, when stated:
+    # "every 60 minutes" sets the tick frequency (default 5 minutes);
+    # an explicit "delete them" authorizes autonomous cleanup in one
+    # step (otherwise the mission starts in dry-run review); "urgent"
+    # becomes a notification keyword so urgent mail alerts immediately
+    # instead of waiting for the neglect threshold.
+    freq_seconds = parse_frequency_seconds(instruction) or 300
+    delete_authorized = has_explicit_delete_directive(instruction)
+    if re.search(r"\burgent\b", instruction, re.IGNORECASE) and "urgent" not in [k.lower() for k in custom_topics]:
+        custom_topics = [*custom_topics, "urgent"]
     base_notif = {
         "notify_deadlines": True,
         "notify_interviews": True,
@@ -130,14 +214,19 @@ async def handle_email_intelligence_instruction(
         combined_kws = list(dict.fromkeys(prev_kws + custom_topics))
         base_notif["custom_keywords"] = combined_kws
 
+        _update_fields: dict[str, Any] = {
+            "status": "active",
+            "conversation_id": chat_id or existing_mission.get("conversation_id"),
+            "frequency_seconds": freq_seconds,
+            "notification_policy_json": json.dumps(base_notif),
+            "next_run_at": time.time(),
+        }
+        if delete_authorized:
+            _update_fields["policy_authorized"] = 1
+            _update_fields["dry_run"] = 0
         db.update_email_mission(
             mission_id,
-            {
-                "status": "active",
-                "conversation_id": chat_id or existing_mission.get("conversation_id"),
-                "notification_policy_json": json.dumps(base_notif),
-                "next_run_at": time.time(),
-            },
+            _update_fields,
             db_path=db_path,
         )
         mission = db.get_email_mission(mission_id, db_path=db_path)
@@ -145,8 +234,10 @@ async def handle_email_intelligence_instruction(
         mission = db.create_email_mission(
             account_email=account_email,
             provider=provider,
-            frequency_seconds=300,
+            frequency_seconds=freq_seconds,
             conversation_id=chat_id,
+            policy_authorized=delete_authorized,
+            dry_run=not delete_authorized,
             cleanup_policy={
                 "allow_promotions": True,
                 "allow_newsletters": True,
@@ -173,12 +264,20 @@ async def handle_email_intelligence_instruction(
 
     channel_text = f"\n• **Dedicated Chat Channel:** This chat thread is now dedicated to continuous email monitoring. Live alerts will stream directly here." if chat_id else ""
 
+    freq_text = format_frequency_seconds(instruction, freq_seconds)
+    if delete_authorized:
+        mode_text = "**AUTONOMOUS CLEANUP ACTIVE**"
+        auth_note = "You authorized deletion in this instruction — eligible messages are moved to Trash (restorable at any time)."
+    else:
+        mode_text = "**DRY-RUN REVIEW**"
+        auth_note = "No messages will be moved to Trash until you **explicitly authorize** autonomous cleanup."
+
     summary_markdown = f"""### 📬 Autonomous Email Intelligence Mission Configured
 
 I have configured continuous email monitoring for your account. Here is the operational summary:
 
 • **Connected Account:** `{account_email}` ({provider.upper()}) {mode_label}  
-• **Monitoring Frequency:** Every 5 minutes (300 seconds)  {channel_text}{custom_topics_text}
+• **Monitoring Frequency:** {freq_text}  {channel_text}{custom_topics_text}
 • **Email Categories Monitored:**
   - **Unnecessary:** Promotional campaigns, newsletters, repeated automated notifications, bulk marketing.
   - **Important:** University/academic communication, recruitment/job opportunities, interview invitations, assessment deadlines, banking & financial statements, security alerts, personal communication.
@@ -192,11 +291,11 @@ I have configured continuous email monitoring for your account. Here is the oper
 > **Safety Guarantee: Zero Permanent Deletions.**
 > Deletions move messages to **Trash** only. You can restore any message at any time.
 
-• **Current Mode:** **DRY-RUN REVIEW**  
+• **Current Mode:** {mode_text}  
 • **Deletion Eligibility Rules:**
   - Eligible messages must be classified as *unnecessary* with confidence >= 80%.
   - Protected categories (**Banking, Financial, Security, Academic, Recruitment, Personal, and Deadlines**) are **strictly locked and never automatically deleted**.
-  - No messages will be moved to Trash until you **explicitly authorize** autonomous cleanup.
+  - {auth_note}
 
 ---
 

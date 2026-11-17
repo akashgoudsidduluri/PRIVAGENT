@@ -529,3 +529,77 @@ async def test_dedicated_chat_binding_and_custom_topic_alerts(email_db, mailbox,
     alert_texts = [msg["content"] for msg in msgs]
     assert any("Important Email Alert" in txt for txt in alert_texts)
 
+
+
+# ==============================================================================
+# 8. Stated schedule + explicit delete authorization + urgent keyword
+#    (SIH review demo item 3: 60-minute sweep, trash promos, notify urgent)
+# ==============================================================================
+
+def test_parse_frequency_seconds():
+    from app.email_intelligence.mission_setup import parse_frequency_seconds
+
+    assert parse_frequency_seconds("scan email for every 60 minutes") == 3600
+    assert parse_frequency_seconds("check every 2 hours") == 7200
+    assert parse_frequency_seconds("every 90 minutes") == 5400
+    assert parse_frequency_seconds("every 30 seconds") == 60  # clamped to the 60s floor
+    assert parse_frequency_seconds("monitor my inbox") is None
+
+
+def test_explicit_delete_directive():
+    from app.email_intelligence.mission_setup import has_explicit_delete_directive
+
+    assert has_explicit_delete_directive("if u find any unnecessary promotion emails delete them") is True
+    assert has_explicit_delete_directive("trash promotional emails") is True
+    assert has_explicit_delete_directive("move them to trash") is True
+    # "remove" is ambiguous (remove from attention / flag) — setup stays
+    # dry-run until a separate authorization, as the original design holds.
+    assert has_explicit_delete_directive("Continuously scan my emails. Identify unnecessary emails and remove them.") is False
+    assert has_explicit_delete_directive("don't delete anything, just flag it") is False
+    assert has_explicit_delete_directive("monitor my inbox and notify me") is False
+
+
+@pytest.mark.asyncio
+async def test_sixty_minute_sweep_deletes_promos_notifies_urgent(email_db, mailbox, monkeypatch):
+    """The user's exact instruction, run against the demo sandbox mailbox.
+
+    Before this, the setup ignored the stated frequency (always 5 min),
+    ignored an explicit 'delete them' (always dry-run), and 'urgent' was
+    not a notification keyword — so the sweep never did what was asked.
+    """
+    from app.email_intelligence import sync_engine
+    monkeypatch.setattr(sync_engine, "_demo_mailbox", mailbox)
+
+    instruction = (
+        "scan email for every 60 minutes if u find any unnesary promotion "
+        "emails delete them, if u find any urgent mails then notify me"
+    )
+    assert is_email_mission_setup_instruction(instruction) is True
+
+    summary = await handle_email_intelligence_instruction(
+        instruction + " using demo sandbox",
+        chat_id=db.create_chat("Gmail sweep demo", db_path=email_db)["id"],
+        db_path=email_db,
+    )
+    assert "Autonomous Email Intelligence Mission Configured" in summary
+    assert "Every 60 minutes (3600 seconds)" in summary
+    assert "AUTONOMOUS CLEANUP ACTIVE" in summary
+
+    missions = db.list_email_missions(db_path=email_db)
+    assert len(missions) == 1
+    m = missions[0]
+    assert m["frequency_seconds"] == 3600
+    assert m["policy_authorized"] == 1
+    assert m["dry_run"] == 0
+    assert "urgent" in (m.get("notification_policy") or {}).get("custom_keywords", [])
+
+    # The setup already ran the first tick. Promo mail is in Trash, the
+    # urgent mail produced a chat notification, the protected bank OTP
+    # is untouched.
+    trash = db.get_email_classifications(m["id"], action_taken="moved_to_trash", db_path=email_db)
+    assert any("Mega Electronics Sale" in (c.get("subject") or "") for c in trash)
+    notifs = db.get_email_notifications(m["id"], db_path=email_db)
+    assert any("Urgent: Project handover" in (n.get("subject") or "") for n in notifs)
+    bank = [c for c in db.get_email_classifications(m["id"], db_path=email_db)
+            if "HDFC Bank Alert" in (c.get("subject") or "")]
+    assert bank and all(c.get("action_taken") != "moved_to_trash" for c in bank)
