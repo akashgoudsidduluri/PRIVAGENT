@@ -370,3 +370,47 @@ def test_repeated_failure_loop_detection_stops_stale_clicks():
         if isinstance(h, dict)
     )
     assert has_warning
+
+
+def test_tab_opened_by_click_registers_and_can_be_selected():
+    """A tab opened by a click (not a `new_tab` action) must register
+    in the task's tab registry, so a later select_tab to it is allowed.
+
+    Live Flipkart run 2026-11-18: the agent opened the product page
+    in a new tab (step 5), scrolled (step 6), then the switch was
+    rejected — "unknown tab: tab <id> is not in this task's tab
+    registry" — because only `new_tab` actions registered tabs. The
+    tab the loop is observing is ground truth for a tab the task owns,
+    so it registers on every iteration now.
+    """
+    hub = FakeHub({"click": [{"ok": True}], "select_tab": [{"ok": True}]})
+    calls = {"n": 0, "obs": 0}
+
+    def obs_factory():
+        calls["obs"] += 1
+        if calls["obs"] == 1:
+            return {"tabId": 1, "url": "https://www.flipkart.com/search?q=logitech", "title": "Search",
+                    "interactive": [{"targetId": "prod-link", "role": "link", "name": "Logitech MX Master 3S", "tag": "a", "visible": True, "enabled": True}],
+                    "scroll": {}, "dpr": 1}
+        return {"tabId": 2, "url": "https://www.flipkart.com/product/p/itm271ade01ff274", "title": "Logitech MX Master 3S",
+                "interactive": [], "scroll": {}, "dpr": 1}
+
+    class Planner:
+        def __call__(self, i, p, h):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"goal": "open product", "steps": [{"why": "open product", "action": {
+                    "type": "click", "risk": "write", "verify": "v", "timeoutMs": 100,
+                    "target": {"targetId": "prod-link", "name": "Logitech MX Master 3S"}}}]}
+            if calls["n"] == 2:
+                return {"goal": "open product", "steps": [{"why": "switch to product tab", "action": {
+                    "type": "select_tab", "risk": "write", "verify": "v", "timeoutMs": 100,
+                    "params": {"tabId": 2}}}]}
+            return {"goal": "open product", "steps": []}
+
+    state = asyncio.run(agentLoop.run_with_injection(
+        hub, planner=Planner(), obs_factory=obs_factory,
+        initial_memory={"primary_tab_id": 1},
+    ))
+    assert state["final"] == "completed"
+    assert "unknown tab" not in (state["summary"] or "")

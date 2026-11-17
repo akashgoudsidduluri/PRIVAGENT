@@ -560,6 +560,41 @@ async def _run_loop(
                 obs_cache.store(raw_obs)
                 last_obs_url = observation_url(raw_obs)
                 last_obs_tab_id = observation_tab_id(raw_obs)
+        # Tab registry sync: the tab the loop is OBSERVING is ground
+        # truth for "a tab this task owns". The registry previously
+        # only learned about tabs from `new_tab` actions that returned
+        # an observation tabId — a tab opened any other way (a click
+        # on a link that opens a new tab, a PDF opened in a new tab)
+        # never registered, so the next select_tab to it was rejected
+        # as "unknown tab" even though the planner had learned the id
+        # from the observation itself (live Flipkart run 2026-11-18:
+        # product page opened in a new tab, then "unknown tab" on the
+        # switch). Register the observed tab here, every iteration,
+        # idempotently; the gate below still rejects tabs the task has
+        # never observed, so the operator's personal tabs stay out of
+        # reach. Membership only — the active marker is NOT touched
+        # here: it is owned by the post-action sync (a new_tab /
+        # switch moves it), and stealing it on every observation
+        # would mark the last-observed tab active even when the task
+        # just switched elsewhere. The session's child registry is
+        # synced the same way so the persisted session record matches.
+        _observed_tab_id = observation_tab_id(raw_obs)
+        if _observed_tab_id is not None:
+            try:
+                _register_tab_in_memory(
+                    working_memory, int(_observed_tab_id),
+                    url=observation_url(raw_obs) or "",
+                )
+            except (TypeError, ValueError):
+                pass
+            if session_id:
+                try:
+                    from .session_manager import session_manager
+                    _sess = session_manager.get_session(session_id)
+                    if _sess and int(_observed_tab_id) != _sess.primary_tab_id:
+                        session_manager.register_child_tab(session_id, int(_observed_tab_id))
+                except Exception:
+                    pass
         try:
             if batch_continuation:
                 # The pinned payload is already redacted; re-running

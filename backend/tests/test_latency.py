@@ -55,13 +55,14 @@ class _Hub:
         return self.result
 
 
-def _run(hub: _Hub, planner, obs_factory) -> dict[str, Any]:
+def _run(hub: _Hub, planner, obs_factory, **kwargs) -> dict[str, Any]:
     return asyncio.run(agentLoop.run_with_injection(
         hub,
         planner=planner,
         obs_factory=obs_factory,
         task_id="latency-test",
         instruction="measure",
+        **kwargs,
     ))
 
 
@@ -158,7 +159,13 @@ def test_tab_switch_forces_a_fresh_observation():
             }}],
         }
 
-    _run(hub, planner, obs_factory)
+    # Tab 2 is registered up front: the loop only switches to tabs it
+    # has observed (or that were seeded), and this test's point is the
+    # fresh observation after the switch, not the gate.
+    _run(hub, planner, obs_factory, initial_memory={"tabs": [
+        {"tab_id": 1, "url": "https://site.local/start", "title": "primary", "active": True},
+        {"tab_id": 2, "url": "https://site.local/wrong-tab", "title": "other", "active": False},
+    ]})
 
     assert obs_calls == 2
     assert payloads[1].url == "https://site.local/start"

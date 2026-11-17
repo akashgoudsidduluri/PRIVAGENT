@@ -572,7 +572,13 @@ def test_tab_switch_invalidates_cache_and_reobserves():
             _el("search", "searchbox", "Search courses", input_type="search"),
         ]) | {"tabId": 2}
 
-    result = _run(hub, planner, obs_factory)
+    # Tab 2 is registered up front: the loop only switches to tabs it
+    # has observed (or that were seeded), and this test's point is the
+    # cache invalidation on switch, not the gate.
+    result = _run(hub, planner, obs_factory, initial_memory={"tabs": [
+        {"tab_id": 1, "url": LOGIN_URL, "title": "primary", "active": True},
+        {"tab_id": 2, "url": SEARCH_URL, "title": "other", "active": False},
+    ]})
     assert result["final"] == "completed"
     # The tab switch forced a live re-observation (the cached entry
     # was for the old tab).
