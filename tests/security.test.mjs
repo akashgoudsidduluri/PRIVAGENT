@@ -105,3 +105,28 @@ test("renderMarkdown keeps markdown links inert when the scheme is unsafe", () =
   const safe = renderMarkdown("[docs](https://example.com/a)");
   assert.ok(safe.includes('href="https://example.com/a"'), safe);
 });
+
+test("renderMarkdown renders product images and refuses unsafe image URLs", () => {
+  const out = renderMarkdown(
+    "![Samsung Galaxy Fit3 — ₹3,899](https://m.media-amazon.com/images/I/fit3.jpg)"
+  );
+  assert.ok(out.includes('<img src="https://m.media-amazon.com/images/I/fit3.jpg"'), out);
+  assert.ok(out.includes('alt="Samsung Galaxy Fit3 — ₹3,899"'), out);
+  assert.ok(out.includes('class="md-product-img"'), out);
+
+  // An image is not also turned into a link with a stray "!" in front.
+  assert.ok(!out.includes("!"), out);
+
+  // Unsafe image URLs render as inert text, never an <img>.
+  for (const bad of [
+    "![x](javascript:alert(1))",
+    "![x](data:image/png;base64,AAAA)",
+    "![x](https://user:pass@cdn.example.com/x.jpg)",
+  ]) {
+    assert.ok(!renderMarkdown(bad).includes("<img"), bad);
+  }
+
+  // Alt text is escaped like any other attribute value.
+  const quoted = renderMarkdown('![a"b](https://cdn.example.com/x.jpg)');
+  assert.ok(quoted.includes('alt="a&quot;b"'), quoted);
+});

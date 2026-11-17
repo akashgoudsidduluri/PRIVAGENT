@@ -240,6 +240,78 @@ describe("Task 14 — observation carries page-declared standards", () => {
     expect(obs.ucpProfileUrl).toBeUndefined();
   });
 
+  it("collects ogImage from the page's og:image meta tag, resolving relative URLs", async () => {
+    vi.stubGlobal("document", {
+      modelContext: undefined,
+      querySelector: (sel: string) =>
+        sel.includes("og:image") ? { content: "/images/fit3.jpg" } : null,
+    });
+    vi.stubGlobal("navigator", {});
+    vi.stubGlobal("location", { href: "https://www.flipkart.com/product/p/itm1", origin: "https://www.flipkart.com" });
+
+    const executeScript = vi.fn(async (injection: { func?: Function; args?: unknown[] }) => {
+      const src = String(injection.func ?? "");
+      if (src.includes("modelContext")) {
+        const out = await (injection.func as (...a: unknown[]) => Promise<unknown>)(
+          ...(injection.args ?? []),
+        );
+        return [{ result: out }];
+      }
+      if (src.includes("scrollY")) return [{ result: { y: 0, w: 1280, h: 800, dpr: 1 } }];
+      return [{ result: [] }];
+    });
+
+    vi.stubGlobal("chrome", {
+      tabs: {
+        get: vi.fn(async (id: number) => ({ id, url: "https://www.flipkart.com/product/p/itm1", title: "Fit3", windowId: 1, active: true })),
+        query: vi.fn(async () => [
+          { id: 5, url: "https://www.flipkart.com/product/p/itm1", title: "Fit3", windowId: 1, active: true },
+        ]),
+        update: vi.fn(async () => ({})),
+      },
+      scripting: { executeScript },
+    });
+
+    const obs = await observe(5);
+    expect(obs.ogImage).toBe("https://www.flipkart.com/images/fit3.jpg");
+  });
+
+  it("omits ogImage when the page's og:image is not a credential-free http(s) URL", async () => {
+    vi.stubGlobal("document", {
+      modelContext: undefined,
+      querySelector: (sel: string) =>
+        sel.includes("og:image") ? { content: "javascript:alert(1)" } : null,
+    });
+    vi.stubGlobal("navigator", {});
+    vi.stubGlobal("location", { href: "https://example.com/", origin: "https://example.com" });
+
+    const executeScript = vi.fn(async (injection: { func?: Function; args?: unknown[] }) => {
+      const src = String(injection.func ?? "");
+      if (src.includes("modelContext")) {
+        const out = await (injection.func as (...a: unknown[]) => Promise<unknown>)(
+          ...(injection.args ?? []),
+        );
+        return [{ result: out }];
+      }
+      if (src.includes("scrollY")) return [{ result: { y: 0, w: 1280, h: 800, dpr: 1 } }];
+      return [{ result: [] }];
+    });
+
+    vi.stubGlobal("chrome", {
+      tabs: {
+        get: vi.fn(async (id: number) => ({ id, url: "https://example.com/", title: "Example", windowId: 1, active: true })),
+        query: vi.fn(async () => [
+          { id: 5, url: "https://example.com/", title: "Example", windowId: 1, active: true },
+        ]),
+        update: vi.fn(async () => ({})),
+      },
+      scripting: { executeScript },
+    });
+
+    const obs = await observe(5);
+    expect(obs.ogImage).toBeUndefined();
+  });
+
   it("passes over-long names/descriptions through over-long, so the backend drops them", async () => {
     // REVIEW (Task 14 audit): the backend drops (never truncates) a
     // name over 64 chars or a description over 2000 chars. The

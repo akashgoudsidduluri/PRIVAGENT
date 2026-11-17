@@ -418,3 +418,25 @@ def test_distinguish_verified_unavailable_and_unvisited_sites():
     assert "| **Flipkart** | Unavailable | N/A | 0 results found |" in table
     assert "| **Samsung Store** | Unvisited | N/A | Not visited |" in table
 
+
+
+def test_comparison_table_shows_product_images():
+    """A verified listing that declares a product image renders it
+    above the comparison table (the card-with-image shape other
+    agents show). A listing with no image gets no image line — never
+    a broken placeholder."""
+    tracker = {"required_sites": {
+        "amazon": {"site_key": "amazon", "name": "Amazon", "domains": ["amazon.in"],
+                   "default_url": "https://www.amazon.in/s?k=fit3", "status": "completed",
+                   "data": {"price": "₹3,899", "url": "https://www.amazon.in/dp/B0X", "variant": "Black",
+                            "title": "Samsung Galaxy Fit3",
+                            "image": "https://m.media-amazon.com/images/I/fit3.jpg"}},
+        "flipkart": {"site_key": "flipkart", "name": "Flipkart", "domains": ["flipkart.com"],
+                     "default_url": "https://www.flipkart.com/search?q=fit3", "status": "completed",
+                     "data": {"price": "₹3,499", "url": "https://www.flipkart.com/p/itm1", "variant": "Black",
+                              "title": "Amazfit Band 7", "image": None}},
+    }}
+    out = format_comparison_table(tracker)
+    assert "![Samsung Galaxy Fit3 — ₹3,899](https://m.media-amazon.com/images/I/fit3.jpg)" in out
+    assert out.count("![") == 1
+    assert out.index("![Samsung Galaxy Fit3") < out.index("| Retailer |")

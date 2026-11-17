@@ -181,6 +181,12 @@ class BrowserObservation(BaseModel):
     # validate.
     webmcp_tools: Optional[list[dict[str, Any]]] = Field(default=None, alias="webmcpTools")
     ucp_profile_url: Optional[str] = Field(default=None, alias="ucpProfileUrl")
+    # Product image the page declares via <meta property="og:image">,
+    # if any. Optional so older observations still validate. The
+    # extractor re-validates it before it reaches a fact, a table or
+    # a document — an og:image is page-declared data, never trusted
+    # on arrival.
+    og_image: Optional[str] = Field(default=None, alias="ogImage")
 
     model_config = {"populate_by_name": True}
 

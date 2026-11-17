@@ -294,6 +294,11 @@ export interface BrowserObservation {
   /** Task 14: UCP profile URL the page declares via <link rel="ucp">,
    * if any (same-origin only). */
   ucpProfileUrl?: string;
+  /** Product image the page declares via <meta property="og:image">,
+   * if any (absolute http(s) URL). The backend validates it before the
+   * planner or the workspace ever renders it, and the workspace only
+   * renders it for a product the agent actually visited. */
+  ogImage?: string;
 }
 
 /** Task 14: one page-declared WebMCP tool, mirroring

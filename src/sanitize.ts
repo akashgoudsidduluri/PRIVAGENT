@@ -76,6 +76,36 @@ function splitTableRow(line: string): string[] {
   return line.replace(/^\|/, "").replace(/\|$/, "").split("|").map(cell => cell.trim());
 }
 
+/** Render Markdown images ![alt](url) as <img>, everything else via linkify.
+ *
+ * An image URL is only accepted when `safeHttpUrl` passes it
+ * (credential-free http(s)) — javascript:/data: URLs render as inert
+ * text, and the alt text is escaped like every other attribute value.
+ * Loading the image fetches it from the store's image CDN; the backend
+ * only ever supplies an og:image from a product page the agent
+ * actually visited. Images are consumed here, before `linkify`, so
+ * the `[alt](url)` inside `![alt](url)` is never also turned into a
+ * link (with a stray `!` left in front of it).
+ */
+function renderInlineImages(part: string): string {
+  const re = /!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g;
+  const out: string[] = [];
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(part)) !== null) {
+    out.push(linkify(part.slice(last, m.index)));
+    const src = safeHttpUrl(m[2]);
+    if (src) {
+      out.push(`<img src="${escapeHtml(src)}" alt="${escapeHtml(m[1])}" loading="lazy" class="md-product-img">`);
+    } else {
+      out.push(escapeHtml(m[0]));
+    }
+    last = re.lastIndex;
+  }
+  out.push(linkify(part.slice(last)));
+  return out.join("");
+}
+
 /** Inline Markdown that cannot emit arbitrary HTML.
  *
  * `linkify` escapes the text before anchors are added, and every other
@@ -86,7 +116,7 @@ function renderInline(raw: string): string {
     if (part.length >= 2 && part.startsWith("`") && part.endsWith("`")) {
       return `<code>${escapeHtml(part.slice(1, -1))}</code>`;
     }
-    return linkify(part)
+    return renderInlineImages(part)
       .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
       .replace(/__([^_]+)__/g, "<strong>$1</strong>")
       .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
@@ -97,7 +127,7 @@ function renderInline(raw: string): string {
 /** Render model Markdown without trusting it.
  *
  * Supports headings, paragraphs, bold/italic, inline and fenced code, lists,
- * blockquotes, tables and links. Raw HTML is always escaped, so a model answer
+ * blockquotes, tables, links and images. Raw HTML is always escaped, so a model answer
  * cannot inject markup. Unknown syntax is shown as plain text.
  */
 export function renderMarkdown(text: string): string {

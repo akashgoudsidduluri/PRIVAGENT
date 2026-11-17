@@ -2203,6 +2203,7 @@ export async function observe(tabId: number, sessionId?: string): Promise<Browse
     // a missing API is an empty list, not an observation failure.
     let webmcpTools: WebMCPTool[] = [];
     let ucpProfileUrl: string | undefined;
+    let ogImage: string | undefined;
     try {
       const [std] = await execScript({
         target: { tabId },
@@ -2244,13 +2245,28 @@ export async function observe(tabId: number, sessionId?: string): Promise<Browse
               if (u.origin === location.origin) ucp = u.href;
             }
           } catch { /* no UCP link */ }
-          return { tools, ucpProfileUrl: ucp };
+          // Product image the page declares for sharing. Resolved
+          // against the page URL (og:image is often relative) and
+          // restricted to credential-free http(s); the backend
+          // re-validates it before anything renders it. A product
+          // image usually lives on the store's image CDN, not the
+          // page host, so this is deliberately NOT same-origin.
+          let og: string | undefined;
+          try {
+            const meta = document.querySelector('meta[property="og:image"]') as HTMLMetaElement | null;
+            if (meta?.content) {
+              const u = new URL(meta.content, location.href);
+              if ((u.protocol === "http:" || u.protocol === "https:") && !u.username && !u.password) og = u.href;
+            }
+          } catch { /* no og:image */ }
+          return { tools, ucpProfileUrl: ucp, ogImage: og };
         },
       });
-      const r = std?.result as { tools?: WebMCPTool[]; ucpProfileUrl?: string } | undefined;
+      const r = std?.result as { tools?: WebMCPTool[]; ucpProfileUrl?: string; ogImage?: string } | undefined;
       if (r) {
         webmcpTools = Array.isArray(r.tools) ? r.tools : [];
         ucpProfileUrl = r.ucpProfileUrl;
+        ogImage = r.ogImage;
       }
     } catch { /* standards collection is best-effort */ }
 
@@ -2296,6 +2312,7 @@ export async function observe(tabId: number, sessionId?: string): Promise<Browse
     // the backend's optional fields).
     ...(webmcpTools.length > 0 ? { webmcpTools } : {}),
     ...(ucpProfileUrl ? { ucpProfileUrl } : {}),
+    ...(ogImage ? { ogImage } : {}),
     interactive: list.map(e => ({
       targetId: e.targetId,
       elementRef: e.elementRef,

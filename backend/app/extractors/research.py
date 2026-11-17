@@ -412,6 +412,20 @@ def format_comparison_table(tracker: dict[str, Any], instruction: str = "") -> s
     table_header = "| Retailer | Status | Price | Details | Link |\n| :--- | :--- | :--- | :--- | :--- |"
     table = f"{table_header}\n" + "\n".join(rows)
 
+    # Product images, one per verified listing that declares one —
+    # the same card-with-image shape other agents show, rendered
+    # above the table. The image URL comes from the product page's
+    # own og:image (validated in the extractor); the workspace
+    # re-validates it before emitting an <img>.
+    images = []
+    for s in tracker["required_sites"].values():
+        if s.get("status") == "completed" and s.get("data"):
+            d = s["data"]
+            img = d.get("image")
+            if img:
+                images.append(f"![{d.get('title', s['name'])} — {d.get('price', '')}]({img})")
+    images_section = ("\n\n" + "\n\n".join(images)) if images else ""
+
     conclusion = ""
     if len(valid_prices) >= 2:
         valid_prices.sort(key=lambda x: x[0])
@@ -432,7 +446,30 @@ def format_comparison_table(tracker: dict[str, Any], instruction: str = "") -> s
     else:
         conclusion = "\n\n**Summary**: No verified listings were found across the requested retailers."
 
-    return f"### Price & Availability Comparison:\n{table}{conclusion}"
+    return f"### Price & Availability Comparison:{images_section}\n{table}{conclusion}"
+
+
+def _valid_image_url(raw: str | None) -> str | None:
+    """Accept a page-declared product image URL, or None.
+
+    Only credential-free http(s) URLs with a hostname pass. The host
+    is deliberately NOT restricted to the page host — a product image
+    almost always lives on the store's image CDN, not the listing
+    page's own host. The URL is only ever rendered for a product page
+    the agent actually visited, and the workspace re-validates it
+    with safeHttpUrl before emitting an <img>.
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        parsed = urllib.parse.urlparse(raw.strip())
+    except ValueError:
+        return None
+    if parsed.scheme not in ("http", "https"):
+        return None
+    if not parsed.netloc or parsed.username or parsed.password:
+        return None
+    return raw.strip()[:2048]
 
 
 def extract_page_research(
@@ -440,6 +477,7 @@ def extract_page_research(
     title: str,
     page_text: str,
     interactive_elements: Optional[list[dict[str, Any]]] = None,
+    image_url: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
     """Extract structured research entity (price, variant, seller, url) from visited pages.
     
@@ -530,4 +568,7 @@ def extract_page_research(
         "variant": ", ".join(variants) if variants else "Standard",
         "seller": seller or domain.capitalize(),
         "in_stock": in_stock,
+        # Product image from the page's og:image, validated above.
+        # Absent (None) when the page declares none or it is unsafe.
+        "image": _valid_image_url(image_url),
     }

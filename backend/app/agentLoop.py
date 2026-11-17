@@ -658,6 +658,15 @@ async def _run_loop(
             or (raw_obs.get("readable_text") if isinstance(raw_obs, dict) else "")
             or ""
         )
+        # Product image the page declares via og:image. The extension
+        # sends it as camelCase "ogImage" in the raw dict (or as the
+        # og_image attribute on a validated BrowserObservation); the
+        # extractor re-validates it before it reaches any fact.
+        raw_image = str(
+            getattr(raw_obs, "og_image", None)
+            or (raw_obs.get("ogImage") if isinstance(raw_obs, dict) else "")
+            or ""
+        )
         # -- Task 14: standards state for this observation ----------------
         # WebMCP tools ride the redacted payload (validated at
         # redaction time); the UCP profile is fetched here — same
@@ -733,7 +742,7 @@ async def _run_loop(
         if not batch_continuation and raw_url and raw_text:
             try:
                 from .extractors.research import extract_page_research, update_multi_site_tracker
-                fact = extract_page_research(raw_url, raw_title, raw_text)
+                fact = extract_page_research(raw_url, raw_title, raw_text, image_url=raw_image or None)
                 if fact:
                     if "collected_research" not in working_memory:
                         working_memory["collected_research"] = {}

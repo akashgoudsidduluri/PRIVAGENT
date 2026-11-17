@@ -99,11 +99,12 @@ def build_comparison_package(
             price,
             str(data.get("variant") or "Standard"),
             url,
+            str(data.get("image") or ""),
         ])
     pkg.tables.append(DataTable(
         table_id="tbl_1",
         title="Price comparison",
-        headers=["Store", "Price", "Variant", "Link"],
+        headers=["Store", "Price", "Variant", "Link", "Image"],
         rows=rows,
         caption=f"Verified prices for {product} across {len(rows)} store(s).",
         source_ids=[f"src_{i}" for i in range(1, len(rows) + 1)],
