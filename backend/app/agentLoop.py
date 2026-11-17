@@ -1228,6 +1228,48 @@ async def _run_loop(
                 if consecutive_repeats >= 1:
                     penalties.append(f"loop warning: action '{action.get('type')}' was already completed. Do not repeat it; proceed to next step or conclude.")
 
+        # Repeated-failure loop detection: the checks above only run
+        # when the last step SUCCEEDED, so a planner that keeps
+        # re-emitting an action that FAILS with the same error was
+        # never stopped — it burned the whole step budget one failure
+        # at a time (live Flipkart run 2026-11-17: 38 identical
+        # popup-close clicks, each STALE_TARGET as the page
+        # re-rendered). Count trailing failures of this same action
+        # with this same error; three in a row stops the task, one
+        # earns a warning penalty — mirroring the success-path
+        # thresholds above. Runs on every iteration, regardless of
+        # the last step's outcome.
+        failed_repeats = 0
+        if history and history[-1].get("result_ok") is False and history[-1].get("error"):
+            _last_err = history[-1].get("error")
+            for _h in reversed(history):
+                if (
+                    _h.get("result_ok") is False
+                    and _actions_match(_h.get("action", {}), action)
+                    and _h.get("error") == _last_err
+                ):
+                    failed_repeats += 1
+                else:
+                    break
+            if failed_repeats >= 3:
+                return {
+                    "final": "budget_exceeded",
+                    "steps": steps_done,
+                    "summary": (
+                        f"Loop detected: action '{action.get('type')}' failed "
+                        f"{failed_repeats} times in a row with the same error "
+                        f"({_last_err}); stopping instead of repeating it."
+                    ),
+                    "history": history,
+                }
+            if failed_repeats >= 1:
+                penalties.append(
+                    f"Repeated failure warning: action '{action.get('type')}' already "
+                    f"failed {failed_repeats} time(s) with the same error ({_last_err}). "
+                    "Do not repeat it without a new target or strategy; conclude if "
+                    "the goal cannot be reached."
+                )
+
         # Task 7: resolve element refs against this *redacted*
         # observation before anything executes. A ref the planner quoted
         # is looked up in the current accessibility tree; a match pins

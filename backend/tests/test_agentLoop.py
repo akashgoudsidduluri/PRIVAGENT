@@ -291,3 +291,56 @@ def test_state_aware_loop_detection_identical_state():
         if isinstance(h, dict)
     )
     assert has_warning
+
+
+def test_repeated_failure_loop_detection_stops_stale_clicks():
+    """A planner that keeps re-emitting an action that FAILS with the same
+    error must be stopped — not allowed to burn the whole step budget one
+    failure at a time.
+
+    Live run 2026-11-17 (price hunt on Flipkart): 38 identical
+    popup-close clicks, each failing STALE_TARGET as the page
+    re-rendered, because loop detection only ran when the last step
+    SUCCEEDED. The task ran to the 50-step cap with 1/3 sites done.
+    """
+    hub = FakeHub({"click": [{"ok": False, "error": {"code": "STALE_TARGET", "message": "STALE_TARGET", "recoverable": True}, "msg": "STALE_TARGET", "fail_n": 50}]})
+    plans: list[dict] = []
+
+    class Planner:
+        def __call__(self, i, p, h):
+            plans.append(h)
+            return {
+                "goal": "dismiss popup",
+                "steps": [{
+                    "why": "close popup",
+                    "action": {
+                        "type": "click",
+                        "risk": "write",
+                        "verify": "v",
+                        "timeoutMs": 100,
+                        "target": {"targetId": "popup-close", "name": "Close"},
+                    },
+                }],
+            }
+
+    state = asyncio.run(agentLoop.run_with_injection(
+        hub, planner=Planner(),
+        obs_factory=lambda: {
+            "tabId": 1, "url": "https://www.flipkart.com/search?q=logitech", "title": "Search",
+            "interactive": [{"targetId": "popup-close", "role": "button", "name": "Close", "tag": "button", "visible": True, "enabled": True}],
+            "scroll": {}, "dpr": 1,
+        },
+    ))
+    assert state["final"] == "budget_exceeded"
+    assert "Loop detected" in state["summary"]
+    assert "failed" in state["summary"]
+    # Stopped after a few failures, not at the 50-step cap.
+    assert state["steps"] <= 5
+    # The repeated-failure warning reached the planner before the stop.
+    has_warning = any(
+        "Repeated failure warning" in str(h.get("penalty", ""))
+        for call_hist in plans
+        for h in call_hist
+        if isinstance(h, dict)
+    )
+    assert has_warning
