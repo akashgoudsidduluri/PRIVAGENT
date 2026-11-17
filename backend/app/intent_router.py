@@ -84,7 +84,7 @@ class IntentClassification:
 FORMAT_PDF_RE = re.compile(r"(?:\bpdf\b|\.pdf\b)", re.IGNORECASE)
 FORMAT_DOCX_RE = re.compile(r"(?:\bdocx\b|\bword(?:\s+doc(?:ument)?)?\b|\.docx\b)", re.IGNORECASE)
 FORMAT_PPTX_RE = re.compile(r"(?:\bpptx\b|\bpowerpoint\b|\bpresentation\b|\bslide\s*deck\b|\bslides?\b|\.pptx\b)", re.IGNORECASE)
-FORMAT_XLSX_RE = re.compile(r"(?:\bxlsx\b|\bexcel\b|\bspreadsheet\b|\bworkbook\b|\.xlsx\b)", re.IGNORECASE)
+FORMAT_XLSX_RE = re.compile(r"(?:\bxlsx\b|\bexcel\b|\bxcel\b|\bspreadsheet\b|\bworkbook\b|\.xlsx\b)", re.IGNORECASE)
 FORMAT_CSV_RE = re.compile(r"(?:\bcsv\b|\.csv\b)", re.IGNORECASE)
 FORMAT_MD_RE = re.compile(r"(?:\bmarkdown\b|\.md\b)", re.IGNORECASE)
 FORMAT_HTML_RE = re.compile(r"(?:\bhtml\b|\bwebpage\b|\.html?\b)", re.IGNORECASE)

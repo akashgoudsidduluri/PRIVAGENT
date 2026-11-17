@@ -87,6 +87,7 @@ from .loop_helpers import (
 from .loop_research import (
     _finalize_research_artifacts,
     _finalize_research_summary,
+    build_comparison_package,
 )
 from .loop_state import (
     _await_takeover,
@@ -3160,6 +3161,39 @@ async def run_task(task_id: str) -> None:
         else:
             final_state = "cancelled"
         record.state = final_state  # type: ignore[assignment]
+        # Comparison document: the instruction asked for a document
+        # format and the task collected multi-site comparison facts.
+        # Browser comparison tasks never reached the research document
+        # pipeline, so "give the comparison in an Excel" produced no
+        # file. Bridge it here through the existing artifact pipeline
+        # (xlsx/docx/pdf/pptx + download endpoint). A missing or
+        # failed render must never fail the task itself.
+        if classification.requested_format:
+            try:
+                _cmp_wm = state.get("working_memory") or initial_memory
+                _cmp_tracker = _cmp_wm.get("multi_site_research")
+                if _cmp_tracker:
+                    _cmp_pkg = build_comparison_package(
+                        task_id, record.instruction, _cmp_tracker,
+                        summary_msg=record.message,
+                        target_format=classification.requested_format,
+                    )
+                    if _cmp_pkg is not None:
+                        _cmp_wm["research_knowledge_package"] = _cmp_pkg.to_dict()
+                        _cmp_wm["requested_format"] = canonical_format_map.get(
+                            classification.requested_format, classification.requested_format
+                        )
+                        _cmp_wm["instruction"] = record.instruction
+                        _cmp_art = _finalize_research_artifacts(task_id, chat_id, _cmp_wm, summary_msg=record.message)
+                        if _cmp_art and Path(_cmp_art["filepath"]).exists() and _cmp_art["file_size_bytes"] > 0:
+                            _fn = _cmp_art["filename"]
+                            _fmt = _cmp_art["file_format"].upper()
+                            _kb = _cmp_art["file_size_bytes"] / 1024.0
+                            record.message = (record.message or "") + (
+                                f"\n\n📄 **Deliverable Ready:** [{_fn}] ({_fmt}, {_kb:.1f} KB). Available for download."
+                            )
+            except Exception:
+                pass
         is_planner_err = "Planner unavailable" in (record.message or "") or "Planner timed out" in (record.message or "")
         sess_status = "active" if (is_planner_err or final_state == "completed") else final_state
         session_manager.update_status(session.session_id, sess_status)

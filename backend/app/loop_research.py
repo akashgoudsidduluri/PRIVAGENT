@@ -18,7 +18,99 @@ from .loop_helpers import canonical_format_map
 __all__ = [
     "_finalize_research_artifacts",
     "_finalize_research_summary",
+    "build_comparison_package",
 ]
+
+
+def build_comparison_package(
+    task_id: str,
+    instruction: str,
+    tracker: dict[str, Any] | None,
+    summary_msg: str | None = None,
+    target_format: str = "xlsx",
+) -> Optional["ResearchKnowledgePackage"]:
+    """Build a ResearchKnowledgePackage from multi-site comparison facts.
+
+    A browser comparison task (price hunt, product compare) collects
+    per-site facts in the multi-site tracker but never reaches the
+    research document pipeline — so "give the comparison in an Excel"
+    produced no file. This bridges the two: the tracker's completed
+    sites become sources + price claims + one comparison DataTable,
+    which :func:`_finalize_research_artifacts` renders into the
+    requested format. Returns None when there is nothing verified to
+    report (no completed site with a price) — the caller then renders
+    nothing instead of an empty document.
+    """
+    from urllib.parse import urlparse
+
+    from .extractors.research import extract_target_product_query
+    from .research.models import (
+        DataTable,
+        ResearchClaim,
+        ResearchKnowledgePackage,
+        ResearchTopic,
+        SourceReference,
+    )
+
+    if not tracker:
+        return None
+    sites = tracker.get("required_sites") or {}
+    completed: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for site in sites.values():
+        data = site.get("data") if isinstance(site.get("data"), dict) else None
+        if site.get("status") == "completed" and data and data.get("price"):
+            completed.append((site, data))
+    if not completed:
+        return None
+
+    product = (extract_target_product_query(instruction) or "").strip()
+    product = re.sub(r"^(?:the\s+)?(?:lowest\s+price\s+for\s+(?:the\s+)?|price\s+of\s+(?:the\s+)?)", "", product, flags=re.IGNORECASE).strip()
+    product = product[:80] or "product"
+    pkg = ResearchKnowledgePackage(
+        package_id=f"pkg_{task_id}",
+        topic=ResearchTopic(
+            title=f"Price comparison — {product}"[:120],
+            objective=instruction,
+            target_format=target_format,
+        ),
+    )
+    if summary_msg:
+        pkg.topic.findings_summary = summary_msg.strip()[:2000]
+
+    rows: list[list[Any]] = []
+    for idx, (site, data) in enumerate(completed, start=1):
+        url = str(data.get("url") or site.get("default_url") or "")
+        domains = site.get("domains") or []
+        domain = str(domains[0]) if domains else (urlparse(url).netloc or "")
+        src_id = f"src_{idx}"
+        pkg.add_source(SourceReference(
+            source_id=src_id, url=url, domain=domain,
+            title=str(site.get("name") or domain),
+        ))
+        price = str(data.get("price"))
+        pkg.add_claim(ResearchClaim(
+            claim_id=f"clm_{idx}",
+            statement=f"The {product} costs {price} on {site.get('name')}.",
+            claim_type="comparison",
+            primary_source_id=src_id,
+        ))
+        rows.append([
+            str(site.get("name") or ""),
+            price,
+            str(data.get("variant") or "Standard"),
+            url,
+        ])
+    pkg.tables.append(DataTable(
+        table_id="tbl_1",
+        title="Price comparison",
+        headers=["Store", "Price", "Variant", "Link"],
+        rows=rows,
+        caption=f"Verified prices for {product} across {len(rows)} store(s).",
+        source_ids=[f"src_{i}" for i in range(1, len(rows) + 1)],
+    ))
+    pkg.metadata["completed_sites"] = len(rows)
+    pkg.metadata["pending_sites"] = sum(1 for s in sites.values() if s.get("status") != "completed")
+    return pkg
 
 
 def _finalize_research_artifacts(
