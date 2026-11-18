@@ -49,7 +49,7 @@ from .models import (
     SourceReference,
     VisualAsset,
 )
-from .adaptive_planner import PageConstraint, PageConstraintType
+from .adaptive_planner import PageConstraint, PageConstraintType, PageSpec, reconcile_page_count
 
 
 class BlockType(str, Enum):
@@ -170,6 +170,17 @@ class StructuredDocumentPlan(BaseModel):
     target_pages: Optional[int] = None
     is_slides: bool = False
     total_allocated_pages: int = 1
+    # Per-page mode: the user described what goes on each page, so the
+    # plan is one section per user page instead of the fixed sections.
+    is_per_page: bool = False
+    # Page numbers (1-based) whose content still overflowed one PDF page
+    # even at the deepest trim — the renderer records these honestly
+    # instead of silently merging pages.
+    per_page_overflow: list[int] = Field(default_factory=list)
+    # When the instruction declared an explicit "N pages" that disagreed
+    # with the number of per-page briefs, the mismatch message (the
+    # briefs win). None when they agree or no count was declared.
+    per_page_mismatch: Optional[str] = None
     created_at: float = Field(default_factory=time.time)
 
     model_config = {"populate_by_name": True}
@@ -229,6 +240,217 @@ def _clean_subtopic_title(raw_title: str, parent_title: str = "", idx: int = 1) 
 # AI Document Planner Implementation
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Per-page plans (user describes what goes on each page)
+# ---------------------------------------------------------------------------
+
+# Words too generic to match evidence to a page brief.
+_PAGE_STOPWORDS = {
+    "the", "a", "an", "of", "to", "and", "or", "for", "with", "on", "in",
+    "at", "by", "from", "is", "are", "was", "were", "be", "been", "it",
+    "its", "this", "that", "these", "those", "page", "pages", "intro",
+    "introduction", "overview", "section", "about", "what", "how", "why",
+    "when", "where", "which", "please", "give", "make", "need", "want",
+}
+
+# A page's content budget: enough evidence to fill one page, never so
+# much that the section spills onto a second PDF page.
+_PER_PAGE_MAX_CLAIMS = 3
+_PER_PAGE_MAX_IMAGES = 1
+
+
+def _page_keywords(text: str) -> set[str]:
+    """Lowercased content words from a brief, title, or statement."""
+    if not text:
+        return set()
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    return {w for w in words if len(w) > 2 and w not in _PAGE_STOPWORDS}
+
+
+def _score_claim_for_page(
+    claim: ResearchClaim,
+    page_kw: set[str],
+    source_title_by_id: dict[str, str],
+    subtopic_title_by_id: dict[str, str],
+) -> int:
+    """Keyword overlap of a claim against one page's brief.
+
+    The claim statement counts double; the title of its primary source
+    and of its subtopic count once each. A claim whose statement shares
+    no word with the brief scores 0 and is never placed on that page.
+    """
+    score = len(_page_keywords(claim.statement) & page_kw) * 2
+    if claim.primary_source_id and claim.primary_source_id in source_title_by_id:
+        score += len(_page_keywords(source_title_by_id[claim.primary_source_id]) & page_kw)
+    if claim.subtopic_id and claim.subtopic_id in subtopic_title_by_id:
+        score += len(_page_keywords(subtopic_title_by_id[claim.subtopic_id]) & page_kw)
+    return score
+
+
+def _score_visual_for_page(
+    visual: VisualAsset,
+    page_kw: set[str],
+    source_title_by_id: dict[str, str],
+) -> int:
+    """Keyword overlap of a visual asset against one page's brief.
+
+    Uses the asset's title, caption, source URL, and its source's
+    title — never the image URL itself (opaque). Authentic browser
+    images and generated diagrams are scored the same way.
+    """
+    score = 0
+    for text in (visual.title, visual.caption, visual.source_url):
+        score += len(_page_keywords(text or "") & page_kw)
+    if visual.source_id and visual.source_id in source_title_by_id:
+        score += len(_page_keywords(source_title_by_id[visual.source_id]) & page_kw)
+    return score
+
+
+def build_per_page_plan(
+    pkg: ResearchKnowledgePackage,
+    page_specs: list[PageSpec],
+    target_format: str = "pdf",
+    page_constraint: Optional[PageConstraint] = None,
+    **kwargs: Any,
+) -> StructuredDocumentPlan:
+    """Build one section per user page, filled from the research evidence.
+
+    Each spec becomes exactly one section (page_break_before on every
+    section after the first, page_number = the spec's number). Evidence
+    is matched by keyword overlap with that page's brief: each claim
+    goes to its highest-scoring page (ties -> earliest page), each
+    visual to its highest-scoring page with a score above zero (ties ->
+    earliest), at most one image per page. Nothing is invented: a page
+    with no matching evidence says so in plain text. No bibliography
+    section is added — it would push the document past the exact page
+    count; provenance stays inline as citation brackets on the claims.
+    """
+    plan_id = f"docplan_{int(time.time() * 1000)}"
+    cit_map = _build_citation_map(pkg)
+    clean_doc_title = _clean_title(pkg.topic.title)
+    now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%B %d, %Y")
+    is_slides = bool(
+        target_format in ("pptx", "presentation", "slides")
+        or (page_constraint and page_constraint.is_slides)
+    )
+    meta = DocumentMetadata(
+        title=clean_doc_title,
+        subtitle="Autonomous Multi-Source Technical Research Report",
+        objective=pkg.topic.objective or clean_doc_title,
+        date_str=now_str,
+        sources_count=len(pkg.sources),
+        claims_count=len(pkg.claims),
+        target_format=target_format,
+        is_slides=is_slides,
+    )
+
+    source_title_by_id = {
+        src.source_id: (src.title or "") for src in pkg.sources.values()
+    }
+    subtopic_title_by_id = {
+        sub.subtopic_id: (sub.title or "") for sub in pkg.topic.subtopics
+    }
+
+    n_pages = len(page_specs)
+    page_keywords = [_page_keywords(spec.brief) for spec in page_specs]
+
+    # Assign each claim to its best page (score > 0, ties -> earliest).
+    claims_by_page: dict[int, list[tuple[int, ResearchClaim]]] = {i: [] for i in range(n_pages)}
+    for claim in pkg.claims.values():
+        best_page, best_score = -1, 0
+        for idx, kw in enumerate(page_keywords):
+            score = _score_claim_for_page(claim, kw, source_title_by_id, subtopic_title_by_id)
+            if score > best_score:
+                best_page, best_score = idx, score
+        if best_page >= 0:
+            claims_by_page[best_page].append((best_score, claim))
+    # Assign each visual to its best page (score > 0, ties -> earliest).
+    visuals_by_page: dict[int, list[tuple[int, VisualAsset]]] = {i: [] for i in range(n_pages)}
+    for visual in pkg.visuals:
+        best_page, best_score = -1, 0
+        for idx, kw in enumerate(page_keywords):
+            score = _score_visual_for_page(visual, kw, source_title_by_id)
+            if score > best_score:
+                best_page, best_score = idx, score
+        if best_page >= 0:
+            visuals_by_page[best_page].append((best_score, visual))
+
+    sections: list[DocumentSection] = []
+    for idx, spec in enumerate(page_specs):
+        sec = DocumentSection(
+            section_id=f"sec_pp_{spec.page_number:02d}",
+            title=f"{spec.page_number}. {spec.title}",
+            level=1,
+            page_break_before=idx > 0,
+            page_number=spec.page_number,
+            metadata={"filler": False},
+        )
+        page_claims = sorted(claims_by_page[idx], key=lambda sc: -sc[0])[:_PER_PAGE_MAX_CLAIMS]
+        if page_claims:
+            sentences: list[str] = []
+            for _, claim in page_claims:
+                stmt = (claim.statement or "").strip()
+                if not stmt:
+                    continue
+                src_ids = ([claim.primary_source_id] if claim.primary_source_id else []) + list(claim.supporting_source_ids or [])
+                cit = _format_citation(src_ids, cit_map)
+                sentences.append(f"{stmt} {cit}".strip() if cit else stmt)
+            if sentences:
+                sec.add_text(text=" ".join(sentences))
+        else:
+            sec.add_text(
+                text=(
+                    f"No evidence from the research surfaced for this page "
+                    f"({spec.title}). Nothing has been invented to fill it."
+                )
+            )
+        page_visuals = sorted(visuals_by_page[idx], key=lambda sv: -sv[0])[:_PER_PAGE_MAX_IMAGES]
+        for _, visual in page_visuals:
+            sec.add_visual(visual)
+        sections.append(sec)
+
+    # Provenance: the bibliography section is omitted in per-page mode
+    # (it would push the document past the exact page count), but the
+    # claims still carry inline citation brackets, and those brackets
+    # must resolve. A compact "Sources" paragraph on the last page
+    # maps each cited number to its title and URL — no separate page,
+    # no lost attribution.
+    cited_source_ids: list[str] = []
+    seen_ids: set[str] = set()
+    for idx in range(n_pages):
+        for _, claim in claims_by_page[idx]:
+            for src_id in ([claim.primary_source_id] if claim.primary_source_id else []) + list(claim.supporting_source_ids or []):
+                if src_id and src_id in cit_map and src_id not in seen_ids:
+                    seen_ids.add(src_id)
+                    cited_source_ids.append(src_id)
+    if cited_source_ids and sections:
+        parts: list[str] = []
+        for src_id in cited_source_ids[:5]:
+            src = pkg.sources.get(src_id)
+            if not src:
+                continue
+            num = cit_map[src_id]
+            title = (src.title or src.domain or src.url or "").strip()
+            if len(title) > 60:
+                title = title[:57] + "..."
+            parts.append(f"[{num}] {title} — {src.url}")
+        if parts:
+            sections[-1].add_text(
+                text="Sources: " + "; ".join(parts),
+                title="Sources",
+            )
+
+    return StructuredDocumentPlan(
+        plan_id=plan_id,
+        metadata=meta,
+        sections=sections,
+        target_pages=n_pages,
+        is_slides=is_slides,
+        total_allocated_pages=n_pages,
+        is_per_page=True,
+    )
+
+
 def build_structured_document_plan(
     pkg: ResearchKnowledgePackage,
     target_format: str = "pdf",
@@ -283,6 +505,26 @@ def build_structured_document_plan(
         target_format=target_format,
         is_slides=is_slides,
     )
+
+    # 3. Per-page mode: the user described what goes on each page.
+    # The spec list wins over a conflicting "N pages" count; the
+    # mismatch is recorded on the plan (per_page_mismatch) so the
+    # caller can surface it instead of it being silently swallowed.
+    page_specs = kwargs.get("page_specs")
+    mismatch: Optional[str] = None
+    if page_specs is None and kwargs.get("instruction"):
+        _, page_specs, mismatch = reconcile_page_count(str(kwargs["instruction"]))
+    if page_specs:
+        per_page_plan = build_per_page_plan(
+            pkg,
+            page_specs,
+            target_format=target_format,
+            page_constraint=page_constraint,
+            **kwargs,
+        )
+        if mismatch:
+            per_page_plan.per_page_mismatch = mismatch
+        return per_page_plan
 
     # 3. Content Analysis & Asset Correlation
     # Track which visuals, formulas, and tables have been placed inline
