@@ -232,3 +232,161 @@ def test_ordinary_coding_and_math_not_routed_to_browser():
     assert classify_intent("Calculate 25 * 400 + 15% of 80.").intent == TaskIntent.NON_BROWSER
     assert classify_intent("What is dependency injection?").intent == TaskIntent.NON_BROWSER
 
+
+# --- Research query cleaning + allow-list-aware discovery (2026-11-19) ---
+#
+# Live failure: "so i have to submit a research paper on topic :
+# \"Quantum Mechanics similarities with life?\" so can you research
+# about this topic online..." produced queries[0] ==
+# "i have to submit a paper : \"Quantum overview technical
+# principles" (submission scaffolding ate the 8-word cap, the real
+# topic was truncated, a UI arrow leaked in) and discovery picked
+# nature.com — which was not on the user's domain allow-list — so
+# the deterministic plan was rejected with PLAN_INVALID and the
+# research task died on the first step.
+
+_RESEARCH_INSTRUCTION = (
+    'so i have to submit a research paper on topic : '
+    '"Quantum Mechanics similarities with life?" so can you research '
+    "about this topic online and get me information report in doc "
+    "format and include the images in it"
+)
+_ERROR_URL_INSTRUCTION = 'i have to submit a paper : "Quantum overview technical principles ↗'
+
+
+def test_research_query_strips_submission_preamble_and_ui_glyph(sandbox_resolver):
+    """The decomposed research query is the topic only: no submission
+    scaffolding, no quotes/colons, no UI glyph, and the real topic is
+    not truncated by the 8-word cap."""
+    res = sandbox_resolver.discover_websites_for_task(_RESEARCH_INSTRUCTION, context={})
+    assert res["category"] == "research"
+    queries = res["search_queries"]
+    assert len(queries) >= 1
+    q0 = queries[0]
+    assert "Quantum Mechanics similarities with life" in q0
+    for banned in ("i have to submit", "submit a paper", "research paper", "on topic", '"', ":", "↗", "✓", "›"):
+        assert banned not in q0, f"query still carries {banned!r}: {q0!r}"
+    # The primary URL carries the clean topic, not the raw instruction.
+    assert "Quantum+Mechanics+similarities+with+life" in (res["primary_navigation_url"] or "")
+    assert "submit" not in (res["primary_navigation_url"] or "")
+
+
+def test_research_query_error_url_variant_is_clean(sandbox_resolver):
+    """The exact phrasing behind the failed nature.com URL (with the
+    leaked external-link arrow) decomposes to the clean topic, and the
+    research suffix is not duplicated onto a topic that already
+    carries it."""
+    res = sandbox_resolver.discover_websites_for_task(_ERROR_URL_INSTRUCTION, context={})
+    q0 = res["search_queries"][0]
+    assert q0 == "Quantum overview technical principles", q0
+    assert "↗" not in q0 and "submit" not in q0
+    assert "overview technical principles overview" not in " ".join(res["search_queries"])
+
+
+def test_quoted_topic_and_helpers():
+    """Unit checks for the topic helpers."""
+    from app.website_resolver import (
+        _extract_quoted_topic,
+        _strip_submission_preamble,
+        _strip_ui_glyphs,
+    )
+
+    assert _extract_quoted_topic(
+        'submit a paper on topic : "Quantum Mechanics similarities with life?"'
+    ) == "Quantum Mechanics similarities with life"
+    # Unclosed quote still counts.
+    assert _extract_quoted_topic('i have to submit a paper : "Quantum overview') == "Quantum overview"
+    assert _extract_quoted_topic("research solid-state batteries") is None
+    assert _strip_submission_preamble("i have to submit a research paper on topic Quantum") == "Quantum"
+    assert _strip_submission_preamble("i need to write an essay about photosynthesis") == "photosynthesis"
+    assert "on topic" not in _strip_submission_preamble("submit a paper on topic black holes")
+    assert _strip_ui_glyphs("Quantum overview ↗") == "Quantum overview"
+    assert _strip_ui_glyphs("check this ✓ and that ›") == "check this and that"
+
+
+def test_research_discovery_filters_hubs_by_allowlist(sandbox_resolver):
+    """Discovery never offers a hub outside the domain allow-list.
+    With no research hub allow-listed, the primary URL is None and
+    the block is explained instead of a doomed PLAN_INVALID navigate."""
+    # No research hub on the list -> blocked, honestly.
+    res = sandbox_resolver.discover_websites_for_task(
+        _RESEARCH_INSTRUCTION,
+        context={},
+        allowed_domains=["amazon.in", "flipkart.com", "croma.com"],
+    )
+    assert res["category"] == "research"
+    domains = [s["domain"] for s in res["selected_sources"]]
+    assert "nature.com" not in domains and "arxiv.org" not in domains
+    assert res["primary_navigation_url"] is None
+    assert res["discovery_blocked_reason"]
+    assert "PRIVAGENT_ALLOWED_DOMAINS" in res["discovery_blocked_reason"]
+
+    # google.com on the list -> Google fallback with the CLEAN query.
+    res = sandbox_resolver.discover_websites_for_task(
+        _RESEARCH_INSTRUCTION,
+        context={},
+        allowed_domains=["amazon.in", "google.com"],
+    )
+    assert res["primary_navigation_url"] is not None
+    assert res["primary_navigation_url"].startswith("https://www.google.com/search?q=")
+    assert "Quantum+Mechanics+similarities+with+life" in res["primary_navigation_url"]
+    assert "submit" not in res["primary_navigation_url"]
+    assert res["discovery_blocked_reason"] is None
+
+    # en.wikipedia.org on the list -> Wikipedia is the primary hub.
+    res = sandbox_resolver.discover_websites_for_task(
+        _RESEARCH_INSTRUCTION,
+        context={},
+        allowed_domains=["amazon.in", "en.wikipedia.org"],
+    )
+    assert res["selected_sources"][0]["domain"] == "en.wikipedia.org"
+    assert "en.wikipedia.org/wiki/Special:Search" in res["primary_navigation_url"]
+    assert "Quantum+Mechanics+similarities+with+life" in res["primary_navigation_url"]
+
+    # No allow-list configured -> backwards compatible: nature.com offered.
+    res = sandbox_resolver.discover_websites_for_task(_RESEARCH_INSTRUCTION, context={})
+    assert "nature.com" in [s["domain"] for s in res["selected_sources"]]
+    assert res["primary_navigation_url"] is not None
+    assert "nature.com/search" in res["primary_navigation_url"]
+    assert res["discovery_blocked_reason"] is None
+
+
+def test_deterministic_plan_blocked_discovery_answers_honestly():
+    """When discovery is blocked (no allow-listed hub), the
+    deterministic planner answers with the fix instead of a navigate
+    the allow-list gate would reject with PLAN_INVALID."""
+    from app.planner import try_deterministic_plan
+    from app.privacy import PrivacyFilteredPayload
+
+    working_memory = {
+        "autonomous_discovery": {
+            "scenario": "B",
+            "category": "research",
+            "search_queries": ["Quantum Mechanics similarities with life overview technical principles"],
+            "selected_sources": [],
+            "primary_navigation_url": None,
+            "discovery_blocked_reason": (
+                "No research source is on the domain allow-list, so I cannot open a page to research this. "
+                "Add one of google.com, en.wikipedia.org, arxiv.org, or nature.com to "
+                "PRIVAGENT_ALLOWED_DOMAINS in backend/.env and restart the backend, then ask again."
+            ),
+        }
+    }
+    payload = PrivacyFilteredPayload(
+        tab_id=1,
+        url="",
+        title="",
+        interactive=[],
+        scroll={},
+        dpr=1.0,
+        elements_original=0,
+        elements_sent=0,
+    )
+    plan = try_deterministic_plan(_RESEARCH_INSTRUCTION, payload, [], working_memory=working_memory)
+    assert plan is not None
+    # No navigate step: the plan is an honest answer, not a doomed action.
+    assert plan.steps == []
+    assert plan.answer is not None
+    assert "PRIVAGENT_ALLOWED_DOMAINS" in plan.answer
+    assert "google.com" in plan.answer
+

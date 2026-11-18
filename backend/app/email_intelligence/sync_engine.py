@@ -63,6 +63,24 @@ def _get_connector_for_mission(mission: dict[str, Any]):
     )
 
 
+def _post_delete_receipt(mission: dict, task_record, db_path=None) -> None:
+    """Post the user's deletion receipt ('.' or 'deleted') to the
+    mission's chat when a mail is moved to Trash. Only posts when the
+    user asked for it (notification_policy.delete_receipt_text, set by
+    the 'send . when you delete' chat instruction). A receipt failure
+    must never break the tick."""
+    try:
+        pol = mission.get("notification_policy") or {}
+        receipt = pol.get("delete_receipt_text")
+        conv_id = mission.get("conversation_id")
+        if not receipt or not conv_id:
+            return
+        db.add_message(conv_id, "agent", receipt, evidence="email_delete_receipt", task_id=task_record.task_id, db_path=db_path)
+        db.touch_chat(conv_id, db_path=db_path)
+    except Exception:
+        return
+
+
 async def run_email_mission_tick(mission_id: str, db_path: Optional[str] = None) -> dict[str, Any]:
     """Execute one synchronization, classification, cleanup, and neglect-detection tick."""
     db.init_db(db_path)
@@ -284,6 +302,14 @@ async def run_email_mission_tick(mission_id: str, db_path: Optional[str] = None)
                     db.save_email_classification(cls_result_dict, db_path=db_path)
                     task_record.message = f"Moved to Trash: {email.subject[:30]}..."
                     await hub.broadcast_progress(task_record)
+                    # Deletion receipt: if the user asked for one ("."
+                    # or "deleted") on every deletion, post it to the
+                    # mission's chat. This runs in the background tick,
+                    # where no LLM is present, so the receipt must be
+                    # posted by code — the agent's chat promise alone
+                    # cannot deliver it. Same pattern as the neglect
+                    # notification below (db.add_message + touch_chat).
+                    _post_delete_receipt(mission, task_record, db_path=db_path)
                 elif decision.action == "dry_run_flagged":
                     new_dry_run += 1
                     cls_result_dict["action_taken"] = "dry_run_flagged"

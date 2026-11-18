@@ -50,6 +50,8 @@ def _strip_query_filler(text: str) -> str:
     garbage nature.com search URL. A query that is only filler comes
     back empty."""
     out = text or ""
+    out = _strip_ui_glyphs(out)
+    out = _strip_submission_preamble(out)
     out = _QUERY_DOMAIN_WITH_PREP_RE.sub(" ", out)
     out = _QUERY_DOMAIN_RE.sub(" ", out)
     for pat in _TOPIC_META_RES:
@@ -76,6 +78,108 @@ def _strip_query_filler(text: str) -> str:
     if out.lower() in ("whole", "entire", "and", "also", "or"):
         return ""
     return out
+
+
+# Decorative / UI glyphs that leak into an instruction when the user
+# copies text from a chat or a page (an external-link arrow, a
+# checkmark, a chevron). They are never search keywords: a query
+# carrying one gets templated verbatim into a hub search URL.
+_UI_GLYPH_RE = re.compile(
+    r"[↗↘↙↖→←↑↓↔✓✔✗✕✖›‹«»•●○◆◇★☆☐☑☒⏎⏏⇧⌘⟳⟲⤴⤵⧉]"
+)
+# Assignment / submission scaffolding: the user states WHY they need
+# the research ("i have to submit a paper", "i need to write an
+# essay"), not WHAT it is about. Left in, the scaffolding eats the
+# 8-word cap and the real topic is truncated away — live case:
+# "i have to submit a research paper on topic : \"Quantum Mechanics
+# similarities with life?\"" decomposed to queries[0] ==
+# "i have to submit a paper : \"Quantum overview technical
+# principles" (preamble + first word + generic research suffix).
+_SUBMISSION_PREAMBLE_RES = [
+    # "i have to submit a paper / research paper / assignment / essay"
+    re.compile(
+        r"^(?:so\s+)?i\s+(?:have\s+to|need\s+to|must|am\s+going\s+to|’m\s+going\s+to|’ve\s+got\s+to|have\s+got\s+to)\s+"
+        r"(?:submit|write|prepare|present|do|complete)\s+(?:a\s+|an\s+|my\s+|the\s+)?"
+        r"(?:research\s+)?(?:paper|assignment|essay|report|thesis|dissertation|project|homework|article|review)\b",
+        re.IGNORECASE,
+    ),
+    # "submit a paper / write an essay" without the "i have to"
+    re.compile(
+        r"^(?:so\s+)?(?:submit|write|prepare|present|do|complete)\s+(?:a\s+|an\s+|my\s+|the\s+)?"
+        r"(?:research\s+)?(?:paper|assignment|essay|report|thesis|dissertation|project|homework|article|review)\b",
+        re.IGNORECASE,
+    ),
+    # "for my assignment / paper / class / submission"
+    re.compile(
+        r"\bfor\s+my\s+(?:assignment|paper|essay|report|thesis|class|submission|homework)\b",
+        re.IGNORECASE,
+    ),
+    # "on topic", "about the topic", "the topic is", "topic:", "on the topic of"
+    re.compile(
+        r"\b(?:on|about|of)\s+(?:the\s+)?topic\s*(?::|is|about|of)?\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"^\s*topic\s*:\s*", re.IGNORECASE),
+]
+
+
+def _strip_ui_glyphs(text: str) -> str:
+    """Drop decorative/UI glyphs (external-link arrows, checkmarks,
+    chevrons) that leak into an instruction from a copy-paste."""
+    out = _UI_GLYPH_RE.sub(" ", text or "")
+    return re.sub(r"\s+", " ", out).strip()
+
+
+def _strip_submission_preamble(text: str) -> str:
+    """Remove assignment/submission scaffolding ("i have to submit a
+    paper", "on topic", "topic:") so only the subject survives.
+    Repeated until stable: stripping one scaffold can expose the
+    next ("i have to submit a research paper on topic" -> "" after
+    the topic is quoted out, but "i have to submit a paper on
+    topic" needs two passes)."""
+    out = text or ""
+    for _ in range(3):
+        prev = out
+        for pat in _SUBMISSION_PREAMBLE_RES:
+            out = pat.sub(" ", out)
+        out = re.sub(r"\s+", " ", out).strip()
+        out = re.sub(r"^[\s:;,\-–—]+", "", out).strip()
+        out = re.sub(r"[\s:;,\-–—]+$", "", out).strip()
+        # A bare preposition left in front of the topic ("about
+        # photosynthesis" from "write an essay about photosynthesis").
+        out = re.sub(r"^(?:about|on|of|regarding|concerning)\s+", "", out, flags=re.IGNORECASE).strip()
+        if out == prev:
+            break
+    return out
+
+
+def _extract_quoted_topic(text: str) -> Optional[str]:
+    """Return the topic the user put in double quotes, if any.
+    A quoted span is the strongest topic signal there is: the user
+    quoted it because it IS the subject ("submit a paper on topic:
+    \"Quantum Mechanics similarities with life?\""). An unclosed
+    quote still counts (the user often drops the closing quote).
+    Returns None when there is no quoted span of 3+ chars."""
+    m = re.search(r'"([^"]{3,})"?', text or "")
+    if not m:
+        return None
+    topic = m.group(1).strip()
+    # Strip a trailing question mark / period the user put inside
+    # the quotes ("... with life?" -> "... with life").
+    topic = re.sub(r"[?.!]+$", "", topic).strip()
+    return topic or None
+
+
+def _host_on_allowlist(host: str, allowed_domains: Optional[list[str]]) -> bool:
+    """True when *host* is covered by *allowed_domains*. An empty /
+    unset allow-list means "not configured": everything is allowed
+    (``host_matches_allowlist`` returns False for an empty list, so
+    it cannot be used directly for this check)."""
+    if not allowed_domains:
+        return True
+    from .allowlist import host_matches_allowlist
+
+    return host_matches_allowlist(host, allowed_domains)
 
 
 @dataclass
@@ -864,6 +968,21 @@ class WebsiteResolver:
         # Use topic_sentence as basis for clean
         clean = topic_sentence
 
+        # Prefer an explicitly quoted topic, then strip submission
+        # scaffolding and UI glyphs — BEFORE the 8-word cap below.
+        # The cap is applied to the cleaned topic; if the scaffolding
+        # ("i have to submit a research paper on topic") is still in
+        # place it eats the cap and the real topic is truncated away.
+        # Live case: "so i have to submit a research paper on topic :
+        # \"Quantum Mechanics similarities with life?\"" -> topic
+        # "Quantum Mechanics similarities with life".
+        quoted = _extract_quoted_topic(clean)
+        if quoted:
+            clean = quoted
+        else:
+            clean = _strip_submission_preamble(clean)
+        clean = _strip_ui_glyphs(clean)
+
         # 1. Strip conversational openers and slang
         clean = re.sub(
             r"^(?:(?:hey|hi|yo|hello|ok|okay|bro|dude|man|please|pls|buddy|pal|friend|so|well)\s+)+",
@@ -1055,9 +1174,16 @@ class WebsiteResolver:
                 queries.append(f"{clean} models benchmarks comparison")
                 queries.append(f"{clean} architecture technical documentation")
             else:
-                queries.append(f"{clean} overview technical principles")
-                queries.append(f"{clean} key components methodologies")
-                queries.append(f"{clean} authoritative research overview")
+                # The topic itself may already carry the suffix words
+                # ("Quantum overview technical principles"): appending
+                # them again duplicates the tail. Skip a suffix the
+                # topic already ends with.
+                def _with_suffix(base: str, suffix: str) -> str:
+                    return base if base.lower().endswith(suffix.lower()) else f"{base} {suffix}"
+
+                queries.append(_with_suffix(clean, "overview technical principles"))
+                queries.append(_with_suffix(clean, "key components methodologies"))
+                queries.append(_with_suffix(clean, "authoritative research overview"))
         elif category == "travel":
             queries.append(f"{clean} booking prices")
             queries.append(f"{clean} schedule rates comparison")
@@ -1088,8 +1214,20 @@ class WebsiteResolver:
         context: Optional[dict[str, Any]] = None,
         max_sources: int = 5,
         provenance_log: Optional[list[dict[str, Any]]] = None,
+        allowed_domains: Optional[list[str]] = None,
     ) -> list[DiscoveredSource]:
-        """Discover, filter, score, and rank candidate sources for autonomous website discovery."""
+        """Discover, filter, score, and rank candidate sources for autonomous website discovery.
+
+        ``allowed_domains`` (None = no allow-list configured, keep every
+        hub) restricts the hubs to domains the operator actually allows
+        navigation to. A hub outside the allow-list is never offered:
+        offering it builds a deterministic plan that the allow-list
+        gate then rejects with PLAN_INVALID, so the task fails before
+        the LLM planner ever runs. Live case: research picked
+        nature.com (highest suitability) although nature.com was not
+        in PRIVAGENT_ALLOWED_DOMAINS, and the research task died on
+        the first step.
+        """
         candidates: list[DiscoveredSource] = []
         visited_domains = set((context or {}).get("visited_domains", []))
         reg_clean = (region or self.default_region).upper()
@@ -1333,6 +1471,26 @@ class WebsiteResolver:
                 },
             ]
 
+        # Allow-list filter: only offer hubs the operator allows
+        # navigation to. None/empty = no allow-list configured, keep
+        # every hub (backwards compatible). A filtered-out hub is
+        # logged so the provenance trail shows why it was skipped.
+        if allowed_domains:
+            from .allowlist import host_matches_allowlist
+
+            kept: list[dict[str, Any]] = []
+            for hub in primary_hubs:
+                if host_matches_allowlist(hub["domain"], allowed_domains):
+                    kept.append(hub)
+                elif provenance_log is not None:
+                    provenance_log.append({
+                        "domain": hub["domain"],
+                        "url": hub["url_template"],
+                        "status": "rejected",
+                        "reason": "Rejected: domain is not on the domain allow-list",
+                    })
+            primary_hubs = kept
+
         # Generate candidates from queries across candidate hubs
         seen_domains: set[str] = set()
         # Gate: a query that is only filler ("whole on this topic")
@@ -1437,8 +1595,15 @@ class WebsiteResolver:
         instruction: str,
         region: str = "IN",
         context: Optional[dict[str, Any]] = None,
+        allowed_domains: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         """Autonomous Website Discovery coordinator for PrivAgent missions.
+
+        ``allowed_domains`` (None = no allow-list configured) is
+        threaded into candidate discovery so only navigable hubs are
+        offered. The result carries ``discovery_blocked_reason`` when
+        no hub survives: the caller must surface it instead of
+        building a plan that the allow-list gate will reject.
 
         Handles:
         - Scenario A: User specifies a website -> resolves & verifies official domain.
@@ -1518,6 +1683,7 @@ class WebsiteResolver:
             region=region,
             context=context,
             provenance_log=provenance_log,
+            allowed_domains=allowed_domains,
         )
 
         # Select top sources (multi-source for comparison/corroboration)
@@ -1532,7 +1698,27 @@ class WebsiteResolver:
                 else:
                     entry["status"] = "fallback"
 
-        primary_url = selected[0].url if selected else f"https://www.google.com/search?q={urllib.parse.quote_plus(instruction)}"
+        # No candidate survived (SSRF rejection, or every hub filtered
+        # out by the domain allow-list). Never fall back to a
+        # raw-instruction Google URL: the instruction is not a query
+        # (it carries the assignment scaffolding and the deliverable),
+        # and a Google URL is rejected by the same allow-list that
+        # filtered the hubs. Fall back to Google only with the CLEANED
+        # query and only when Google itself is allow-listed (or no
+        # allow-list is configured); otherwise report the block so the
+        # caller can tell the user which domain to add.
+        blocked_reason: Optional[str] = None
+        if selected:
+            primary_url = selected[0].url
+        elif queries and (not allowed_domains or _host_on_allowlist("google.com", allowed_domains)):
+            primary_url = f"https://www.google.com/search?q={urllib.parse.quote_plus(queries[0])}"
+        else:
+            primary_url = None
+            blocked_reason = (
+                "No research source is on the domain allow-list, so I cannot open a page to research this. "
+                "Add one of google.com, en.wikipedia.org, arxiv.org, or nature.com to "
+                "PRIVAGENT_ALLOWED_DOMAINS in backend/.env and restart the backend, then ask again."
+            )
 
         # Log discovery decisions in task context
         if context is not None and isinstance(context, dict):
@@ -1558,6 +1744,7 @@ class WebsiteResolver:
             "candidate_sources": [c.to_dict() for c in candidates],
             "selected_sources": [s.to_dict() for s in selected],
             "primary_navigation_url": primary_url,
+            "discovery_blocked_reason": blocked_reason,
             "source_provenance": provenance_log,
         }
 
