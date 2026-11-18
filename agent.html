@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>PrivAgent — Control Center</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='10' fill='%23061032'/%3E%3Ccircle cx='12' cy='12' r='6.5' fill='none' stroke='%2346d7ff' stroke-width='1.8'/%3E%3Ccircle cx='12' cy='12' r='2.4' fill='%23a06bff'/%3E%3C/svg%3E" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='10' fill='%23101210'/%3E%3Ccircle cx='12' cy='12' r='6.5' fill='none' stroke='%23d5ff70' stroke-width='1.8'/%3E%3Ccircle cx='12' cy='12' r='2.4' fill='%23d5ff70'/%3E%3C/svg%3E" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <!-- Fonts load async (preload + onload rel-swap): a plain stylesheet
@@ -13,6 +13,12 @@
   <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=IBM+Plex+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&display=swap" onload="this.onload=null;this.rel='stylesheet'" />
 </head>
 <body class="agent-body">
+  <!-- Motion background: two slow-drifting lime aurora blobs, fixed
+       behind the workspace (see .motion-bg in agent.css). -->
+  <div class="motion-bg" aria-hidden="true">
+    <div class="motion-bg__blob motion-bg__blob--a"></div>
+    <div class="motion-bg__blob motion-bg__blob--b"></div>
+  </div>
   <!-- Top App Bar -->
   <header class="agent-header">
     <div class="agent-header__left">
@@ -25,8 +31,6 @@
         </span>
         <span class="nav__wordmark">PRIVAGENT<sup>CONTROL CENTER</sup></span>
       </a>
-      <span class="agent-pill">Human-governed autonomy</span>
-      <span class="agent-pill agent-pill--vault">Local-first runtime</span>
       <button id="btnLlmSettings" class="btn btn--sm btn--ghost" title="LLM Provider Settings" aria-haspopup="dialog">
         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
         <span id="llmSettingsLabel">Provider</span>
@@ -86,26 +90,23 @@
 
     <!-- Center: Timeline & Chat Feed -->
     <section class="agent-timeline">
-<div class="workspace-heading"><span class="eyebrow">YOUR PRIVATE OPERATIONS LAYER</span><h1>Intent into <em>action.</em></h1><p>One mission. Every decision visible. You stay in control.</p></div>
       <!-- Input Panel -->
       <div class="agent-input-card">
         <label for="missionInput" class="agent-input-label">
           <span>MISSION DIRECTIVE</span>
           <span class="agent-state-badge" id="missionStateBadge">READY</span>
         </label>
-        <textarea id="missionInput" class="agent-textarea" rows="2" placeholder="e.g. Buy me a yellow dress from amazon (proceed until checkout)"></textarea>
+        <div class="agent-input-row">
+          <textarea id="missionInput" class="agent-textarea" rows="2" placeholder="e.g. Buy me a yellow dress from amazon (proceed until checkout)"></textarea>
+          <button id="btnCancelMission" class="btn-cancel-circle" hidden aria-label="Cancel mission" title="Cancel mission">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
         <label class="agent-attachment" for="missionAttachment">Attach a file for this mission (up to 5 MiB)
           <input id="missionAttachment" type="file" accept=".pdf,.png,.jpg,.jpeg,.txt,.csv,.docx,.xlsx" />
         </label>
 
-        <div class="agent-actions">
-          <button id="btnStartMission" class="btn btn--primary" disabled>
-            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-            Start Mission
-          </button>
-          <button id="btnCancelMission" class="btn btn--ghost" hidden>Cancel</button>
-          <span id="missionSubtext" class="agent-subtext">Automated browsing with fail-closed privacy.</span>
-        </div>
+        <span id="missionSubtext" class="agent-subtext"></span>
       </div>
 
       <!-- Human Credential / Action Banner (shown when sign-in or payment reached) -->
@@ -195,7 +196,6 @@
       <div class="inspector-card">
         <div class="inspector-card__header">
           <h4>BROWSER INSPECTOR</h4>
-          <span class="live-dot">● EVIDENCE</span>
         </div>
         <div class="inspector-field">
           <label>ACTIVE TAB URL</label>
@@ -231,35 +231,13 @@
         </div>
       </div>
 
-      <!-- Privacy Sentinel Card -->
-      <div class="inspector-card">
+      <!-- Privacy Sentinel — one status line, not three paragraphs.
+           The detail lives in Privacy Center. -->
+      <div class="inspector-card inspector-card--sentinel">
         <div class="inspector-card__header">
           <h4>PRIVACY SENTINEL</h4>
-          <span class="shield-badge">POLICY</span>
+          <span class="sentinel-status"><span class="sentinel-dot" aria-hidden="true"></span>Local redaction on · human gate on</span>
         </div>
-        <ul class="sentinel-list">
-          <li>
-            <span class="sentinel-icon">🔒</span>
-            <div>
-              <strong>Local Vault Redaction</strong>
-              <p>Passwords, credit cards, SSNs, and auth tokens are stripped locally before model call.</p>
-            </div>
-          </li>
-          <li>
-            <span class="sentinel-icon">⚡</span>
-            <div>
-              <strong>Local-First Perception</strong>
-              <p>DOM candidates and bounds are analyzed locally. Screenshot consent is controlled in Privacy Center; detected sensitive content still withholds the image.</p>
-            </div>
-          </li>
-          <li>
-            <span class="sentinel-icon">🛡️</span>
-            <div>
-              <strong>Human-in-the-Loop Gate</strong>
-              <p>Pauses automatically on sign-in or payment submission.</p>
-            </div>
-          </li>
-        </ul>
       </div>
 
       <!-- System Telemetry -->

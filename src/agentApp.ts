@@ -17,8 +17,11 @@ let chatHistoryList: HTMLUListElement | null = null;
 // Directive & Timeline Elements
 let missionInput: HTMLTextAreaElement | null = null;
 let missionAttachment: HTMLInputElement | null = null;
-let btnStartMission: HTMLButtonElement | null = null;
 let btnCancelMission: HTMLButtonElement | null = null;
+// The mission submitter, wired in initWorkspaceElements(). There is no
+// Start button: Enter in the input is the only submit path, and it calls
+// this. Assigned once, when the workspace mounts.
+let startMission: (() => Promise<void>) | null = null;
 const btnNewSession = document.getElementById("btnNewSession") as HTMLButtonElement | null;
 let missionSubtext: HTMLElement | null = null;
 let stateBadge: HTMLElement | null = null;
@@ -177,7 +180,6 @@ function initWorkspaceElements(): void {
   chatHistoryList = document.getElementById("chatHistoryList") as HTMLUListElement | null;
   missionInput = document.getElementById("missionInput") as HTMLTextAreaElement | null;
   missionAttachment = document.getElementById("missionAttachment") as HTMLInputElement | null;
-  btnStartMission = document.getElementById("btnStartMission") as HTMLButtonElement | null;
   btnCancelMission = document.getElementById("btnCancelMission") as HTMLButtonElement | null;
   missionSubtext = document.getElementById("missionSubtext") as HTMLElement | null;
   stateBadge = document.getElementById("missionStateBadge") as HTMLElement | null;
@@ -226,24 +228,17 @@ function initWorkspaceElements(): void {
     createNewChat();
   });
 
-  // Non-null assertions below: each handler is attached only when
-  // missionInput was non-null (the `?.` receiver), and the ref is never
-  // cleared afterwards — the element exists for the page's lifetime.
-  missionInput?.addEventListener("input", () => {
-    if (btnStartMission && !isWorking) btnStartMission.disabled = !missionInput!.value.trim();
-  });
-
+  // Enter submits the mission (Shift+Enter inserts a newline). There is
+  // no Start button: the input is the only submit path.
   missionInput?.addEventListener("keydown", (e: KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      if (!isWorking && missionInput!.value.trim() && btnStartMission && !btnStartMission.disabled) {
-        btnStartMission.click();
-      }
+      void startMission?.();
     }
   });
 
-  btnStartMission?.addEventListener("click", async () => {
-    if (isWorking || !missionInput || !btnStartMission || !missionInput.value.trim()) return;
+  startMission = async (): Promise<void> => {
+    if (isWorking || !missionInput || !missionInput.value.trim()) return;
     const instruction = missionInput.value.trim();
     activeInstruction = instruction;
 
@@ -258,7 +253,6 @@ function initWorkspaceElements(): void {
     // Append user instruction bubble immediately
     addUserMessageItem(instruction);
     missionInput.value = "";
-    if (btnStartMission) btnStartMission.disabled = true;
 
     if (telPlannerLatency) telPlannerLatency.textContent = "—";
     setTaskState("planning");
@@ -346,7 +340,7 @@ function initWorkspaceElements(): void {
       cancelRequested = false;
       if (btnCancelMission) btnCancelMission.hidden = true;
     }
-  });
+  };
 
   btnCancelMission?.addEventListener("click", async () => {
     const id = currentTaskId;
@@ -504,7 +498,7 @@ function setTaskState(state: string): void {
   if (!stateBadge) return;
   stateBadge.textContent = state.toUpperCase();
   if (["running", "planning"].includes(state.toLowerCase())) {
-    stateBadge.style.color = "#38bdf8";
+    stateBadge.style.color = "#a4ad9e";
     stateBadge.style.background = "rgba(56, 189, 248, 0.2)";
   } else if (state === "completed") {
     stateBadge.style.color = "#34d399";
@@ -791,18 +785,6 @@ function addStepItem(message: string, stepNum?: number): void {
   }
 }
 
-const START_MISSION_HTML = `
-  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-  Start Mission
-`.trim();
-
-const WORKING_MISSION_HTML = `
-  <span class="btn-working-content">
-    <svg class="btn-working-spinner" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
-    Working<span class="btn-working-dots">...</span>
-  </span>
-`.trim();
-
 function showStalledNotice(): void {
   if (missionSubtext && isWorking) {
     missionSubtext.innerHTML = `
@@ -815,22 +797,20 @@ function showStalledNotice(): void {
 
 function clearStalledNotice(): void {
   if (missionSubtext) {
-    missionSubtext.textContent = "Automated browsing with fail-closed privacy.";
+    // The subtext is a live status line only — no decorative default.
+    // .agent-subtext:empty hides it until a real status is written.
+    missionSubtext.textContent = "";
   }
 }
 
+// Working state is a flag, not a button label: there is no Start button
+// any more, so there is nothing to re-label. The Cancel button's
+// visibility is managed by the call sites, not here.
 function setButtonWorking(working: boolean): void {
   isWorking = working;
-  if (!btnStartMission) return;
   if (working) {
     lastProgressTime = Date.now();
-    btnStartMission.disabled = true;
-    btnStartMission.classList.add("btn--working");
-    btnStartMission.innerHTML = WORKING_MISSION_HTML;
   } else {
-    btnStartMission.classList.remove("btn--working");
-    btnStartMission.innerHTML = START_MISSION_HTML;
-    btnStartMission.disabled = !missionInput?.value.trim();
     clearStalledNotice();
   }
 }
@@ -887,11 +867,11 @@ async function syncActiveTask(taskId: string): Promise<boolean> {
 
     if (missionSubtext && !missionSubtext.innerHTML.includes("Progress is taking longer")) {
       if (t.isBrowserTask === false || t.intent === "NON_BROWSER") {
-        missionSubtext.innerHTML = `<span style="color: #a78bfa; font-weight: 500;">💬 Mode: Conversational (Zero Browser Actions)</span>`;
+        missionSubtext.innerHTML = `<span style="color: #d5ff70; font-weight: 500;">💬 Mode: Conversational (Zero Browser Actions)</span>`;
       } else if (t.sessionId) {
         const tabInfo = t.primaryTabId ? ` · Tab #${t.primaryTabId}` : "";
         const childInfo = t.childTabIds && t.childTabIds.length > 0 ? ` (+${t.childTabIds.length} child tabs)` : "";
-        missionSubtext.innerHTML = `<span style="color: #38bdf8; font-weight: 500;">🌐 Session: ${escapeHtml(t.sessionId.slice(0, 8))}${tabInfo}${childInfo}</span>`;
+        missionSubtext.innerHTML = `<span style="color: #a4ad9e; font-weight: 500;">🌐 Session: ${escapeHtml(t.sessionId.slice(0, 8))}${tabInfo}${childInfo}</span>`;
       }
       // Task 14: routing decision ("via Gmail connector" / "via
       // WebMCP tool X" / "via UCP checkout"). The label is built from
@@ -1209,7 +1189,6 @@ async function selectChat(chatId: string): Promise<void> {
   if (missionInput) {
     missionInput.value = "";
     missionInput.placeholder = "Ask a follow-up directive for this mission...";
-    if (btnStartMission) btnStartMission.disabled = true;
   }
 
   try {
@@ -1400,6 +1379,12 @@ function createNewChat(): void {
     stepsList.innerHTML = '<li class="agent-step-placeholder">Submit a mission directive to begin autonomous browser execution.</li>';
   }
   if (resultCard) resultCard.hidden = true;
+  // A new chat must not keep the previous chat's deliverables: the
+  // artifacts card is only re-populated by loadArtifacts() for the chat
+  // that is actually selected, and a fresh chat has none yet.
+  if (artifactsCard) artifactsCard.hidden = true;
+  if (artifactsList) artifactsList.innerHTML = "";
+  if (artifactsCount) artifactsCount.textContent = "0 artifacts";
   if (stepsCount) stepsCount.textContent = "0 steps executed";
   renderStepBudget();
   if (telPlannerLatency) telPlannerLatency.textContent = "—";
@@ -1475,7 +1460,6 @@ document.addEventListener("click", event => {
   const chipBtn = target.closest<HTMLButtonElement>(".suggested-chip");
   if (chipBtn && chipBtn.dataset.prompt && missionInput) {
     missionInput.value = chipBtn.dataset.prompt;
-    if (btnStartMission && !isWorking) btnStartMission.disabled = false;
     missionInput.focus();
     missionInput.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }
@@ -1542,11 +1526,11 @@ function connectWebSocket(): void {
 
       if (missionSubtext && !missionSubtext.innerHTML.includes("Progress is taking longer")) {
         if (p.isBrowserTask === false || p.intent === "NON_BROWSER") {
-          missionSubtext.innerHTML = `<span style="color: #a78bfa; font-weight: 500;">💬 Mode: Conversational (Zero Browser Actions)</span>`;
+          missionSubtext.innerHTML = `<span style="color: #d5ff70; font-weight: 500;">💬 Mode: Conversational (Zero Browser Actions)</span>`;
         } else if (p.sessionId) {
           const tabInfo = p.primaryTabId ? ` · Tab #${p.primaryTabId}` : "";
           const childInfo = p.childTabIds && p.childTabIds.length > 0 ? ` (+${p.childTabIds.length} child tabs)` : "";
-          missionSubtext.innerHTML = `<span style="color: #38bdf8; font-weight: 500;">🌐 Session: ${escapeHtml(p.sessionId.slice(0, 8))}${tabInfo}${childInfo}</span>`;
+          missionSubtext.innerHTML = `<span style="color: #a4ad9e; font-weight: 500;">🌐 Session: ${escapeHtml(p.sessionId.slice(0, 8))}${tabInfo}${childInfo}</span>`;
         }
         // Task 14: routing decision — see the polling path above.
         const routeText = taskRouteLabel((p as any).route);

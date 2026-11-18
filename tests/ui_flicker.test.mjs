@@ -41,7 +41,6 @@ const WORKSPACE_IDS = [
   "chatSidebar",
   "chatHistoryList",
   "missionInput",
-  "btnStartMission",
   "btnCancelMission",
   "agentStepsList",
   "planPreview",
@@ -54,7 +53,7 @@ const WORKSPACE_IDS = [
 // Missions-view nodes the template clone must produce on instantiation.
 const MISSIONS_IDS = [
   "missionInput",
-  "btnStartMission",
+  "btnCancelMission",
   "agentStepsList",
   "planPreview",
   "taskTimelineList",
@@ -131,10 +130,17 @@ test("Missions view still instantiates: template clone produces its nodes", () =
     for (const id of MISSIONS_IDS) {
       assert.ok(host.querySelector(`#${id}`), `template clone is missing #${id}`);
     }
+    // No Start button: Enter submits the mission, and Cancel is a
+    // circular button to the right of the input. Both must be present
+    // in the clone, and the old Start button must be gone.
     assert.equal(
-      host.querySelector("#btnStartMission")?.textContent.trim().includes("Start Mission"),
-      true,
-      "cloned Start Mission button lost its label",
+      host.querySelector("#btnStartMission"),
+      null,
+      "template clone still carries a Start Mission button",
+    );
+    assert.ok(
+      host.querySelector("#btnCancelMission")?.classList.contains("btn-cancel-circle"),
+      "cloned Cancel button is not the circular button right of the input",
     );
     assert.equal(
       host.querySelector("#btnGateApproveStep")?.textContent.includes("Approve this step only"),
@@ -160,13 +166,16 @@ test("workspace refs resolve lazily in agentApp, listeners wire on mount", () =>
   assert.ok(agentApp.includes("let missionInput: HTMLTextAreaElement | null = null;"), "missionInput is not a lazy let");
   const initAt = agentApp.indexOf("function initWorkspaceElements");
   for (const wiring of [
-    'btnStartMission?.addEventListener("click"',
+    // Enter submits the mission: the keydown handler calls startMission(),
+    // and there is no Start button to click any more.
+    'void startMission?.();',
     'btnGateApproveStep?.addEventListener("click"',
     'decision: "approve_step"',
   ]) {
     const at = agentApp.indexOf(wiring);
     assert.ok(at > initAt, `${wiring} is not wired inside initWorkspaceElements`);
   }
+  assert.ok(!agentApp.includes("btnStartMission"), "agentApp still references the removed Start button");
   // The static header stays live from load.
   assert.ok(agentApp.includes('const btnToggleSidebarHeader = document.getElementById("btnToggleSidebarHeader")'), "header toggle lost its eager wiring");
   assert.ok(agentApp.includes('const wsDot = document.getElementById("wsDot")'), "connection dot lost its eager wiring");
@@ -193,10 +202,92 @@ test("agent.html loads no landing stylesheet and agent.css exactly once", () => 
   assert.ok(!distHtml.includes("main.css"), "built agent.html still references main.css");
 });
 
+test("UI redesign: one palette — no cyan/purple/blue accents in agent.css", () => {
+  // 2026-11-18 redesign: the old cyan (#46d7ff) / purple (#a06bff) /
+  // navy "AI slop" palette is gone. The workspace is ink + electric
+  // lime only. Semantic colours stay: format badges (red/blue/amber/
+  // green), store-card variants, and status red/amber/green.
+  const srcCss = read("src/styles/agent.css");
+  for (const bad of [
+    "#46d7ff", "#a06bff", "#c084fc", "#c9a9ff", "#38bdf8", "#a78bfa",
+    "#55eaff", "#7ae3ff", "#0ea5e9", "#f1edff",
+    "70, 215, 255", "160, 107, 255", "85, 234, 255",
+    "56, 189, 248", "70, 160, 220",
+    "#060b1e", "#04122b", "#0a1230",
+  ]) {
+    assert.ok(!srcCss.includes(bad), `agent.css still uses the old palette colour ${bad}`);
+  }
+  assert.ok(srcCss.includes("--accent: #d5ff70"), "agent.css does not define the lime accent");
+  assert.ok(srcCss.includes("--bg: #101210"), "agent.css does not define the ink background");
+  // No garish gradients on cards/buttons (the motion-bg aurora and the
+  // amber human-gate banner are the only gradients allowed).
+  const gradients = [...srcCss.matchAll(/linear-gradient\([^)]*\)/g)].map((m) => m[0]);
+  for (const g of gradients) {
+    assert.ok(
+      g.includes("245, 158, 11") || g.includes("217, 119, 6"),
+      `agent.css still has a decorative gradient: ${g}`,
+    );
+  }
+  // No glassmorphism on panels (the modal overlay blur is functional).
+  assert.ok(!srcCss.includes("backdrop-filter: blur(12px)"), "agent.css still blurs the header");
+  assert.ok(!srcCss.includes("backdrop-filter: blur(8px)"), "agent.css still blurs a card");
+});
+
+test("UI redesign: motion background exists and respects reduced motion", () => {
+  assert.ok(agentHtml.includes('class="motion-bg"'), "agent.html has no .motion-bg element");
+  assert.ok(agentHtml.includes("motion-bg__blob--a"), "agent.html is missing the first aurora blob");
+  assert.ok(agentHtml.includes("motion-bg__blob--b"), "agent.html is missing the second aurora blob");
+  const srcCss = read("src/styles/agent.css");
+  assert.ok(srcCss.includes(".motion-bg__blob"), "agent.css has no motion-bg rules");
+  assert.ok(srcCss.includes("@keyframes motion-bg-drift"), "agent.css has no drift animation");
+  assert.ok(
+    srcCss.includes("@media (prefers-reduced-motion: reduce)") && srcCss.includes(".motion-bg__blob { animation: none; }"),
+    "motion background does not stop for prefers-reduced-motion",
+  );
+});
+
+test("UI redesign: clutter is gone (heading, pills, sentinel copy, badges)", () => {
+  assert.ok(!agentHtml.includes("workspace-heading"), "agent.html still has the marketing heading");
+  assert.ok(!agentHtml.includes("Intent into"), "agent.html still has the 'Intent into action' heading");
+  assert.ok(!agentHtml.includes("YOUR PRIVATE OPERATIONS LAYER"), "agent.html still has the operations-layer eyebrow");
+  assert.ok(!agentHtml.includes("agent-pill"), "agent.html still has header pills");
+  assert.ok(!agentHtml.includes("Human-governed autonomy"), "agent.html still has the autonomy pill");
+  assert.ok(!agentHtml.includes("Local-first runtime"), "agent.html still has the runtime pill");
+  assert.ok(!agentHtml.includes("live-dot"), "agent.html still has the EVIDENCE dot");
+  assert.ok(!agentHtml.includes("shield-badge"), "agent.html still has the POLICY badge");
+  assert.ok(!agentHtml.includes("sentinel-list"), "agent.html still has the Sentinel long copy");
+  assert.ok(!agentHtml.includes("Local Vault Redaction"), "agent.html still has the Sentinel redaction paragraph");
+  assert.ok(!agentHtml.includes("Local-First Perception"), "agent.html still has the Sentinel perception paragraph");
+  assert.ok(!agentHtml.includes("Human-in-the-Loop Gate"), "agent.html still has the Sentinel gate paragraph");
+  // The Sentinel is one status line now.
+  assert.ok(agentHtml.includes("sentinel-status"), "agent.html lost the compact Sentinel status line");
+  assert.ok(agentHtml.includes("Local redaction on"), "Sentinel status line lost its text");
+  // The subtext has no decorative default; it is a live status line.
+  assert.ok(!agentHtml.includes("Automated browsing with fail-closed privacy."), "agent.html still has the decorative subtext");
+  assert.ok(!agentApp.includes('missionSubtext.textContent = "Automated browsing'), "clearStalledNotice still writes the decorative default");
+  const srcCss = read("src/styles/agent.css");
+  assert.ok(srcCss.includes(".agent-subtext:empty"), "agent.css does not hide the empty subtext");
+});
+
+test("new chat clears the previous chat's artifacts (artifact leak fix)", () => {
+  // Bug 2026-11-18: createNewChat() cleared the steps, result card and
+  // inspector but never touched the artifacts card, so the previous
+  // chat's deliverables stayed visible in a fresh chat. A new chat has
+  // no artifacts until loadArtifacts() runs for a selected chat.
+  const start = agentApp.indexOf("function createNewChat()");
+  assert.ok(start >= 0, "createNewChat not found in agentApp.ts");
+  const end = agentApp.indexOf("// UI Events — static header", start);
+  assert.ok(end > start, "createNewChat end marker not found");
+  const body = agentApp.slice(start, end);
+  assert.ok(body.includes("artifactsCard.hidden = true"), "createNewChat does not hide the artifacts card");
+  assert.ok(body.includes('artifactsList.innerHTML = ""'), "createNewChat does not clear the artifacts list");
+  assert.ok(body.includes('artifactsCount.textContent = "0 artifacts"'), "createNewChat does not reset the artifacts count");
+});
+
 test("Quick Missions presets are removed from the workspace", () => {
   // Removed 2026-11-18: the preset chips (WhatsApp / YouTube / yellow
   // dress / Realme specs) were demo clutter in the mission composer.
-  // The composer is now just the input + Start Mission, nothing else.
+  // The composer is now just the input + circular Cancel, nothing else.
   assert.ok(!agentHtml.includes("Quick Missions"), "agent.html still renders the Quick Missions label");
   assert.ok(!agentHtml.includes("preset-chip"), "agent.html still has preset-chip buttons");
   assert.ok(!agentHtml.includes("agent-presets"), "agent.html still has the presets container");
