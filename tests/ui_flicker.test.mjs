@@ -162,7 +162,6 @@ test("workspace refs resolve lazily in agentApp, listeners wire on mount", () =>
   for (const wiring of [
     'btnStartMission?.addEventListener("click"',
     'btnGateApproveStep?.addEventListener("click"',
-    'document.querySelectorAll(".preset-chip")',
     'decision: "approve_step"',
   ]) {
     const at = agentApp.indexOf(wiring);
@@ -192,6 +191,19 @@ test("agent.html loads no landing stylesheet and agent.css exactly once", () => 
   assert.equal(links.length, 1, `built agent.html must load exactly one stylesheet, found: ${links.join(", ")}`);
   assert.ok(links[0].includes("agent-") && links[0].endsWith(".css"), `built agent.html stylesheet is not the agent bundle: ${links[0]}`);
   assert.ok(!distHtml.includes("main.css"), "built agent.html still references main.css");
+});
+
+test("Quick Missions presets are removed from the workspace", () => {
+  // Removed 2026-11-18: the preset chips (WhatsApp / YouTube / yellow
+  // dress / Realme specs) were demo clutter in the mission composer.
+  // The composer is now just the input + Start Mission, nothing else.
+  assert.ok(!agentHtml.includes("Quick Missions"), "agent.html still renders the Quick Missions label");
+  assert.ok(!agentHtml.includes("preset-chip"), "agent.html still has preset-chip buttons");
+  assert.ok(!agentHtml.includes("agent-presets"), "agent.html still has the presets container");
+  assert.ok(!agentApp.includes('querySelectorAll(".preset-chip")'), "agentApp still wires preset chips");
+  const srcCss = read("src/styles/agent.css");
+  assert.ok(!srcCss.includes(".preset-chip"), "agent.css still carries preset-chip rules");
+  assert.ok(!srcCss.includes(".agent-presets"), "agent.css still carries presets rules");
 });
 
 test("Google Fonts load async and never block first paint", () => {

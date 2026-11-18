@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import datetime
 import io
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -116,6 +117,9 @@ class PdfRenderer(BaseRenderer):
             page_constraint=page_constraint,
             **kwargs,
         )
+        # Kept for observability (and tests): the plan carries
+        # is_per_page and per_page_overflow after rendering.
+        self.last_doc_plan = doc_plan
 
         # Set canvas running header document title
         NumberedCanvas.doc_title = doc_plan.metadata.title or "PrivAgent Autonomous Research Report"
@@ -208,65 +212,76 @@ class PdfRenderer(BaseRenderer):
         def _build_story(trim: dict[str, Any]) -> list[Any]:
             story: list[Any] = []
 
-            # 2. Document Classification Badge & Title Block
-            story.append(Paragraph(
-                "<font color='#2563EB'><b>AUTONOMOUS TECHNICAL DOSSIER</b></font> &nbsp;|&nbsp; "
-                "<font color='#64748B'>CROSS-VERIFIED EVIDENCE & PROVENANCE</font>",
-                badge_style,
-            ))
-
-            if doc_plan.is_slides:
-                disp_title = f"Slide 1: {doc_plan.metadata.title}"
+            # Per-page mode: the user described what goes on each page, so
+            # the document is one section per page with no boilerplate
+            # eating page 1. The big title block and metadata card are
+            # suppressed — the doc title already runs in the header on
+            # pages 2+ and the footer on every page — and only a compact
+            # title line opens page 1, so the first user section starts
+            # at the top of its own page.
+            if doc_plan.is_per_page:
+                story.append(Paragraph(doc_plan.metadata.title, title_style))
+                story.append(Spacer(1, 6))
             else:
-                disp_title = doc_plan.metadata.title
+                # 2. Document Classification Badge & Title Block
+                story.append(Paragraph(
+                    "<font color='#2563EB'><b>AUTONOMOUS TECHNICAL DOSSIER</b></font> &nbsp;|&nbsp; "
+                    "<font color='#64748B'>CROSS-VERIFIED EVIDENCE & PROVENANCE</font>",
+                    badge_style,
+                ))
 
-            title_block = Table(
-                [[
-                    Paragraph(disp_title, title_style),
-                ]],
-                colWidths=[504],
-            )
-            title_block.setStyle(
-                TableStyle([
-                    ("LINELEFT", (0, 0), (0, -1), 4.0, colors.HexColor("#1E3A8A")),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 10),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-                    ("TOPPADDING", (0, 0), (-1, -1), 0),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-                ])
-            )
-            story.append(title_block)
-            story.append(Spacer(1, 4))
-            story.append(Paragraph(doc_plan.metadata.subtitle, subtitle_style))
+                if doc_plan.is_slides:
+                    disp_title = f"Slide 1: {doc_plan.metadata.title}"
+                else:
+                    disp_title = doc_plan.metadata.title
 
-            # 3. Modern Metadata Card (2x2 Grid)
-            meta_data = [
-                [
-                    Paragraph(f"<b>Research Scope:</b> {doc_plan.metadata.objective}", body_style),
-                    Paragraph(f"<b>Generation Date:</b> {doc_plan.metadata.date_str}", body_style),
-                ],
-                [
-                    Paragraph(
-                        f"<b>Authoritative Sources:</b> {doc_plan.metadata.sources_count} visited websites"
-                        if doc_plan.metadata.sources_count > 0
-                        else "<b>Authoritative Sources:</b> Direct technical synthesis",
-                        body_style,
-                    ),
-                    Paragraph(f"<b>Verified Empirical Findings:</b> {doc_plan.metadata.claims_count} validated claims", body_style),
-                ],
-            ]
-            meta_table = Table(meta_data, colWidths=[330, 174])
-            meta_table.setStyle(
-                TableStyle([
-                    ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F8FAFC")),
-                    ("PADDING", (0, 0), (-1, -1), 7),
-                    ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E1")),
-                    ("LINEBELOW", (0, 0), (-1, 0), 0.5, colors.HexColor("#E2E8F0")),
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ])
-            )
-            story.append(meta_table)
-            story.append(Spacer(1, 10))
+                title_block = Table(
+                    [[
+                        Paragraph(disp_title, title_style),
+                    ]],
+                    colWidths=[504],
+                )
+                title_block.setStyle(
+                    TableStyle([
+                        ("LINELEFT", (0, 0), (0, -1), 4.0, colors.HexColor("#1E3A8A")),
+                        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+                        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                        ("TOPPADDING", (0, 0), (-1, -1), 0),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+                    ])
+                )
+                story.append(title_block)
+                story.append(Spacer(1, 4))
+                story.append(Paragraph(doc_plan.metadata.subtitle, subtitle_style))
+
+                # 3. Modern Metadata Card (2x2 Grid)
+                meta_data = [
+                    [
+                        Paragraph(f"<b>Research Scope:</b> {doc_plan.metadata.objective}", body_style),
+                        Paragraph(f"<b>Generation Date:</b> {doc_plan.metadata.date_str}", body_style),
+                    ],
+                    [
+                        Paragraph(
+                            f"<b>Authoritative Sources:</b> {doc_plan.metadata.sources_count} visited websites"
+                            if doc_plan.metadata.sources_count > 0
+                            else "<b>Authoritative Sources:</b> Direct technical synthesis",
+                            body_style,
+                        ),
+                        Paragraph(f"<b>Verified Empirical Findings:</b> {doc_plan.metadata.claims_count} validated claims", body_style),
+                    ],
+                ]
+                meta_table = Table(meta_data, colWidths=[330, 174])
+                meta_table.setStyle(
+                    TableStyle([
+                        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F8FAFC")),
+                        ("PADDING", (0, 0), (-1, -1), 7),
+                        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E1")),
+                        ("LINEBELOW", (0, 0), (-1, 0), 0.5, colors.HexColor("#E2E8F0")),
+                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ])
+                )
+                story.append(meta_table)
+                story.append(Spacer(1, 10))
 
             # 4. Render Sections and Generic Content Blocks from Document Plan
             images_emitted = 0
@@ -548,6 +563,51 @@ class PdfRenderer(BaseRenderer):
             data = buf.getvalue()
             return data, len(PdfReader(io.BytesIO(data)).pages)
 
+        def _per_page_overflow(pdf_bytes: bytes, sections: list[Any]) -> list[int]:
+            """Page numbers whose section spilled past one PDF page.
+
+            In per-page mode each user page must be exactly one PDF
+            page. This checks the rendered PDF by looking for each
+            section's title ONLY on its own expected page — never by
+            scanning the whole document, because a title phrase that
+            also appears in another page's body would then false-
+            positive. A section that spills pushes the next section
+            one page down, so the first page whose title is missing
+            identifies the section that spilled (the one just before
+            it). If no title is missing but the document still has
+            more pages than sections, the last section spilled.
+            Returns [] when the mapping holds exactly. The check is
+            text-based (pypdf extraction) and tolerant of line
+            wrapping: whitespace is collapsed and the title is matched
+            without its number prefix.
+            """
+            try:
+                reader = PdfReader(io.BytesIO(pdf_bytes))
+            except Exception:
+                return []
+            n = len(sections)
+
+            def _title_on_page(sec: Any, page_idx: int) -> bool:
+                title = (sec.title or "").strip()
+                title_body = re.sub(r"^\d+\.\s*", "", title).strip().lower()
+                if not title_body or page_idx >= len(reader.pages):
+                    return False
+                try:
+                    page_text = reader.pages[page_idx].extract_text() or ""
+                except Exception:
+                    page_text = ""
+                return title_body in re.sub(r"\s+", " ", page_text).lower()
+
+            for idx, sec in enumerate(sections):
+                if not _title_on_page(sec, idx):
+                    # idx is 0-based; the spilled section is the one
+                    # just before this page (its 1-based number is idx),
+                    # or page 1 if the first section itself is missing.
+                    return [idx if idx > 0 else 1]
+            if len(reader.pages) > n:
+                return [n]
+            return []
+
         # Exact page budget: render, count real pages, and trim the
         # lowest-priority content until the document fits. The loop
         # stops at the first level that reaches the target, prefers an
@@ -566,20 +626,41 @@ class PdfRenderer(BaseRenderer):
                 {"image_cap": 100.0, "drop_filler_text": True, "drop_bibliography": True},
                 {"image_cap": 90.0, "drop_filler_text": True, "drop_bibliography": True, "max_images": 1},
             ]
-        results: list[tuple[int, bytes]] = []
+        results: list[tuple[int, bytes, list[int]]] = []
         for trim in trim_levels:
             pdf_bytes, pages = _render_to_bytes(_build_story(trim))
-            results.append((pages, pdf_bytes))
+            overflow = _per_page_overflow(pdf_bytes, doc_plan.sections) if doc_plan.is_per_page else []
+            results.append((pages, pdf_bytes, overflow))
             if target_pages is not None and pages <= target_pages:
-                break
+                # Per-page mode needs more than the count: every section
+                # must sit on its own page. A fit that lands the count
+                # but spills a section is not good enough, so deeper
+                # trims (smaller images) are still tried.
+                if not doc_plan.is_per_page or not overflow:
+                    break
         if target_pages is None:
             chosen = results[0][1]
+            chosen_overflow: list[int] = []
         else:
-            exact = [b for p, b in results if p == target_pages]
-            if exact:
-                chosen = exact[0]
+            exact_clean = [r for r in results if r[0] == target_pages and not r[2]]
+            if exact_clean:
+                chosen, chosen_overflow = exact_clean[0][1], []
             else:
-                above = [(p, b) for p, b in results if p > target_pages]
-                chosen = min(above, key=lambda pb: pb[0])[1] if above else results[0][1]
+                exact = [r for r in results if r[0] == target_pages]
+                if exact:
+                    best = min(exact, key=lambda r: len(r[2]))
+                    chosen, chosen_overflow = best[1], best[2]
+                else:
+                    above = [r for r in results if r[0] > target_pages]
+                    if above:
+                        best = min(above, key=lambda r: (r[0], len(r[2])))
+                        chosen, chosen_overflow = best[1], best[2]
+                    else:
+                        chosen, chosen_overflow = results[0][1], results[0][2]
+        if doc_plan.is_per_page:
+            # Record honestly which pages overflowed their section, so
+            # the caller can tell the user instead of the PDF silently
+            # being longer than asked or shuffling content across pages.
+            doc_plan.per_page_overflow = list(chosen_overflow)
         out_file.write_bytes(chosen)
         return str(out_file)

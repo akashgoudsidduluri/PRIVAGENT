@@ -59,6 +59,7 @@ from .loop_helpers import (
     _IDEMPOTENT_RETRY_TYPES,
     _MESSAGING_DOMAINS,
     _actions_match,
+    _failure_action_matches,
     _auto_complete_after_send,
     _call_planner,
     _enforce_date_integrity,
@@ -1379,7 +1380,7 @@ async def _run_loop(
                 for _h in reversed(history):
                     if (
                         _h.get("result_ok") is False
-                        and _actions_match(_h.get("action", {}), action)
+                        and _failure_action_matches(_h.get("action", {}), action)
                         and _normalize_loop_error(_h.get("error")) == _last_key
                     ):
                         failed_repeats += 1

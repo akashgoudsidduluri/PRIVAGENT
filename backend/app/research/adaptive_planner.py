@@ -92,6 +92,22 @@ class SectionAllocation(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class PageSpec(BaseModel):
+    """User-specified content for a single page of a document.
+
+    Produced by parse_page_specs from an instruction like
+    "I need 5 pages: page 1 intro, page 2 specs, ...". The page
+    number is 1-based; the plan builder turns each spec into one
+    section, and the PDF renderer lands each section on its own page.
+    """
+    page_number: int
+    title: str
+    brief: str
+    raw: str = ""
+
+    model_config = {"populate_by_name": True}
+
+
 class PageConstraint(BaseModel):
     """Explicit or derived document length constraint."""
     constraint_type: PageConstraintType = PageConstraintType.CONTENT_DRIVEN
@@ -263,6 +279,148 @@ def parse_page_constraint(
         max_pages=10,
         raw_expression=None,
     )
+
+
+# ---------------------------------------------------------------------------
+# 1b. Per-page spec parsing (user describes what goes on each page)
+# ---------------------------------------------------------------------------
+
+# A "page N" marker is unambiguous: the user wrote the word "page".
+_PAGE_MARKER_RE = re.compile(r"page\s+(\d{1,3})\b", re.IGNORECASE)
+# Ordinal markers: "first page" is page 1, "last"/"final page" is the
+# final page. They get a placeholder number (1 / 999) and the renumber
+# step below orders them correctly once all specs are known.
+_ORDINAL_PAGE_RE = re.compile(r"\b(first|last|final)\s+page\b", re.IGNORECASE)
+_ORDINAL_NUM = {"first": 1, "last": 999, "final": 999}
+# A bare "N." / "N)" marker is only a page spec when the instruction also
+# declares an exact page count that matches the number of such items —
+# otherwise a plain numbered list (requirements, steps) would be misread
+# as page specs. The number must not sit inside a word or a decimal
+# ("v1.2", "3.5"), so it is anchored on a non-word, non-dot boundary.
+_BARE_NUM_MARKER_RE = re.compile(r"(?<![\w.])(\d{1,3})[.)]\s+")
+_SPEC_STRIP_RE = re.compile(r"^[\s:;\-–—.,]+|[\s:;\-–—.,]+$")
+
+
+def _spec_title(brief: str) -> str:
+    """Short title for a page: the brief's first clause, capped."""
+    title = re.split(r"[,.;]", brief, maxsplit=1)[0].strip()
+    if not title:
+        title = brief.strip()
+    return title[:60] if title else brief.strip()[:60]
+
+
+def _renumber_specs(specs: list[PageSpec]) -> list[PageSpec]:
+    """Sort by the page number the user wrote, then renumber 1..N.
+
+    Users type 1, 2, 3 — sorting is a no-op in practice. Renumbering
+    keeps the caller free from gaps (user wrote "page 1, page 3" means
+    two pages, not a hole at page 2).
+    """
+    specs.sort(key=lambda s: s.page_number)
+    for i, s in enumerate(specs, start=1):
+        s.page_number = i
+    return specs
+
+
+def parse_page_specs(instruction: str) -> list[PageSpec]:
+    """Extract explicit per-page descriptions from an instruction.
+
+    Deterministic regex, no LLM — same style as parse_page_constraint.
+    Handles "page 1: intro, page 2: specs", "page 1 - intro; page 2 -
+    specs", newlines, and (when the instruction also declares an exact
+    page count that matches) bare "1. intro 2. specs" lists.
+    Returns [] when the instruction has no per-page briefs. Never
+    raises on odd input; fragments with an empty brief are skipped.
+    """
+    if not instruction or not isinstance(instruction, str):
+        return []
+    text = instruction
+
+    specs: list[PageSpec] = []
+    markers = [(m.start(), int(m.group(1))) for m in _PAGE_MARKER_RE.finditer(text)]
+    if not markers:
+        # No numeric "page N" markers: try ordinal ones ("first page",
+        # "last page", "final page").
+        markers = [
+            (m.start(), _ORDINAL_NUM[m.group(1).lower()])
+            for m in _ORDINAL_PAGE_RE.finditer(text)
+        ]
+    if markers:
+        # A "page N" marker must be followed by its brief. If the same
+        # number appears twice, keep the LAST — a repeat is usually a
+        # reference inside an earlier brief ("see page 2 for the
+        # chart"), and the real marker for that page comes after it.
+        last_pos: dict[int, int] = {}
+        for start, num in markers:
+            last_pos[num] = start
+        markers = sorted(
+            ((start, num) for num, start in last_pos.items()),
+            key=lambda ms: ms[0],
+        )
+        for idx, (start, num) in enumerate(markers):
+            end = markers[idx + 1][0] if idx + 1 < len(markers) else len(text)
+            # Brief starts after the marker; the marker regex consumed
+            # "page N", so skip any separator that follows it.
+            brief_start = start
+            m = _PAGE_MARKER_RE.match(text, start)
+            if m is None:
+                m = _ORDINAL_PAGE_RE.match(text, start)
+            brief_start = m.end() if m else start
+            brief = _SPEC_STRIP_RE.sub("", text[brief_start:end])
+            if not brief:
+                continue
+            specs.append(PageSpec(
+                page_number=num,
+                title=_spec_title(brief),
+                brief=brief,
+                raw=text[start:end].strip(),
+            ))
+        return _renumber_specs(specs)
+
+    # No "page N" markers: try the bare numbered-list form, but only
+    # when an exact page count agrees with the item count.
+    bare = [(m.start(), int(m.group(1))) for m in _BARE_NUM_MARKER_RE.finditer(text)]
+    if bare:
+        constraint = parse_page_constraint(text)
+        if constraint.constraint_type == PageConstraintType.EXACT and constraint.target_pages == len(bare):
+            for idx, (start, num) in enumerate(bare):
+                end = bare[idx + 1][0] if idx + 1 < len(bare) else len(text)
+                m = _BARE_NUM_MARKER_RE.match(text, start)
+                brief_start = m.end() if m else start
+                brief = _SPEC_STRIP_RE.sub("", text[brief_start:end])
+                if not brief:
+                    continue
+                specs.append(PageSpec(
+                    page_number=num,
+                    title=_spec_title(brief),
+                    brief=brief,
+                    raw=text[start:end].strip(),
+                ))
+            return _renumber_specs(specs)
+    return []
+
+
+def reconcile_page_count(instruction: str) -> tuple[Optional[int], list[PageSpec], Optional[str]]:
+    """Return (target_pages, page_specs, mismatch_message_or_None).
+
+    Rules: the per-page spec list wins — it IS the page count. When
+    the instruction also declares an explicit "N pages" that disagrees
+    with the number of specs, the mismatch is reported, not silently
+    ignored. With no per-page specs, the existing page constraint
+    applies unchanged.
+    """
+    specs = parse_page_specs(instruction)
+    constraint = parse_page_constraint(instruction)
+    if not specs:
+        return constraint.target_pages, [], None
+    n = len(specs)
+    explicit = constraint.target_pages
+    if explicit is not None and explicit != n:
+        return n, specs, (
+            f"Instruction asks for {explicit} pages but lists {n} per-page briefs; "
+            f"using the per-page briefs ({n} pages)."
+        )
+    return n, specs, None
 
 
 # ---------------------------------------------------------------------------
