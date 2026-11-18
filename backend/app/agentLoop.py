@@ -3014,6 +3014,10 @@ async def run_task(task_id: str) -> None:
                 is_continuous_monitoring_directive,
                 handle_continuous_monitoring_instruction,
             )
+            from .memory_companion import (
+                is_remember_directive,
+                handle_remember_instruction,
+            )
             from .email_dispatch import (
                 is_email_dispatch_instruction,
                 handle_email_dispatch,
@@ -3034,6 +3038,11 @@ async def run_task(task_id: str) -> None:
                     chat_id=chat_id,
                     history=initial_memory.get("conversation_history", []),
                 )
+            elif is_remember_directive(record.instruction):
+                # Chat-only memory entry (2026-11-18): "remember ..." in
+                # chat stores the fact directly (same store and PII
+                # rejection as the removed form) — no browser task.
+                answer = handle_remember_instruction(record.instruction)
             elif is_dispatch and dispatch_recip:
                 answer = await handle_email_dispatch(
                     record.instruction,

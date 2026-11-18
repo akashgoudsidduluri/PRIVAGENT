@@ -185,7 +185,7 @@ test("controlCenter mounts the workspace on demand, never at load", () => {
   assert.ok(controlCenter.includes("ensureWorkspaceMounted"), "controlCenter never mounts the workspace");
   assert.ok(controlCenter.includes("ensureLiveNodes"), "controlCenter does not cache the live nodes once");
   assert.ok(!controlCenter.includes("querySelector<HTMLElement>('#agentWorkspace')!"), "controlCenter still captures #agentWorkspace at module top level");
-  assert.ok(controlCenter.includes("index === 1 || index === 2 || index === 9"), "mount is not limited to the views that need live nodes");
+  assert.ok(controlCenter.includes("index === 1 || index === 2 || index === 8"), "mount is not limited to the views that need live nodes");
 });
 
 test("agent.html loads no landing stylesheet and agent.css exactly once", () => {
@@ -391,7 +391,7 @@ test("completed message is shown once, not repeated in the result card", () => {
   const fn = agentApp.match(/function addCompletionStepItem\(taskState: string, message: string\)[\s\S]*?\n\}/);
   assert.ok(fn, "no addCompletionStepItem in agentApp.ts");
   assert.ok(
-    fn[0].includes("if (isMessageInTimeline(message)) return;"),
+    fn[0].includes("if (isMessageInTimeline(cleanMessage)) return;"),
     "addCompletionStepItem does not skip a message already in the timeline",
   );
   const fmt = agentApp.match(/function formatResultHtml\(rawMessage: string, includeRawMessage = true\)[\s\S]*?\n\}/);
@@ -637,4 +637,106 @@ test("built agent CSS has the moved shell rules and no landing styles", () => {
   for (const s of [".hero__title", ".console__panel", "100deg"]) {
     assert.ok(!css.includes(s), `built agent CSS still carries landing styles: ${s}`);
   }
+});
+
+test("Chat-only monitoring: the Missions page (monitor form + scheduled list) is gone", () => {
+  // 2026-11-18: monitoring is chat-only. The Missions view (Create a
+  // monitor form + Scheduled missions list) was removed — a monitor can
+  // be anything (price, page, inbox), not just a product URL, so the
+  // product-only form was the wrong shape. The nav has 11 views now.
+  assert.ok(!read("src/controlCenter.ts").includes("'Missions'"), "controlCenter still lists a Missions view");
+  assert.ok(!read("src/controlCenter.ts").includes("◎"), "controlCenter still has the Missions nav icon");
+  assert.ok(!read("src/controlViews.ts").includes("Create a monitor"), "controlViews still renders the monitor form");
+  assert.ok(!read("src/controlViews.ts").includes("Scheduled missions"), "controlViews still renders the scheduled list");
+  assert.ok(!read("src/controlViews.ts").includes("missionForm"), "controlViews still wires the monitor form");
+  assert.ok(!read("src/controlViews.ts").includes("mission-action"), "controlViews still wires monitor Pause/Activate");
+  assert.ok(!read("src/controlViews.ts").includes("mission-events"), "controlViews still wires View diffs");
+  assert.ok(!read("src/controlViews.ts").includes("missionDiffs"), "controlViews still has the mission diffs container");
+  // The nav indices shifted: Email Intelligence is now index 3 and
+  // Activity is index 8; the mount list must match controlViews.
+  const cc = read("src/controlCenter.ts");
+  assert.ok(cc.includes("if(index===8){content.append(nodes!.feed)"), "Activity is not index 8 after the removal");
+  assert.ok(cc.includes("if([0,3,4,5,6,7,9,10].includes(index))"), "mount list does not match the shifted indices");
+  const cv = read("src/controlViews.ts");
+  assert.ok(cv.includes("if (index === 3) {\n      await mountEmailIntelligence"), "Email Intelligence is not index 3 after the removal");
+  assert.ok(cv.includes("if (index === 10) {"), "Settings is not index 10 after the removal");
+  // The old #missions hash falls back to Overview (route() renders
+  // index 0 when no view name matches), so a bookmarked link does not
+  // break the control center.
+  assert.ok(cc.includes("render(index<0?0:index)"), "unknown hash does not fall back to Overview");
+});
+
+test("Interactive watch card: confirmation carries a marker, chat renders Pause / Cancel / View changes", () => {
+  // 2026-11-18: when the agent creates a watch in chat, the backend
+  // appends a machine-readable marker to the confirmation. The
+  // workspace strips it before rendering (it must never show as
+  // literal text) and renders an interactive watch card with real
+  // controls wired to the missions API.
+  assert.ok(agentApp.includes("privagent-watch:"), "agentApp has no watch-marker handling");
+  assert.ok(agentApp.includes("function stripWatchMarker"), "agentApp has no stripWatchMarker helper");
+  assert.ok(agentApp.includes("WATCH_MARKER_RE"), "agentApp has no watch-marker regex");
+  assert.ok(agentApp.includes("watch-card"), "agentApp renders no watch card");
+  assert.ok(agentApp.includes("data-watch-pause"), "watch card has no Pause/Resume button");
+  assert.ok(agentApp.includes("data-watch-cancel"), "watch card has no Cancel button");
+  assert.ok(agentApp.includes("data-watch-events"), "watch card has no View changes button");
+  assert.ok(agentApp.includes("function hydrateWatchCard"), "watch card never fills in the real title/status");
+  assert.ok(agentApp.includes("/api/control/missions/${encodeURIComponent(missionId)}"), "watch card does not call the missions API by id");
+  assert.ok(agentApp.includes('method: "PATCH"'), "watch card never pauses/resumes via PATCH");
+  assert.ok(agentApp.includes('method: "DELETE"'), "watch card never cancels via DELETE");
+  assert.ok(agentApp.includes("Confirm cancel?"), "Cancel is not a two-step inline confirm");
+  // The marker must be stripped before renderMarkdown in the result
+  // card path too, or it would show as literal text there.
+  assert.ok(agentApp.includes("stripWatchMarker(rawMessage).text"), "formatResultHtml does not strip the marker");
+  assert.ok(agentApp.includes("stripWatchMarker(message).text"), "renderCompletion failed path does not strip the marker");
+  const css = read("src/styles/agent.css");
+  assert.ok(css.includes(".watch-card"), "agent.css has no watch-card styles");
+  assert.ok(css.includes(".watch-card__status"), "agent.css has no watch status pill");
+  assert.ok(css.includes(".watch-card__btn--danger"), "agent.css has no crimson Cancel button");
+});
+
+test("Interactive step stream: completed steps expand to a detail panel with Copy", () => {
+  // 2026-11-18: the bot's current actions were static text. A
+  // completed step is now a button (chevron + text); clicking it
+  // opens a detail panel with the step number, the full message, and
+  // a Copy button. The transient Thinking row stays a plain status.
+  assert.ok(agentApp.includes("agent-step-item__toggle"), "addStepItem does not render an expandable step toggle");
+  assert.ok(agentApp.includes('aria-expanded="false"'), "step toggle has no aria-expanded state");
+  assert.ok(agentApp.includes("agent-step-item__detail"), "addStepItem does not render a step detail panel");
+  assert.ok(agentApp.includes("agent-step-item__copy"), "step detail has no Copy button");
+  assert.ok(agentApp.includes("data-copy-step"), "Copy button has no data-copy-step hook");
+  assert.ok(agentApp.includes("navigator.clipboard"), "Copy does not use the clipboard");
+  const css = read("src/styles/agent.css");
+  assert.ok(css.includes(".agent-step-item__toggle"), "agent.css has no step toggle styles");
+  assert.ok(css.includes(".agent-step-item__chevron"), "agent.css has no step chevron");
+  assert.ok(css.includes(".agent-step-item__detail"), "agent.css has no step detail styles");
+  assert.ok(css.includes(".agent-step-item__copy"), "agent.css has no Copy button styles");
+});
+
+test("Chat-only memory: the 'Remember a fact' form is gone, the transparency lists stay", () => {
+  // 2026-11-18: same pattern as monitoring. Facts are learned from
+  // the conversation ("remember my preferred language is Python") —
+  // the manual Category/Key/Value/Retention form is not how memory
+  // should be entered. The lists underneath stay: they are the
+  // privacy surface showing what the agent knows, with Forget/Delete.
+  const cv = read("src/controlViews.ts");
+  assert.ok(!cv.includes("factForm"), "controlViews still wires the fact form");
+  assert.ok(!cv.includes("cc-form--memory"), "controlViews still renders the fact form");
+  assert.ok(!cv.includes('name="ttlDays"'), "controlViews still renders the retention input");
+  assert.ok(cv.includes("CHAT-ONLY MEMORY"), "Memory view has no chat-only pointer card");
+  assert.ok(cv.includes("remember my preferred language is Python"), "pointer card does not show the chat example");
+  // The transparency lists stay, with their Forget/Delete controls.
+  assert.ok(cv.includes("card('Semantic facts'"), "Semantic facts list is gone");
+  assert.ok(cv.includes("card('Preferences'"), "Preferences list is gone");
+  assert.ok(cv.includes("card('Episodic history'"), "Episodic history is gone");
+  assert.ok(cv.includes("data-forget"), "Forget button is gone");
+  assert.ok(cv.includes("data-preference"), "Preference Delete button is gone");
+  assert.ok(cv.includes("data-delete-chat"), "Delete chat button is gone");
+  // The backend chat path must exist: the agent loop routes
+  // "remember ..." to the companion before the browser task.
+  const companion = read("backend/app/memory_companion.py");
+  assert.ok(companion.includes("def is_remember_directive"), "no remember-directive detector");
+  assert.ok(companion.includes("def handle_remember_instruction"), "no remember handler");
+  assert.ok(companion.includes("semantic.remember"), "remember handler does not use the semantic store");
+  const loop = read("backend/app/agentLoop.py");
+  assert.ok(loop.includes("is_remember_directive(record.instruction)"), "agent loop does not route remember directives");
 });

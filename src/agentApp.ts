@@ -742,9 +742,11 @@ function formatResultHtml(rawMessage: string, includeRawMessage = true): string 
   // timeline (see renderCompletion): the result card then carries only
   // the structured extras (comparison showcase, price, links) and the
   // Suggested Next Moves — the reply itself appears once, in the
-  // timeline, instead of twice.
+  // timeline, instead of twice. The watch marker is stripped here too
+  // so it never renders as literal text in the card; the interactive
+  // watch card lives in the timeline item, not the result card.
   const rawHtml = includeRawMessage
-    ? `<div class="result-raw-text md-body">${renderMarkdown(rawMessage)}</div>`
+    ? `<div class="result-raw-text md-body">${renderMarkdown(stripWatchMarker(rawMessage).text)}</div>`
     : "";
   return `
     ${showcaseHtml}
@@ -849,6 +851,7 @@ function addStepItem(message: string, stepNum?: number): void {
     : "agent-step-item agent-step-item--completed";
   li.dataset.eventKey = eventKey;
   if (isTransient) li.dataset.transient = "true";
+  if (typeof stepNum === "number" && stepNum > 0) li.dataset.stepNum = String(stepNum);
   // The live "Thinking" row gets a subtle warm-stone pulse bar +
   // "Sanitizing DOM locally…" label (no bouncing dots) so the user
   // can see at a glance the agent is still working. The row's
@@ -857,9 +860,30 @@ function addStepItem(message: string, stepNum?: number): void {
   // renders a forest-sage checkmark. Inlined (not a pre-built
   // string) so the innerHTML guard can see the escaping at the
   // assignment site.
-  li.innerHTML = `
-    <span class="agent-step-item__icon">${isTransient ? "◌" : "✓"}</span>
-    <span class="agent-step-item__text">${isTransient ? `<span class="thinking-label">Sanitizing DOM locally…</span><span class="thinking-pulse" aria-hidden="true"></span>` : linkify(displayMessage)}</span>
+  //
+  // Completed steps are expandable: the row is a button (chevron +
+  // text) and clicking it opens a detail panel with the step number,
+  // the full message, and a Copy button — the step stream is no
+  // longer a static log the user can only read. The Thinking row
+  // stays a plain status line (it is transient, not a step).
+  li.innerHTML = isTransient
+    ? `
+    <span class="agent-step-item__icon">◌</span>
+    <span class="agent-step-item__text"><span class="thinking-label">Sanitizing DOM locally…</span><span class="thinking-pulse" aria-hidden="true"></span></span>
+  `
+    : `
+    <span class="agent-step-item__icon">✓</span>
+    <div class="agent-step-item__main">
+      <button type="button" class="agent-step-item__toggle" aria-expanded="false">
+        <span class="agent-step-item__chevron" aria-hidden="true">›</span>
+        <span class="agent-step-item__text">${linkify(displayMessage)}</span>
+      </button>
+      <div class="agent-step-item__detail" hidden>
+        <div class="agent-step-item__detail-meta">${typeof stepNum === "number" && stepNum > 0 ? `Step ${escapeHtml(String(stepNum))} · ` : ""}Completed</div>
+        <div class="agent-step-item__detail-text">${escapeHtml(displayMessage)}</div>
+        <button type="button" class="agent-step-item__copy" data-copy-step>Copy step</button>
+      </div>
+    </div>
   `;
   stepsList.appendChild(li);
   li.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -916,8 +940,56 @@ function normalizeForDedup(text: string): string {
   // Compare messages ignoring markdown markers and whitespace: a
   // progress step renders with linkify (keeps "**bold**" literal) while
   // the result renders with renderMarkdown (strips it), so the same
-  // message would otherwise never compare equal.
-  return text.replace(/[*_`#]/g, "").replace(/\s+/g, " ").trim();
+  // message would otherwise never compare equal. The watch marker is
+  // stripped too: the timeline renders the message without it, so a
+  // raw confirmation (marker included) must compare equal to the
+  // rendered one or the result would be added twice.
+  return stripWatchMarker(text).text.replace(/[*_`#]/g, "").replace(/\s+/g, " ").trim();
+}
+
+// Chat-only monitoring (2026-11-18): when the agent creates a watch,
+// the backend appends `<!-- privagent-watch: <mission-id> -->` to the
+// confirmation. The marker is machine-readable only — it is stripped
+// before rendering and turned into an interactive watch card (Pause /
+// Resume / Cancel / View changes) in the conversation. The id is a
+// uuid4 hex string; anything else is not a marker.
+const WATCH_MARKER_RE = /<!--\s*privagent-watch:\s*([0-9a-fA-F-]{36})\s*-->/;
+function stripWatchMarker(message: string): { text: string; watchId: string | null } {
+  const match = (message || "").match(WATCH_MARKER_RE);
+  if (!match) return { text: message || "", watchId: null };
+  return { text: (message || "").replace(WATCH_MARKER_RE, "").replace(/\n{3,}/g, "\n\n").trim(), watchId: match[1] };
+}
+
+async function fetchWatch(missionId: string): Promise<{ id: string; title: string; status: string; condition_type?: string; target_url?: string } | null> {
+  try {
+    const res = await apiFetch(`${API}/api/control/missions`);
+    if (!res.ok) return null;
+    const missions = (await res.json()) as Array<{ id: string; title: string; status: string; condition_type?: string; target_url?: string }>;
+    return missions.find(m => m.id === missionId) || null;
+  } catch {
+    return null;
+  }
+}
+
+async function hydrateWatchCard(card: HTMLElement): Promise<void> {
+  const missionId = card.dataset.watchId;
+  if (!missionId) return;
+  const mission = await fetchWatch(missionId);
+  if (!mission) {
+    card.querySelector<HTMLElement>(".watch-card__title")!.textContent = "Watch not found";
+    card.querySelector<HTMLElement>(".watch-card__note")!.textContent = "This watch may have been cancelled already.";
+    card.querySelectorAll<HTMLButtonElement>(".watch-card__btn").forEach(b => { b.disabled = true; });
+    return;
+  }
+  card.querySelector<HTMLElement>(".watch-card__title")!.textContent = mission.title || "Watch active";
+  const statusEl = card.querySelector<HTMLElement>("[data-watch-status]")!;
+  const pauseBtn = card.querySelector<HTMLButtonElement>("[data-watch-pause]")!;
+  const applyStatus = (status: string) => {
+    statusEl.textContent = status === "active" ? "Active" : "Paused";
+    statusEl.dataset.status = status;
+    pauseBtn.textContent = status === "active" ? "Pause" : "Resume";
+  };
+  applyStatus(mission.status);
 }
 
 function isMessageInTimeline(message: string): boolean {
@@ -940,26 +1012,56 @@ function isMessageInTimeline(message: string): boolean {
 
 function addCompletionStepItem(taskState: string, message: string): void {
   if (!stepsList) return;
+  // Strip the watch marker before dedup/render: the timeline shows
+  // the confirmation without it, and the card below carries the id.
+  const { text: cleanMessage, watchId } = stripWatchMarker(message);
   // No duplicate: if this exact message is already the last thing the
   // timeline shows (e.g. a conversational reply that arrived as a
   // progress step), adding a "Mission Result" item would show it twice.
   // The reply stays once, in the step that already carries it.
-  if (isMessageInTimeline(message)) return;
+  if (isMessageInTimeline(cleanMessage)) return;
   const isOk = taskState === "completed";
 
   // Each turn owns its own result item. Overwriting a previous turn's result
   // made a follow-up failure erase the answer the user was still reading.
   const li = document.createElement("li");
   li.className = isOk ? "agent-step-item agent-step-item--result" : "agent-step-item agent-step-item--failed";
+  // The watch card is inlined here (not a helper call) so the
+  // innerHTML guard can see escapeHtml(watchId) at the assignment
+  // site. It renders only when the backend appended the watch marker
+  // to the confirmation; hydrateWatchCard fills in the real title and
+  // status from GET /api/control/missions.
   li.innerHTML = `
     <span class="agent-step-item__icon">${isOk ? "✓" : "✗"}</span>
     <div class="agent-step-item__text">
       <div class="agent-step-item__label"><strong>${isOk ? "Mission Result" : "Task Incomplete"}</strong>:</div>
-      <div class="md-body">${renderMarkdown(message || (isOk ? "Mission completed." : "Task stopped."))}</div>
+      <div class="md-body">${renderMarkdown(cleanMessage || (isOk ? "Mission completed." : "Task stopped."))}</div>
+      ${watchId ? `
+      <div class="watch-card" data-watch-id="${escapeHtml(watchId)}">
+        <div class="watch-card__header">
+          <span class="watch-card__icon" aria-hidden="true">🔔</span>
+          <span class="watch-card__title">Watch active</span>
+          <span class="watch-card__status" data-watch-status>Active</span>
+        </div>
+        <div class="watch-card__body">
+          <p class="watch-card__note">This watch lives in this conversation. I'll alert you here the moment anything changes.</p>
+        </div>
+        <div class="watch-card__actions">
+          <button type="button" class="watch-card__btn watch-card__btn--pause" data-watch-pause>Pause</button>
+          <button type="button" class="watch-card__btn watch-card__btn--ghost" data-watch-events>View changes</button>
+          <button type="button" class="watch-card__btn watch-card__btn--danger" data-watch-cancel>Cancel watch</button>
+        </div>
+        <div class="watch-card__events" hidden></div>
+      </div>
+      ` : ""}
     </div>
   `;
   stepsList.appendChild(li);
   li.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  if (watchId) {
+    const card = li.querySelector<HTMLElement>(".watch-card");
+    if (card) void hydrateWatchCard(card);
+  }
 }
 
 async function syncActiveTask(taskId: string): Promise<boolean> {
@@ -1084,7 +1186,7 @@ function renderCompletion(taskState: string, message: string, appendToTimeline =
         const showRaw = !isMessageInTimeline(message);
         resultContent.innerHTML = formatResultHtml(message || "The autonomous task completed successfully.", showRaw);
       } else {
-        resultContent.innerHTML = `<div class="result-raw-text md-body">${renderMarkdown(message || "Task stopped before completing all steps.")}</div>`;
+        resultContent.innerHTML = `<div class="result-raw-text md-body">${renderMarkdown(stripWatchMarker(message).text || "Task stopped before completing all steps.")}</div>`;
       }
     }
     return;
@@ -1113,7 +1215,7 @@ function renderCompletion(taskState: string, message: string, appendToTimeline =
     } else {
       resultCard.classList.add("is-failed");
       resultBadge.textContent = "✗ Task Blocked / Incomplete";
-      resultContent.innerHTML = `<div class="result-raw-text md-body">${renderMarkdown(message || "Task stopped before completing all steps.")}</div>`;
+      resultContent.innerHTML = `<div class="result-raw-text md-body">${renderMarkdown(stripWatchMarker(message).text || "Task stopped before completing all steps.")}</div>`;
     }
     resultCard.scrollIntoView({ behavior: "smooth", block: "nearest" });
     loadArtifacts(currentTaskId, activeChatId);
@@ -1602,6 +1704,117 @@ document.addEventListener("click", event => {
     missionInput.value = chipBtn.dataset.prompt;
     missionInput.focus();
     missionInput.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    return;
+  }
+
+  // Expandable step rows: the toggle button opens/closes the step's
+  // detail panel (step number, full message, Copy). The Copy button
+  // copies the step text to the clipboard.
+  const stepToggle = target.closest<HTMLButtonElement>(".agent-step-item__toggle");
+  if (stepToggle) {
+    const item = stepToggle.closest<HTMLElement>(".agent-step-item");
+    const detail = item?.querySelector<HTMLElement>(".agent-step-item__detail");
+    if (detail) {
+      const expanded = stepToggle.getAttribute("aria-expanded") === "true";
+      stepToggle.setAttribute("aria-expanded", String(!expanded));
+      detail.hidden = expanded;
+    }
+    return;
+  }
+  const copyBtn = target.closest<HTMLButtonElement>("[data-copy-step]");
+  if (copyBtn) {
+    const item = copyBtn.closest<HTMLElement>(".agent-step-item");
+    const text = item?.querySelector<HTMLElement>(".agent-step-item__detail-text")?.textContent || "";
+    const done = () => { copyBtn.textContent = "Copied ✓"; setTimeout(() => { copyBtn.textContent = "Copy step"; }, 1500); };
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text).then(done).catch(() => { copyBtn.textContent = "Copy failed"; });
+    } else {
+      copyBtn.textContent = "Copy unavailable";
+    }
+    return;
+  }
+
+  // Interactive watch card (chat-only monitoring): Pause/Resume,
+  // Cancel, and View changes call the control missions API and
+  // update the card in place. Cancel is a two-step inline confirm
+  // (no window.confirm) so a stray click cannot delete a watch.
+  const watchCard = target.closest<HTMLElement>(".watch-card");
+  if (watchCard?.dataset.watchId) {
+    const missionId = watchCard.dataset.watchId;
+    const statusEl = watchCard.querySelector<HTMLElement>("[data-watch-status]");
+    const pauseBtn = watchCard.querySelector<HTMLButtonElement>("[data-watch-pause]");
+    const cancelBtn = watchCard.querySelector<HTMLButtonElement>("[data-watch-cancel]");
+    const eventsEl = watchCard.querySelector<HTMLElement>(".watch-card__events");
+    const setBusy = (busy: boolean) => {
+      watchCard.querySelectorAll<HTMLButtonElement>(".watch-card__btn").forEach(b => { b.disabled = busy; });
+    };
+    if (target.closest<HTMLButtonElement>("[data-watch-pause]") && pauseBtn && statusEl) {
+      const resume = pauseBtn.textContent === "Resume";
+      setBusy(true);
+      apiFetch(`${API}/api/control/missions/${encodeURIComponent(missionId)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: resume ? "active" : "paused" }),
+      }).then(async res => {
+        if (!res.ok) throw new Error("Backend returned " + res.status);
+        const next = resume ? "active" : "paused";
+        statusEl.textContent = next === "active" ? "Active" : "Paused";
+        statusEl.dataset.status = next;
+        pauseBtn.textContent = next === "active" ? "Pause" : "Resume";
+      }).catch(() => {
+        statusEl.textContent = "Update failed — try again";
+      }).finally(() => setBusy(false));
+      return;
+    }
+    if (target.closest<HTMLButtonElement>("[data-watch-cancel]") && cancelBtn) {
+      if (cancelBtn.dataset.confirm !== "true") {
+        cancelBtn.dataset.confirm = "true";
+        cancelBtn.textContent = "Confirm cancel?";
+        setTimeout(() => {
+          if (cancelBtn.dataset.confirm === "true") {
+            cancelBtn.dataset.confirm = "";
+            cancelBtn.textContent = "Cancel watch";
+          }
+        }, 4000);
+        return;
+      }
+      setBusy(true);
+      apiFetch(`${API}/api/control/missions/${encodeURIComponent(missionId)}`, { method: "DELETE" })
+        .then(async res => {
+          if (!res.ok) throw new Error("Backend returned " + res.status);
+          watchCard.querySelector<HTMLElement>(".watch-card__title")!.textContent = "Watch cancelled";
+          if (statusEl) statusEl.textContent = "Cancelled";
+          watchCard.querySelector<HTMLElement>(".watch-card__note")!.textContent = "This watch is stopped and removed. Ask me in chat to watch something again.";
+          watchCard.querySelectorAll<HTMLButtonElement>(".watch-card__btn").forEach(b => { b.disabled = true; });
+          if (eventsEl) eventsEl.hidden = true;
+        })
+        .catch(() => {
+          cancelBtn.dataset.confirm = "";
+          cancelBtn.textContent = "Cancel failed — try again";
+        })
+        .finally(() => setBusy(false));
+      return;
+    }
+    if (target.closest<HTMLButtonElement>("[data-watch-events]") && eventsEl) {
+      if (!eventsEl.hidden) {
+        eventsEl.hidden = true;
+        return;
+      }
+      eventsEl.hidden = false;
+      eventsEl.innerHTML = `<p class="watch-card__events-note">Loading changes…</p>`;
+      apiFetch(`${API}/api/control/missions/${encodeURIComponent(missionId)}/events`)
+        .then(async res => {
+          if (!res.ok) throw new Error("Backend returned " + res.status);
+          const events = (await res.json()) as Array<{ title?: string; summary?: string; detected_at?: number }>;
+          eventsEl.innerHTML = events.length
+            ? events.slice(0, 10).map(e => `<article class="watch-card__event"><h4>${escapeHtml(e.title || "Change detected")}</h4><p>${escapeHtml(e.summary || "")}</p><time>${e.detected_at ? new Date(e.detected_at * 1000).toLocaleString() : ""}</time></article>`).join("")
+            : `<p class="watch-card__events-note">No changes recorded yet — the next observed difference will appear here.</p>`;
+        })
+        .catch(() => {
+          eventsEl.innerHTML = `<p class="watch-card__events-note">Could not load changes.</p>`;
+        });
+      return;
+    }
   }
 });
 

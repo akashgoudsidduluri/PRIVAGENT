@@ -383,21 +383,28 @@ async def handle_continuous_monitoring_instruction(
         conn.commit()
 
     # Inform connected workspace clients (alerts land in the
-    # conversation and in the Control Center monitoring view).
+    # conversation the watch was created in).
     try:
         hub.spawn(hub.broadcast_control_state())
     except Exception:
         pass
 
+    # The watch marker is machine-readable: the workspace strips it
+    # before rendering and turns it into an interactive watch card
+    # (Pause / Resume / Cancel / View changes) in the conversation.
+    # Monitoring is chat-only since 2026-11-18 — there is no monitor
+    # form or scheduled-missions page anymore, so the confirmation
+    # must not point at the Control Center dashboard.
     return (
         f"### 🎯 Continuous Price Monitoring Activated\n\n"
         f"I've configured continuous background price tracking for **{product_title}**.\n\n"
-        f"• **Status:** Active on your Control Center dashboard ([http://localhost:5173](http://localhost:5173))\n"
+        f"• **Status:** Active — I'll post an alert right here in this conversation the moment anything changes\n"
         f"• **Monitored Target:** [{product_title} Listing ↗]({target_url})\n"
         f"{cadence_line}"
         f"{alert_line}"
         f"• **Persistence:** Stored in SQLite — checks continue automatically even if you navigate away\n\n"
         f"---\n\n"
-        f"*I've got the watch running in the background — I'll post an alert right here in this conversation the moment anything changes. Catch you later, buddy!* 👋"
+        f"*I've got the watch running in the background — I'll post an alert right here in this conversation the moment anything changes. Catch you later, buddy!* 👋\n"
+        f"<!-- privagent-watch: {mission_id} -->"
     )
 

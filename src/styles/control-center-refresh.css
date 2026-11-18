@@ -22,7 +22,7 @@
 .cc-card-heading{padding-bottom:15px;border-bottom:1px solid #354435;margin-bottom:17px}
 .cc-card h2{font:500 16px 'Source Serif 4',Georgia,serif;letter-spacing:.02em}
 .cc-card h3{font:500 16px 'Inter',system-ui,sans-serif;letter-spacing:-.01em;color:#181818}
-.cc-card small,.cc-mission-row small,.cc-settings-grid small{color:#787878;font-size:10px;letter-spacing:.12em;text-transform:uppercase}
+.cc-card small,.cc-settings-grid small{color:#787878;font-size:10px;letter-spacing:.12em;text-transform:uppercase}
 .cc-card p{font-size:13px;line-height:1.6}.cc-row{min-width:0}.cc-row>div:first-child{min-width:0}.cc-row p{margin:5px 0 0;overflow-wrap:anywhere}
 .cc-row-actions,.cc-provider-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
 .cc-tag{white-space:nowrap;color:#181818;background:#f3f0ea;border:1px solid var(--line)}
