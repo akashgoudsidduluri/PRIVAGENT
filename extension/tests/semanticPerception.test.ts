@@ -1,7 +1,10 @@
 // @vitest-environment jsdom
 import {describe,it,expect,afterEach} from 'vitest';
-import {accessibleName,queryAllWithShadow,perceptible,checkTargetFreshness,semanticElement,isOccluded} from '../src/semantic';
+import {accessibleName,queryAllWithShadow,perceptible,checkTargetFreshness,semanticElement,isOccluded,stripIconGlyphs,rawAccessibleName} from '../src/semantic';
 afterEach(()=>{document.body.innerHTML='';});
+// FontAwesome search icon, U+F002 — built from its code point so the
+// source never has to contain a literal private-use character.
+const GLYPH = String.fromCodePoint(0xf002);
 describe('semantic perception',()=>{
  it('honors name precedence and native labels',()=>{
   document.body.innerHTML='<span id="lab">Account</span><label for="email">Email</label><input id="email" aria-labelledby="lab" aria-label="Wrong" placeholder="Other">';
@@ -31,5 +34,30 @@ describe('semantic perception',()=>{
   expect(checkTargetFreshness('removed',undefined,'Save')).toBe(document.querySelector('button'));
   document.body.innerHTML='<button>Save</button><button>Save</button>';
   expect(checkTargetFreshness('removed',undefined,'Save')).toBe(null);
+ });
+ it('strips icon glyphs from accessible names (Moodle fix)',()=>{
+  // Moodle's search button name arrives as "<glyph> Search courses".
+  expect(stripIconGlyphs(`${GLYPH} Search courses`)).toBe('Search courses');
+  expect(stripIconGlyphs('Search courses')).toBe('Search courses');
+  expect(stripIconGlyphs(`${String.fromCodePoint(0xe001)}Home`)).toBe('Home');
+  expect(stripIconGlyphs(`Save${String.fromCodePoint(0xfe0f)}`)).toBe('Save');
+  expect(stripIconGlyphs('Cafe - 50% off!')).toBe('Cafe - 50% off!');
+  expect(stripIconGlyphs('')).toBe('');
+  document.body.innerHTML=`<button aria-label="${GLYPH} Search courses">x</button><button>${GLYPH} Go</button>`;
+  const [labelled, text] = Array.from(document.querySelectorAll('button'));
+  expect(accessibleName(labelled)).toBe('Search courses');
+  expect(rawAccessibleName(labelled)).toBe(`${GLYPH} Search courses`);
+  expect(accessibleName(text)).toBe('Go');
+  expect(rawAccessibleName(text)).toBe(`${GLYPH} Go`);
+ });
+ it('keeps the raw name on the semantic element only when it differs',()=>{
+  document.body.innerHTML=`<button>${GLYPH} Search courses</button><button>Plain</button>`;
+  const [glyph, plain] = Array.from(document.querySelectorAll('button'));
+  const semGlyph = semanticElement(glyph, 'g');
+  const semPlain = semanticElement(plain, 'p');
+  expect(semGlyph?.semanticName).toBe('Search courses');
+  expect(semGlyph?.rawSemanticName).toBe(`${GLYPH} Search courses`);
+  expect(semPlain?.semanticName).toBe('Plain');
+  expect(semPlain?.rawSemanticName).toBeUndefined();
  });
 });

@@ -4,13 +4,24 @@ export type RelayMessage = {
   payload: unknown;
 };
 
-export type InboundMessage = {
-  type: "EXECUTE_ACTION";
-  taskId: string;
-  payload: unknown;
-};
+export type InboundMessage =
+  | {
+      type: "EXECUTE_ACTION";
+      taskId: string;
+      payload: unknown;
+      // Task 3: the task's domain allow-list, sent by the backend with the
+      // action so the extension can refuse a disallowed navigation itself.
+      allowedDomains?: string[];
+    }
+  | {
+      // Task 4: takeover notifications. No payload, no action — the
+      // extension just stops observing/screenshotting until TAKEOVER_END.
+      type: "TAKEOVER_START" | "TAKEOVER_END";
+      taskId: string;
+      payload: unknown;
+    };
 
-const INBOUND_TYPES = new Set(["EXECUTE_ACTION"]);
+const INBOUND_TYPES = new Set(["EXECUTE_ACTION", "TAKEOVER_START", "TAKEOVER_END"]);
 
 /** Frame around a WebSocket: outbound envelopes + inbound dispatch.
  * Routing logic is pure and testable without Chrome. */
@@ -28,11 +39,18 @@ export class Relay {
         return;
       }
       if (typeof msg !== "object" || msg === null) return;
-      const m = msg as { type?: string; taskId?: string; payload?: unknown };
+      const m = msg as { type?: string; taskId?: string; payload?: unknown; allowedDomains?: unknown };
       if (!m.type || !INBOUND_TYPES.has(m.type) || typeof m.taskId !== "string" || !m.taskId) return;
       for (const h of this.handlers) {
         try {
-          h({ type: m.type as "EXECUTE_ACTION", taskId: m.taskId, payload: m.payload ?? {} });
+          h({
+            type: m.type as InboundMessage["type"],
+            taskId: m.taskId,
+            payload: m.payload ?? {},
+            allowedDomains: Array.isArray(m.allowedDomains)
+              ? m.allowedDomains.filter((d): d is string => typeof d === "string")
+              : undefined,
+          });
         } catch {
           // A handler bug must not tear down the socket listener.
         }

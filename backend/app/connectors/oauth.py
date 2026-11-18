@@ -14,8 +14,14 @@ import httpx
 from . import GmailConnector, OutlookConnector, GoogleCalendarConnector, GoogleDriveConnector, SlackConnector, GitHubConnector
 
 _PROVIDER = {
+    # drive.readonly is required for search/extract on the user's EXISTING
+    # files: drive.file only covers files this app created or opened, so
+    # "find X in Drive" returned empty/403 on real accounts. drive.file
+    # stays for uploads (upload_deliverable). Both are least-privilege:
+    # readonly for reads, file-scoped for writes. Adding readonly needs
+    # the user to re-consent on Google.
     "google": {"auth": "https://accounts.google.com/o/oauth2/v2/auth", "token": "https://oauth2.googleapis.com/token",
-               "scopes": "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/drive.file"},
+               "scopes": "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.file"},
     "microsoft": {"auth": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
                   "token": "https://login.microsoftonline.com/common/oauth2/v2.0/token",
                   "scopes": "offline_access Mail.ReadWrite Calendars.ReadWrite"},
@@ -44,37 +50,47 @@ def _load_env_if_needed() -> None:
                 pass
 
 
-def _update_env_file(key: str, value: str) -> None:
-    """Persist key=value into backend/.env so it survives restarts, skipping during test runs."""
-    import sys
-    if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("PYTEST_VERSION") or "pytest" in sys.modules:
-        return
-    candidate_dirs = [
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-        os.getcwd(),
-        os.path.join(os.getcwd(), "backend"),
-    ]
-    for d in candidate_dirs:
-        env_file = os.path.join(d, ".env")
-        if os.path.exists(env_file):
-            try:
-                lines: list[str] = []
-                found = False
-                with open(env_file, "r", encoding="utf-8") as f:
-                    for line in f:
-                        if line.startswith(f"{key}="):
-                            lines.append(f"{key}={value}\n")
-                            found = True
-                        else:
-                            lines.append(line)
-                if not found:
-                    if lines and not lines[-1].endswith("\n"):
-                        lines[-1] += "\n"
-                    lines.append(f"{key}={value}\n")
-                with open(env_file, "w", encoding="utf-8") as f:
-                    f.writelines(lines)
-            except Exception:
-                pass
+def _store_get(env_key: str) -> str | None:
+    """Read a secret that used to live in ``.env`` from the encrypted store.
+
+    Best effort: a missing/corrupt store simply yields ``None`` and the
+    caller falls back to the environment.
+    """
+    try:
+        from .. import secrets as secrets_store
+        return secrets_store.get_secret_for_env_key(env_key)
+    except Exception:
+        return None
+
+
+def _store_set(env_key: str, value: str) -> None:
+    """Write a secret to the encrypted store (never to ``.env``)."""
+    from .. import secrets as secrets_store
+    secrets_store.set_secret(secrets_store.ENV_TO_STORE_KEY[env_key], value)
+
+
+def _store_delete(env_key: str) -> None:
+    try:
+        from .. import secrets as secrets_store
+        secrets_store.delete_secret(secrets_store.ENV_TO_STORE_KEY[env_key])
+    except Exception:
+        pass
+
+
+def _oauth_credential(provider: str, kind: str) -> str:
+    """Resolve an OAuth client credential: environment first, store second.
+
+    ``kind`` is ``"CLIENT_ID"`` or ``"CLIENT_SECRET"``. Client IDs are not
+    secrets and still normally come from ``.env``; client secrets moved to
+    the encrypted store in Task 2 (with ``.env`` migration on startup).
+    """
+    prefix = f"PRIVAGENT_{provider.upper()}_OAUTH_"
+    env_value = os.environ.get(prefix + kind, "")
+    if env_value:
+        return env_value
+    if kind == "CLIENT_SECRET":
+        return _store_get(prefix + kind) or ""
+    return ""
 
 
 class OAuthManager:
@@ -92,20 +108,28 @@ class OAuthManager:
             _load_env_if_needed()
             for name in _PROVIDER:
                 env_tok = os.environ.get(f"PRIVAGENT_{name.upper()}_ACCESS_TOKEN")
+                if not env_tok:
+                    env_tok = _store_get(f"PRIVAGENT_{name.upper()}_ACCESS_TOKEN")
                 if env_tok:
                     self._tokens[name] = env_tok.strip()
                 env_ref = os.environ.get(f"PRIVAGENT_{name.upper()}_REFRESH_TOKEN")
+                if not env_ref:
+                    env_ref = _store_get(f"PRIVAGENT_{name.upper()}_REFRESH_TOKEN")
                 if env_ref:
                     self._refresh_tokens[name] = env_ref.strip()
 
     def configured(self, provider: str) -> bool:
         _load_env_if_needed()
-        prefix = f"PRIVAGENT_{provider.upper()}_OAUTH_"
-        has_creds = bool(os.environ.get(prefix + "CLIENT_ID") and os.environ.get(prefix + "CLIENT_SECRET"))
+        has_creds = bool(_oauth_credential(provider, "CLIENT_ID") and _oauth_credential(provider, "CLIENT_SECRET"))
         return provider in _PROVIDER and (has_creds or bool(self._tokens.get(provider)) or bool(self._refresh_tokens.get(provider)))
 
     def set_credentials(self, provider: str, client_id: str, client_secret: str) -> None:
-        """Set OAuth client credentials in process memory and persist to .env."""
+        """Set OAuth client credentials.
+
+        The client ID is not a secret and lives in process memory (operators
+        may still keep it in ``.env``). The client secret is a secret: it is
+        stored encrypted (Task 2) and never written to ``.env`` again.
+        """
         if provider not in _PROVIDER:
             raise ValueError(f"Unknown provider '{provider}'")
         self._verification_cache.pop(provider, None)
@@ -114,12 +138,16 @@ class OAuthManager:
         csec = (client_secret or "").strip()
         os.environ[prefix + "CLIENT_ID"] = cid
         os.environ[prefix + "CLIENT_SECRET"] = csec
-        if not self._is_test_client:
-            _update_env_file(prefix + "CLIENT_ID", cid)
-            _update_env_file(prefix + "CLIENT_SECRET", csec)
+        if not self._is_test_client and csec:
+            _store_set(prefix + "CLIENT_SECRET", csec)
 
     def set_tokens(self, provider: str, access_token: str | None = None, refresh_token: str | None = None) -> None:
-        """Set access token and/or refresh token and persist so restarts don't lose them."""
+        """Set access/refresh tokens, stored encrypted (Task 2).
+
+        Tokens are also mirrored into ``os.environ`` for this process only,
+        so existing connector code that reads the environment keeps working;
+        they are never written to ``.env`` again.
+        """
         if provider not in _PROVIDER:
             raise ValueError(f"Unknown provider '{provider}'")
         self._verification_cache.pop(provider, None)
@@ -129,14 +157,14 @@ class OAuthManager:
             prefix = f"PRIVAGENT_{provider.upper()}_ACCESS_TOKEN"
             os.environ[prefix] = clean_tok
             if not self._is_test_client:
-                _update_env_file(prefix, clean_tok)
+                _store_set(prefix, clean_tok)
         if refresh_token is not None:
             clean_ref = refresh_token.strip()
             self._refresh_tokens[provider] = clean_ref
             prefix_ref = f"PRIVAGENT_{provider.upper()}_REFRESH_TOKEN"
             os.environ[prefix_ref] = clean_ref
             if not self._is_test_client:
-                _update_env_file(prefix_ref, clean_ref)
+                _store_set(prefix_ref, clean_ref)
 
     def set_token(self, provider: str, token: str) -> None:
         self.set_tokens(provider, access_token=token)
@@ -150,8 +178,8 @@ class OAuthManager:
             return None
 
         prefix = f"PRIVAGENT_{provider.upper()}_OAUTH_"
-        client_id = os.environ.get(prefix + "CLIENT_ID", "")
-        client_secret = os.environ.get(prefix + "CLIENT_SECRET", "")
+        client_id = _oauth_credential(provider, "CLIENT_ID")
+        client_secret = _oauth_credential(provider, "CLIENT_SECRET")
 
         token_url = _PROVIDER[provider]["token"]
         data: dict[str, str] = {
@@ -257,7 +285,7 @@ class OAuthManager:
         verifier = secrets.token_urlsafe(48)
         self._pending[state] = (time.monotonic() + 600, provider, verifier)
         self._pending = {key: value for key, value in self._pending.items() if value[0] > time.monotonic()}
-        params = {"client_id": os.environ[f"PRIVAGENT_{provider.upper()}_OAUTH_CLIENT_ID"],
+        params = {"client_id": _oauth_credential(provider, "CLIENT_ID"),
                   "redirect_uri": self._redirect(provider), "response_type": "code", "state": state,
                   "scope": spec["scopes"]}
         if provider in ("google", "microsoft"):
@@ -271,8 +299,8 @@ class OAuthManager:
         pending = self._pending.pop(state, None)
         if not pending or pending[0] < time.monotonic() or pending[1] != provider or not code:
             raise PermissionError("OAuth state is invalid or expired")
-        data = {"client_id": os.environ[f"PRIVAGENT_{provider.upper()}_OAUTH_CLIENT_ID"],
-                "client_secret": os.environ[f"PRIVAGENT_{provider.upper()}_OAUTH_CLIENT_SECRET"],
+        data = {"client_id": _oauth_credential(provider, "CLIENT_ID"),
+                "client_secret": _oauth_credential(provider, "CLIENT_SECRET"),
                 "code": code, "redirect_uri": self._redirect(provider)}
         if provider in ("google", "microsoft"):
             data.update({"grant_type": "authorization_code", "code_verifier": pending[2]})
@@ -294,8 +322,8 @@ class OAuthManager:
         os.environ.pop(prefix, None)
         os.environ.pop(prefix_ref, None)
         if not self._is_test_client:
-            _update_env_file(prefix, "")
-            _update_env_file(prefix_ref, "")
+            _store_delete(prefix)
+            _store_delete(prefix_ref)
 
     def connector(self, name: str):
         mapping = {"gmail": ("google", GmailConnector), "outlook": ("microsoft", OutlookConnector),

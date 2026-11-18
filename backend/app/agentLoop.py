@@ -9,6 +9,7 @@ import asyncio
 import atexit
 from concurrent.futures import ThreadPoolExecutor
 import inspect
+import logging
 import re
 import threading
 import time
@@ -18,13 +19,123 @@ from urllib.parse import urlsplit
 from pathlib import Path
 
 from . import config
+from .allowlist import check_url, effective_allowlist
+from .batch import batch_prefix, is_non_submitting_type
+from .checker import check_plan, scan_page_text
+from .plan_preview import plan_preview
 from .contracts import PrivacyViolation
 from .hub import Hub, hub as real_hub, TaskRecord
+from .latency import LoopTimings, phase_ms
+# Task 13: loop state (cancel / pause / takeover registries) lives in
+# loop_state.py; agentLoop re-exports every name so existing imports
+# (``agentLoop.request_cancel``, ``agentLoop._pause_events``, ...) keep
+# working — the registries are the same objects, not copies.
+from .loop_checkpoints import (
+    _compact_history,
+    _maybe_compact_history,
+    _persist_agent_message,
+    _persist_derived_memory,
+    _prune_tabs_not_in_observation,
+    _register_tab_in_memory,
+    _remove_tab_from_memory,
+    _save_checkpoint_defensive,
+    _set_active_tab_in_memory,
+    save_cancel_checkpoint,
+)
+from .loop_gates import (
+    HANDOFF_MESSAGE,
+    _ConfirmGate,
+    _TakeoverGate,
+    _gate_message,
+    _request_confirmation,
+)
+from .loop_helpers import (
+    CANONICAL_FORMAT_MAP,
+    MAX_HISTORY_TEXT_CHARS,
+    MAX_TRANSIENT_PLAN_RETRIES,
+    _AUTH_HOSTS,
+    _AUTH_PATH_TOKENS,
+    _FORCE_REOBSERVE_ACTIONS,
+    _IDEMPOTENT_RETRY_TYPES,
+    _MESSAGING_DOMAINS,
+    _actions_match,
+    _auto_complete_after_send,
+    _call_planner,
+    _enforce_date_integrity,
+    _execute_with_retries,
+    _fresh_observation,
+    _history_view,
+    _host_matches,
+    _host_of,
+    _origin_of,
+    _is_auth_url,
+    _is_composer_target,
+    _is_messaging_host,
+    _is_redundant_completed_action,
+    _is_whatsapp_qr,
+    _normalize_loop_error,
+    _plan_tree_and_refs,
+    _same_failure,
+    _state_digest,
+    _summary,
+    _target_name,
+    _to_obs,
+    canonical_format_map,
+    extract_mission_facts,
+    fresh_tree_for_observation,
+    is_transient_planner_error,
+    ref_freshness,
+    transient_plan_backoff_s,
+    warm_loop_caches,
+)
+from .loop_research import (
+    _finalize_research_artifacts,
+    _finalize_research_summary,
+    build_comparison_package,
+)
+from .loop_state import (
+    _await_takeover,
+    _cancelled,
+    _notify_extension_takeover,
+    _pause_events,
+    _takeover_wait_events,
+    is_cancelled,
+    request_cancel,
+    request_pause,
+    request_resume,
+)
+from .obs_cache import ObservationCache, observation_fingerprint, observation_tab_id, observation_url
+from .outcome import (
+    is_dialog_error,
+    is_stale_target_error,
+    resolve_fresh_ref,
+    verify_step_outcome,
+)
 from .planner import plan_from_observation
 from .privacy import classify_and_redact, redact_text_urls, redact_url
 from .providers.errors import ProviderUnavailable
+from .takeover import (
+    AUTH_PATH_TOKENS,
+    detect_takeover_trigger,
+    is_blocked_action,
+    is_payment_surface,
+    takeover_reason_for_wait,
+)
+from .vault import (
+    contains_placeholder,
+    parse_placeholder,
+    placeholder_value,
+    scrub_value_from_text,
+    substitute_placeholders_in_action,
+)
+
+logger = logging.getLogger("navigator.loop")
 
 MAX_STEPS = config.MAX_STEPS
+# Task 9: long-horizon tasks get a bigger budget (100 steps) and a
+# deterministic compaction summary every 25 steps so the prompt stays
+# bounded while the history stays useful.
+MAX_LONG_STEPS = config.MAX_LONG_STEPS
 MAX_RETRIES = config.MAX_RETRIES
 TASK_TIMEOUT_S = config.TASK_TIMEOUT_S
 PLANNER_TIMEOUT_S = float(getattr(config, "PLANNER_TIMEOUT_S", 60.0))
@@ -61,197 +172,10 @@ def shutdown_planner_executor(wait: bool = False, cancel_futures: bool = True) -
 atexit.register(shutdown_planner_executor)
 
 
-def _get_planner_semaphore() -> asyncio.Semaphore:
-    """Retained for backward compatibility."""
-    return asyncio.Semaphore(MAX_CONCURRENT_PLANNERS)
-
 MAX_NOTES_CHARS = 4000
-MAX_HISTORY_TEXT_CHARS = 400
 # A malformed plan must not kill the mission. Give the model a bounded number
 # of replans with the exact validation error before failing honestly.
 MAX_INVALID_PLANS = 3
-
-# TIMEOUT is ambiguous: the extension may still be executing the action. Only
-# retry action types that cannot duplicate a side effect.
-_IDEMPOTENT_RETRY_TYPES = {"observe", "scroll", "wait", "zoom", "select_tab"}
-
-# Tab changes relocate the active surface; their result carries no observation
-# in production, so the loop re-observes instead of trusting a stale tab view.
-_FORCE_REOBSERVE_ACTIONS = {"select_tab", "close_tab"}
-
-CANONICAL_FORMAT_MAP: dict[str, str] = {
-    "presentation": "pptx",
-    "slides": "pptx",
-    "slide_deck": "pptx",
-    "ppt": "pptx",
-    "powerpoint": "pptx",
-    "excel": "xlsx",
-    "spreadsheet": "xlsx",
-    "workbook": "xlsx",
-    "word": "docx",
-    "document": "docx",
-    "doc": "docx",
-    "webpage": "html",
-    "web": "html",
-}
-canonical_format_map = CANONICAL_FORMAT_MAP
-
-_cancelled: set[str] = set()
-
-# Chat/messaging hosts where "typed with submit" genuinely means "sent".
-# Kept as registrable domains so web./www. subdomains match too.
-_MESSAGING_DOMAINS = (
-    "whatsapp.com",
-    "messenger.com",
-    "telegram.org",
-    "telegram.me",
-    "instagram.com",
-    "x.com",
-    "twitter.com",
-    "linkedin.com",
-    "discord.com",
-    "slack.com",
-    "teams.microsoft.com",
-    "teams.live.com",
-    "skype.com",
-    "signal.org",
-    "chat.google.com",
-    "messages.google.com",
-)
-
-# Full hostnames that are sign-in surfaces (not whole registrable domains:
-# google.com itself is a search engine, not an auth page).
-_AUTH_HOSTS = (
-    "accounts.google.com",
-    "login.microsoftonline.com",
-    "login.live.com",
-    "login.microsoft.com",
-    "appleid.apple.com",
-    "auth0.com",
-    "okta.com",
-    "onelogin.com",
-)
-
-# Whole path segments that indicate a credential / payment surface.
-_AUTH_PATH_TOKENS = {
-    "signin", "sign-in", "login", "log-in", "logon", "log-on", "signup",
-    "sign-up", "auth", "authenticate", "authorize", "oauth", "oauth2",
-    "otp", "verify", "verification", "mfa", "2fa", "password", "passwd",
-    "checkout", "payment", "pay-now", "makepayment", "billing", "purchase",
-}
-
-
-def request_cancel(task_id: str) -> None:
-    _cancelled.add(task_id)
-    event = _pause_events.get(task_id)
-    if event:
-        event.set()
-
-
-def is_cancelled(task_id: str) -> bool:
-    return task_id in _cancelled
-
-
-_pause_events: dict[str, asyncio.Event] = {}
-
-
-def request_pause(task_id: str) -> None:
-    _pause_events.setdefault(task_id, asyncio.Event()).clear()
-
-
-def request_resume(task_id: str) -> None:
-    event = _pause_events.pop(task_id, None)
-    if event:
-        event.set()
-
-
-def _noop_progress(record: TaskRecord | dict[str, Any], *_: Any) -> None:
-    pass
-
-
-def _host_of(url: str) -> str:
-    try:
-        return (urlsplit(url).hostname or "").lower()
-    except ValueError:
-        return ""
-
-
-def _host_matches(host: str, domain: str) -> bool:
-    return bool(host) and (host == domain or host.endswith("." + domain))
-
-
-def _is_messaging_host(url: str) -> bool:
-    host = _host_of(url)
-    return any(_host_matches(host, d) for d in _MESSAGING_DOMAINS)
-
-
-def _is_auth_url(url: str) -> bool:
-    """True only for genuine sign-in/payment surfaces.
-
-    Substring matching used to flag any URL containing "auth" (including
-    /author/, /authority/) and force a human gate. Match whole path segments
-    and known auth hostnames instead.
-    """
-    host = _host_of(url)
-    if not host:
-        return False
-    if any(_host_matches(host, h) for h in _AUTH_HOSTS):
-        return True
-    try:
-        path = urlsplit(url).path.lower()
-    except ValueError:
-        return False
-    # Split on separators but keep hyphenated tokens ("sign-in", "log-in").
-    tokens: set[str] = set()
-    for token in re.split(r"[/_.]+", path):
-        if not token:
-            continue
-        tokens.add(token)
-        if "-" in token:
-            tokens.update(part for part in token.split("-") if part)
-    return bool(tokens & _AUTH_PATH_TOKENS)
-
-
-def _target_name(target: Any) -> str:
-    if isinstance(target, dict):
-        return str(target.get("name") or target.get("targetId") or "").strip().lower()
-    return str(target or "").strip().lower()
-
-
-def _is_composer_target(target: Any) -> bool:
-    name = _target_name(target)
-    return (
-        "type a message" in name
-        or "composer" in name
-        or name == "message"
-        or name.startswith("message to ")
-    )
-
-
-def _auto_complete_after_send(history: list[dict[str, Any]], action: dict[str, Any], url: str) -> bool:
-    """Detect a redundant follow-up after a composer send on a chat app.
-
-    Scoped to known messaging hosts and to the same composer / explicit send
-    controls: a later search-box "type" must not be mistaken for a resend.
-    """
-    if not _is_messaging_host(url) or not history:
-        return False
-    last = history[-1]
-    if not last.get("result_ok"):
-        return False
-    last_act = last.get("action") or {}
-    params = last_act.get("params") or {}
-    if last_act.get("type") != "type" or not params.get("submit"):
-        return False
-    if not _is_composer_target(last_act.get("target")):
-        return False
-
-    nxt_type = action.get("type")
-    nxt_target = action.get("target") or {}
-    if nxt_type == "type":
-        return _is_composer_target(nxt_target)
-    target_text = str(nxt_target).lower()
-    return any(w in target_text for w in ("send", "voice", "ptt", "microphone"))
 
 
 async def run_with_injection(
@@ -264,12 +188,20 @@ async def run_with_injection(
     on_progress: Optional[Callable[..., None]] = None,
     confirm_gate: Optional[Any] = None,
     confirm_timeout_s: float = 120.0,
+    takeover_gate: Optional[Any] = None,
+    takeover_timeout_s: float = 600.0,
     on_metrics: Optional[Callable[[dict[str, Any]], None]] = None,
     initial_memory: Optional[dict[str, Any]] = None,
     session_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
+    allowed_domains: Optional[list[str]] = None,
+    max_steps: Optional[int] = None,
+    long_horizon: bool = False,
 ) -> dict[str, Any]:
     """Test entrypoint mirroring run_task's flow with injectable parts."""
+    # Task 11: per-step timings ride along with the run and are
+    # attached to the result (durations + counts + action types only).
+    timings = LoopTimings()
     try:
         mem = initial_memory if initial_memory is not None else {}
         res = await _run_loop(
@@ -281,385 +213,28 @@ async def run_with_injection(
             on_progress=on_progress,
             confirm_gate=confirm_gate,
             confirm_timeout_s=confirm_timeout_s,
+            takeover_gate=takeover_gate,
+            takeover_timeout_s=takeover_timeout_s,
             on_metrics=on_metrics,
             initial_memory=mem,
             session_id=session_id,
             conversation_id=conversation_id,
+            allowed_domains=allowed_domains,
+            max_steps=max_steps,
+            long_horizon=long_horizon,
+            timings=timings,
         )
         if isinstance(res, dict) and "working_memory" not in res:
             res["working_memory"] = mem
+        if isinstance(res, dict):
+            res.setdefault("timings", timings.summary())
         return res
     finally:
         # Never leak cancellation markers: task ids are unique, but a stale
         # marker would make a replayed id silently cancel itself.
         _cancelled.discard(task_id)
         _pause_events.pop(task_id, None)
-
-
-def _enforce_date_integrity(action: dict[str, Any], instruction: str) -> None:
-    """Validate and preserve exact user-specified dates and years (e.g. 2026 must never become 2027)."""
-    inst = instruction or ""
-    if "2026" in inst and "2027" not in inst:
-        params = action.get("params") or {}
-        if "text" in params and isinstance(params["text"], str) and "2027" in params["text"]:
-            params["text"] = params["text"].replace("2027", "2026")
-        if "url" in params and isinstance(params["url"], str) and "2027" in params["url"]:
-            params["url"] = params["url"].replace("2027", "2026")
-
-
-def _save_checkpoint_defensive(
-    task_id: str,
-    conversation_id: Optional[str],
-    session_id: Optional[str],
-    steps_done: int,
-    raw_url: str,
-    history: list[dict[str, Any]],
-    working_memory: dict[str, Any],
-) -> None:
-    try:
-        from . import db
-        db.save_task_checkpoint(
-            task_id=task_id,
-            conversation_id=conversation_id or "default",
-            session_id=session_id,
-            step_index=steps_done,
-            last_url=raw_url or "",
-            history=history,
-            working_memory=working_memory,
-        )
-    except Exception:
-        pass
-
-
-def _finalize_research_artifacts(
-    task_id: str,
-    conversation_id: Optional[str],
-    working_memory: dict[str, Any],
-    summary_msg: Optional[str] = None,
-) -> Optional[dict[str, Any]]:
-    """Synthesize visual assets, render requested deliverables, and register artifacts."""
-    try:
-        from pathlib import Path
-        from . import db
-        from .research.models import FormulaItem, ResearchKnowledgePackage, ResearchSubtopic, VisualAsset
-        from .research.renderers import render_artifact
-        from .research.visuals.chart_generator import generate_chart_from_table
-        from .research.visuals.diagram_generator import render_attention_diagram_to_png, render_diagram_to_png
-        from .research.visuals.formula_renderer import render_latex_formula
-
-        pkg_data = working_memory.get("research_knowledge_package")
-        if not pkg_data:
-            return None
-
-        pkg = ResearchKnowledgePackage.from_dict(pkg_data) if isinstance(pkg_data, dict) else pkg_data
-
-        # Enrich package with planner synthesis if available
-        if summary_msg:
-            clean_summary = re.sub(r"📄\s*\*\*Deliverable Ready:\*\*.*$", "", summary_msg, flags=re.DOTALL).strip()
-            if not pkg.topic.findings_summary and clean_summary:
-                pkg.topic.findings_summary = clean_summary
-
-            # Extract LaTeX equations from summary text if none explicitly registered
-            if not pkg.formulas:
-                math_blocks = re.findall(r"\$\$(.+?)\$\$", clean_summary, re.DOTALL)
-                for idx, mb in enumerate(math_blocks[:4], start=1):
-                    latex_clean = mb.strip().replace("\n", " ")
-                    if latex_clean and len(latex_clean) < 400:
-                        f_id = f"form_{idx:02d}"
-                        name = f"Equation {idx}"
-                        if "\\text{Attention}" in latex_clean or "Attention(" in latex_clean:
-                            name = "Scaled Dot-Product Attention"
-                        elif "\\text{MultiHead}" in latex_clean or "MultiHead(" in latex_clean:
-                            name = "Multi-Head Attention Mechanism"
-                        elif "PE_" in latex_clean or "\\sin" in latex_clean:
-                            name = "Sinusoidal Positional Encoding"
-                        f_item = FormulaItem(
-                            formula_id=f_id,
-                            name=name,
-                            latex=latex_clean,
-                            explanation="Mathematical formulation synthesized from authoritative research evidence.",
-                        )
-                        pkg.add_formula(f_item)
-
-                # Fallback technical formulations for transformer / attention research
-                if not pkg.formulas:
-                    inst_and_sum = (clean_summary + " " + (pkg.topic.objective or "")).lower()
-                    if "attention" in inst_and_sum or "transformer" in inst_and_sum:
-                        pkg.add_formula(FormulaItem(
-                            formula_id="form_01",
-                            name="Scaled Dot-Product Attention",
-                            latex=r"\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V",
-                            explanation="Computes token-to-token attention weights scaled by the square root of key dimension d_k to prevent vanishing softmax gradients in high-dimensional projections.",
-                        ))
-                        pkg.add_formula(FormulaItem(
-                            formula_id="form_02",
-                            name="Multi-Head Attention",
-                            latex=r"\text{MultiHead}(Q, K, V) = \text{Concat}(\text{head}_1, \dots, \text{head}_h)W^O \quad \text{where} \quad \text{head}_i = \text{Attention}(QW_i^Q, KW_i^K, VW_i^V)",
-                            explanation="Projects queries, keys, and values h times with distinct learned linear projections, enabling simultaneous joint attendance to information across distinct representation subspaces.",
-                        ))
-                        pkg.add_formula(FormulaItem(
-                            formula_id="form_03",
-                            name="Sinusoidal Positional Encoding",
-                            latex=r"PE_{(pos, 2i)} = \sin\left(\frac{pos}{10000^{2i/d_{\text{model}}}}\right), \quad PE_{(pos, 2i+1)} = \cos\left(\frac{pos}{10000^{2i/d_{\text{model}}}}\right)",
-                            explanation="Injects sequence order. Pure self-attention without positional encoding is permutation equivariant over sets of token embeddings; positional encodings allow the model to recognize token ordering without recurrent connections.",
-                        ))
-
-            # Extract major subtopics from markdown headers if empty
-            if not pkg.topic.subtopics and "## " in clean_summary:
-                sections = re.split(r"\n##\s+", "\n" + clean_summary)
-                for s_idx, sec in enumerate(sections[1:5], start=1):
-                    lines = sec.strip().splitlines()
-                    if lines:
-                        s_title = lines[0].strip()
-                        s_body = " ".join(lines[1:4]).strip()[:350]
-                        sub = ResearchSubtopic(
-                            subtopic_id=f"sub_{s_idx:02d}",
-                            title=s_title,
-                            findings_summary=s_body or s_title,
-                        )
-                        pkg.topic.subtopics.append(sub)
-
-        # Determine deliverables directory
-        artifacts_dir = Path(__file__).resolve().parents[1] / "data" / "artifacts" / task_id
-        artifacts_dir.mkdir(parents=True, exist_ok=True)
-
-        # 1. Render formula assets if any exist without image paths
-        for f in pkg.formulas:
-            has_vis = any(v.metadata.get("formula_id") == f.formula_id for v in pkg.visuals)
-            if not has_vis:
-                f_path = artifacts_dir / f"eq_{f.formula_id}.png"
-                try:
-                    render_latex_formula(f.latex, str(f_path))
-                    vis = VisualAsset(
-                        asset_id=f"vis_formula_{f.formula_id}",
-                        asset_type="formula",
-                        title=f.name,
-                        caption=f.explanation or f.name,
-                        url_or_path=str(f_path),
-                        is_generated=True,
-                        metadata={"formula_id": f.formula_id},
-                    )
-                    pkg.add_visual(vis)
-                except Exception:
-                    pass
-
-        # 2. Render chart assets from data tables if no chart exists
-        has_chart = any(v.asset_type == "chart" for v in pkg.visuals)
-        if not has_chart and pkg.tables:
-            for tbl in pkg.tables[:1]:
-                c_path = artifacts_dir / f"chart_{tbl.table_id}.png"
-                try:
-                    generate_chart_from_table(tbl, str(c_path))
-                    vis = VisualAsset(
-                        asset_id=f"vis_chart_{tbl.table_id}",
-                        asset_type="chart",
-                        title=tbl.title,
-                        caption=tbl.caption or f"Statistical comparison for {tbl.title}",
-                        url_or_path=str(c_path),
-                        is_generated=True,
-                        metadata={"table_id": tbl.table_id},
-                    )
-                    pkg.add_visual(vis)
-                except Exception:
-                    pass
-
-        # 3. Render architecture block diagram if relevant topic and no diagram exists
-        has_diagram = any(v.asset_id == "vis_diagram_arch" for v in pkg.visuals)
-        if not has_diagram:
-            diag_path = artifacts_dir / "architecture_diagram.png"
-            try:
-                render_diagram_to_png(pkg.topic.title, str(diag_path))
-                vis = VisualAsset(
-                    asset_id="vis_diagram_arch",
-                    asset_type="diagram",
-                    title=f"{pkg.topic.title} Architecture",
-                    caption="Architectural flow and component breakdown",
-                    url_or_path=str(diag_path),
-                    is_generated=True,
-                )
-                pkg.add_visual(vis)
-            except Exception:
-                pass
-
-        # 4. Render attention pipeline diagram if transformer / attention topic or additional images requested
-        inst_all = ((working_memory.get("instruction") or "") + " " + (pkg.topic.objective or "")).lower()
-        has_att_diag = any(v.asset_id == "vis_diagram_attention" for v in pkg.visuals)
-        if not has_att_diag and ("attention" in inst_all or "transformer" in inst_all):
-            att_path = artifacts_dir / "attention_mechanism_diagram.png"
-            try:
-                render_attention_diagram_to_png(str(att_path))
-                vis = VisualAsset(
-                    asset_id="vis_diagram_attention",
-                    asset_type="diagram",
-                    title="Scaled Dot-Product Attention Pipeline",
-                    caption="Vector computation flow from Q, K, V projections through scaled dot-product and softmax weighting",
-                    url_or_path=str(att_path),
-                    is_generated=True,
-                )
-                pkg.add_visual(vis)
-            except Exception:
-                pass
-
-        # Pre-cache authentic remote visual assets securely
-        try:
-            from .research.visuals.image_pipeline import ensure_local_image_asset
-            for vis in pkg.visuals:
-                if vis.url_or_path and vis.url_or_path.startswith(("http://", "https://")):
-                    ensure_local_image_asset(vis, cache_dir=artifacts_dir / "images")
-        except Exception:
-            pass
-
-        # Determine requested deliverable formats (single or multiple)
-        raw_req_fmt = (working_memory.get("requested_format") or working_memory.get("deliverable_type") or "docx").lower().strip(" .")
-
-        canonical_format_map = {
-            "presentation": "pptx",
-            "slides": "pptx",
-            "slide_deck": "pptx",
-            "ppt": "pptx",
-            "powerpoint": "pptx",
-            "excel": "xlsx",
-            "spreadsheet": "xlsx",
-            "workbook": "xlsx",
-            "dataset": "xlsx",
-            "xls": "xlsx",
-            "word": "docx",
-            "doc": "docx",
-            "report": "docx",
-            "document": "docx",
-            "pdf": "pdf",
-            "csv": "csv",
-            "markdown": "markdown",
-            "md": "markdown",
-            "html": "html",
-            "htm": "html",
-            "webpage": "html",
-        }
-        req_fmt = canonical_format_map.get(raw_req_fmt, raw_req_fmt)
-
-        # Check if instruction requested multiple formats
-        inst_lower = (working_memory.get("instruction") or pkg.topic.objective or "").lower()
-        formats_to_render = [req_fmt]
-        if "multi" in raw_req_fmt or "multi-format" in inst_lower or ("markdown" in inst_lower and "html" in inst_lower and "csv" in inst_lower):
-            formats_to_render = ["markdown", "html", "csv"]
-        else:
-            formats_to_render = [canonical_format_map.get(f.lower().strip(" ."), f.lower().strip(" .")) for f in formats_to_render]
-
-        clean_slug = re.sub(r"[^a-zA-Z0-9_\-]", "_", pkg.topic.title.strip())[:40] or "Research_Report"
-        generated_artifacts = []
-
-        format_extensions = {
-            "docx": (".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
-            "doc": (".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
-            "word": (".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
-            "pdf": (".pdf", "application/pdf"),
-            "pptx": (".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
-            "presentation": (".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
-            "slides": (".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
-            "slide_deck": (".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
-            "ppt": (".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
-            "powerpoint": (".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
-            "xlsx": (".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-            "excel": (".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-            "spreadsheet": (".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-            "xls": (".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-            "csv": (".csv", "text/csv; charset=utf-8"),
-            "markdown": (".md", "text/markdown; charset=utf-8"),
-            "md": (".md", "text/markdown; charset=utf-8"),
-            "html": (".html", "text/html; charset=utf-8"),
-            "htm": (".html", "text/html; charset=utf-8"),
-        }
-
-        for fmt in formats_to_render:
-            canon_fmt = canonical_format_map.get(fmt, fmt)
-            ext, mime = format_extensions.get(canon_fmt, (".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"))
-            filename = f"{clean_slug}{ext}"
-            out_file = artifacts_dir / filename
-
-            render_artifact(
-                pkg,
-                canon_fmt,
-                str(out_file),
-                research_plan=working_memory.get("research_plan"),
-                instruction=working_memory.get("instruction") or pkg.topic.objective,
-                deliverable_type=working_memory.get("deliverable_type"),
-            )
-
-            file_size = out_file.stat().st_size if out_file.exists() else 0
-            art_record = {
-                "artifact_id": f"art_{task_id}_{canon_fmt}",
-                "task_id": task_id,
-                "conversation_id": conversation_id or "default",
-                "filename": filename,
-                "filepath": str(out_file),
-                "file_format": canon_fmt,
-                "mime_type": mime,
-                "file_size_bytes": file_size,
-                "title": f"{pkg.topic.title} ({canon_fmt.upper()})",
-                "summary": f"Autonomous research deliverable in {canon_fmt.upper()} format.",
-                "metadata": {
-                    "sources_count": len(pkg.sources),
-                    "claims_count": len(pkg.claims),
-                    "tables_count": len(pkg.tables),
-                    "visuals_count": len(pkg.visuals),
-                },
-            }
-            db.save_artifact(art_record)
-            generated_artifacts.append(art_record)
-
-        working_memory["artifacts"] = generated_artifacts
-        working_memory["research_knowledge_package"] = pkg.to_dict()
-        working_memory["research_stage"] = "completed"
-        try:
-            from . import db
-            db.save_research_package(pkg.to_dict(), conversation_id or "default", task_id, status="completed")
-        except Exception:
-            pass
-        return generated_artifacts[0] if generated_artifacts else None
-
-    except Exception:
-        return None
-
-
-def _finalize_research_summary(
-    task_id: str,
-    conversation_id: Optional[str],
-    working_memory: dict[str, Any],
-    summary_msg: Optional[str],
-) -> str:
-    """Attach a generated deliverable to a research completion summary.
-
-    Every successful research completion path must call this. Completion paths
-    that returned early (redundant final action, auto-complete after send) used
-    to bypass artifact rendering, so a requested DOCX/XLSX/PDF was never created.
-    """
-    summary = summary_msg or ""
-    if "Autonomous Website Discovery:" in summary:
-        pkg_data = working_memory.get("research_knowledge_package") or {}
-        topic = working_memory.get("research_topic") or (pkg_data.get("topic") or {}).get("title") or "Technical Research"
-        sources_cnt = len(pkg_data.get("sources") or {})
-        claims_cnt = len(pkg_data.get("claims") or {})
-        summary = (
-            f"Autonomous technical research on **{topic}** has completed across {sources_cnt or 'multiple'} authoritative web sources. "
-            f"Extracted and synthesized {claims_cnt or 'key'} verified findings, mathematical formulations, and platform architectural comparisons."
-        )
-    if not working_memory.get("is_research"):
-        return summary
-    pkg_data = working_memory.get("research_knowledge_package") or {}
-    if not (pkg_data.get("sources") or pkg_data.get("evidence") or pkg_data.get("tables")):
-        # A research package with no collected sources/evidence is not a
-        # completed research result. Never claim success or render an empty
-        # deliverable in that case.
-        return summary
-    primary_art = _finalize_research_artifacts(task_id, conversation_id, working_memory, summary)
-    if not primary_art:
-        return summary
-    art_msg = (
-        f"\n\n📄 **Deliverable Ready:** [{primary_art['filename']}] "
-        f"({primary_art['file_format'].upper()}, {primary_art['file_size_bytes'] / 1024:.1f} KB). "
-        "Available for download."
-    )
-    return f"{summary}{art_msg}"
+        _takeover_wait_events.pop(task_id, None)
 
 
 async def _run_loop(
@@ -672,21 +247,51 @@ async def _run_loop(
     on_progress: Optional[Callable[..., None]],
     confirm_gate: Optional[Any],
     confirm_timeout_s: float,
+    takeover_gate: Optional[Any] = None,
+    takeover_timeout_s: float = 600.0,
     on_metrics: Optional[Callable[[dict[str, Any]], None]] = None,
     initial_memory: Optional[dict[str, Any]] = None,
     session_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
+    allowed_domains: Optional[list[str]] = None,
+    max_steps: Optional[int] = None,
+    long_horizon: bool = False,
+    timings: Optional[LoopTimings] = None,
 ) -> dict[str, Any]:
+    # Task 4 (latency): pay the loop's one-time per-process costs now —
+    # Fernet key derivation + the redaction modules' first imports —
+    # before the first step, so step 1 does not look ~200 ms slower
+    # than every later step. Best-effort and ~0 ms once warm; a failure
+    # just means the first step pays the cost as before.
+    warm_loop_caches()
     history: list[dict[str, Any]] = []
     if initial_memory and initial_memory.get("prior_checkpoint_history"):
         history = list(initial_memory["prior_checkpoint_history"])
     penalties: list[str] = []
     working_memory: dict[str, Any] = initial_memory if initial_memory is not None else {}
+    # Task 9: step budget. A long-horizon task gets MAX_LONG_STEPS
+    # (100) with compaction; everything else gets MAX_STEPS (50).
+    # An explicit max_steps (tests / scheduler) wins over both.
+    effective_max_steps = max_steps if max_steps is not None else (MAX_LONG_STEPS if long_horizon else MAX_STEPS)
+    working_memory["long_horizon"] = bool(long_horizon)
+    working_memory["max_steps"] = effective_max_steps
+    # REVIEW (Task 9 audit): the instruction must be in the checkpoint
+    # or a resumed task loses it. main._require restores a task from
+    # SQLite as "interrupted" and reads the instruction from the
+    # checkpoint's working memory — but the loop never stored it there
+    # (only save_cancel_checkpoint did), so a task interrupted by a
+    # backend restart resumed with instruction "Task" and planned
+    # nonsense. setdefault: a restored checkpoint's instruction wins
+    # when one is already present.
+    working_memory.setdefault("instruction", instruction)
+    # Task 3: the effective allow-list travels in working memory so the
+    # planner providers can state it in the prompt (build_prompt) and the
+    # loop can enforce it in code. None = not configured (allow all,
+    # warned at task creation).
+    effective_domains = allowed_domains if allowed_domains is not None else None
+    if effective_domains is not None:
+        working_memory["allowed_domains"] = list(effective_domains)
 
-    def _ret(d: dict[str, Any]) -> dict[str, Any]:
-        if "working_memory" not in d:
-            d["working_memory"] = working_memory
-        return d
     # Give plan validation the session's pinned primary tab so close_tab on it
     # can be rejected deterministically.
     if session_id and "primary_tab_id" not in working_memory:
@@ -697,6 +302,13 @@ async def _run_loop(
                 working_memory["primary_tab_id"] = sess0.primary_tab_id
         except Exception:
             pass
+    # Task 9: seed the tab registry with the primary tab so the
+    # planner's OPEN TABS list is never empty and switch_tab has
+    # something to validate against.
+    if working_memory.get("primary_tab_id") is not None and not working_memory.get("tabs"):
+        _register_tab_in_memory(
+            working_memory, int(working_memory["primary_tab_id"]), url="", title="primary", active=True
+        )
     try:
         from .extractors.research import init_multi_site_tracker
         ms_tracker = init_multi_site_tracker(instruction, working_memory.get("multi_site_research"))
@@ -726,6 +338,39 @@ async def _run_loop(
     cached_obs: Any = None
     last_digest: Optional[str] = None
     zero_change_repeats = 0
+    # Task 11: latency instrumentation, observation cache, batching.
+    # ``timings`` is created by run_with_injection (and attached to the
+    # result); a direct _run_loop caller gets a fresh one.
+    if timings is None:
+        timings = LoopTimings()
+    obs_cache = ObservationCache()
+    # Last observed tab+URL, for cache lookups. Updated whenever an
+    # observation is stored; reset when the active surface changes
+    # out from under the cache (tab switch/close).
+    last_obs_url: str = ""
+    last_obs_tab_id: Optional[int] = None
+    # Pinned batch (Task 11): the remaining steps of an already
+    # validated plan, with the observation + AX tree they were built
+    # from. Consumed (set to None) at the top of the next iteration,
+    # so any mid-iteration ``continue`` re-plans instead of resuming
+    # a stale batch.
+    pending_batch: Optional[dict[str, Any]] = None
+    # The AX tree + valid refs + URL of the observation the current
+    # plan was built from. Built once per plan, not once per step.
+    plan_tree: Any = None
+    plan_refs: Optional[set[str]] = None
+    plan_url: str = ""
+    # REVIEW (Task 11 audit): the DOM fingerprint of the observation
+    # the current plan was built from. The batch gate compares the
+    # post-action observation against it — a type step can mutate the
+    # DOM (autocomplete, validation, dynamic content) without changing
+    # the URL, and a batch pinned to the stale tree would execute on
+    # elements the planner never saw. None until a plan is built.
+    plan_fingerprint: Optional[str] = None
+    # Task 7: stale element refs. A ref that no longer resolves against
+    # the current observation gets ONE re-observe + replan; a second
+    # stale ref in a row fails honestly instead of looping forever.
+    grounding_stale_retries = 0
     url_history: list[str] = []
     last_site_name: Optional[str] = None
 
@@ -745,34 +390,288 @@ async def _run_loop(
 
     def metrics(phase: str, started: float) -> None:
         """Report one phase's wall time. Never lets telemetry break the loop."""
+        ms = phase_ms(started)
+        try:
+            # Task 11: "act" is the execution phase; the timings
+            # record keeps the "execute" name for readability.
+            timings.record({"act": "execute"}.get(phase, phase), ms)
+        except Exception:
+            pass
         if not on_metrics:
             return
         try:
-            on_metrics({"phase": phase, "ms": int((time.perf_counter() - started) * 1000)})
+            on_metrics({"phase": phase, "ms": ms})
         except Exception:
             pass
 
-    while steps_done < MAX_STEPS:
+    # -- Task 4: takeover state -------------------------------------------
+    # The first observation after a completed takeover carries no
+    # screenshot: the operator may have left a password, card, or OTP
+    # visible on screen, and a screenshot would send it to the planner.
+    post_takeover_no_screenshot = False
+    suppress_step_screenshot = False
+
+    async def _enter_takeover(trigger: Any) -> str:
+        """Enter takeover for *trigger*.
+
+        Returns ``"completed"`` (operator finished, resume the loop),
+        ``"already_done"`` (this surface was already taken over once —
+        proceed without taking over again), ``"exhausted"`` (the task
+        already used its takeover budget on new surfaces), ``"no_gate"``
+        (no takeover gate exists — fail closed), ``"rejected"`` or
+        ``"timeout"``. On entry the cached observation is discarded
+        and the extension is told to stop observing/screenshotting.
+        """
+        nonlocal cached_obs, last_digest, post_takeover_no_screenshot
+        completed_keys: list[str] = working_memory.setdefault("takeover_completed", [])
+        count = int(working_memory.get("takeover_count", 0))
+        if trigger.key in completed_keys:
+            return "already_done"
+        if count >= config.MAX_TAKEOVERS_PER_TASK:
+            return "exhausted"
+        if takeover_gate is None:
+            return "no_gate"
+        cached_obs = None
+        last_digest = None
+        # Task 11: the operator is about to act in the browser — the
+        # cached observation is for a page that is about to change.
+        obs_cache.invalidate()
+        await _notify_extension_takeover(ext_hub, task_id, True)
+        # Task 10: audit — takeover start (kind + reason only; the
+        # reason names the surface, never its contents).
+        try:
+            from .audit import append_event as _audit_event
+
+            _audit_event("takeover_started", f"takeover started: {trigger.kind}",
+                         actor="system", task_id=task_id)
+        except Exception:
+            pass
+        progress(f"Takeover: {trigger.reason}")
+        takeover_started = time.perf_counter()
+        outcome = await _await_takeover(takeover_gate, task_id, trigger, takeover_timeout_s)
+        metrics("takeover_wait", takeover_started)
+        await _notify_extension_takeover(ext_hub, task_id, False)
+        # Task 10: audit — takeover end with the outcome.
+        try:
+            from .audit import append_event as _audit_event2
+
+            _audit_event2("takeover_ended", f"takeover ended: {outcome} ({trigger.kind})",
+                          actor="system", task_id=task_id)
+        except Exception:
+            pass
+        if outcome == "completed":
+            working_memory["takeover_count"] = count + 1
+            completed_keys.append(trigger.key)
+            post_takeover_no_screenshot = True
+        return outcome
+
+    def _takeover_failure_summary(outcome: str, trigger: Any) -> str:
+        """Honest failure message for a takeover that did not complete.
+
+        Returns only the message — the call sites build the dict literal
+        themselves, because the verifier-honesty test requires every
+        ``_run_loop`` return to be a dict literal carrying ``history``.
+        """
+        if outcome == "exhausted":
+            return (
+                f"Task incomplete: the task already used its takeover budget "
+                f"({config.MAX_TAKEOVERS_PER_TASK} takeovers) and a new "
+                f"{trigger.kind} surface appeared — stopping instead of "
+                f"looping on manual steps."
+            )
+        if outcome == "no_gate":
+            return (
+                f"Task incomplete: a {trigger.kind} step requires takeover, "
+                f"but no takeover gate is available — failing closed instead "
+                f"of typing credentials or a one-time code."
+            )
+        if outcome == "timeout":
+            return (
+                f"Task incomplete: takeover timed out after "
+                f"{int(takeover_timeout_s)}s — the operator did not finish "
+                f"the {trigger.kind} step, so the task stopped. Nothing was "
+                f"typed or submitted during takeover."
+            )
+        # rejected (including a cancel during takeover)
+        return (
+            f"Task stopped: the operator cancelled the {trigger.kind} "
+            f"takeover before any credential or payment step."
+        )
+
+    while steps_done < effective_max_steps:
         pause_event = _pause_events.get(task_id)
         if pause_event is not None and not pause_event.is_set():
             pause_started = time.monotonic()
             await pause_event.wait()
             start += time.monotonic() - pause_started
+            # Task 11: the operator may have acted in the browser
+            # while paused — the cached observation is untrusted now.
+            obs_cache.invalidate()
         if is_cancelled(task_id):
             return {"final": "cancelled", "steps": steps_done, "summary": None, "history": history}
         if time.monotonic() - start > TASK_TIMEOUT_S:
             return {"final": "budget_exceeded", "steps": steps_done, "summary": "timeout", "history": history}
 
-        if cached_obs is not None:
+        # Task 11: batch continuation reuses the pinned plan (no new
+        # observation, no new planner call); anything else re-plans
+        # from a fresh observation.
+        timings.begin_step()
+        batch_ctx = pending_batch
+        pending_batch = None
+        batch_continuation = False
+        # Task 12: reset per iteration — see the confirmation block
+        # below, which sets it only for the step just approved.
+        step_only_approval = False
+        if batch_ctx is not None and batch_ctx.get("steps"):
+            steps = batch_ctx["steps"]
+            payload = batch_ctx["payload"]
+            raw_obs = batch_ctx["raw_obs"]
+            plan_tree = batch_ctx["tree"]
+            plan_refs = batch_ctx["refs"]
+            plan_url = batch_ctx["url"]
+            # REVIEW (Task 11 audit): the fingerprint of the plan
+            # observation rides along with the pinned batch, so the
+            # gate at the end of the iteration can tell whether the
+            # page still looks like the one the plan was built from.
+            plan_fingerprint = batch_ctx.get("fingerprint")
+            batch_continuation = True
+            timings.note_cache("n/a")
+        elif cached_obs is not None:
             raw_obs = cached_obs
             cached_obs = None
+            timings.note_cache("n/a")
         else:
-            observe_started = time.perf_counter()
-            _maybe = obs_factory()
-            raw_obs = await _maybe if asyncio.iscoroutine(_maybe) else _maybe
-            metrics("observe", observe_started)
+            cached = obs_cache.lookup(last_obs_url, last_obs_tab_id)
+            if cached is not None:
+                # No action executed since this observation was stored,
+                # so the page cannot have changed because of the agent
+                # — reuse it without a round trip. It is still
+                # re-redacted below, exactly like the loop's existing
+                # post-action observation reuse.
+                raw_obs = cached
+                timings.note_cache("hit")
+            else:
+                observe_started = time.perf_counter()
+                _maybe = obs_factory()
+                raw_obs = await _maybe if asyncio.iscoroutine(_maybe) else _maybe
+                metrics("observe", observe_started)
+                timings.note_observation_call()
+                timings.note_cache("miss")
+                # If the cache held an entry for this tab+URL with a
+                # different fingerprint, the page changed while the
+                # cache was invalid — the miss was necessary.
+                if obs_cache.has_entry_for(observation_url(raw_obs), observation_tab_id(raw_obs)) and not obs_cache.check_fresh(raw_obs):
+                    timings.note_stale_detected()
+                obs_cache.store(raw_obs)
+                last_obs_url = observation_url(raw_obs)
+                last_obs_tab_id = observation_tab_id(raw_obs)
+        # Tab registry sync: the tab the loop is OBSERVING is ground
+        # truth for "a tab this task owns". The registry previously
+        # only learned about tabs from `new_tab` actions that returned
+        # an observation tabId — a tab opened any other way (a click
+        # on a link that opens a new tab, a PDF opened in a new tab)
+        # never registered, so the next select_tab to it was rejected
+        # as "unknown tab" even though the planner had learned the id
+        # from the observation itself (live Flipkart run 2026-11-18:
+        # product page opened in a new tab, then "unknown tab" on the
+        # switch). Register the observed tab here, every iteration,
+        # idempotently; the gate below still rejects tabs the task has
+        # never observed, so the operator's personal tabs stay out of
+        # reach. Membership only — the active marker is NOT touched
+        # here: it is owned by the post-action sync (a new_tab /
+        # switch moves it), and stealing it on every observation
+        # would mark the last-observed tab active even when the task
+        # just switched elsewhere. The session's child registry is
+        # synced the same way so the persisted session record matches.
+        _observed_tab_id = observation_tab_id(raw_obs)
+        if _observed_tab_id is not None:
+            try:
+                _register_tab_in_memory(
+                    working_memory, int(_observed_tab_id),
+                    url=observation_url(raw_obs) or "",
+                )
+            except (TypeError, ValueError):
+                pass
+            if session_id:
+                try:
+                    from .session_manager import session_manager
+                    _sess = session_manager.get_session(session_id)
+                    if _sess and int(_observed_tab_id) != _sess.primary_tab_id:
+                        session_manager.register_child_tab(session_id, int(_observed_tab_id))
+                except Exception:
+                    pass
+            # Prune closed tabs: the observation carries the task's
+            # open tabs (``tabs``). A tab the operator closed is gone
+            # from that list but would otherwise stay in the registry
+            # as a zombie the select_tab gate lets through. Only a
+            # fresh snapshot prunes (non-empty, containing the
+            # observed tab); a missing list prunes nothing. The
+            # primary tab is never pruned here.
+            try:
+                _obs_tabs = raw_obs.get("tabs") if isinstance(raw_obs, dict) else getattr(raw_obs, "tabs", None)
+            except Exception:
+                _obs_tabs = None
+            if isinstance(_obs_tabs, list) and _obs_tabs:
+                _open_ids: list[int] = []
+                for _t in _obs_tabs:
+                    if isinstance(_t, dict):
+                        _tid = _t.get("tabId", _t.get("tab_id"))
+                        if isinstance(_tid, int):
+                            _open_ids.append(_tid)
+                if int(_observed_tab_id) in _open_ids:
+                    _pruned = _prune_tabs_not_in_observation(
+                        working_memory, _open_ids,
+                        observed_tab_id=int(_observed_tab_id),
+                        primary_tab_id=working_memory.get("primary_tab_id"),
+                    )
+                    if _pruned and session_id:
+                        try:
+                            from .session_manager import session_manager
+                            for _pid in _pruned:
+                                session_manager.unregister_child_tab(session_id, int(_pid))
+                        except Exception:
+                            pass
         try:
-            payload, _decision = classify_and_redact(_to_obs(raw_obs), instruction=instruction)
+            if batch_continuation:
+                # The pinned payload is already redacted; re-running
+                # redaction would be pure overhead.
+                pass
+            else:
+                redact_started = time.perf_counter()
+                payload, _decision = classify_and_redact(_to_obs(raw_obs), instruction=instruction)
+                metrics("redact", redact_started)
+            if post_takeover_no_screenshot:
+                # Task 4: the first observation after takeover must not
+                # carry a screenshot — the operator may have left a
+                # password, card, or OTP visible on screen. The
+                # redacted payload is the planner's view; the raw
+                # screenshot is dropped from the UI frame as well, and
+                # the step's own screenshot is suppressed below.
+                payload.screenshot = None
+                post_takeover_no_screenshot = False
+                suppress_step_screenshot = True
+                if isinstance(raw_obs, dict):
+                    raw_obs["screenshot"] = None
+                else:
+                    try:
+                        raw_obs.screenshot = None
+                    except Exception:
+                        pass
+            else:
+                # Task 10: zero retention — no screenshot ever reaches
+                # the planner, so a rendered page (which may show a
+                # password, card, or OTP the DOM redactor never saw)
+                # is never sent to a provider or persisted.
+                try:
+                    from .zero_retention import is_enabled as _zr_enabled
+
+                    if _zr_enabled():
+                        from .zero_retention import strip_screenshot as _zr_strip
+
+                        _zr_strip(payload, raw_obs)
+                        suppress_step_screenshot = True
+                except Exception:
+                    pass
             progress("", observation=raw_obs)
         except PrivacyViolation:
             return {"final": "failed", "steps": steps_done, "summary": "privacy violation — payload not sent", "history": history}
@@ -794,10 +693,99 @@ async def _run_loop(
             or (raw_obs.get("readable_text") if isinstance(raw_obs, dict) else "")
             or ""
         )
-        if raw_url and raw_text:
+        # Product image the page declares via og:image. The extension
+        # sends it as camelCase "ogImage" in the raw dict (or as the
+        # og_image attribute on a validated BrowserObservation); the
+        # extractor re-validates it before it reaches any fact.
+        raw_image = str(
+            getattr(raw_obs, "og_image", None)
+            or (raw_obs.get("ogImage") if isinstance(raw_obs, dict) else "")
+            or ""
+        )
+        # -- Task 14: standards state for this observation ----------------
+        # WebMCP tools ride the redacted payload (validated at
+        # redaction time); the UCP profile is fetched here — same
+        # origin only, egress-gated, cached per host for the task —
+        # and both land in working_memory so validation and the prompt
+        # can see them. The planner never sees a profile the loop did
+        # not fetch and validate itself. This sits AFTER raw_url is
+        # computed: the stash needs the current page's origin, and on
+        # the first iteration raw_url does not exist yet above.
+        if not batch_continuation:
+            # WebMCP tools: always stashed (a UCP fetch failure below
+            # must never drop them — the two are independent).
+            try:
+                working_memory["webmcp_tools"] = list(getattr(payload, "webmcp_tools", None) or [])
+                working_memory["webmcp_origin"] = _origin_of(raw_url)
+            except Exception:
+                working_memory["webmcp_tools"] = []
+                working_memory["webmcp_origin"] = ""
+            # UCP profile: fetched per origin, cached for the task. A
+            # missing profile URL means the merchant has no UCP
+            # checkout. A FAILED fetch is different: the merchant
+            # declared a profile URL but it could not be read (DNS,
+            # egress, HTTP, invalid JSON) — record the reason instead
+            # of silently treating it as "no UCP checkout".
+            try:
+                _page_origin = _origin_of(raw_url)
+                _ucp_url = getattr(payload, "ucp_profile_url", None)
+                if _ucp_url and _origin_of(_ucp_url) == _page_origin:
+                    _ucp_cache = working_memory.setdefault("ucp_profiles", {})
+                    if _page_origin not in _ucp_cache:
+                        from .ucp import fetch_ucp_profile
+
+                        _fetched = await asyncio.to_thread(
+                            fetch_ucp_profile, _page_origin
+                        )
+                        # Cache the plain-dict form, not the UCPProfile
+                        # object: working_memory is checkpointed as JSON,
+                        # and a dataclass would break serialization.
+                        _ucp_cache[_page_origin] = (
+                            _fetched.to_dict() if _fetched is not None else None
+                        )
+                    _prof = _ucp_cache.get(_page_origin)
+                    payload.ucp_profile = _prof
+                    working_memory["ucp_profile"] = _prof
+                    working_memory["ucp_profile_error"] = None
+                    payload.ucp_profile_error = None
+                else:
+                    working_memory["ucp_profile"] = None
+                    working_memory["ucp_profile_error"] = None
+                    payload.ucp_profile_error = None
+            except Exception as exc:
+                working_memory["ucp_profile"] = None
+                working_memory["ucp_profile_error"] = str(exc)[:200] or "UCP profile fetch failed"
+                payload.ucp_profile_error = working_memory["ucp_profile_error"]
+        # -- Task 4: takeover detection -----------------------------------
+        # A login / payment / OTP / CAPTCHA surface must never be planned
+        # on: the observation that detected it is the last one the agent
+        # sees until the operator finishes the step themselves. The
+        # planner is not called on this round at all.
+        _trigger = detect_takeover_trigger(raw_url, payload.interactive, raw_text)
+        # Takeover needs a gate. Production (run_task) always wires one;
+        # a caller without one (e.g. a harness driving only the
+        # confirmation gate) keeps the pre-Task 4 behaviour: the planner
+        # plans on, and the confirmation gate halts consequential
+        # actions. Failing closed here would break that legitimate flow.
+        # Task 11: a pinned batch step plans from the same observation
+        # this check already ran on — re-running it cannot fire.
+        if not batch_continuation and _trigger is not None and takeover_gate is not None:
+            _outcome = await _enter_takeover(_trigger)
+            if _outcome == "completed":
+                continue
+            if _outcome == "already_done":
+                pass  # already taken over once for this surface: proceed
+            elif is_cancelled(task_id):
+                return {"final": "cancelled", "steps": steps_done, "summary": None, "history": history}
+            else:
+                _save_checkpoint_defensive(task_id, conversation_id, session_id, steps_done, "", history, working_memory)
+                return {"final": "failed", "steps": steps_done, "summary": _takeover_failure_summary(_outcome, _trigger), "history": history}
+        # Task 11: a pinned batch step reads the same observation the
+        # research extraction already ran on — nothing new to harvest.
+        if not batch_continuation and raw_url and raw_text:
             try:
                 from .extractors.research import extract_page_research, update_multi_site_tracker
-                fact = extract_page_research(raw_url, raw_title, raw_text)
+                fact = extract_page_research(raw_url, raw_title, raw_text, image_url=raw_image or None)
                 if fact:
                     if "collected_research" not in working_memory:
                         working_memory["collected_research"] = {}
@@ -847,7 +835,16 @@ async def _run_loop(
 
         plan_deadline = time.monotonic() + PLANNER_TIMEOUT_S
         MAX_PLAN_RETRIES = 2
-        for plan_attempt in range(MAX_PLAN_RETRIES):
+        # The attempt loop covers the transient budget too: non-transient
+        # errors still stop after MAX_PLAN_RETRIES (the fail check
+        # below), transient ones get MAX_TRANSIENT_PLAN_RETRIES.
+        for plan_attempt in range(max(MAX_PLAN_RETRIES, MAX_TRANSIENT_PLAN_RETRIES)):
+            if batch_continuation:
+                # Task 11: no planner call — execute the next step of
+                # the already-validated plan. The stub keeps the shared
+                # post-plan code (notes, completion paths) working.
+                raw_plan = {"goal": instruction, "steps": steps}
+                break
             time_left = plan_deadline - time.monotonic()
             if time_left <= 0 and plan_attempt > 0:
                 _save_checkpoint_defensive(task_id, conversation_id, session_id, steps_done, raw_url, history, working_memory)
@@ -857,6 +854,7 @@ async def _run_loop(
                     "summary": f"Planner timed out: shared planning deadline ({int(PLANNER_TIMEOUT_S)}s) expired (step {steps_done} state preserved).", "history": history,
                 }
             try:
+                timings.note_planner_call()
                 raw_plan = await asyncio.wait_for(
                     loop.run_in_executor(
                         planner_executor,
@@ -866,6 +864,7 @@ async def _run_loop(
                         payload_dict,
                         h_view,
                         working_memory,
+                        plan_deadline,
                     ),
                     timeout=max(0.001, time_left),
                 )
@@ -902,18 +901,44 @@ async def _run_loop(
                 except Exception:
                     pass
 
+                # Transient network/DNS blips (the gateway unreachable)
+                # earn more attempts with a growing backoff (2s, 5s,
+                # 10s): the old 2-attempt / 1.5s loop killed a live
+                # price hunt on a DNS blip that lasted a few seconds.
+                # Auth, quota and plan-shape failures keep the old
+                # fast-fail behaviour.
+                is_transient = is_transient_planner_error(err_text)
+                limit = MAX_TRANSIENT_PLAN_RETRIES if is_transient else MAX_PLAN_RETRIES
+
                 # If cooldown is long (> 3.0s) or explicitly in quota exhaustion, do not repeatedly call providers still in cooldown
                 is_long_cooldown = retry_s > 3.0 or "quota exhausted" in err_text or "1m" in err_text
-                if is_long_cooldown or plan_attempt + 1 >= MAX_PLAN_RETRIES:
+                if is_long_cooldown or plan_attempt + 1 >= limit:
                     _save_checkpoint_defensive(task_id, conversation_id, session_id, steps_done, raw_url, history, working_memory)
+                    # Error attribution: name the failing hop. A
+                    # planner-call failure says nothing about the
+                    # requested sites — no browser navigation was
+                    # attempted in this step, so the sites were never
+                    # tested and must not be blamed for it.
+                    suffix = (
+                        " The planner call itself failed (the model gateway could not be reached); "
+                        "this says nothing about the requested sites, which were not tested."
+                        if is_transient else ""
+                    )
                     return {
                         "final": "failed",
                         "steps": steps_done,
-                        "summary": f"Planner unavailable: {redact_text_urls(err_text)[:400]} (step {steps_done} state preserved).", "history": history,
+                        "summary": f"Planner unavailable: {redact_text_urls(err_text)[:400]} (step {steps_done} state preserved).{suffix}", "history": history,
                     }
 
-                wait_time = max(retry_s + 0.5, 1.5)
-                progress(f"Provider unavailable; retrying ({plan_attempt + 1}/{MAX_PLAN_RETRIES})...")
+                if is_transient:
+                    wait_time = max(retry_s + 0.5, transient_plan_backoff_s(plan_attempt))
+                else:
+                    wait_time = max(retry_s + 0.5, 1.5)
+                # Never sleep past the shared planning deadline: the
+                # next iteration reports the timeout instead.
+                time_left = plan_deadline - time.monotonic()
+                wait_time = min(wait_time, max(0.0, time_left))
+                progress(f"Provider unavailable; retrying ({plan_attempt + 1}/{limit})...")
                 await asyncio.sleep(wait_time)
                 continue
             finally:
@@ -1015,6 +1040,17 @@ async def _run_loop(
                         comp_table = format_comparison_table(ms_tracker, instruction)
                         if comp_table and "Price & Availability Comparison" not in summary_msg:
                             summary_msg = f"{summary_msg}\n\n{comp_table}" if summary_msg else comp_table
+                        # Fix 5: after a comparison with verified
+                        # listings finishes, proactively offer the
+                        # alert (live case: the Fit3 verdict never
+                        # asked "do you want me to alert you?", so
+                        # the user never reached the daily digest).
+                        # No offer when nothing was verified — the
+                        # verifier already fails that turn honestly.
+                        from .continuous_monitoring_companion import ALERT_OFFER_MARKER, ALERT_OFFER_TEXT
+                        from .extractors.research import get_completed_sites
+                        if get_completed_sites(ms_tracker) and ALERT_OFFER_MARKER not in summary_msg:
+                            summary_msg = f"{summary_msg}\n\n{ALERT_OFFER_TEXT}" if summary_msg else ALERT_OFFER_TEXT
                 except Exception:
                     pass
             if not steps:
@@ -1162,6 +1198,24 @@ async def _run_loop(
                     return {"final": "completed", "steps": steps_done, "summary": summary_msg,
                             "history": history, "url": raw_url, "last_obs": raw_obs, "working_memory": working_memory}
 
+        if not batch_continuation and isinstance(steps, list):
+            # Task 11: build the AX tree once per plan (not once per
+            # step — the validator already built it once more).
+            # NOTE: the plan is deliberately NOT trimmed to its batch
+            # prefix here. The Requirement 8 dedup below and the
+            # checker both need the FULL plan: a redundant steps[0]
+            # must be skippable in favour of steps[1], and a flag on
+            # any step must block the whole plan. The trim happens
+            # just before execution, once `first` is final.
+            plan_tree, plan_refs = _plan_tree_and_refs(payload)
+            plan_url = raw_url
+            # REVIEW (Task 11 audit): fingerprint the observation the
+            # plan was built from, for the batch gate below. The raw
+            # observation is fingerprinted (not the redacted payload):
+            # the post-action observation the gate compares against is
+            # raw too, so the two are computed over the same shape.
+            plan_fingerprint = observation_fingerprint(raw_obs)
+
         first = steps[0] if isinstance(steps, list) else None
         action = first.get("action") if isinstance(first, dict) else None
         if not isinstance(action, dict) or not action.get("type"):
@@ -1303,25 +1357,218 @@ async def _run_loop(
                 if consecutive_repeats >= 1:
                     penalties.append(f"loop warning: action '{action.get('type')}' was already completed. Do not repeat it; proceed to next step or conclude.")
 
-        # Ground ambiguous planner labels against this *redacted* observation.
-        # A semantic match supplies a fresh target ID and a spatial fallback;
-        # no match leaves the executor to report STALE_TARGET honestly.
+        # Repeated-failure loop detection: the checks above only run
+        # when the last step SUCCEEDED, so a planner that keeps
+        # re-emitting an action that FAILS with the same error was
+        # never stopped — it burned the whole step budget one failure
+        # at a time (live Flipkart run 2026-11-17: 38 identical
+        # popup-close clicks, each STALE_TARGET as the page
+        # re-rendered). Count trailing failures of this same action
+        # with this same error; three in a row stops the task, one
+        # earns a warning penalty — mirroring the success-path
+        # thresholds above. Runs on every iteration, regardless of
+        # the last step's outcome. Errors are compared by normalized
+        # cause, not raw text: the extension embeds the changing
+        # target (refs, ids, coords) in the message, so two failures
+        # with the same cause never share a raw string.
+        failed_repeats = 0
+        if history and history[-1].get("result_ok") is False and history[-1].get("error"):
+            _last_err = history[-1].get("error")
+            _last_key = _normalize_loop_error(_last_err)
+            if _last_key:
+                for _h in reversed(history):
+                    if (
+                        _h.get("result_ok") is False
+                        and _actions_match(_h.get("action", {}), action)
+                        and _normalize_loop_error(_h.get("error")) == _last_key
+                    ):
+                        failed_repeats += 1
+                    else:
+                        break
+            if failed_repeats >= 3:
+                return {
+                    "final": "budget_exceeded",
+                    "steps": steps_done,
+                    "summary": (
+                        f"Loop detected: action '{action.get('type')}' failed "
+                        f"{failed_repeats} times in a row with the same error "
+                        f"({_last_err}); stopping instead of repeating it."
+                    ),
+                    "history": history,
+                }
+            if failed_repeats >= 1:
+                penalties.append(
+                    f"Repeated failure warning: action '{action.get('type')}' already "
+                    f"failed {failed_repeats} time(s) with the same error ({_last_err}). "
+                    "Do not repeat it without a new target or strategy; conclude if "
+                    "the goal cannot be reached."
+                )
+
+        # Task 7: resolve element refs against this *redacted*
+        # observation before anything executes. A ref the planner quoted
+        # is looked up in the current accessibility tree; a match pins
+        # the live target id and a coordinate fallback. A ref that is
+        # gone (or whose element changed role/name) is stale: re-observe
+        # once and replan on the fresh tree; a second stale ref in a row
+        # fails honestly with "element no longer found" instead of
+        # clicking whatever now sits at those coordinates. Actions
+        # without a ref keep the legacy name-based semantic match below.
+        # Ground ambiguous planner labels against this *redacted*
+        # observation. A semantic match supplies a fresh target ID and a
+        # spatial fallback; no match leaves the executor to report
+        # STALE_TARGET honestly.
+        _verified_ref: str | None = None
+        _verified_node = None
         if action and action.get("type") in ("click", "type", "select_option", "set_date", "upload_file"):
             target = action.get("target") or {}
             if isinstance(target, dict):
-                from .observation import match_semantic_target
-                matched = match_semantic_target(
-                    payload.interactive, target_id=target.get("targetId") or "",
-                    name=target.get("name") or "", role=target.get("role") or "",
-                    expected_bounds=target.get("expectedBounds"))
-                if matched:
+                _ref = target.get("elementRef") or target.get("element_ref")
+                if _ref:
+                    from .grounding import node_center as _node_center
+
+                    # Task 11: reuse the tree built once per plan above,
+                    # falling back to a fresh build only when the plan
+                    # came from a path that never built one.
+                    _tree = plan_tree
+                    if _tree is None:
+                        _tree, _built_refs = _plan_tree_and_refs(payload)
+                        plan_tree = _tree
+                        plan_refs = _built_refs
+                        # REVIEW (Task 11 audit): keep the fingerprint
+                        # in step — a batch pinned from this path still
+                        # needs a baseline to compare the DOM against.
+                        if plan_fingerprint is None:
+                            plan_fingerprint = observation_fingerprint(raw_obs)
+                    # Task 13: freshness is real now. The old code
+                    # compared the node against the tree it was resolved
+                    # from, so "changed" was unreachable — a node always
+                    # matches its own tree (the Task 7 design flaw the
+                    # Moodle-fix review found). The fresh tree comes
+                    # from the FRESHEST observation we hold: in a batch
+                    # continuation that is the post-action observation
+                    # (cached_obs — still in memory because the batch
+                    # branch took precedence over the cached_obs branch
+                    # at iteration top, so no round trip), built through
+                    # the same redaction pipeline as the plan-time tree
+                    # so a difference is a real page change, not a
+                    # redaction artifact. Outside a batch there is no
+                    # fresher observation than the plan-time one — the
+                    # verdict is trivially "ok", and the post-wait
+                    # re-verification below covers the window where the
+                    # page can move (confirmation / pause).
+                    _fresh_tree = None
+                    # REVIEW (Task 13 audit): a fresh tree that could
+                    # not be built is "cannot verify", NOT "ok".
+                    # ref_freshness returns "ok" when no fresh tree is
+                    # given, which is correct for a single step (there
+                    # is no fresher observation than the plan-time
+                    # one), but in a batch continuation we DID have a
+                    # fresher observation and redaction failed on it.
+                    # Executing the pinned step anyway would run blind
+                    # on the plan-time tree — the exact failure the
+                    # post-wait path (below) refuses. Track it and end
+                    # the batch on the shared one-retry counter.
+                    _fresh_unavailable = False
+                    if batch_ctx is not None and cached_obs is not None:
+                        _built = fresh_tree_for_observation(cached_obs, instruction)
+                        if _built is not None:
+                            _fresh_tree = _built[0]
+                        else:
+                            _fresh_unavailable = True
+                    _fresh, _node, _plan_node = ref_freshness(_tree, str(_ref), _fresh_tree)
+                    _verified_ref = str(_ref)
+                    _verified_node = _plan_node
+                    # A changed element inside a batch ends the batch:
+                    # the pinned plan was built from a moved page, so
+                    # re-observe and replan rather than execute it.
+                    # It takes the same one-retry-then-fail path as a
+                    # stale ref. Task 11's fingerprint gate already ends
+                    # the batch on a coarse DOM change; this adds the
+                    # per-ref name/role/target-id check the fingerprint
+                    # misses (same count/ids, different name/role) — the
+                    # two must agree, and both end the batch.
+                    _batch_changed = batch_ctx is not None and _fresh == "changed"
+                    if _node is None or _fresh == "stale" or _batch_changed or _fresh_unavailable:
+                        if grounding_stale_retries < 1:
+                            grounding_stale_retries += 1
+                            if _fresh_unavailable:
+                                penalties.append(
+                                    f"Could not re-verify element ref {_ref!r} against the "
+                                    "post-action observation (redaction failed) — ending "
+                                    "the batch, re-observing once and replanning instead "
+                                    "of executing blind."
+                                )
+                            elif _batch_changed:
+                                penalties.append(
+                                    f"Element ref {_ref!r} changed since the plan "
+                                    "was made (the page re-rendered mid-batch) — "
+                                    "ending the batch, re-observing once and "
+                                    "replanning on the fresh accessibility tree."
+                                )
+                            else:
+                                penalties.append(
+                                    f"Element ref {_ref!r} is stale in the current "
+                                    "observation — re-observing once and replanning "
+                                    "on the fresh accessibility tree."
+                                )
+                            logger.warning(
+                                "task %s: %s element ref %r; re-observing once",
+                                task_id, "unverifiable" if _fresh_unavailable else ("changed" if _batch_changed else "stale"), _ref,
+                            )
+                            cached_obs = None
+                            last_digest = None
+                            # Task 11: the page changed under us — the
+                            # cached observation is for the old tree.
+                            obs_cache.invalidate()
+                            continue
+                        _save_checkpoint_defensive(task_id, conversation_id, session_id, steps_done, raw_url, history, working_memory)
+                        if _fresh_unavailable:
+                            return {"final": "failed", "steps": steps_done,
+                                    "summary": f"could not re-verify element ref {_ref!r}: the post-action observation could not be redacted, so the target could not be re-grounded. Stopping instead of executing blind.",
+                                    "history": history}
+                        if _batch_changed:
+                            return {"final": "failed", "steps": steps_done,
+                                    "summary": f"element changed mid-batch: the element ref {_ref!r} changed (role, name, or target id moved) and could not be re-grounded after a fresh observation. Stopping instead of clicking the wrong control.",
+                                    "history": history}
+                        return {"final": "failed", "steps": steps_done,
+                                "summary": f"element no longer found: the element ref {_ref!r} is not in the current page — the page changed and the target could not be re-grounded. Stopping instead of clicking the wrong control.",
+                                "history": history}
+                    if _fresh == "changed":
+                        logger.warning(
+                            "task %s: element ref %r changed since observation "
+                            "(role/name moved); proceeding on the live element",
+                            task_id, _ref,
+                        )
+                        penalties.append(
+                            f"Element ref {_ref!r} changed since the observation "
+                            "(role or name moved) — proceeding on the live "
+                            "element; verify the result before continuing."
+                        )
                     target = dict(target)
-                    target["targetId"] = matched.target_id
-                    target.setdefault("name", matched.name)
-                    bounds = matched.semantic.interactability["bounds"]
-                    target.setdefault("coords", {"x": bounds["x"] + bounds["width"] / 2,
-                                                 "y": bounds["y"] + bounds["height"] / 2})
+                    if _node.target_id:
+                        target["targetId"] = _node.target_id
+                    target.setdefault("name", _node.name)
+                    if _node.role:
+                        target.setdefault("role", _node.role)
+                    _center = _node_center(_node)
+                    if _center:
+                        target.setdefault("coords", _center)
                     action["target"] = target
+                    grounding_stale_retries = 0
+                else:
+                    from .observation import match_semantic_target
+                    matched = match_semantic_target(
+                        payload.interactive, target_id=target.get("targetId") or "",
+                        name=target.get("name") or "", role=target.get("role") or "",
+                        expected_bounds=target.get("expectedBounds"))
+                    if matched:
+                        target = dict(target)
+                        target["targetId"] = matched.target_id
+                        target.setdefault("name", matched.name)
+                        bounds = matched.semantic.interactability["bounds"]
+                        target.setdefault("coords", {"x": bounds["x"] + bounds["width"] / 2,
+                                                     "y": bounds["y"] + bounds["height"] / 2})
+                        action["target"] = target
 
         last_digest = current_digest
 
@@ -1341,27 +1588,366 @@ async def _run_loop(
         needs_confirm = action.get("risk") == "sensitive" or is_auth_page or is_wa_qr or (
             is_strict and action.get("risk") == "write" and action.get("type") not in ("navigate", "scroll", "zoom", "wait", "observe", "select_tab")
         )
+
+        # -- Task 4: blocked outright (no gate, no override) ---------------
+        # Account creation and permanent account deletion are never
+        # executed, whatever the planner or the page says.
+        _blocked_reason = is_blocked_action(instruction, action, raw_url, payload.interactive)
+        if _blocked_reason:
+            _save_checkpoint_defensive(task_id, conversation_id, session_id, steps_done, raw_url, history, working_memory)
+            return {"final": "failed", "steps": steps_done, "summary": _blocked_reason, "history": history}
+
+        # -- Task 4: sensitive wait / payment surface -> takeover ----------
+        # A planner-emitted sensitive wait on a takeover surface, or any
+        # action on a payment surface that only appeared after planning
+        # (e.g. the planner navigated to checkout), becomes a takeover,
+        # not a plain confirmation. The operator does the step in the
+        # tab; the agent observes nothing while they do. A completed
+        # takeover re-observes from the top of the loop.
+        _wait_trigger = None
+        if action.get("type") == "wait" and action.get("risk") == "sensitive":
+            _wait_trigger = takeover_reason_for_wait(raw_url, payload.interactive)
+        elif action.get("type") == "ucp_checkout":
+            # Task 14: a UCP checkout always goes through takeover —
+            # the operator approves the amount and does the payment
+            # step themselves; the agent never submits a payment.
+            from .takeover import TakeoverTrigger
+
+            _wait_trigger = TakeoverTrigger(
+                kind="payment",
+                reason=(
+                    "A UCP checkout is about to run. Payments always "
+                    "require your approval and your own hands in the browser — "
+                    "the agent never submits a payment."
+                ),
+                url=raw_url,
+            )
+        elif action.get("type") == "webmcp_tool":
+            # Task 14: a WebMCP tool that asks for credentials or a
+            # payment is a takeover — the operator supplies it in the
+            # tab; the agent never types a secret into a page tool.
+            _tool_name = (action.get("params") or {}).get("tool")
+            _tool = next(
+                (t for t in (working_memory.get("webmcp_tools") or [])
+                 if isinstance(t, dict) and t.get("name") == _tool_name),
+                None,
+            )
+            if _tool is not None:
+                try:
+                    from .webmcp import WebMCPTool as _WMT
+                    from .webmcp import tool_requests_sensitive as _sens
+
+                    _kind = _sens(_WMT.from_dict(_tool))
+                except Exception:
+                    _kind = None
+                if _kind is not None:
+                    from .takeover import TakeoverTrigger
+
+                    _wait_trigger = TakeoverTrigger(
+                        kind="credentials" if _kind == "credentials" else "payment",
+                        reason=(
+                            f"The site tool '{_tool_name}' asks for {_kind}. "
+                            "Supply it yourself in the browser — the agent "
+                            "never types a secret into a page tool."
+                        ),
+                        url=raw_url,
+                    )
+        elif is_payment_surface(raw_url, payload.interactive) and action.get("type") not in {"observe", "wait", "scroll", "zoom", "select_tab"}:
+            from .takeover import TakeoverTrigger
+
+            _wait_trigger = TakeoverTrigger(
+                kind="payment",
+                reason=(
+                    "A payment / checkout surface is visible. Payments always "
+                    "require your approval and your own hands in the browser — "
+                    "the agent never submits a payment."
+                ),
+                url=raw_url,
+            )
+        if _wait_trigger is not None and takeover_gate is not None:
+            _outcome = await _enter_takeover(_wait_trigger)
+            if _outcome == "completed":
+                continue
+            if _outcome == "already_done":
+                pass  # fall through to the normal confirmation gate
+            elif is_cancelled(task_id):
+                return {"final": "cancelled", "steps": steps_done, "summary": None, "history": history}
+            else:
+                _save_checkpoint_defensive(task_id, conversation_id, session_id, steps_done, "", history, working_memory)
+                return {"final": "failed", "steps": steps_done, "summary": _takeover_failure_summary(_outcome, _wait_trigger), "history": history}
+
+        # -- Task 3: domain allow-list + web-blind checker ----------------
+        # Both run before any consequential action executes. A blocked
+        # navigation is rejected (never executed) and the task halts for
+        # a human decision through the same confirmation gate as a
+        # sensitive action; approving allows that one navigation as a
+        # logged one-off override. A checker flag does the same. With no
+        # gate available there is nobody to ask, so the task fails
+        # closed instead of executing.
+        checker_msg: Optional[str] = None
+        task3_flagged = False
+        if action.get("type") in {"navigate", "new_tab"}:
+            nav_url = (action.get("params") or {}).get("url")
+            if nav_url and effective_domains:
+                ok, why = check_url(nav_url, effective_domains)
+                if not ok:
+                    task3_flagged = True
+                    logger.warning("task %s: blocked navigation: %s", task_id, why)
+                    # Task 10: audit — allow-list denial (host only;
+                    # the full URL may carry query secrets).
+                    try:
+                        from .audit import append_event as _audit_event3
+                        from urllib.parse import urlsplit as _audit_split
+
+                        _audit_host = (_audit_split(nav_url).hostname or "unknown")
+                        _audit_event3("allowlist_denied",
+                                      f"navigation to {_audit_host} denied by allow-list",
+                                      actor="system", task_id=task_id)
+                    except Exception:
+                        pass
+                    checker_msg = (
+                        f"Blocked navigation: {why}. The action was not executed. "
+                        "Approve to allow this one navigation anyway, or reject to stop the task."
+                    )
+        findings = []
+        # Task 11: a pinned batch step is a subset of a plan the
+        # checker already approved on this same observation — re-running
+        # the scan + check on every batched step is redundant work.
+        # The navigate allow-list above still runs per step.
+        if batch_continuation:
+            timings.note_checker_skipped()
+        else:
+            # Scan the raw observation text (not the cleansed planner
+            # payload — cleansing quarantines the very patterns the scan
+            # looks for). Accept both "pageText" (extension) and "page_text".
+            scan_text = raw_text or ""
+            if not scan_text:
+                if isinstance(raw_obs, dict):
+                    scan_text = str(raw_obs.get("pageText") or raw_obs.get("page_text") or "")
+                else:
+                    scan_text = str(
+                        getattr(raw_obs, "page_text", None)
+                        or getattr(raw_obs, "pageText", None)
+                        or ""
+                    )
+            if scan_text:
+                findings = scan_page_text(scan_text, raw_url)
+        if findings:
+            result = check_plan(instruction, steps, findings, raw_url, allowed_domains=None)
+            if result.flagged:
+                task3_flagged = True
+                reasons = "; ".join(result.reasons)
+                logger.warning("task %s: isolation checker flagged plan: %s", task_id, reasons)
+                checker_msg = (
+                    (checker_msg + " " if checker_msg else "")
+                    + f"Isolation checker flagged this plan: {reasons}. "
+                    "Approve to proceed anyway, or reject to stop the task."
+                )
+        if task3_flagged:
+            needs_confirm = True
+            if confirm_gate is None:
+                _save_checkpoint_defensive(task_id, conversation_id, session_id, steps_done, raw_url, history, working_memory)
+                return {"final": "failed", "steps": steps_done,
+                        "summary": f"isolation check blocked the action: {checker_msg}",
+                        "history": history}
+
         approved = False
+        # Task 13: set when this iteration actually waited for the
+        # operator (confirmation and/or pause). The operator had the
+        # browser in that window, so a ref step is re-verified against
+        # a fresh observation below before it executes.
+        _waited_for_operator = False
+        # Task 12: "approve this step only" — the operator approved the
+        # pending step but asked to see a fresh plan before the next
+        # one. The flag is consumed by the batch gate at the end of
+        # this iteration (no pending_batch is pinned), and reset at
+        # the top of every iteration so it can never leak into a later
+        # step the operator did not choose it for.
         if confirm_gate is not None and needs_confirm:
-            gate_msg = _gate_message(action, is_wa_qr, is_auth_page)
-            approved = await _request_confirmation(confirm_gate, action, task_id, confirm_timeout_s, custom_message=gate_msg)
+            gate_msg = checker_msg or _gate_message(action, is_wa_qr, is_auth_page)
+            confirm_started = time.perf_counter()
+            # Task 12: the gate request carries the whole validated
+            # plan as a preview (structured fields only — see
+            # plan_preview.py), so the operator sees what they are
+            # approving. `steps` here is the FULL plan: the batch trim
+            # happens later, just before execution. Start from `first`
+            # (the dedup may have advanced past a redundant steps[0]).
+            _plan_start = next((i for i, s in enumerate(steps) if s is first), 0) if isinstance(steps, list) else 0
+            approved = await _request_confirmation(
+                confirm_gate, action, task_id, confirm_timeout_s,
+                custom_message=gate_msg,
+                plan=plan_preview(steps[_plan_start:] if isinstance(steps, list) else []),
+            )
+            _waited_for_operator = True
+            step_only_approval = bool(getattr(confirm_gate, "step_only", False))
+            metrics("confirm_wait", confirm_started)
             if is_cancelled(task_id):
                 return {"final": "cancelled", "steps": steps_done, "summary": None, "history": history}
             if approved is False:
                 return {"final": "failed", "steps": steps_done,
                         "summary": f"user rejected action: {action.get('type')}", "history": history}
+            if task3_flagged:
+                # A human overrode a Task 3 flag. Record it so the
+                # override is visible in the task history, not silent.
+                logger.warning("task %s: operator approved a flagged action: %s", task_id, checker_msg)
+                penalties.append(f"operator approved a flagged action: {checker_msg}")
 
         pause_event = _pause_events.get(task_id)
         if pause_event is not None and not pause_event.is_set():
             pause_started = time.monotonic()
             await pause_event.wait()
+            _waited_for_operator = True
             start += time.monotonic() - pause_started
+            # Task 11: the operator may have acted in the browser
+            # while paused — the cached observation is untrusted now.
+            obs_cache.invalidate()
         if is_cancelled(task_id):
             return {"final": "cancelled", "steps": steps_done, "summary": None, "history": history}
 
+        # Task 13: post-wait re-verification. The operator had the
+        # browser while the loop waited (confirmation and/or pause) —
+        # the page may have moved under the plan, and that window is
+        # exactly what the old vacuous check could never see. A ref
+        # step is re-verified against ONE fresh observation before it
+        # executes. A changed element proceeds on the LIVE node
+        # (target re-pinned); a stale one re-observes and replans
+        # once, then fails honestly; an observation that cannot be
+        # redacted is treated as "cannot verify" — never execute
+        # blind. All three failure paths share the one-retry counter
+        # with the ref site above, so a persistently broken
+        # observation source cannot loop the operator through
+        # confirmations forever. A changed element inside a batch
+        # ends the batch, like the ref-site rule.
+        if _verified_node is not None and _waited_for_operator:
+            _fresh_raw = None
+            try:
+                _maybe_fresh = obs_factory()
+                _fresh_raw = await _maybe_fresh if asyncio.iscoroutine(_maybe_fresh) else _maybe_fresh
+                timings.note_observation_call()
+            except Exception:
+                _fresh_raw = None
+            _built2 = fresh_tree_for_observation(_fresh_raw, instruction) if _fresh_raw is not None else None
+            if _built2 is None:
+                if grounding_stale_retries < 1:
+                    grounding_stale_retries += 1
+                    penalties.append(
+                        f"Could not re-verify element ref {_verified_ref!r} after "
+                        "the operator wait (fresh observation unavailable) — "
+                        "re-observing and replanning instead of executing blind."
+                    )
+                    cached_obs = None
+                    last_digest = None
+                    obs_cache.invalidate()
+                    continue
+                _save_checkpoint_defensive(task_id, conversation_id, session_id, steps_done, raw_url, history, working_memory)
+                return {"final": "failed", "steps": steps_done,
+                        "summary": f"could not re-verify element ref {_verified_ref!r} after the operator wait (fresh observation unavailable) — stopping instead of executing blind.",
+                        "history": history}
+            _fresh2, _live2, _ = ref_freshness(plan_tree, _verified_ref, _built2[0])
+            _post_batch_changed = batch_ctx is not None and _fresh2 == "changed"
+            if _fresh2 == "stale" or _post_batch_changed:
+                if grounding_stale_retries < 1:
+                    grounding_stale_retries += 1
+                    if _post_batch_changed:
+                        penalties.append(
+                            f"Element ref {_verified_ref!r} changed while waiting "
+                            "for the operator (the page re-rendered mid-batch) — "
+                            "ending the batch, re-observing once and replanning "
+                            "on the fresh accessibility tree."
+                        )
+                    else:
+                        penalties.append(
+                            f"Element ref {_verified_ref!r} disappeared while "
+                            "waiting for the operator — re-observing once and "
+                            "replanning on the fresh accessibility tree."
+                        )
+                    cached_obs = None
+                    last_digest = None
+                    obs_cache.invalidate()
+                    continue
+                _save_checkpoint_defensive(task_id, conversation_id, session_id, steps_done, raw_url, history, working_memory)
+                if _post_batch_changed:
+                    return {"final": "failed", "steps": steps_done,
+                            "summary": f"element changed mid-batch: the element ref {_verified_ref!r} changed while waiting for the operator and could not be re-grounded after a fresh observation. Stopping instead of clicking the wrong control.",
+                            "history": history}
+                return {"final": "failed", "steps": steps_done,
+                        "summary": f"element no longer found: the element ref {_verified_ref!r} disappeared while waiting for the operator and could not be re-grounded. Stopping instead of clicking the wrong control.",
+                        "history": history}
+            if _fresh2 == "changed" and _live2 is not None:
+                logger.warning(
+                    "task %s: element ref %r changed while waiting for the "
+                    "operator; proceeding on the live element",
+                    task_id, _verified_ref,
+                )
+                penalties.append(
+                    f"Element ref {_verified_ref!r} changed while waiting for "
+                    "the operator (role, name, or target id moved) — "
+                    "proceeding on the live element; verify the result "
+                    "before continuing."
+                )
+                from .grounding import node_center as _node_center2
+
+                _target2 = dict(action.get("target") or {})
+                if _live2.target_id:
+                    _target2["targetId"] = _live2.target_id
+                _target2["name"] = _live2.name
+                if _live2.role:
+                    _target2["role"] = _live2.role
+                _center2 = _node_center2(_live2)
+                if _center2:
+                    _target2["coords"] = _center2
+                action["target"] = _target2
+            # The post-action observation (below) is newer than this
+            # one, so the fresh observation is used only for this
+            # verification — it is not kept as the cached observation.
+
         _enforce_date_integrity(action, instruction)
+        # -- Task 9: tab registry gate ----------------------------------
+        # switch_tab / select_tab may only target a tab the task owns.
+        # An unknown tabId is rejected here — before anything is sent
+        # to the extension — instead of letting the browser switch to
+        # a tab outside the task (e.g. the operator's personal tab).
+        # An empty registry means "no tabs tracked yet" (legacy /
+        # test flows): nothing to validate against, so allow it.
+        if action.get("type") in {"select_tab", "switch_tab"}:
+            _target_tab = (action.get("params") or {}).get("tabId")
+            _known_tabs = working_memory.get("tabs") or []
+            if _known_tabs and _target_tab is not None and not any(
+                t.get("tab_id") == _target_tab for t in _known_tabs
+            ):
+                _save_checkpoint_defensive(task_id, conversation_id, session_id, steps_done, raw_url, history, working_memory)
+                return {"final": "failed", "steps": steps_done,
+                        "summary": f"unknown tab: tab {_target_tab} is not in this task's tab registry",
+                        "history": history}
         action_started = time.perf_counter()
         execution_action = action
+        # -- Task 4: vault placeholder substitution ------------------------
+        # The planner only ever sees placeholders. The real value is
+        # substituted here — after the confirmation gate, just before
+        # the action is sent to the extension — and never anywhere else.
+        # History keeps the placeholder form; the evidence below is
+        # scrubbed of the real value before it is recorded.
+        _substituted_values: list[str] = []
+        if action.get("type") == "type":
+            _params = action.get("params") or {}
+            _text = _params.get("text")
+            if isinstance(_text, str) and contains_placeholder(_text):
+                try:
+                    _remaining = _text
+                    while True:
+                        _parsed = parse_placeholder(_remaining)
+                        if _parsed is None:
+                            break
+                        _substituted_values.append(placeholder_value(*_parsed))
+                        _remaining = _remaining.replace(
+                            "{{CREDENTIAL:%s:%s:%s}}" % _parsed, "", 1
+                        )
+                    execution_action = substitute_placeholders_in_action(action)
+                except (KeyError, ValueError) as exc:
+                    _save_checkpoint_defensive(task_id, conversation_id, session_id, steps_done, raw_url, history, working_memory)
+                    return {"final": "failed", "steps": steps_done,
+                            "summary": f"credential placeholder could not be resolved: {exc}",
+                            "history": history}
         if action.get("type") == "upload_file":
             from .file_uploads import get as get_attachment
             from .hub import hub
@@ -1371,8 +1957,234 @@ async def _run_loop(
                         "summary": "File upload blocked: select the exact attachment in the workspace first.", "history": history}
             execution_action = dict(action)
             execution_action["params"] = {"fileName": attachment[0], "base64": attachment[1]}
-        result = await _execute_with_retries(ext_hub, execution_action, task_id, session_id=session_id)
-        metrics("act", action_started)
+        # Task 11: trim the plan to its executable batch prefix — only
+        # now, after the dedup and the checker have seen the full plan.
+        # The batch starts at the step actually about to execute
+        # (`first`, which the dedup may have advanced past a redundant
+        # steps[0]); trimming earlier discarded steps the dedup needs
+        # to advance to. If `first` is a step the planner did not emit
+        # (the multi-site fallback synthesises one), the batch is just
+        # [first]. Pinned iterations skip this: their `steps` is already
+        # the remainder of a batch.
+        if not batch_continuation and isinstance(steps, list):
+            _start = next((i for i, s in enumerate(steps) if s is first), None)
+            if _start is None:
+                steps = [first]
+            else:
+                steps = batch_prefix(steps[_start:], plan_refs)
+        # Task 14: record how this step is being executed, so the
+        # workspace can show it ("via WebMCP tool X" / "via UCP
+        # checkout") and the record carries it after the task ends.
+        if action.get("type") == "webmcp_tool":
+            working_memory["route"] = {
+                "via": "webmcp_tool",
+                "tool": (action.get("params") or {}).get("tool"),
+            }
+        elif action.get("type") == "ucp_checkout":
+            working_memory["route"] = {
+                "via": "ucp_checkout",
+                "merchant": (action.get("params") or {}).get("merchant"),
+                "amount": (action.get("params") or {}).get("amount"),
+                "currency": (action.get("params") or {}).get("currency"),
+            }
+        # Task 14: a UCP checkout is executed by the backend, never
+        # sent to the extension and never retried — a payment step
+        # runs exactly once. The result is shaped like an executor
+        # result so the rest of the loop (cache invalidation,
+        # evidence, failure handling) treats it uniformly. No
+        # observation is returned: the page has (or has failed to)
+        # change, so the loop re-observes from the top.
+        if action.get("type") == "ucp_checkout":
+            from .ucp import execute_ucp_checkout
+
+            _params = action.get("params") or {}
+            _prof = working_memory.get("ucp_profile")
+            try:
+                _ucp_outcome = await asyncio.to_thread(
+                    execute_ucp_checkout,
+                    _prof if isinstance(_prof, dict) else None,
+                    amount=_params.get("amount"),
+                    currency=_params.get("currency"),
+                    task_id=task_id,
+                )
+            except Exception as exc:  # never raises inside, but never trust that
+                _ucp_outcome = {"ok": False, "error": {"message": f"UCP checkout failed: {exc}"}}
+            # The executor returns the action-result shape: ok plus
+            # evidence on success, error{message} on failure.
+            if _ucp_outcome.get("ok"):
+                result = {
+                    "ok": True,
+                    "evidence": _ucp_outcome.get("evidence", "UCP checkout completed"),
+                }
+            else:
+                _ucp_err = _ucp_outcome.get("error")
+                _ucp_msg = (
+                    _ucp_err.get("message")
+                    if isinstance(_ucp_err, dict)
+                    else str(_ucp_err or "UCP checkout failed")
+                )
+                result = {"ok": False, "error": {"message": _ucp_msg}}
+            metrics("act", action_started)
+        else:
+            # Task 13: the loop passes its own MAX_RETRIES (a patch point
+            # tests use) — _execute_with_retries defaults to
+            # config.MAX_RETRIES for direct callers.
+            result = await _execute_with_retries(ext_hub, execution_action, task_id, session_id=session_id, max_retries=MAX_RETRIES)
+            metrics("act", action_started)
+        # Task 1 (automation): one bounded execution-time recovery.
+        # A ref that was fresh at plan time can still go stale in the
+        # window between planning and execution (the page re-rendered,
+        # or a popup/dialog moved the target): the extension reports
+        # STALE_TARGET (or a dialog error) and the step fails. Failing
+        # the step and replanning from scratch loses the step's place
+        # in the plan; instead, re-observe ONCE, resolve the same
+        # control again in the fresh tree (same target id, else same
+        # role + name, unambiguous only — never a guess), and retry
+        # the step once with the fresh ref. Exactly one retry per
+        # step: a second failure is recorded honestly and the loop
+        # replans next iteration, as before. UCP checkouts never
+        # retry (a payment step runs exactly once). The recovery is
+        # attached to the step record below (entry["recovery"]) and
+        # to working_memory["automation_recoveries"].
+        _recovery: Optional[dict[str, Any]] = None
+        # The raw observation the recovery re-observed with. When the
+        # step still fails, the next iteration plans from THIS
+        # observation (it is already the freshest page state) instead
+        # of spending another observation round trip on the same page.
+        _recovery_raw_obs: Any = None
+        if action.get("type") != "ucp_checkout" and (
+            is_stale_target_error(result) or is_dialog_error(result)
+        ):
+            _err_code = str((result.get("error") or {}).get("code") or "")
+            _kind = "dialog_retry" if is_dialog_error(result) else "stale_ref_retry"
+            _fresh_raw: Any = None
+            try:
+                _maybe_recover = obs_factory()
+                _fresh_raw = await _maybe_recover if asyncio.iscoroutine(_maybe_recover) else _maybe_recover
+                timings.note_observation_call()
+            except Exception:
+                _fresh_raw = None
+            _recovery_raw_obs = _fresh_raw
+            _built_recover = fresh_tree_for_observation(_fresh_raw, instruction) if _fresh_raw is not None else None
+            _old_ref = (
+                _verified_ref
+                or (action.get("target") or {}).get("elementRef")
+                or (action.get("target") or {}).get("element_ref")
+            )
+            if _built_recover is None:
+                _recovery = {
+                    "kind": _kind, "trigger": _err_code,
+                    "old_ref": _old_ref, "new_ref": None,
+                    "result_ok": False,
+                    "note": "fresh observation unavailable; no retry attempted",
+                }
+            else:
+                _fresh_ref, _fresh_node = resolve_fresh_ref(
+                    _verified_node, _built_recover[0],
+                    target=action.get("target") if isinstance(action.get("target"), dict) else None,
+                )
+                # A retry is warranted when the control moved: a new
+                # ref, a new stable target id, or both. (Refs are
+                # positional — build_ax_tree assigns e0, e1, ... in
+                # list order — so a re-render that only re-assigns the
+                # target id leaves the ref unchanged; the retry still
+                # matters, because the executor resolves by id.)
+                _old_target_id = (
+                    (_verified_node.target_id if _verified_node is not None else None)
+                    or (action.get("target") or {}).get("targetId")
+                )
+                _moved = (
+                    _fresh_ref is not None and _fresh_node is not None
+                    and (
+                        str(_fresh_ref) != str(_old_ref or "")
+                        or str(_fresh_node.target_id or "") != str(_old_target_id or "")
+                    )
+                )
+                # A stale ref retries only when the control actually
+                # moved (same ref + same id means nothing changed, so
+                # a retry would just repeat the failure). A dialog
+                # error is different: the target never moved — the
+                # popup did — so re-attempting the same ref on the
+                # freshly observed page (dialog gone or dismissed) is
+                # the recovery.
+                _should_retry = (
+                    _moved if _kind == "stale_ref_retry"
+                    else (_fresh_ref is not None and _fresh_node is not None)
+                )
+                if _should_retry:
+                    from .grounding import node_center as _node_center_recover
+
+                    _retry_target = dict(action.get("target") or {})
+                    _retry_target["elementRef"] = _fresh_ref
+                    if _fresh_node.target_id:
+                        _retry_target["targetId"] = _fresh_node.target_id
+                    _retry_target["name"] = _fresh_node.name
+                    if _fresh_node.role:
+                        _retry_target["role"] = _fresh_node.role
+                    _center_r = _node_center_recover(_fresh_node)
+                    if _center_r:
+                        _retry_target["coords"] = _center_r
+                    _retry_action = dict(execution_action)
+                    _retry_action["target"] = _retry_target
+                    obs_cache.invalidate()
+                    _retry_result = await _execute_with_retries(
+                        ext_hub, _retry_action, task_id,
+                        session_id=session_id, max_retries=MAX_RETRIES)
+                    _recovery = {
+                        "kind": _kind, "trigger": _err_code,
+                        "old_ref": _old_ref, "new_ref": _fresh_ref,
+                        "new_target_id": _fresh_node.target_id,
+                        "result_ok": bool(_retry_result.get("ok")),
+                    }
+                    if _retry_result.get("ok"):
+                        result = _retry_result
+                        action["target"] = _retry_target
+                        grounding_stale_retries = 0
+                        logger.warning(
+                            "task %s: %s recovered: ref %r -> %r; retry succeeded",
+                            task_id, _kind, _old_ref, _fresh_ref,
+                        )
+                    else:
+                        logger.warning(
+                            "task %s: %s retried with fresh ref %r but still failed; replanning next iteration",
+                            task_id, _kind, _fresh_ref,
+                        )
+                else:
+                    _recovery = {
+                        "kind": _kind, "trigger": _err_code,
+                        "old_ref": _old_ref, "new_ref": None,
+                        "result_ok": False,
+                        "note": (
+                            "target found in the fresh observation but it did not move; "
+                            "retrying the same ref would repeat the failure"
+                            if _fresh_ref is not None
+                            else "no unambiguous fresh ref for the target in the fresh observation; no retry attempted"
+                        ),
+                    }
+        # REVIEW (Task 14 audit): a WebMCP tool result is untrusted
+        # page content, and the extension reports it as evidence text
+        # — which the loop copies into the history entry the planner
+        # sees next round. The extension truncates the result, but
+        # truncation is not sanitisation: a lure ("Ignore all previous
+        # instructions...") reached the planner verbatim in round 2.
+        # Sanitise it here, before anything downstream (narrative,
+        # evidence, history, timeline) can consume it — bounded,
+        # redacted, injection patterns quarantined, wrapped as
+        # <untrusted_tool_content>, exactly as webmcp.py promises.
+        # The failure fallback withholds the result rather than
+        # passing it through raw.
+        if action.get("type") == "webmcp_tool" and isinstance(result.get("evidence"), str):
+            try:
+                from .mcp.sanitizer import sanitize_tool_output
+
+                result = dict(result)
+                result["evidence"] = sanitize_tool_output(result["evidence"])["content"]
+            except Exception:
+                result = dict(result)
+                result["evidence"] = (
+                    "<untrusted_tool_content>[tool result withheld: "
+                    "could not sanitize]</untrusted_tool_content>"
+                )
         if session_id and result.get("ok"):
             obs = result.get("observation")
             if isinstance(obs, dict) and "tabId" in obs:
@@ -1391,10 +2203,51 @@ async def _run_loop(
                     closed_tab_id = None
                 if closed_tab_id is not None:
                     session_manager.unregister_child_tab(session_id, closed_tab_id)
+        # -- Task 9: keep the tab registry in sync ---------------------
+        # The registry is what the planner sees in <task-tabs> and
+        # what switch_tab validates against, so it must track reality:
+        # a new tab registers (and becomes active), a switch moves the
+        # active marker, a close removes the tab.
+        if result.get("ok"):
+            _obs = result.get("observation")
+            _obs_tab = _obs.get("tabId") if isinstance(_obs, dict) else None
+            if action.get("type") == "new_tab" and _obs_tab is not None:
+                _register_tab_in_memory(
+                    working_memory, int(_obs_tab),
+                    url=(action.get("params") or {}).get("url", ""),
+                    active=True,
+                )
+            elif action.get("type") in {"select_tab", "switch_tab"}:
+                _tab_param = (action.get("params") or {}).get("tabId")
+                if _tab_param is not None:
+                    _set_active_tab_in_memory(working_memory, int(_tab_param))
+            elif action.get("type") == "close_tab":
+                _tab_param = (action.get("params") or {}).get("tabId")
+                if _tab_param is not None:
+                    _remove_tab_from_memory(working_memory, int(_tab_param))
         if is_cancelled(task_id):
             return {"final": "cancelled", "steps": steps_done, "summary": None, "history": history}
         steps_done += 1
         cached_obs = _fresh_observation(result, action)
+        # Task 11: keep the observation cache in sync with reality.
+        # A successful action's returned observation is the freshest
+        # page state; a failed action may have half-mutated the page;
+        # a tab switch/close relocates the active surface and the loop
+        # forces a live re-observation; a success with no observation
+        # leaves the page state unknown. In all four cases the
+        # pre-action entry must not be served again.
+        if action.get("type") in {"select_tab", "close_tab"}:
+            obs_cache.invalidate()
+            last_obs_url = ""
+            last_obs_tab_id = None
+        elif not result.get("ok"):
+            obs_cache.invalidate()
+        elif cached_obs is not None:
+            obs_cache.store(cached_obs)
+            last_obs_url = observation_url(cached_obs)
+            last_obs_tab_id = observation_tab_id(cached_obs)
+        else:
+            obs_cache.invalidate()
         if needs_confirm and approved:
             try:
                 from .auth_validator import verify_authentication_state
@@ -1406,6 +2259,21 @@ async def _run_loop(
                 pass
         if not result.get("ok") or zero_change_repeats > 0:
             cached_obs = None
+        if _recovery_raw_obs is not None and not result.get("ok"):
+            # Task 1 (automation): the step still failed after the
+            # recovery attempt, but the recovery re-observation is
+            # already the freshest page state. Plan the next iteration
+            # from it instead of spending another observation round
+            # trip on the same page — a failed action must still force
+            # a fresh observation, and this one already is fresh.
+            try:
+                _recovery_obs = _to_obs(_recovery_raw_obs)
+                cached_obs = _recovery_obs
+                obs_cache.store(_recovery_obs)
+                last_obs_url = observation_url(_recovery_obs)
+                last_obs_tab_id = observation_tab_id(_recovery_obs)
+            except Exception:
+                pass
 
         evidence: Any = result.get("evidence")
         if not evidence:
@@ -1420,8 +2288,14 @@ async def _run_loop(
             if cached_obs
             else (result.get("observation") or {}).get("screenshot")
         )
-        step_screenshot = fresh_shot or raw_screenshot
+        step_screenshot = None if suppress_step_screenshot else (fresh_shot or raw_screenshot)
+        suppress_step_screenshot = False
         safe_evidence: Any = redact_text_urls(evidence) if isinstance(evidence, str) else evidence
+        # Task 4: a substituted vault value must never be recorded in
+        # evidence — scrub it even if the extension echoed it back.
+        if isinstance(safe_evidence, str):
+            for _value in _substituted_values:
+                safe_evidence = scrub_value_from_text(safe_evidence, _value)
         try:
             from .step_narrator import generate_step_narrative, _extract_site_and_query
             step_narrative = generate_step_narrative(
@@ -1446,10 +2320,18 @@ async def _run_loop(
         if action_ok:
             from .completion_verifier import verify_action_receipt
             receipt = verify_action_receipt(action, result, before=raw_obs, goal=instruction)
-            action_status = "verified" if receipt["verified"] else "completed_unverified"
+            # Task 1 (automation): verify the outcome actually
+            # happened (URL/title/text/digest change, or the receipt)
+            # before the loop advances on this step. A step that
+            # reported ok but changed nothing is a silent no-op, not
+            # progress — see the handling after history.append.
+            outcome = verify_step_outcome(action, result, before=raw_obs, receipt=receipt)
+            action_status = "verified" if (receipt["verified"] or outcome["verified"]) else "completed_unverified"
         else:
             receipt = None
+            outcome = verify_step_outcome(action, result, before=raw_obs, receipt=None)
             action_status = "failed"
+        _outcome_unverified = action_ok and not outcome["verified"]
 
         entry = {
             "action": action,
@@ -1457,11 +2339,30 @@ async def _run_loop(
             "status": action_status,
             "evidence": safe_evidence,
             "verification": receipt,
+            # Task 1 (automation): the outcome verdict for this step
+            # (verified / reason / observable signals / dialog flag),
+            # and the recovery if the step was retried with a fresh
+            # ref. Both ride the step record, so the timeline and any
+            # later audit can show exactly what happened and why.
+            "outcome": outcome,
+            "recovery": _recovery,
             "narrative": step_narrative,
+            # Task 7: trajectory grounding — which element ref this step
+            # acted on (if any), and whether the observation the step was
+            # planned from carried a screenshot the planner could see.
+            # A ref here means the step was grounded; its absence means
+            # the legacy name path was used.
+            "grounded_ref": (
+                (action.get("target") or {}).get("elementRef")
+                or (action.get("target") or {}).get("element_ref")
+            ) if isinstance(action.get("target"), dict) else None,
+            "screenshot_attached": bool(getattr(payload, "screenshot", None)),
         }
         if not action_ok:
             err = result.get("error") or {}
             err_msg = str(err.get("message", "unknown"))
+            for _value in _substituted_values:
+                err_msg = scrub_value_from_text(err_msg, _value)
             entry["error"] = redact_text_urls(err_msg)
             if not err.get("recoverable", False):
                 _save_checkpoint_defensive(task_id, conversation_id, session_id, steps_done, raw_url, history, working_memory)
@@ -1471,9 +2372,122 @@ async def _run_loop(
             if penalty:
                 penalties.append(penalty)
         history.append(entry)
-        _save_checkpoint_defensive(task_id, conversation_id, session_id, steps_done, raw_url, history, working_memory)
+        if _recovery is not None:
+            working_memory.setdefault("automation_recoveries", []).append(
+                {"step": steps_done, **_recovery}
+            )
+        if _outcome_unverified:
+            # Task 1 (automation): a step that reported ok but changed
+            # nothing is a silent no-op, not progress. Never pin the
+            # next batch step on it (see the batch gate below) and
+            # never plan from its cached observation — the next
+            # iteration re-observes fresh and replans, with a penalty
+            # telling the planner the action had no effect. The step
+            # still counts against the budget (a no-op is not free),
+            # and the task is NOT failed here: the planner gets one
+            # honest chance to try a different target or strategy,
+            # and the loop-detection / step-budget guards still bound
+            # a planner that keeps repeating it.
+            obs_cache.invalidate()
+            cached_obs = None
+            penalties.append(
+                f"Outcome unverified: the {action.get('type')} step reported success but "
+                f"{outcome['reason']}. Re-observing and replanning — do not repeat the same "
+                "action on the same target without a new strategy."
+                + (" A dialog/popup is covering the page." if outcome.get("dialog_detected") else "")
+            )
+            working_memory.setdefault("automation_recoveries", []).append({
+                "kind": "outcome_noop",
+                "step": steps_done,
+                "action": action.get("type"),
+                "reason": outcome["reason"],
+                "dialog_detected": bool(outcome.get("dialog_detected")),
+            })
+        # Task 10: zero retention — the in-memory history is pruned to
+        # the last few steps, stripped to the fields loop detection
+        # needs; evidence/narratives (which can quote page text) are
+        # dropped, and no checkpoint is persisted (see
+        # _save_checkpoint_defensive).
+        try:
+            from .zero_retention import is_enabled as _zr_enabled2
+            from .zero_retention import prune_history as _zr_prune
 
-        if steps_done >= MAX_STEPS:
+            if _zr_enabled2():
+                _zr_prune(history)
+        except Exception:
+            pass
+        # Task 9: long-horizon compaction — every 25 steps the loop
+        # writes a deterministic summary into the checkpoint and plans
+        # from the summary + the last steps from then on.
+        _maybe_compact_history(working_memory, history, instruction, steps_done, long_horizon)
+        checkpoint_started = time.perf_counter()
+        _save_checkpoint_defensive(task_id, conversation_id, session_id, steps_done, raw_url, history, working_memory)
+        metrics("checkpoint", checkpoint_started)
+        # Task 11: snapshot this executed step's timings — after the
+        # checkpoint, so the checkpoint cost belongs to the step
+        # (action type + durations only — never names, values, or
+        # page text).
+        _step_entry = timings.flush_step(steps_done, action.get("type") or "step", batch_continuation)
+        # Task 13: one structured JSON log line per executed step
+        # (navigator.observe) — same StepTiming object, no second
+        # timing system. See backend/app/observability.py.
+        from .observability import log_step as _log_step
+
+        _log_step(task_id, _step_entry, "ok" if result.get("ok") else "failed")
+
+        # Task 11: batch continuation — execute the next step of the
+        # already-validated plan without re-planning, when the step
+        # just executed cannot have changed the page (a non-submitting
+        # type), it succeeded, and the post-action observation is on
+        # the same page the plan was built from. Anything else ends
+        # the batch: the next iteration re-observes and re-plans.
+        # REVIEW (Task 11 audit): "same page" means the same URL *and*
+        # the same DOM fingerprint. A type step can mutate the DOM
+        # (autocomplete dropdown, validation message, dynamic fields)
+        # without navigating, and the pinned plan's refs were quoted
+        # against the pre-type tree. URL equality alone let a batch run
+        # on after such a change without the planner ever seeing it;
+        # the fingerprint (url | title | element count | first 12
+        # target ids) catches count/title/identity changes with no
+        # extra round trip — the post-action observation is already in
+        # memory. A missing baseline fingerprint pins no batch at all
+        # (fail closed on the optimisation, never on safety).
+        if steps_done < effective_max_steps:
+            _exec_idx = next((i for i, s in enumerate(steps) if s is first), 0)
+            _remainder = steps[_exec_idx + 1:]
+            _dom_unchanged = (
+                plan_fingerprint is not None
+                and cached_obs is not None
+                and observation_fingerprint(cached_obs) == plan_fingerprint
+            )
+            if (
+                _remainder
+                and result.get("ok")
+                and is_non_submitting_type(first)
+                and cached_obs is not None
+                and observation_url(cached_obs) == plan_url
+                and _dom_unchanged
+                # Task 1 (automation): an unverified outcome is a
+                # silent no-op — never pin the next batch step on it.
+                # The next iteration re-observes and replans instead.
+                and not _outcome_unverified
+                # Task 12: the operator approved this step only — do
+                # not pin the rest of the batch. The next iteration
+                # re-observes and re-plans, so the next step gets its
+                # own preview and its own confirmation.
+                and not step_only_approval
+            ):
+                pending_batch = {
+                    "steps": list(_remainder),
+                    "payload": payload,
+                    "raw_obs": raw_obs,
+                    "tree": plan_tree,
+                    "refs": plan_refs,
+                    "url": plan_url,
+                    "fingerprint": plan_fingerprint,
+                }
+
+        if steps_done >= effective_max_steps:
             break
 
     if is_cancelled(task_id):
@@ -1487,347 +2501,6 @@ async def _run_loop(
             except Exception:
                 final_obs = {}
     return {"final": "budget_exceeded", "steps": steps_done, "summary": _summary(final_obs, history), "history": history}
-
-
-def _call_planner(
-    planner: Callable[..., dict[str, Any]],
-    instruction: str,
-    payload: dict[str, Any],
-    history: list[dict[str, Any]],
-    working_memory: dict[str, Any],
-) -> dict[str, Any]:
-    """Call the planner with working_memory only when it declares support.
-
-    Intent inspection beats catching TypeError: a TypeError raised *inside*
-    a planner must surface instead of silently replaying the call without
-    working memory (which could duplicate side effects).
-    """
-    try:
-        params = inspect.signature(planner).parameters
-    except (TypeError, ValueError):
-        params = {}
-    supports_wm = "working_memory" in params or any(
-        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
-    )
-    if supports_wm:
-        return planner(instruction, payload, history, working_memory=working_memory)
-    return planner(instruction, payload, history)
-
-
-def _actions_match(a1: dict[str, Any], a2: dict[str, Any]) -> bool:
-    if a1.get("type") != a2.get("type"):
-        return False
-    t1 = a1.get("target") or {}
-    t2 = a2.get("target") or {}
-    p1 = a1.get("params") or {}
-    p2 = a2.get("params") or {}
-    if t1 and t2:
-        if t1.get("name") and t1.get("name") == t2.get("name"):
-            return True
-        if t1.get("targetId") and t1.get("targetId") == t2.get("targetId"):
-            return True
-    if p1.get("text") and p1.get("text") == p2.get("text"):
-        return True
-    if p1.get("url") and p1.get("url") == p2.get("url"):
-        return True
-    return False
-
-
-def _is_redundant_completed_action(action: dict[str, Any], history: list[dict[str, Any]], current_url: str) -> bool:
-    """Never repeat completed browser actions (e.g. redundant navigate or form submission after provider fallback)."""
-    if not history or not action:
-        return False
-    atype = action.get("type")
-    params = action.get("params") or {}
-    if atype == "navigate":
-        nav_url = params.get("url")
-        if nav_url and current_url:
-            try:
-                cur_parts = urlsplit(current_url)
-                nav_parts = urlsplit(nav_url)
-                if cur_parts.hostname and nav_parts.hostname and (
-                    cur_parts.hostname == nav_parts.hostname
-                    or cur_parts.hostname.endswith("." + nav_parts.hostname)
-                    or nav_parts.hostname.endswith("." + cur_parts.hostname)
-                ):
-                    if cur_parts.path.rstrip("/") == nav_parts.path.rstrip("/"):
-                        for h in history:
-                            h_act = h.get("action") or {}
-                            if h.get("result_ok") and h_act.get("type") == "navigate":
-                                return True
-            except Exception:
-                pass
-    elif atype == "type":
-        text = params.get("text")
-        if text and params.get("submit"):
-            for h in history:
-                h_act = h.get("action") or {}
-                if h.get("result_ok") and h_act.get("type") == "type":
-                    h_params = h_act.get("params") or {}
-                    if h_params.get("text") == text and h_params.get("submit"):
-                        return True
-    return False
-
-
-def _state_digest(raw_obs: Any) -> str:
-    if raw_obs is None:
-        return ""
-    url = str(getattr(raw_obs, "url", None) or (raw_obs.get("url") if isinstance(raw_obs, dict) else "") or "")
-    title = str(getattr(raw_obs, "title", None) or (raw_obs.get("title") if isinstance(raw_obs, dict) else "") or "")
-    interactive = getattr(raw_obs, "interactive", None) or (raw_obs.get("interactive") if isinstance(raw_obs, dict) else []) or []
-    el_sample = ",".join(
-        str(getattr(e, "target_id", None) or (e.get("targetId") if isinstance(e, dict) else ""))
-        for e in interactive[:12]
-    )
-    return f"{url}|{title}|{len(interactive)}|{el_sample}"
-
-
-def _is_whatsapp_qr(raw_url: str, raw_obs: Any) -> bool:
-    if not _host_matches(_host_of(raw_url), "whatsapp.com"):
-        return False
-    elements = getattr(raw_obs, "interactive", None)
-    if elements is None and isinstance(raw_obs, dict):
-        elements = raw_obs.get("interactive") or []
-
-    has_chats = False
-    has_qr_prompt = False
-    for el in elements or []:
-        name = str(getattr(el, "name", None) or (el.get("name") if isinstance(el, dict) else "")).lower()
-        role = str(getattr(el, "role", None) or (el.get("role") if isinstance(el, dict) else "")).lower()
-        if (
-            "search or start new chat" in name
-            or "type a message" in name
-            or role == "listitem"
-            or name in ("chats", "status", "channels", "communities")
-        ):
-            has_chats = True
-        if (
-            "scan this qr code" in name
-            or "use whatsapp on your computer" in name
-            or "link with phone number" in name
-            or "to use whatsapp on your computer" in name
-            or ("qr" in name and "code" in name and not has_chats)
-        ):
-            has_qr_prompt = True
-
-    # If chats or search input are visible, user is logged in — never block on QR gate
-    if has_chats:
-        return False
-    return has_qr_prompt
-
-
-HANDOFF_MESSAGE = "Please solve the CAPTCHA / sign in manually in your browser, then click Continue."
-
-
-def _gate_message(action: dict[str, Any], is_wa_qr: bool, is_auth_page: bool) -> Optional[str]:
-    """Operator-facing instruction shown with the confirmation gate."""
-    if is_wa_qr:
-        return ("WhatsApp Web requires QR code scan. Please scan the QR code in your "
-                "WhatsApp tab to log in, then click Continue.")
-    if action.get("type") == "wait" and action.get("risk") == "sensitive":
-        # The planner's human-in-the-loop handoff (CAPTCHA / login wall).
-        return HANDOFF_MESSAGE
-    if is_auth_page:
-        return ("Site requires Sign-In or Payment Credentials. Please sign in or complete "
-                "authentication in your browser tab, then click Continue.")
-    return None
-
-
-async def _request_confirmation(gate: Any, action: dict[str, Any], task_id: str, timeout_s: float, custom_message: Optional[str] = None) -> bool:
-    """Pause and await a human decision. Returns True if approved.
-    gate contract: confirm_requests list + asyncio.Event confirm_event + decision:bool|None."""
-    req = {
-        "taskId": task_id,
-        "action": action,
-        "message": custom_message or f"NAVIGATOR wants to {action.get('type')} (risk {action.get('risk')})"
-    }
-    if hasattr(gate, "add_request"):
-        gate.add_request(req)
-    else:
-        gate.confirm_requests.append(req)
-    gate.decision = None
-    gate.confirm_event.clear()
-    try:
-        await asyncio.wait_for(gate.confirm_event.wait(), timeout_s)
-    except asyncio.TimeoutError:
-        return False
-    return bool(gate.decision)
-
-
-def _summary(obs: Any, history: list[dict[str, Any]]) -> str:
-    last_ok = next((h.get("evidence") for h in reversed(history) if h.get("result_ok") and h.get("evidence")), None)
-    raw_url = getattr(obs, "url", None) or (obs.get("url") if isinstance(obs, dict) else "") or ""
-    # Summary is persisted and rendered; never surface tokens from the URL or
-    # from evidence strings that echo navigated-to URLs.
-    evidence = redact_text_urls(str(last_ok)) if last_ok else "none"
-    # Running out of steps is a failure, not a victory. Say why, so the UI shows
-    # a truthful reason instead of a generic completion line.
-    note = ""
-    last = history[-1] if history else None
-    if last and last.get("result_ok") is False:
-        act = (last.get("action") or {}).get("type") or "action"
-        note = f"Task incomplete: the last {act} failed ({redact_text_urls(str(last.get('error') or 'error'))}). "
-    elif _is_auth_url(str(raw_url)):
-        note = "Task incomplete: the page is still a sign-in screen, so the requested data was not retrieved. "
-    return note + f"final url: {redact_url(str(raw_url))} | last evidence: {evidence}"
-
-
-def _same_failure(history: list[dict[str, Any]], entry: dict[str, Any]) -> Optional[str]:
-    for prev in reversed(history):
-        if prev.get("result_ok"):
-            return None
-        if prev.get("error") == entry.get("error") and prev["action"].get("type") == entry["action"].get("type"):
-            return f"repeated failure: {entry['error']} on {entry['action'].get('type')}"
-    return None
-
-
-def _history_view(history: list[dict[str, Any]], penalties: list[str], working_memory: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    for h in history[-5:]:
-        entry = dict(h)
-        for key in ("evidence", "error"):
-            if isinstance(entry.get(key), str):
-                entry[key] = entry[key][:MAX_HISTORY_TEXT_CHARS]
-        out.append(entry)
-    if working_memory and working_memory.get("notes"):
-        out.append({"working_memory": working_memory["notes"]})
-    for p in penalties[-3:]:
-        out.append({"penalty": p})
-    return out
-
-
-async def _execute_with_retries(ext_hub: Any, action: dict[str, Any], task_id: str, session_id: Optional[str] = None) -> dict[str, Any]:
-    act = dict(action)
-    if session_id and "sessionId" not in act:
-        act["sessionId"] = session_id
-    if "timeoutMs" not in act:
-        act["timeoutMs"] = act.get("timeout_ms", 10000)
-    # Wait slightly longer than the extension's own action deadline (+5s) so
-    # the backend never declares TIMEOUT while the action may still finish,
-    # then retry it and double-execute a click.
-    raw_timeout = act.get("timeoutMs")
-    timeout_s = 45.0
-    if isinstance(raw_timeout, (int, float)) and raw_timeout > 0:
-        timeout_s = min(float(raw_timeout) / 1000.0, 60.0) + 10.0
-
-    res: dict[str, Any] = {"ok": False, "error": {"code": "CANCELLED", "message": "task cancelled", "recoverable": False}}
-    for attempt in range(MAX_RETRIES + 1):
-        if is_cancelled(task_id):
-            return {"ok": False, "error": {"code": "CANCELLED", "message": "task cancelled", "recoverable": False}}
-        # Route with the real task id: "task" was a placeholder that broke
-        # per-task socket routing and cancellation audits.
-        res = await ext_hub.send_action(task_id, act, timeout_s=timeout_s)
-        if res.get("ok"):
-            return res
-        err = res.get("error") or {}
-        if err.get("code") == "TIMEOUT" and act.get("type") not in _IDEMPOTENT_RETRY_TYPES:
-            return res
-        if not err.get("recoverable", False) or attempt == MAX_RETRIES:
-            return res
-        await asyncio.sleep(0.2 * (attempt + 1))
-    return res
-
-
-def _fresh_observation(result: dict[str, Any], action: dict[str, Any]) -> Any:
-    """Return a validated post-action observation, or None to re-observe.
-
-    Only successful, non-tab-changing actions qualify. Validation is
-    defensive: a malformed extension payload must fall back to obs_factory()
-    rather than reach the privacy layer as a partial object.
-    """
-    if not result.get("ok") or action.get("type") in _FORCE_REOBSERVE_ACTIONS:
-        return None
-    obs = result.get("observation")
-    if not obs:
-        return None
-    try:
-        return _to_obs(obs)
-    except Exception:
-        return None
-
-
-def _to_obs(raw: dict[str, Any]):
-    from .contracts import BrowserObservation
-    if isinstance(raw, BrowserObservation):
-        return raw
-    return BrowserObservation.model_validate(raw)
-
-
-def extract_mission_facts(instruction: str, summary: str, history: Optional[list[dict[str, Any]]] = None) -> dict[str, str]:
-    """Extract structured key-value entities from mission execution for persistent chat_memory."""
-    facts: dict[str, str] = {}
-    full_text = f"{instruction} | {summary}"
-
-    # 1. Price extraction
-    price_match = re.search(r"(?:₹|Rs\.?|INR|\$)\s?[\d,]+(?:\.\d+)?", full_text, re.IGNORECASE)
-    if price_match:
-        facts["extracted_price"] = price_match.group(0).strip()
-
-    # 2. Canonical URL extraction from summary or history evidence
-    url_match = re.search(r"https?://[^\s\"'<>)]+", summary)
-    if not url_match and history:
-        for h in reversed(history):
-            ev = str(h.get("evidence") or "")
-            u_match = re.search(r"https?://[^\s\"'<>)]+", ev)
-            if u_match:
-                url_match = u_match
-                break
-    if url_match:
-        facts["canonical_url"] = url_match.group(0).strip()
-
-    # 3. Product / Subject Target
-    cleaned_target = re.sub(
-        r"(?i)\b(find|search|buy|check|compare|look for|me|the|a|an|on amazon|on flipkart|on google|specs|price|and|for)\b",
-        " ",
-        instruction,
-    )
-    cleaned_target = re.sub(r"\s+", " ", cleaned_target).strip()
-    if cleaned_target and len(cleaned_target) > 2:
-        facts["target_item"] = cleaned_target[:60]
-
-    # 4. Core constraints
-    constraint_match = re.search(r"(?i)\b(under\s+[\d,]+|below\s+[\d,]+|budget\s+[\d,]+|size\s+[a-z0-9]+|to checkout)\b", instruction)
-    if constraint_match:
-        facts["core_constraint"] = constraint_match.group(0).strip()
-
-    # 5. Last result summary snippet
-    if summary:
-        facts["last_result"] = summary[:240].strip()
-
-    # 6. LeetCode Profile extraction
-    if "leetcode" in full_text.lower():
-        try:
-            from .extractors.leetcode import extract_leetcode_profile
-            profile = extract_leetcode_profile({"url": facts.get("canonical_url", "")}, page_text=full_text)
-            if profile.get("username") and profile["username"] != "Authenticated User":
-                facts["leetcode_username"] = str(profile["username"])
-            if profile.get("total_solved") and str(profile["total_solved"]) != "0":
-                facts["leetcode_solved"] = str(profile["total_solved"])
-            if profile.get("contest_rating") and "unrated" not in str(profile["contest_rating"]).lower():
-                facts["leetcode_rating"] = str(profile["contest_rating"])
-        except Exception:
-            pass
-
-    # 7. Research & Deliverable extraction
-    if "research" in full_text.lower() or "deliverable ready" in full_text.lower() or any(ext in full_text.lower() for ext in (".pdf", ".docx", ".pptx", ".xlsx", ".csv", ".html")):
-        art_match = re.search(r"\[([^\]]+\.(?:pdf|docx|pptx|xlsx|csv|html))\]", summary, re.IGNORECASE)
-        if art_match:
-            facts["last_deliverable"] = art_match.group(1).strip()
-        try:
-            from .intent_router import extract_research_topic, detect_deliverable_type, detect_requested_format
-            topic = extract_research_topic(instruction)
-            if topic and len(topic.split()) >= 2:
-                facts["research_topic"] = topic[:80]
-            deliv = detect_deliverable_type(instruction)
-            if deliv:
-                facts["deliverable_type"] = deliv
-            fmt = detect_requested_format(instruction)
-            if fmt:
-                facts["requested_format"] = fmt
-        except Exception:
-            pass
-
-    return facts
 
 
 async def run_task(task_id: str) -> None:
@@ -1850,6 +2523,39 @@ async def run_task(task_id: str) -> None:
                 {"category": f["category"], "key": f["fact_key"], "value": f["fact_value"]}
                 for f in facts
             ]
+    except Exception:
+        pass
+
+    # Task 9: long-term memory recall. Facts/skills come from the
+    # operator only (user-stated or confirmed task outcomes); file
+    # summaries are attached for this task's files. The planner sees
+    # the recall block in build_prompt — never whole files.
+    try:
+        from .long_memory import recall_for_prompt
+
+        initial_memory["long_memory"] = recall_for_prompt(record.instruction, task_id=task_id)
+    except Exception:
+        pass
+
+    # REVIEW (Task 9 audit): the checkpoint must carry the background
+    # flag so a task restored after a restart (main._require) keeps it.
+    initial_memory["background"] = record.background
+
+    # Task 9: resume from a checkpoint. A task restored from SQLite
+    # (main._require) was interrupted by a restart; its checkpoint
+    # carries the history and working memory, so the loop continues
+    # from where it stopped instead of starting over. A fresh task
+    # has no checkpoint for its id, so this is a no-op for new runs.
+    try:
+        from . import db
+
+        cp = db.get_task_checkpoint(task_id)
+        if cp and cp.get("history"):
+            initial_memory["prior_checkpoint_history"] = cp["history"]
+            for _k, _v in (cp.get("working_memory") or {}).items():
+                initial_memory.setdefault(_k, _v)
+            if (cp.get("working_memory") or {}).get("long_horizon"):
+                record.long_horizon = True
     except Exception:
         pass
 
@@ -1914,6 +2620,57 @@ async def run_task(task_id: str) -> None:
     record.intent = classification.intent.value
     record.is_browser_task = classification.is_browser
 
+    # -- Task 14: connector auto-routing --------------------------------
+    # A Gmail / Calendar / Drive read (or a gated write) goes to the
+    # native API connector instead of driving the web UI — but only
+    # when the instruction is not a research operation (export /
+    # resume / refine / new research own those) and not ambiguous.
+    # The runner fails honestly when the connector is not configured;
+    # it never silently falls back to the browser. Reads answer
+    # directly (the planner never sees connector data); writes go
+    # through the confirmation gate inside the runner.
+    if classification.operation_type not in {
+        ResearchOperationType.EXPORT_EXISTING_PACKAGE,
+        ResearchOperationType.RESUME_EXISTING_MISSION,
+        ResearchOperationType.REFINE_EXISTING_RESEARCH,
+        ResearchOperationType.NEW_RESEARCH,
+    } and not classification.is_ambiguous:
+        try:
+            from .connector_router import route_instruction
+            from .connector_runner import run_connector_route
+
+            _route = route_instruction(record.instruction)
+        except Exception:
+            _route = None
+        if _route is not None:
+            record.route = _route.to_dict()
+            initial_memory["route"] = record.route
+            record.state = "running"
+            record.message = f"Routing {_route.label}…"
+            await real_hub.broadcast_progress(record)
+            _outcome = await run_connector_route(
+                _route, task_id=task_id, instruction=record.instruction, record=record
+            )
+            # The runner's ok flag IS the outcome — no completion
+            # verifier here. The verifier's navigation rule requires a
+            # browser observation of a destination, which a connector
+            # answer legitimately has none of ("No emails matched" is a
+            # completed answer, not an incomplete navigation).
+            record.steps_done = 1
+            record.state = "completed" if _outcome.ok else "failed"
+            record.message = _outcome.message
+            await real_hub.broadcast_progress(record)
+            if chat_id:
+                try:
+                    _persist_agent_message(
+                        chat_id, record.message,
+                        evidence="connector" if _outcome.ok else "failed",
+                        task_id=task_id,
+                    )
+                except Exception:
+                    pass
+            return
+
     # -----------------------------------------------------------------------
     # Explicit Operation Dispatch:
     # 1. EXPORT_EXISTING_PACKAGE: Deliverable-only execution (Zero browser ops)
@@ -1953,9 +2710,7 @@ async def run_task(task_id: str) -> None:
             await real_hub.broadcast_progress(record)
             if chat_id:
                 try:
-                    from . import db
-                    db.add_message(chat_id, "agent", record.message, evidence="ambiguity_clarification", task_id=task_id)
-                    db.touch_chat(chat_id)
+                    _persist_agent_message(chat_id, record.message, evidence="ambiguity_clarification", task_id=task_id)
                 except Exception:
                     pass
             return
@@ -1979,9 +2734,7 @@ async def run_task(task_id: str) -> None:
             await real_hub.broadcast_progress(record)
             if chat_id:
                 try:
-                    from . import db
-                    db.add_message(chat_id, "agent", record.message, evidence="conversational", task_id=task_id)
-                    db.touch_chat(chat_id)
+                    _persist_agent_message(chat_id, record.message, evidence="conversational", task_id=task_id)
                 except Exception:
                     pass
             return
@@ -2036,11 +2789,9 @@ async def run_task(task_id: str) -> None:
             await real_hub.broadcast_progress(record)
             if chat_id:
                 try:
-                    from . import db
-                    db.set_chat_memory(chat_id, "last_deliverable", fn)
-                    db.set_chat_memory(chat_id, "requested_format", primary_art["file_format"])
-                    db.add_message(chat_id, "agent", record.message, evidence="deliverable_exported", task_id=task_id)
-                    db.touch_chat(chat_id)
+                    _persist_derived_memory(chat_id, "last_deliverable", fn)
+                    _persist_derived_memory(chat_id, "requested_format", primary_art["file_format"])
+                    _persist_agent_message(chat_id, record.message, evidence="deliverable_exported", task_id=task_id)
                 except Exception:
                     pass
             return
@@ -2104,9 +2855,8 @@ async def run_task(task_id: str) -> None:
                         await real_hub.broadcast_progress(record)
                         if chat_id:
                             try:
-                                db.set_chat_memory(chat_id, "last_deliverable", fn)
-                                db.add_message(chat_id, "agent", record.message, evidence="deliverable_exported", task_id=task_id)
-                                db.touch_chat(chat_id)
+                                _persist_derived_memory(chat_id, "last_deliverable", fn)
+                                _persist_agent_message(chat_id, record.message, evidence="deliverable_exported", task_id=task_id)
                             except Exception:
                                 pass
                         return
@@ -2119,8 +2869,7 @@ async def run_task(task_id: str) -> None:
                     await real_hub.broadcast_progress(record)
                     if chat_id:
                         try:
-                            db.add_message(chat_id, "agent", record.message, evidence="conversational", task_id=task_id)
-                            db.touch_chat(chat_id)
+                            _persist_agent_message(chat_id, record.message, evidence="conversational", task_id=task_id)
                         except Exception:
                             pass
                     return
@@ -2131,8 +2880,7 @@ async def run_task(task_id: str) -> None:
                 await real_hub.broadcast_progress(record)
                 if chat_id:
                     try:
-                        db.add_message(chat_id, "agent", record.message, evidence="conversational", task_id=task_id)
-                        db.touch_chat(chat_id)
+                        _persist_agent_message(chat_id, record.message, evidence="conversational", task_id=task_id)
                     except Exception:
                         pass
                 return
@@ -2223,9 +2971,7 @@ async def run_task(task_id: str) -> None:
             await real_hub.broadcast_progress(record)
             if chat_id:
                 try:
-                    from . import db
-                    db.add_message(chat_id, "agent", record.message, evidence="unsupported", task_id=task_id)
-                    db.touch_chat(chat_id)
+                    _persist_agent_message(chat_id, record.message, evidence="unsupported", task_id=task_id)
                 except Exception:
                     pass
             return
@@ -2257,7 +3003,10 @@ async def run_task(task_id: str) -> None:
                 answer = await handle_email_intelligence_instruction(record.instruction, chat_id=chat_id)
             elif is_calendar_query(record.instruction):
                 answer = await handle_calendar_instruction(record.instruction, chat_id=chat_id)
-            elif is_continuous_monitoring_directive(record.instruction):
+            elif is_continuous_monitoring_directive(
+                record.instruction,
+                history=initial_memory.get("conversation_history", []),
+            ):
                 answer = await handle_continuous_monitoring_instruction(
                     record.instruction,
                     chat_id=chat_id,
@@ -2283,6 +3032,24 @@ async def run_task(task_id: str) -> None:
                         answer = MockProvider().chat_call(record.instruction, history=history)
                 else:
                     answer = "I have processed your request."
+                # Fix 5: a conversational product suggestion states
+                # prices no browsing ever verified (live case: the
+                # fitness-band suggestion answered from LLM knowledge
+                # with ₹3,899 and a Flipkart link). Say so plainly
+                # and offer the alert, so the daily-digest / watch
+                # path is reachable instead of ending in a bare
+                # verdict.
+                from .continuous_monitoring_companion import (
+                    ALERT_OFFER_MARKER,
+                    ALERT_OFFER_TEXT,
+                    UNVERIFIED_SUGGESTION_NOTE,
+                    needs_unverified_suggestion_note,
+                )
+                if needs_unverified_suggestion_note(record.instruction, answer):
+                    if "didn't check the stores" not in answer:
+                        answer = f"{answer}\n\n{UNVERIFIED_SUGGESTION_NOTE}"
+                    if ALERT_OFFER_MARKER not in answer:
+                        answer = f"{answer}\n\n{ALERT_OFFER_TEXT}"
 
             verified = verify_task_completion(
                 instruction=record.instruction,
@@ -2297,10 +3064,8 @@ async def run_task(task_id: str) -> None:
             await real_hub.broadcast_progress(record)
             if chat_id:
                 try:
-                    from . import db
                     evidence_tag = "conversational" if verified.state == "completed" else "failed"
-                    db.add_message(chat_id, "agent", verified.message, evidence=evidence_tag, task_id=task_id)
-                    db.touch_chat(chat_id)
+                    _persist_agent_message(chat_id, verified.message, evidence=evidence_tag, task_id=task_id)
                 except Exception:
                     pass
             return
@@ -2311,9 +3076,7 @@ async def run_task(task_id: str) -> None:
             await real_hub.broadcast_progress(record)
             if chat_id:
                 try:
-                    from . import db
-                    db.add_message(chat_id, "agent", f"Error: {exc}", evidence="failed", task_id=task_id)
-                    db.touch_chat(chat_id)
+                    _persist_agent_message(chat_id, f"Error: {exc}", evidence="failed", task_id=task_id)
                 except Exception:
                     pass
             return
@@ -2325,9 +3088,7 @@ async def run_task(task_id: str) -> None:
         await real_hub.broadcast_progress(record)
         if chat_id:
             try:
-                from . import db
-                db.add_message(chat_id, "agent", "Error: Chrome extension is not connected.", evidence="failed", task_id=task_id)
-                db.touch_chat(chat_id)
+                _persist_agent_message(chat_id, "Error: Chrome extension is not connected.", evidence="failed", task_id=task_id)
             except Exception:
                 pass
         return
@@ -2347,9 +3108,7 @@ async def run_task(task_id: str) -> None:
         await real_hub.broadcast_progress(record)
         if chat_id:
             try:
-                from . import db
-                db.add_message(chat_id, "agent", record.message, evidence="ambiguity_refusal", task_id=task_id)
-                db.touch_chat(chat_id)
+                _persist_agent_message(chat_id, record.message, evidence="ambiguity_refusal", task_id=task_id)
             except Exception:
                 pass
         return
@@ -2415,9 +3174,7 @@ async def run_task(task_id: str) -> None:
         await real_hub.broadcast_progress(record)
         if chat_id:
             try:
-                from . import db
-                db.add_message(chat_id, "agent", f"Error ({err_code}): {err_msg}", evidence="failed", task_id=task_id)
-                db.touch_chat(chat_id)
+                _persist_agent_message(chat_id, f"Error ({err_code}): {err_msg}", evidence="failed", task_id=task_id)
             except Exception:
                 pass
         return
@@ -2433,6 +3190,20 @@ async def run_task(task_id: str) -> None:
                          observation: Any = None) -> None:
         if observation is not None:
             record.last_observation = observation
+        # REVIEW (Task 9 audit): the loop's tab registry lives in the
+        # loop's working memory, but GET /api/task/{id} reports
+        # record.tabs — and hub.register_tab is never called by the
+        # loop, so record.tabs was [] forever. Mirror the registry
+        # onto the record on every progress call so polling sees it.
+        _wm_tabs = initial_memory.get("tabs")
+        if isinstance(_wm_tabs, list):
+            record.tabs = [dict(t) for t in _wm_tabs if isinstance(t, dict)]
+        # Task 14: mirror the routing decision the same way, so the
+        # workspace can show "via Gmail connector" / "via WebMCP tool
+        # X" / "via UCP checkout" while the task runs.
+        _wm_route = initial_memory.get("route")
+        if isinstance(_wm_route, dict):
+            record.route = dict(_wm_route)
         if not msg:
             return
         record.steps_done = steps
@@ -2444,8 +3215,11 @@ async def run_task(task_id: str) -> None:
         # A terminal task must not be flipped back to running by a late step.
         if record.state not in ("completed", "failed", "cancelled", "paused"):
             record.state = "running"
-        if screenshot:
-            record.screenshot = screenshot
+        # The record tracks the CURRENT step's screenshot, including
+        # None: a screenshot-less step must clear the frame, not leave
+        # the previous step's image up as if it were this step's visual
+        # (the old `if screenshot:` guard made it sticky).
+        record.screenshot = screenshot
         real_hub.spawn(real_hub.broadcast_progress(record))
 
     def on_metrics(fields: dict[str, Any]) -> None:
@@ -2470,10 +3244,14 @@ async def run_task(task_id: str) -> None:
             instruction=record.instruction,
             on_progress=on_step_progress,
             confirm_gate=_ConfirmGate(record),
+            takeover_gate=_TakeoverGate(record),
+            takeover_timeout_s=config.TAKEOVER_TIMEOUT_S,
             on_metrics=on_metrics,
             initial_memory=initial_memory,
             session_id=session.session_id,
             conversation_id=chat_id or "default",
+            allowed_domains=record.allowed_domains,
+            long_horizon=record.long_horizon,
         )
         candidate_final = {"completed": "completed", "failed": "failed", "cancelled": "cancelled",
                            "budget_exceeded": "failed"}.get(state["final"], "failed")
@@ -2487,6 +3265,9 @@ async def run_task(task_id: str) -> None:
             history=state.get("history") or [],
         )
         record.last_observation = state.get("last_obs")
+        # Task 11: per-step timings (durations + counts + action types
+        # only) for GET /api/task/{id} and progress broadcasts.
+        record.timings = state.get("timings")
         if record.cancelled or is_cancelled(task_id):
             final_state = "cancelled"
             record.message = "Task cancelled by user."
@@ -2496,6 +3277,39 @@ async def run_task(task_id: str) -> None:
         else:
             final_state = "cancelled"
         record.state = final_state  # type: ignore[assignment]
+        # Comparison document: the instruction asked for a document
+        # format and the task collected multi-site comparison facts.
+        # Browser comparison tasks never reached the research document
+        # pipeline, so "give the comparison in an Excel" produced no
+        # file. Bridge it here through the existing artifact pipeline
+        # (xlsx/docx/pdf/pptx + download endpoint). A missing or
+        # failed render must never fail the task itself.
+        if classification.requested_format:
+            try:
+                _cmp_wm = state.get("working_memory") or initial_memory
+                _cmp_tracker = _cmp_wm.get("multi_site_research")
+                if _cmp_tracker:
+                    _cmp_pkg = build_comparison_package(
+                        task_id, record.instruction, _cmp_tracker,
+                        summary_msg=record.message,
+                        target_format=classification.requested_format,
+                    )
+                    if _cmp_pkg is not None:
+                        _cmp_wm["research_knowledge_package"] = _cmp_pkg.to_dict()
+                        _cmp_wm["requested_format"] = canonical_format_map.get(
+                            classification.requested_format, classification.requested_format
+                        )
+                        _cmp_wm["instruction"] = record.instruction
+                        _cmp_art = _finalize_research_artifacts(task_id, chat_id, _cmp_wm, summary_msg=record.message)
+                        if _cmp_art and Path(_cmp_art["filepath"]).exists() and _cmp_art["file_size_bytes"] > 0:
+                            _fn = _cmp_art["filename"]
+                            _fmt = _cmp_art["file_format"].upper()
+                            _kb = _cmp_art["file_size_bytes"] / 1024.0
+                            record.message = (record.message or "") + (
+                                f"\n\n📄 **Deliverable Ready:** [{_fn}] ({_fmt}, {_kb:.1f} KB). Available for download."
+                            )
+            except Exception:
+                pass
         is_planner_err = "Planner unavailable" in (record.message or "") or "Planner timed out" in (record.message or "")
         sess_status = "active" if (is_planner_err or final_state == "completed") else final_state
         session_manager.update_status(session.session_id, sess_status)
@@ -2503,17 +3317,52 @@ async def run_task(task_id: str) -> None:
 
         if chat_id:
             try:
-                from . import db
                 summary = state.get("summary") or "Mission finished."
                 evidence_info = f"{final_state} ({state.get('steps', record.steps_done)} steps)"
-                db.add_message(chat_id, "agent", summary, evidence=evidence_info, task_id=task_id)
+                _persist_agent_message(chat_id, summary, evidence=evidence_info, task_id=task_id)
                 if final_state == "completed" or (state.get("history") and any(h.get("result_ok") for h in state.get("history"))):
                     facts = extract_mission_facts(record.instruction, summary, state.get("history") or [])
                     for k, v in facts.items():
-                        db.set_chat_memory(chat_id, k, v)
-                db.touch_chat(chat_id)
+                        _persist_derived_memory(chat_id, k, v)
             except Exception:
                 pass
+
+        # REVIEW (Task 9 audit): record the terminal outcome in the
+        # checkpoint. Without it, a task whose record was pruned (e.g.
+        # after a backend restart) is restored by main._require as
+        # "interrupted" even when it actually completed — the old code
+        # guessed from the last chat message, which scheduled tasks
+        # (no chat) do not have. This save runs BEFORE the proposal
+        # block below: save_proposals re-reads the checkpoint and adds
+        # proposals to it, so the final_state marker survives.
+        _final_wm = state.get("working_memory") or initial_memory
+        _final_wm["final_state"] = final_state
+        _final_tabs = _final_wm.get("tabs")
+        if isinstance(_final_tabs, list):
+            record.tabs = [dict(t) for t in _final_tabs if isinstance(t, dict)]
+        _save_checkpoint_defensive(
+            task_id, chat_id, session.session_id,
+            int(state.get("steps", record.steps_done) or 0),
+            str(state.get("url") or ""), state.get("history") or [], _final_wm,
+        )
+
+        # Task 9: propose memory from this task's confirmed outcomes.
+        # Proposals are stored in the checkpoint — NOT as facts. The
+        # operator confirms each one explicitly via
+        # POST /api/memory/long/proposals/{task_id}/confirm; unconfirmed
+        # proposals are never recalled into any prompt.
+        try:
+            from .long_memory import propose_from_task, save_proposals
+
+            _proposals = propose_from_task(
+                task_id, record.instruction,
+                state.get("summary") or "",
+                state.get("history") or [],
+            )
+            if _proposals:
+                save_proposals(task_id, _proposals)
+        except Exception:
+            pass
     except Exception as exc:
         cancelled = record.cancelled or is_cancelled(task_id)
         if record.state != "cancelled":
@@ -2522,43 +3371,29 @@ async def run_task(task_id: str) -> None:
         session_manager.update_status(session.session_id, "cancelled" if cancelled else "failed")
         await real_hub.broadcast_progress(record)
 
+        # REVIEW (Task 9 audit): same terminal marker as the normal
+        # path, without touching the already-checkpointed history.
+        try:
+            from . import db as _db_exc
+
+            _cp_exc = _db_exc.get_task_checkpoint(task_id)
+            if _cp_exc is not None:
+                _wm_exc = dict(_cp_exc.get("working_memory") or {})
+                _wm_exc["final_state"] = record.state
+                _save_checkpoint_defensive(
+                    task_id, chat_id, session.session_id, record.steps_done,
+                    "", _cp_exc.get("history") or [], _wm_exc)
+        except Exception:
+            pass
+
         if chat_id:
             try:
-                from . import db
-                db.add_message(chat_id, "agent", f"Error: {exc}", evidence="failed", task_id=task_id)
-                db.touch_chat(chat_id)
+                _persist_agent_message(chat_id, f"Error: {exc}", evidence="failed", task_id=task_id)
             except Exception:
                 pass
     finally:
         record.pending_confirmation = None
-
-
-class _ConfirmGate:
-    """Bridges the loop's confirm contract onto the Hub TaskRecord a REST
-    client posts to. Event + decision live on the record itself."""
-    def __init__(self, record: TaskRecord) -> None:
-        self._record = record
-        self.confirm_requests = []
-        self.strict_write_confirm = False
-
-    @property
-    def confirm_event(self) -> asyncio.Event:
-        return self._record.confirm_event
-
-    @property
-    def decision(self) -> Optional[bool]:
-        return self._record.confirm_decision
-
-    @decision.setter
-    def decision(self, v: Optional[bool]) -> None:
-        self._record.confirm_decision = v
-
-    def add_request(self, req: dict[str, Any]) -> None:
-        self.confirm_requests.append(req)
-        self._record.pending_confirmation = req
-        self._record.state = "awaiting_confirmation"
-        self._record.message = req.get("message", "Awaiting confirmation")
-        real_hub.spawn(real_hub.broadcast_progress(self._record))
+        record.takeover = None
 
 
 class _LiveObservation:
@@ -2598,17 +3433,51 @@ def _live_observation_factory(record: TaskRecord) -> _LiveObservation:
     return _LiveObservation(record.task_id, session_id=record.session_id, tab_id=tab)
 
 
-def _provider_for_config():
+def _provider_for_config(skip_ollama: bool = False):
     """Pick a planner provider. Explicit mock wins even with keys present.
 
     Runtime selection (POST /api/llm/config) wins over static config so the
     provider can be switched without restarting the application. Raises only
     when a runtime selection itself cannot be built; the static paths below
     keep their existing fallthrough behavior.
+
+    Task 10 (local planner): ``PRIVAGENT_PLANNER_LOCAL_ONLY=true`` makes
+    the chain ollama -> fail — when Ollama is unreachable this raises
+    :class:`ProviderUnavailable` and NEVER silently falls back to a cloud
+    provider. ``PRIVAGENT_PLANNER_LOCAL_FIRST=true`` (or an explicit
+    ``PRIVAGENT_PLANNER=ollama``) tries Ollama first; the Ollama provider
+    itself falls back to the normal chain on failure. ``skip_ollama`` is
+    the Ollama provider's own fallback guard: it asks for the normal
+    chain without re-entering Ollama, so a fallback cannot recurse.
     """
     from . import config
     from .providers import provider_settings
     from .providers.errors import ProviderUnavailable
+    if config.PLANNER_LOCAL_ONLY:
+        # Local-only is a hard guard: it applies to the runtime selection
+        # too, so a stale /api/llm/config choice can never silently send
+        # page data to a cloud provider after the operator asked for
+        # local-only. An explicit non-local selection is a configuration
+        # error, not something to silently override.
+        effective = config.PROVIDER
+        if provider_settings.active():
+            try:
+                effective = provider_settings.public_state().get("provider") or effective
+            except Exception:
+                pass
+        if effective not in ("ollama", "mock"):
+            raise ProviderUnavailable(
+                f"local-only mode is on (PRIVAGENT_PLANNER_LOCAL_ONLY=true) but "
+                f"the selected planner is {effective!r}; select ollama (or "
+                "mock) or turn local-only off"
+            )
+        if provider_settings.active():
+            return provider_settings.provider_for_runtime()
+        if effective == "mock":
+            from .providers.mock import MockProvider
+            return MockProvider()
+        from .providers.ollama import OllamaProvider
+        return OllamaProvider()
     if provider_settings.active():
         try:
             return provider_settings.provider_for_runtime()
@@ -2617,6 +3486,11 @@ def _provider_for_config():
     from .providers.mock import MockProvider
     if config.PROVIDER == "mock":
         return MockProvider()
+    if not skip_ollama and (
+        config.PROVIDER == "ollama" or getattr(config, "PLANNER_LOCAL_FIRST", False)
+    ):
+        from .providers.ollama import OllamaProvider
+        return OllamaProvider()
     if config.PROVIDER == "deepai" and getattr(config, "DEEPAI_GATEWAY_KEY", ""):
         from .providers.openai_compatible import OpenAICompatibleProvider
         return OpenAICompatibleProvider(
@@ -2666,6 +3540,6 @@ def _real_planner(record: TaskRecord):
         pf = PrivacyFilteredPayload(**payload) if isinstance(payload, dict) else payload
         # exclude_none keeps the WebSocket payload aligned with the TS contract:
         # unset optional params are omitted, never serialized as JSON null.
-        return plan_from_observation(instruction=instruction, payload=pf, provider=provider, history=history, working_memory=working_memory).model_dump(by_alias=True, exclude_none=True)
+        return plan_from_observation(instruction=instruction, payload=pf, provider=provider, history=history, working_memory=working_memory, allowed_domains=(working_memory or {}).get("allowed_domains")).model_dump(by_alias=True, exclude_none=True)
 
     return planner

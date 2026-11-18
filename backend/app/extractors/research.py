@@ -5,68 +5,157 @@ import re
 import urllib.parse
 from typing import Any, Optional
 
+from ..website_resolver import KNOWN_DOMAINS_REGISTRY, website_resolver
 
-KNOWN_RETAILERS: dict[str, dict[str, Any]] = {
-    "amazon": {
-        "key": "amazon",
-        "name": "Amazon",
-        "domains": ["amazon.in", "amazon.com"],
-        "default_url": "https://www.amazon.in",
-        "patterns": [r"\bamazon(?:\.in|\.com)?\b"],
-    },
-    "flipkart": {
-        "key": "flipkart",
-        "name": "Flipkart",
-        "domains": ["flipkart.com"],
-        "default_url": "https://www.flipkart.com",
-        "patterns": [r"\bflipkart(?:\.com)?\b"],
-    },
-    "samsung": {
-        "key": "samsung",
-        "name": "Samsung Store",
-        "domains": ["samsung.com"],
-        "default_url": "https://www.samsung.com/in/",
-        "patterns": [
-            r"\bsamsung(?:'s)?(?:\s+official)?\s+(?:store|shop|website|portal)\b",
-            r"\bsamsung\.com\b",
-        ],
-    },
-    "croma": {
-        "key": "croma",
-        "name": "Croma",
-        "domains": ["croma.com"],
-        "default_url": "https://www.croma.com",
-        "patterns": [r"\bcroma(?:\.com)?\b"],
-    },
-    "reliance_digital": {
-        "key": "reliance_digital",
-        "name": "Reliance Digital",
-        "domains": ["reliancedigital.in"],
-        "default_url": "https://www.reliancedigital.in",
-        "patterns": [r"\breliance\s+digital\b", r"\breliancedigital(?:\.in)?\b"],
-    },
-    "best_buy": {
-        "key": "best_buy",
-        "name": "Best Buy",
-        "domains": ["bestbuy.com"],
-        "default_url": "https://www.bestbuy.com",
-        "patterns": [r"\bbest\s*buy(?:\.com)?\b"],
-    },
-    "walmart": {
-        "key": "walmart",
-        "name": "Walmart",
-        "domains": ["walmart.com"],
-        "default_url": "https://www.walmart.com",
-        "patterns": [r"\bwalmart(?:\.com)?\b"],
-    },
-    "ebay": {
-        "key": "ebay",
-        "name": "eBay",
-        "domains": ["ebay.com"],
-        "default_url": "https://www.ebay.com",
-        "patterns": [r"\bebay(?:\.com)?\b"],
-    },
-}
+# Task 8: the retailer table used to be a second hard-coded copy of the
+# site registry. It is now DERIVED from the data file
+# (backend/app/known_domains.json, category == "retail") — adding a
+# retailer is a data edit, never a code change. A registry entry may
+# carry an optional "display_name" (the label comparison tables show);
+# otherwise the registry name is used.
+def _retailers_from_registry() -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for key, entry in KNOWN_DOMAINS_REGISTRY.items():
+        if entry.get("category") != "retail":
+            continue
+        regional = entry.get("regional_urls") or {}
+        out[key] = {
+            "key": key,
+            "name": entry.get("display_name") or entry["name"],
+            "domains": list(entry["allowed_domains"]),
+            # Default region is IN (same as the resolver); fall back to
+            # the global URL so the derived table matches the old one.
+            "default_url": (
+                regional.get("IN")
+                or regional.get("GLOBAL")
+                or f"https://{entry['primary_domain']}"
+            ),
+            "patterns": list(entry["patterns"]),
+        }
+    return out
+
+
+KNOWN_RETAILERS: dict[str, dict[str, Any]] = _retailers_from_registry()
+
+# Retail display names (data) for stripping "on <site>" tails from a
+# product query and " - <site>" suffixes from a product title. Built
+# from the registry, never hand-listed.
+_RETAILER_DISPLAY_NAMES = "|".join(
+    sorted(
+        (
+            re.escape(entry.get("display_name") or entry["name"])
+            for entry in KNOWN_DOMAINS_REGISTRY.values()
+            if entry.get("category") == "retail"
+        ),
+        key=len,
+        reverse=True,
+    )
+)
+
+# A site token after "on / across / from / at": a registry retail name
+# (case-insensitive, with an optional generic word after it), any other
+# capitalised name, or a domain.
+_SITE_AFTER_PREP = (
+    r"(?:(?i:" + _RETAILER_DISPLAY_NAMES + r")(?:\s+(?:store|shop|official|website|portal|app))?"
+    r"|[A-Z][A-Za-z0-9\-]*(?:\s+(?:[A-Z][A-Za-z0-9\-]*|store|shop|official|website|portal|app))?"
+    r"|[a-z][a-z0-9\-]*(?:\.[a-z]{2,})+)"
+)
+
+# Words that may follow a site name in a comparison list ("Acme Store",
+# "official store"). Anything else ends the site token.
+_SITE_NAME_CONTINUATIONS = {"store", "shop", "official", "website", "portal", "app"}
+
+_COMPARE_SITE_LIST_RE = re.compile(
+    # Dots stay in the capture: a site token may be a domain
+    # ("examplestore.com"). Sentence-ending periods are stripped per
+    # token by _site_token_words; junk tokens are filtered by resolution.
+    r"\b(?:compare|comparison)\b.*?\b(?:on|across|between)\s+([^;:!?]+)",
+    re.IGNORECASE,
+)
+
+
+def _site_token_words(token: str) -> str:
+    """Leading words of a comparison-list token that look like a site name.
+
+    "ExampleStore for under 50000" -> "ExampleStore"; "Acme Store" ->
+    "Acme Store"; "examplestore.com" -> "examplestore.com".
+    """
+    words: list[str] = []
+    for raw in token.split():
+        word = raw.strip(",.")
+        if not word:
+            continue
+        if not words:
+            if word[0].isupper() or "." in word:
+                words.append(word)
+            else:
+                break
+        elif word[0].isupper() or word.lower() in _SITE_NAME_CONTINUATIONS or "." in word:
+            words.append(word)
+        else:
+            break
+    return " ".join(words)
+
+
+def _generic_required_sites(
+    instruction: str, seen_keys: set[str], seen_domains: set[str]
+) -> list[dict[str, Any]]:
+    """Required sites the user named that are NOT in the retailer registry.
+
+    Parses the site list of a comparison phrase ("compare X on A, B and C")
+    and resolves each token through the website resolver. A token becomes
+    a required site when it resolves to a known registry entry, a direct
+    URL, or is itself a domain (``examplestore.com``) that passes the
+    lookalike check. A bare unknown name resolves to a web-search
+    fallback, which is not a site — the general planner path handles it
+    instead.
+    """
+    from ..website_resolver import is_lookalike_or_suspicious
+
+    match = _COMPARE_SITE_LIST_RE.search(instruction or "")
+    if not match:
+        return []
+    found: list[dict[str, Any]] = []
+    for chunk in re.split(r",|\band\b", match.group(1)):
+        name = _site_token_words(chunk.strip().lstrip("the ").strip())
+        if not name:
+            continue
+        key = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+        if not key or key in seen_keys:
+            continue
+        try:
+            resolved = website_resolver.resolve(name)
+        except Exception:
+            continue
+        if resolved.resolution_method in ("registry", "direct_url"):
+            if not resolved.primary_domain or not resolved.canonical_url:
+                continue
+            if resolved.primary_domain in seen_domains:
+                continue
+            seen_keys.add(key)
+            seen_domains.add(resolved.primary_domain)
+            found.append({
+                "site_key": key,
+                "name": resolved.target_name,
+                "domains": [resolved.primary_domain],
+                "default_url": resolved.canonical_url,
+            })
+        elif re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9\-]*(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}", name):
+            domain = name.lower()
+            if domain in seen_domains:
+                continue
+            is_risk, _ = is_lookalike_or_suspicious(domain)
+            if is_risk:
+                continue
+            seen_keys.add(key)
+            seen_domains.add(domain)
+            found.append({
+                "site_key": key,
+                "name": name,
+                "domains": [domain],
+                "default_url": f"https://{domain}",
+            })
+    return found
 
 
 def identify_required_sites(instruction: str) -> list[dict[str, Any]]:
@@ -83,12 +172,15 @@ def identify_required_sites(instruction: str) -> list[dict[str, Any]]:
             if re.search(pat, inst_lower):
                 matched = True
                 break
-        # Special check for Samsung when listed alongside other retailers
-        if not matched and key == "samsung":
-            # e.g., "across Amazon, Flipkart, Samsung" or "Amazon, Flipkart and Samsung"
-            if re.search(r"(?:across|on|and|,)\s+(?:the\s+)?samsung\b", inst_lower):
+        # Bare-name mention alongside another retailer: registry patterns
+        # need a full name ("Acme Store") or a domain ("acme.com"),
+        # but a bare name in a list ("across RetailerA, RetailerB,
+        # Acme") is unambiguous once another retailer matched.
+        if not matched:
+            bare = info["name"].split()[0].lower()
+            if re.search(r"(?:across|on|and|,)\s+(?:the\s+)?" + re.escape(bare) + r"\b", inst_lower):
                 other_retailers = any(
-                    k != "samsung" and any(re.search(p, inst_lower) for p in KNOWN_RETAILERS[k]["patterns"])
+                    k != key and any(re.search(p, inst_lower) for p in KNOWN_RETAILERS[k]["patterns"])
                     for k in KNOWN_RETAILERS
                 )
                 if other_retailers:
@@ -102,6 +194,12 @@ def identify_required_sites(instruction: str) -> list[dict[str, Any]]:
                 "domains": list(info["domains"]),
                 "default_url": info["default_url"],
             })
+
+    # Task 8: sites the user named that no registry covers (e.g. a
+    # regional retailer, or a domain like examplestore.com) still become
+    # required sites — resolved generically, not from a hard-coded list.
+    seen_domains = {d for s in found for d in s["domains"]}
+    found.extend(_generic_required_sites(instruction, seen_keys, seen_domains))
 
     return found
 
@@ -263,8 +361,10 @@ def extract_target_product_query(instruction: str) -> str:
     text = re.sub(r"^(?:find|search(?:\s+for)?|look\s+up|check\s+price(?:\s+of)?|compare(?:\s+prices\s+of)?)\s+", "", text, flags=re.IGNORECASE)
     # Strip trailing "and compare prices", "and compare", "compare prices"
     text = re.sub(r"\s+(?:and\s+)?compare(?:\s+prices)?.*$", "", text, flags=re.IGNORECASE)
-    # Strip "on [store]...", "across [store]..."
-    text = re.sub(r"\s+(?:on|across|from|at)\s+(?:amazon|flipkart|samsung|croma|best\s*buy|walmart|ebay|official\s+store).*$", "", text, flags=re.IGNORECASE)
+    # Strip "on [site]...", "across [site]..." — the site token is any
+    # registry retail name, capitalised name, or domain (Task 8: no
+    # hard-coded store list).
+    text = re.sub(r"\s+(?:on|across|from|at)\s+" + _SITE_AFTER_PREP + r".*$", "", text)
     return text.strip()
 
 
@@ -312,6 +412,20 @@ def format_comparison_table(tracker: dict[str, Any], instruction: str = "") -> s
     table_header = "| Retailer | Status | Price | Details | Link |\n| :--- | :--- | :--- | :--- | :--- |"
     table = f"{table_header}\n" + "\n".join(rows)
 
+    # Product images, one per verified listing that declares one —
+    # the same card-with-image shape other agents show, rendered
+    # above the table. The image URL comes from the product page's
+    # own og:image (validated in the extractor); the workspace
+    # re-validates it before emitting an <img>.
+    images = []
+    for s in tracker["required_sites"].values():
+        if s.get("status") == "completed" and s.get("data"):
+            d = s["data"]
+            img = d.get("image")
+            if img:
+                images.append(f"![{d.get('title', s['name'])} — {d.get('price', '')}]({img})")
+    images_section = ("\n\n" + "\n\n".join(images)) if images else ""
+
     conclusion = ""
     if len(valid_prices) >= 2:
         valid_prices.sort(key=lambda x: x[0])
@@ -332,7 +446,30 @@ def format_comparison_table(tracker: dict[str, Any], instruction: str = "") -> s
     else:
         conclusion = "\n\n**Summary**: No verified listings were found across the requested retailers."
 
-    return f"### Price & Availability Comparison:\n{table}{conclusion}"
+    return f"### Price & Availability Comparison:{images_section}\n{table}{conclusion}"
+
+
+def _valid_image_url(raw: str | None) -> str | None:
+    """Accept a page-declared product image URL, or None.
+
+    Only credential-free http(s) URLs with a hostname pass. The host
+    is deliberately NOT restricted to the page host — a product image
+    almost always lives on the store's image CDN, not the listing
+    page's own host. The URL is only ever rendered for a product page
+    the agent actually visited, and the workspace re-validates it
+    with safeHttpUrl before emitting an <img>.
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        parsed = urllib.parse.urlparse(raw.strip())
+    except ValueError:
+        return None
+    if parsed.scheme not in ("http", "https"):
+        return None
+    if not parsed.netloc or parsed.username or parsed.password:
+        return None
+    return raw.strip()[:2048]
 
 
 def extract_page_research(
@@ -340,6 +477,7 @@ def extract_page_research(
     title: str,
     page_text: str,
     interactive_elements: Optional[list[dict[str, Any]]] = None,
+    image_url: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
     """Extract structured research entity (price, variant, seller, url) from visited pages.
     
@@ -375,9 +513,14 @@ def extract_page_research(
     if not price_str:
         return None
 
-    # Clean product title
+    # Clean product title: strip a trailing " - <site>" suffix, where the
+    # site is a registry retail name or a domain (Task 8: no hard-coded
+    # store list). A capitalised non-site word ("Silver") is kept.
     cleaned_title = title.strip()
-    cleaned_title = re.sub(r"(?i)\s*[-|–]\s*(Amazon\.in|Flipkart|Croma|Reliance Digital|eBay|Best Buy).*$", "", cleaned_title).strip()
+    cleaned_title = re.sub(
+        r"\s*[-|–]\s*(?:(?i:" + _RETAILER_DISPLAY_NAMES + r")|[a-z][a-z0-9\-]*(?:\.[a-z]{2,})+).*$",
+        "", cleaned_title,
+    ).strip()
     if len(cleaned_title) < 5:
         first_line = page_text.splitlines()[0] if page_text.splitlines() else ""
         if len(first_line) > 5:
@@ -404,10 +547,13 @@ def extract_page_research(
     seller_match = re.search(r"(?i)(?:Sold by|Seller:)\s*([A-Za-z0-9\s,\.\-]{3,40}?)(?:\s*(?:and Fulfilled|Free Delivery|\.|\n|$))", full_text)
     if seller_match:
         seller = seller_match.group(1).strip()
-    elif "amazon" in domain:
-        seller = "Amazon Seller"
-    elif "flipkart" in domain:
-        seller = "Flipkart Seller"
+    else:
+        # Task 8: the seller is the site's display name from the
+        # registry, not a hard-coded branch per retailer.
+        for _entry in KNOWN_DOMAINS_REGISTRY.values():
+            if domain == _entry["primary_domain"] or domain in _entry.get("allowed_domains", []):
+                seller = f"{_entry.get('display_name') or _entry['name']} Seller"
+                break
 
     # Availability
     in_stock = True
@@ -422,4 +568,7 @@ def extract_page_research(
         "variant": ", ".join(variants) if variants else "Standard",
         "seller": seller or domain.capitalize(),
         "in_stock": in_stock,
+        # Product image from the page's og:image, validated above.
+        # Absent (None) when the page declares none or it is unsafe.
+        "image": _valid_image_url(image_url),
     }

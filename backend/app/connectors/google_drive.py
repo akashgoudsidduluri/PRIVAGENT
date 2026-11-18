@@ -11,11 +11,19 @@ class GoogleDriveConnector(NativeConnector):
     origin = "https://www.googleapis.com"
     service = "Google Drive"
 
+    def search_documents_page(self, query: str, limit: int = 50, page_token: str | None = None) -> dict:
+        # The raw page: files plus nextPageToken, so callers can walk past
+        # the first 100 instead of silently stopping there.
+        safe = (query or "").replace("'", "\\'")[:150]
+        params: dict = {"q": f"name contains '{safe}' and trashed = false",
+                        "fields": "nextPageToken,files(id,name,mimeType,webViewLink)",
+                        "pageSize": min(max(limit, 1), 100)}
+        if page_token:
+            params["pageToken"] = page_token
+        return self._request("GET", "/drive/v3/files", params=params)
+
     def search_documents(self, query: str, limit: int = 50) -> list[dict]:
-        safe = query.replace("'", "\\'")[:150]
-        data = self._request("GET", "/drive/v3/files", params={"q": f"name contains '{safe}' and trashed = false",
-                      "fields": "nextPageToken,files(id,name,mimeType,webViewLink)", "pageSize": min(max(limit, 1), 100)})
-        return data.get("files", [])
+        return self.search_documents_page(query, limit).get("files", [])
 
     def extract_text(self, file_id: str, mime_type: str) -> str:
         path = f"/drive/v3/files/{quote(file_id, safe='')}"

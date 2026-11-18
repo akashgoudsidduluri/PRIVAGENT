@@ -1,0 +1,22 @@
+{
+  "suite": "osworld",
+  "full_name": "OSWorld 2.0",
+  "status": "blocked",
+  "adapter": "not_implemented",
+  "present": [],
+  "missing": [
+    "env GEMINI_API_KEY not set",
+    "env GROQ_API_KEY not set",
+    "env OPENAI_API_KEY not set",
+    "no Chrome/Chromium binary on PATH",
+    "PrivAgent backend not reachable at http://127.0.0.1:8000 (start it first)",
+    "PrivAgent adapter for this harness: not implemented"
+  ],
+  "needs": [
+    "OSWorld repo cloned (https://github.com/xlang-ai/OSWorld)",
+    "VM hypervisor (VMware / VirtualBox / QEMU) with the OSWorld Ubuntu VM image",
+    "LLM API key: GEMINI_API_KEY or GROQ_API_KEY or OPENAI_API_KEY",
+    "PrivAgent adapter mapping OSWorld's computer-use interface onto the PrivAgent loop"
+  ],
+  "command": "git clone https://github.com/xlang-ai/OSWorld && cd OSWorld && pip install -r requirements.txt && python run.py --headless --model <model> --agent privagent  # adapter not implemented yet"
+}

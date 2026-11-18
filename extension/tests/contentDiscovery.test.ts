@@ -103,3 +103,26 @@ describe("search control discovery", () => {
     expect(found?.name).toBe("Search");
   });
 });
+
+describe("secret fields never leak their value into the element name", () => {
+  it("an unlabelled password/PIN/OTP field is named by its attributes, never its value", () => {
+    document.body.innerHTML = `
+      <input id="pwd" type="password" value="secret123">
+      <input id="pin" type="password" name="pin" value="9876">
+      <input id="otp" type="text" inputmode="numeric" autocomplete="one-time-code" value="123456">
+      <div id="composer" contenteditable="true">my private draft text</div>`;
+    makeVisible();
+
+    const found = list();
+    const byId = Object.fromEntries(found.map(e => [e.targetId, e]));
+    for (const [id, el] of Object.entries(byId)) {
+      expect(el.name, id).not.toContain("secret123");
+      expect(el.name, id).not.toContain("9876");
+      expect(el.name, id).not.toContain("123456");
+      expect(el.name, id).not.toContain("my private draft text");
+    }
+    // The password field is still discoverable — by its type.
+    expect(byId["pwd"]).toBeDefined();
+    expect(byId["pwd"].name.toLowerCase()).toContain("password");
+  });
+});

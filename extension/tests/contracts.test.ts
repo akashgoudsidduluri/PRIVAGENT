@@ -19,11 +19,16 @@ describe("contracts", () => {
       "wait",
       "observe",
       "select_tab",
+      "switch_tab",
       "new_tab",
       "close_tab",
       "select_option",
       "set_date",
       "upload_file",
+      // Task 14: standards actions (webmcp_tool runs in the tab;
+      // ucp_checkout is backend-executed, never sent here).
+      "webmcp_tool",
+      "ucp_checkout",
     ]);
   });
 
@@ -98,6 +103,8 @@ describe("contracts", () => {
       { type: "scroll", risk: "read", timeoutMs: 1000, verify: "v", params: { direction: "sideways" } },
       { type: "zoom", risk: "read", timeoutMs: 1000, verify: "v", params: { factor: 9 } },
       { type: "select_tab", risk: "read", timeoutMs: 1000, verify: "v", params: { tabId: -1 } },
+      { type: "switch_tab", risk: "read", timeoutMs: 1000, verify: "v", params: { tabId: -1 } },
+      { type: "switch_tab", risk: "read", timeoutMs: 1000, verify: "v", params: {} },
       { type: "new_tab", risk: "write", timeoutMs: 1000, verify: "v", params: { url: "about:blank" } },
     ];
     for (const action of cases) {
@@ -127,6 +134,23 @@ describe("contracts", () => {
       target: { targetId: "", coords: { x: 10, y: 20 } },
     } as unknown as BrowserAction;
     expect(validateAction(action).ok).toBe(true);
+  });
+
+  it("switch_tab validates exactly like select_tab (Task 9)", () => {
+    // The planner-facing tab-switch action; select_tab is kept for
+    // back-compat. Same risk floor (read), same tabId rule.
+    expect(TYPE_ACTION_RISK_FLOOR.switch_tab).toBe("read");
+    expect(TYPE_ACTION_RISK_FLOOR.select_tab).toBe("read");
+    const valid = {
+      type: "switch_tab", risk: "read", timeoutMs: 1000, verify: "v",
+      params: { tabId: 3 },
+    } as unknown as BrowserAction;
+    expect(validateAction(valid).ok).toBe(true);
+    const legacy = {
+      type: "select_tab", risk: "read", timeoutMs: 1000, verify: "v",
+      params: { tabId: 3 },
+    } as unknown as BrowserAction;
+    expect(validateAction(legacy).ok).toBe(true);
   });
 });
 

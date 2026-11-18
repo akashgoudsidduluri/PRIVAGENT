@@ -1,4 +1,4 @@
-import { semanticElement, checkTargetFreshness, queryAllWithShadow as semanticQuery, accessibleName as fullAccessibleName, viewportBounds } from "../src/semantic";
+import { semanticElement, checkTargetFreshness, queryAllWithShadow as semanticQuery, accessibleName as fullAccessibleName, stripIconGlyphs, viewportBounds } from "../src/semantic";
 import type { SemanticElement } from "../src/contracts";
 /**
  * Content script injected programmatically by the service worker.
@@ -9,9 +9,15 @@ export {}
 
 interface AgentElement {
   targetId: string;
+  /** Task 7: element reference for this observation's accessibility
+   * tree, assigned in list order (e0, e1, ...). Scoped to one list()
+   * call — the backend resolves it against the same observation. */
+  elementRef: string;
   semantic?: SemanticElement;
   role: string;
   name: string;
+  /** Pre-glyph-strip accessible name, when it differs. Debugging only. */
+  rawName?: string;
   tag: string;
   inputType?: string;
   /** Explicit semantic classification; never used to overwrite DOM attributes. */
@@ -21,6 +27,8 @@ interface AgentElement {
   visible: boolean;
   bounds: { x: number; y: number; width: number; height: number };
   href?: string;
+  /** Task 7: element state from ARIA / DOM (absent = unknown). */
+  state?: { checked?: boolean; selected?: boolean; expanded?: boolean };
 }
 
 interface ValueProbe {
@@ -45,6 +53,7 @@ interface PageStateProbe {
 interface NavigatorAgent {
   list: () => AgentElement[];
   click: (targetId: string, name?: string) => { ok: boolean; error?: string };
+  linkTarget: (targetId: string, name?: string) => string;
   clickCoords: (x: number, y: number) => { ok: boolean; targetId?: string; error?: string };
   getCoords: (targetId: string, name?: string) => { x: number; y: number; width: number; height: number } | null;
   getClickPoint: (targetId: string, name?: string) => { x: number; y: number; width: number; height: number } | null;
@@ -84,6 +93,20 @@ function queryAllWithShadow(root: Document | ShadowRoot | Element, selector: str
 
 function normText(value: string | null | undefined): string {
   return (value ?? "").replace(/\s+/g, " ").trim();
+}
+
+// Task 8: find a price inside a product card by the text itself, not by a
+// retailer's price class. First currency-looking text node wins.
+function priceTextIn(card: Element): string {
+  const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT);
+  let node: Text | null;
+  while ((node = walker.nextNode() as Text | null)) {
+    const t = normText(node.textContent);
+    if (t.length > 0 && t.length <= 40 && /[₹$€£]\s?[\d,]+(\.\d{2})?/.test(t)) {
+      return t;
+    }
+  }
+  return "";
 }
 
 function escapeSelector(value: string): string {
@@ -141,20 +164,22 @@ function associatedLabelText(el: HTMLElement): string {
   return normText(el.closest("label")?.textContent);
 }
 
-/** Human-readable accessible name, preserving the page's own wording. */
+/** Human-readable accessible name, preserving the page's own wording.
+ * Icon glyphs are stripped from the matching name (see semantic.ts);
+ * the raw text is not kept here — the list() assembly keeps rawName. */
 function accessibleName(el: HTMLElement): string {
   const computed = fullAccessibleName(el);
-  if (computed) return computed;
+  if (computed) return stripIconGlyphs(computed);
   const labelled = labelledByText(el);
-  if (labelled) return labelled;
+  if (labelled) return stripIconGlyphs(labelled);
   const ariaLabel = normText(el.getAttribute("aria-label"));
-  if (ariaLabel) return ariaLabel;
+  if (ariaLabel) return stripIconGlyphs(ariaLabel);
   const label = associatedLabelText(el);
-  if (label) return label;
+  if (label) return stripIconGlyphs(label);
   const title = normText(el.getAttribute("title"));
-  if (title) return title;
+  if (title) return stripIconGlyphs(title);
   const input = el as HTMLInputElement;
-  return normText(input.placeholder);
+  return stripIconGlyphs(normText(input.placeholder));
 }
 
 function isTextEntry(el: HTMLElement): boolean {
@@ -228,8 +253,9 @@ function derivedNameHint(el: HTMLElement): string {
 /**
  * Distinguishing hint for a search field the page never named.
  *
- * Only the form field name is used: ids like "plain-search" add noise without
- * disambiguating, while name="field-keywords" is the page's own stable handle.
+ * Only the form field name is used: ids like "plain-search" add noise
+ * without disambiguating, while the name attribute is the page's own
+ * stable handle for the field.
  */
 function searchFallbackHint(el: HTMLElement): string {
   return normText((el as HTMLInputElement).name || "");
@@ -270,27 +296,15 @@ function candidates(): AgentElement[] {
     '[contenteditable="true"]',
     '[data-testid]',
     '[data-tab]',
-    'ytd-thumbnail',
-    '#video-title',
-    '#thumbnail',
-    '.ytp-play-button',
-    '.ytp-button',
-    '[data-icon="send"]',
-    '[data-testid="compose-btn-send"]',
-    '.ytp-ad-skip-button',
-    '.ytp-ad-skip-button-modern',
-    '.ytp-skip-ad-button',
-    '.ytp-ad-overlay-close-button',
+    // Ad-skip and dialog controls are found by accessible name / generic
+    // attribute patterns, never by a site's player classes (Task 8).
     '[id^="skip-button"]',
     'button[aria-label*="close" i]',
     'button[aria-label*="skip" i]',
     'button.close',
-    'button._2doB4z',
-    'button._2KpZ6l._2doB4z',
     '[data-testid*="close"]',
     '[aria-label="Close" i]',
     '[aria-label*="dismiss" i]',
-    '#onetrust-accept-btn-handler',
     'button[id*="cookie"]',
     'button[id*="accept"]',
   ].join(', ');
@@ -320,43 +334,58 @@ function candidates(): AgentElement[] {
 
     const textTrimmed = (el.textContent || "").trim();
     const isCloseGlyph = textTrimmed === "✕" || textTrimmed === "×" || textTrimmed === "X" || textTrimmed.toLowerCase() === "close";
-    const isInModalOrDialog = Boolean(el.closest('[role="dialog"], [aria-modal="true"], .modal, ._2KpZ6l, [class*="dialog" i], [class*="modal" i], [class*="overlay" i], [class*="popup" i]'));
-    const isExplicitClose = el.matches('button._2doB4z, button._2KpZ6l._2doB4z, button.close, [data-testid*="close"], [aria-label*="close" i], [aria-label*="dismiss" i]');
-    const isOverlayClose = (isCloseGlyph && isInModalOrDialog) || isExplicitClose || el.matches('.ytp-ad-overlay-close-button');
+    const isInModalOrDialog = Boolean(el.closest('[role="dialog"], [aria-modal="true"], .modal, [class*="dialog" i], [class*="modal" i], [class*="overlay" i], [class*="popup" i]'));
+    const isExplicitClose = el.matches('button.close, [data-testid*="close"], [aria-label*="close" i], [aria-label*="dismiss" i]');
+    const isOverlayClose = (isCloseGlyph && isInModalOrDialog) || isExplicitClose;
 
-    const isAdSkip = el.matches('.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button, [id^="skip-button"]');
-    const isVoiceBtn = el.matches('[data-icon="ptt"], [aria-label*="voice" i], [aria-label*="audio" i], [aria-label*="record" i]');
-    const isSendBtn = !isVoiceBtn && el.matches('[data-testid="compose-btn-send"], [data-icon="send"], span[data-icon="send"], button[aria-label="Send" i], button[aria-label*="Send message" i]');
-    const isComposer = el.matches('footer [contenteditable="true"], [data-tab="10"], [data-testid="conversation-compose-box-input"], footer [role="textbox"]');
-    const isCancelVoice = el.matches('[data-icon="cancel"], [data-testid="btn-cancel"], [data-icon="delete-clip"], button[aria-label*="cancel" i]');
+    // Task 8: ad-skip is detected by accessible name / generic id, never
+    // by a site's player classes.
+    const skipLabel = (el.getAttribute("aria-label") || "").toLowerCase();
+    const isAdSkip = el.matches('[id^="skip-button"]')
+      || (skipLabel.includes("skip") && (skipLabel.includes("ad") || skipLabel.includes("advert")));
+    const isVoiceBtn = el.matches('[aria-label*="voice" i], [aria-label*="audio" i], [aria-label*="record" i]');
+    const isSendBtn = !isVoiceBtn && el.matches('button[aria-label="Send" i], button[aria-label*="Send message" i]');
+    const isComposer = el.matches('footer [contenteditable="true"], footer [role="textbox"]');
+    const isCancelVoice = el.matches('button[aria-label*="cancel" i]');
 
     // Exclude repetitive header/footer navigation category clutter unless it's a search input, submit or modal close
-    const isNavOrFooter = Boolean(el.closest('footer, #navFooter, #nav-subnav, #nav-belt, .s-navigation-left-panel, [role="navigation"]'));
+    const isNavOrFooter = Boolean(el.closest('footer, [role="navigation"]'));
     const isSpecialControl = isAdSkip || isOverlayClose || el.tagName.toLowerCase() === "input" || el.tagName.toLowerCase() === "textarea" || (el.getAttribute("role") === "searchbox");
     if (isNavOrFooter && !isSpecialControl) {
       return;
     }
 
-    const isWa = window.location.hostname.includes("whatsapp.com");
-    const isWaGroupFilter = isWa && el.matches('button, [role="button"]') && el.textContent?.trim() === "Groups";
-    const isWaCancelSearch = isWa && el.matches('[data-testid="chat-list-search-esc-button"], [data-icon="x-alt"], button[aria-label*="cancel search" i]');
-    const isWaSearch = isWa && el.matches('div[data-tab="3"], [data-testid="chat-list-search"], [aria-label*="search" i]');
-    const isWaChatRow = isWa && el.matches('div[role="listitem"], div[role="row"], div[data-testid*="chat-list-item"], div[data-testid="cell-frame-container"]');
-    let waChatTitle = "";
-    if (isWaChatRow) {
-      const titleEl = el.querySelector('[data-testid="cell-frame-title"], span[title], div[title]');
-      waChatTitle = titleEl?.getAttribute("title") || titleEl?.textContent?.trim() || "";
+    // Task 8: chat surfaces (group filter, cancel-search, chat rows)
+    // are recognised by role + accessible name + text on ANY site — no
+    // host checks, no per-app data-testids. A chat row is a listitem/row
+    // whose title text names the conversation. The search box needs no
+    // special case: isSearchControl below already names it by role/name.
+    const isGroupFilter = el.matches('button, [role="button"]') && el.textContent?.trim() === "Groups";
+    const isCancelSearch = el.matches('button[aria-label*="cancel search" i]');
+    const isChatRow = el.matches('div[role="listitem"], div[role="row"]')
+      && Boolean(el.querySelector('span[title], div[title]'));
+    let chatTitle = "";
+    if (isChatRow) {
+      const titleEl = el.querySelector('span[title], div[title]');
+      chatTitle = titleEl?.getAttribute("title") || titleEl?.textContent?.trim() || "";
     }
 
     const anchor = (el.tagName.toLowerCase() === "a" ? el : el.closest("a[href]")) as HTMLAnchorElement | null;
     const href = anchor?.href || undefined;
 
     const accessible = accessibleName(el);
+    // A field's current VALUE must never become its name: an
+    // unlabelled password/PIN/OTP field's secret would be sent to the
+    // backend (and the planner) as the element's name on every
+    // observation. The same holds for a contenteditable's typed text
+    // (its textContent is user-entered data, not a label), so
+    // textContent is only a name source for non-editable elements
+    // (buttons, links). Unnamed fields fall through to derivedNameHint
+    // (the page's own field name/id/type), never the live value.
     const semanticFallback = (
       (el.getAttribute("data-icon") ? `icon ${el.getAttribute("data-icon")}` : "") ||
       (el.getAttribute("data-testid") && !el.textContent?.trim() ? el.getAttribute("data-testid") : "") ||
-      normText(el.textContent) ||
-      normText(input.value) ||
+      (isEditableElement(el) ? "" : normText(el.textContent)) ||
       derivedNameHint(el)
     );
     let name = (
@@ -371,22 +400,27 @@ function candidates(): AgentElement[] {
     if (isCancelVoice) name = "Cancel Recording";
     if (isSendBtn) name = "Send";
     if (isComposer && (!name || name.length > 50)) name = "Type a message";
-    if (isWaGroupFilter) name = "Groups";
-    if (isWaCancelSearch) name = "Cancel search";
-    if (isWaSearch && !name) name = "Search or start new chat";
-    if (isWaChatRow && waChatTitle) name = waChatTitle;
+    if (isGroupFilter) name = "Groups";
+    if (isCancelSearch) name = "Cancel search";
+    if (isChatRow && chatTitle) name = chatTitle;
 
     // Semantic classification, not a blind rename. A name the page actually
     // exposed (label, aria-label, title, placeholder) is kept verbatim. Only an
     // unnamed search field gets a "Search" fallback plus its form-field name,
-    // so Amazon's #twotabsearchtextbox is discoverable without altering what
-    // Flipkart or a labelled search input already says.
+    // so an unlabelled search input is discoverable without altering what
+    // a labelled search input already says.
     const searchControl = isSearchControl(el, name);
     if (searchControl && !accessible) {
       const hint = searchFallbackHint(el);
       name = `Search${hint ? ` (${hint})` : ""}`;
     }
     name = name.slice(0, 140);
+    // Moodle fix: strip icon-font glyphs from the matching name (a
+    // button whose text is " Search courses" must match "Search
+    // courses"). The raw assembled text is kept as rawName for
+    // debugging only — never for matching.
+    const rawName = name;
+    name = stripIconGlyphs(name);
 
     // Discard generic ad badges and empty link elements
     const nameLower = name.toLowerCase();
@@ -397,12 +431,14 @@ function candidates(): AgentElement[] {
       return;
     }
 
-    // Group product card title and price together for e-commerce
+    // Group product card title and price together for e-commerce. The
+    // card is any generic container (article / listitem / data-id); the
+    // price is the first currency-looking text inside it (Task 8: no
+    // per-retailer classes or price selectors).
     if (href && (href.includes("/dp/") || href.includes("/gp/product/") || href.includes("/p/"))) {
-      const card = el.closest('[data-component-type="s-search-result"], .s-result-item, [data-id], ._1AtVbE, ._75nlfW, [data-asin]');
+      const card = el.closest('article, [role="listitem"], [data-id]');
       if (card) {
-        const priceEl = card.querySelector('.a-price .a-offscreen, ._30jeq3, .Nx9bqj, .priceToPay, [data-feature-name="corePrice"]');
-        const priceText = priceEl?.textContent?.trim() || "";
+        const priceText = priceTextIn(card);
         if (priceText && !name.includes(priceText)) {
           name = `${name} - ${priceText}`;
         }
@@ -418,16 +454,33 @@ function candidates(): AgentElement[] {
     const role = isAdSkip ? "ad-skip" :
                  isOverlayClose ? "close-button" :
                  isComposer ? "textbox" :
-                 isWaSearch ? "textbox" :
                  (searchControl && isTextEntry(el)) ? "searchbox" :
-                 (isSendBtn || isVoiceBtn || isCancelVoice || isWaGroupFilter || isWaCancelSearch) ? "button" :
-                 (isWaChatRow ? "listitem" : (el.getAttribute("role") || el.tagName.toLowerCase()));
+                 (isSendBtn || isVoiceBtn || isCancelVoice || isGroupFilter || isCancelSearch) ? "button" :
+                 (isChatRow ? "listitem" : (el.getAttribute("role") || el.tagName.toLowerCase()));
     const cssSelector = rawId ? `#${CSS.escape(rawId)}` : `[data-navigator-id="${targetId}"]`;
+    // Task 7: element state for the accessibility tree. Checked comes
+    // from the DOM for checkable inputs, selected/expanded from ARIA.
+    const state: { checked?: boolean; selected?: boolean; expanded?: boolean } = {};
+    if (el.tagName.toLowerCase() === "input" && (input.type === "checkbox" || input.type === "radio")) {
+      state.checked = Boolean(input.checked);
+    } else if (el.getAttribute("aria-checked") !== null) {
+      state.checked = el.getAttribute("aria-checked") === "true";
+    }
+    if (el.getAttribute("aria-selected") !== null) {
+      state.selected = el.getAttribute("aria-selected") === "true";
+    }
+    if (el.getAttribute("aria-expanded") !== null) {
+      state.expanded = el.getAttribute("aria-expanded") === "true";
+    }
 
     list.push({
       targetId,
+      // Ref index is the position in the RETURNED list (not the DOM
+      // walk index — pruned nodes must not leave gaps in the refs).
+      elementRef: `e${list.length}`,
       role,
       name,
+      ...(rawName !== name ? { rawName } : {}),
       tag: el.tagName.toLowerCase(),
       inputType: el.tagName.toLowerCase() === "input" ? input.type : undefined,
       search: searchControl || undefined,
@@ -436,6 +489,7 @@ function candidates(): AgentElement[] {
       visible: true,
       href,
       bounds: mapped,
+      state: Object.keys(state).length > 0 ? state : undefined,
       semantic: semanticElement(el, targetId) || undefined,
     });
   });
@@ -494,23 +548,22 @@ function elementFor(targetId: string, name?: string, requireEditable = false): H
   // 6. Fallback search by accessible name / textContent
   if (name && name.trim()) {
     const wanted = name.trim().toLowerCase();
-    const all = queryAllWithShadow(document, 'button, input, textarea, select, a[href], [role="button"], [role="link"], [role="textbox"], [role="searchbox"], [role="row"], [role="listitem"], [role="gridcell"], [tabindex], [data-testid], span[title], div[title], ytd-thumbnail, #video-title') as HTMLElement[];
+    const all = queryAllWithShadow(document, 'button, input, textarea, select, a[href], [role="button"], [role="link"], [role="textbox"], [role="searchbox"], [role="row"], [role="listitem"], [role="gridcell"], [tabindex], [data-testid], span[title], div[title]') as HTMLElement[];
     // Typing/reading a value may never bind to a same-named button or link.
     const pool = requireEditable ? all.filter(isEditableElement) : all;
 
-    // Specialized WhatsApp resolution:
-    if (window.location.hostname.includes("whatsapp.com")) {
-      if (wanted === "groups" || wanted === "group" || wanted.includes("group filter")) {
-        const groupsBtn = pool.find(e => {
-          const t = (e.getAttribute("aria-label") || e.textContent || "").trim().toLowerCase();
-          return t === "groups" || t === "group";
-        });
-        if (groupsBtn) return groupsBtn;
-      }
-      if (wanted.includes("first group") || wanted.includes("group chat") || wanted === "first chat") {
-        const chatRow = document.querySelector('div[role="listitem"], div[role="row"], div[data-testid*="chat-list-item"], div[data-testid="cell-frame-container"]') as HTMLElement | null;
-        if (chatRow) return chatRow;
-      }
+    // Generic chat-app resolution (any site): a "Groups" filter button by
+    // its accessible name, and the first chat row by role.
+    if (wanted === "groups" || wanted === "group" || wanted.includes("group filter")) {
+      const groupsBtn = pool.find(e => {
+        const t = (e.getAttribute("aria-label") || e.textContent || "").trim().toLowerCase();
+        return t === "groups" || t === "group";
+      });
+      if (groupsBtn) return groupsBtn;
+    }
+    if (wanted.includes("first group") || wanted.includes("group chat") || wanted === "first chat") {
+      const chatRow = document.querySelector('div[role="listitem"], div[role="row"]') as HTMLElement | null;
+      if (chatRow) return chatRow;
     }
 
     // Exact or substring match on the full accessible identity (aria-labelledby,
@@ -548,7 +601,7 @@ function editableValue(el: HTMLElement): string {
 }
 
 function computePageState(): PageStateProbe {
-  const main = document.querySelector('main, [role="main"], #content, #centerCol, #dp, body') as HTMLElement | null;
+  const main = document.querySelector('main, [role="main"], #content, body') as HTMLElement | null;
   const text = normText(main?.innerText || document.body?.innerText || "");
   let hash = 0;
   const limit = Math.min(text.length, 4000);
@@ -556,8 +609,6 @@ function computePageState(): PageStateProbe {
     hash = ((hash * 31) + text.charCodeAt(i)) | 0;
   }
   const resultSelectors = [
-    '[data-component-type="s-search-result"]',
-    '.s-result-item',
     '[data-testid*="result" i]',
     '[class*="result" i]',
     'article',
@@ -575,14 +626,13 @@ function computePageState(): PageStateProbe {
 }
 
 /**
- * Chat rows / list items. WhatsApp renders a chat row as a container whose
- * inner text labels are what name-matching usually resolves, but the selection
- * handler lives on the row. Clicking the label's own centre can therefore hit
- * a non-activating child.
+ * Chat rows / list items. A chat app renders a chat row as a container
+ * whose inner text labels are what name-matching usually resolves, but
+ * the selection handler lives on the row. Clicking the label's own
+ * centre can therefore hit a non-activating child.
  */
 const CHAT_ROW_SELECTOR =
-  '[role="listitem"], [role="row"], div[tabindex="-1"], ' +
-  '[data-testid*="cell-frame"], [data-testid*="list-item"], [data-testid*="chat-list-item"]';
+  '[role="listitem"], [role="row"], div[tabindex="-1"]';
 
 const EXPLICIT_CONTROL_SELECTOR =
   'button, a[href], input, textarea, select, [role="button"], [role="link"], ' +
@@ -643,17 +693,6 @@ window.__navigatorAgent = {
     };
   },
   click: (targetId, name) => {
-    // Specialized WhatsApp handling: clear a stale search filter before
-    // clicking Groups or a chat row.
-    if (window.location.hostname.includes("whatsapp.com")) {
-      const nm = (name || "").toLowerCase();
-      if (nm === "groups" || nm === "group" || nm.includes("group") || nm.includes("chat")) {
-        const cancelSearch = document.querySelector('[data-testid="chat-list-search-esc-button"], [data-icon="x-alt"], button[aria-label*="cancel search" i]') as HTMLElement | null;
-        if (cancelSearch && !nm.includes("cancel")) {
-          try { (cancelSearch.closest("button") || cancelSearch).click(); } catch {}
-        }
-      }
-    }
     const el = elementFor(targetId, name);
     if (!el) return { ok: false, error: "STALE_TARGET" };
     try {
@@ -664,7 +703,7 @@ window.__navigatorAgent = {
     // interactive ancestor. Dispatching on the leaf, target, and container
     // (plus anchor click) fired the same action several times.
     const clickable = (
-      el.closest('button, [role="button"], a[href], [role="row"], [role="listitem"], [role="gridcell"], [data-testid*="cell-frame"], [data-testid*="list-item"]') as HTMLElement | null
+      el.closest('button, [role="button"], a[href], [role="row"], [role="listitem"], [role="gridcell"]') as HTMLElement | null
     ) || el;
     try { clickable.focus?.(); } catch {}
 
@@ -701,6 +740,17 @@ window.__navigatorAgent = {
       clickable.dispatchEvent(new MouseEvent("click", { ...base, buttons: 0, detail: 1 }));
     }
     return { ok: true };
+  },
+  /** The closest anchor's `target` attribute ("" when the element is not
+   * a link or has none). doClick uses it to decide whether a
+   * non-navigating link click is a popup-blocked `_blank` (worth
+   * rescuing with an explicit tab) or a same-page/JS-handled link
+   * (which legitimately does not navigate). */
+  linkTarget: (targetId, name) => {
+    const el = elementFor(targetId, name);
+    if (!el) return "";
+    const anchor = (el.tagName.toLowerCase() === "a" ? el : el.closest("a[href]")) as HTMLAnchorElement | null;
+    return anchor?.target || "";
   },
   clickCoords: (x, y) => {
     const el = document.elementFromPoint(x, y) as HTMLElement | null;
@@ -744,38 +794,23 @@ window.__navigatorAgent = {
     // unhandled exception: report it so the executor can surface STALE_TARGET.
     try {
       let el = elementFor(targetId, name, true);
-      const nm = (name || "").toLowerCase();
-
-      // Specialized WhatsApp Web element resolution:
-      if (window.location.hostname.includes("whatsapp.com")) {
-        if (nm.includes("type") || nm.includes("message") || nm.includes("composer") || !el) {
-          const waComposer = document.querySelector('footer [contenteditable="true"], [data-tab="10"], [data-testid="conversation-compose-box-input"]') as HTMLElement | null;
-          if (waComposer) el = waComposer;
-        } else if (nm.includes("search") || nm.includes("find")) {
-          const waSearch = document.querySelector('div[data-tab="3"], [data-testid="chat-list-search"], [aria-label="Search input textbox"]') as HTMLElement | null;
-          if (waSearch) el = waSearch;
-          if (clear || !text) {
-            const cancelSearch = document.querySelector('[data-testid="chat-list-search-esc-button"], [data-icon="x-alt"], [data-icon="back"], button[aria-label*="cancel search" i]') as HTMLElement | null;
-            if (cancelSearch) {
-              try { (cancelSearch.closest("button") || cancelSearch).click(); } catch {}
-            }
-          }
-        }
-      }
+      // The resolved element is authoritative. Never replace it by
+      // name substring: "type"/"message"/"composer" used to redirect
+      // typing into the footer chat composer (so a search box named
+      // "Type to search" got its query typed into a chat draft), and
+      // "search"/"find" into the first searchbox on the page — and
+      // never substitute another element when resolution fails. A
+      // stale target fails closed (STALE_TARGET) so the planner
+      // re-grounds, instead of "succeeding" against an element it
+      // never named.
+      if (!el) return { ok: false, error: "STALE_TARGET" };
 
       if (el && !(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement || el.isContentEditable)) {
         const inner = el.querySelector("input, textarea, select, [contenteditable='true'], [contenteditable]") as HTMLElement | null;
         if (inner) el = inner;
       }
-      if (!el) {
-        const active = document.activeElement as HTMLElement | null;
-        if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement || active?.isContentEditable) {
-          el = active;
-        }
-      }
       // A rich-text editor often keeps the caret in a child node while the
       // planner targeted the wrapper: trust the focused editable.
-      if (!el) return { ok: false, error: "STALE_TARGET" };
       const active = document.activeElement as HTMLElement | null;
       const editable =
         el.isContentEditable
@@ -1064,7 +1099,7 @@ function extractReadableText(maxLen = 4000): string {
   try {
     const root =
       document.querySelector(
-        'main, [role="main"], article, #content, #mw-content-text, #centerCol, #dp, body'
+        'main, [role="main"], article, #content, #mw-content-text, body'
       ) || document.body;
     if (!root) return "";
 
@@ -1072,11 +1107,13 @@ function extractReadableText(maxLen = 4000): string {
     const lines: string[] = [];
     let currentLength = 0;
 
+    // Task 8: readable-text elements are generic (headings, paragraphs,
+    // tables, list items, labelled data) — no per-retailer price/title
+    // classes or hashed class names.
     const elements = root.querySelectorAll(
-      'h1, h2, h3, h4, p, table, [data-feature-name], .a-price, .a-price-whole, #corePriceDisplay_desktop_feature_div, #corePrice_desktop, #apex_desktop, .priceToPay, [data-feature-name="corePrice"], [data-feature-name="title"], #productTitle, #twister, #productDescription, #feature-bullets, #techSpecs-table, #productDetails_techSpec_section_1, #productDetails_db_sections, ' +
-      '._30jeq3, .Nx9bqj, ._16Jk6d, ._21A06W, ._1mX5Pr, ._3k-BhJ, ._2160x1, ._35KyD6, ._4rR01T, .KzDlHZ, .B_NuCI, ' +
-      '[role="listitem"], .pIav2d, .JVOxCe, .yR1fYc, .U3gHgb, [jsname="I3kE2b"], .YMlIz, [data-hotel-id], .D90Uje, .b0G24d, .qA0Zcf, .W8L26d, ' +
-      '[class*="text-label-"], [class*="text-sd-"], [class*="ranking"], [class*="rating"], [data-difficulty], [data-cypress="UserAvatar"], [class*="badge"], [class*="stat"]'
+      'h1, h2, h3, h4, p, table, [data-feature-name], ' +
+      '[role="listitem"], ' +
+      '[class*="text-label-"], [class*="text-sd-"], [class*="ranking"], [class*="rating"], [data-difficulty], [class*="badge"], [class*="stat"]'
     );
 
     if (elements.length === 0) {
@@ -1095,7 +1132,7 @@ function extractReadableText(maxLen = 4000): string {
         continue;
       }
 
-      if (el.closest('nav, footer, header, [role="navigation"], #cookie-banner, .cookie-notice, #nav-main')) {
+      if (el.closest('nav, footer, header, [role="navigation"], #cookie-banner, .cookie-notice')) {
         continue;
       }
 

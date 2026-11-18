@@ -45,7 +45,7 @@ def test_native_connectors_use_fixed_origins_and_distinct_methods():
     client = _client(respond)
     assert GmailConnector("token", client=client).search_threads("report") == [{"id": "T1"}]
     assert GmailConnector("token", client=client).draft_email("me@example.com", "Report", "Body")["id"] == "ok"
-    assert GoogleCalendarConnector("token", client=client).check_availability("a", "b", ["primary"]) == {"calendars": {}}
+    assert GoogleCalendarConnector("token", client=client).check_availability("2026-11-19T09:00:00+05:30", "2026-11-19T10:00:00+05:30", ["primary"]) == {"calendars": {}}
     assert GoogleDriveConnector("token", client=client).search_documents("report") == [{"id": "F1"}]
     assert SlackConnector("token", client=client).query_channels() == [{"id": "C1"}]
     assert GitHubConnector("token", client=client).query_issues("owner", "repo") == [{"number": 1}]

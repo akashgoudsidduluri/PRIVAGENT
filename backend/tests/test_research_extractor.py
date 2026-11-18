@@ -43,3 +43,24 @@ def test_extract_page_research_ignores_search_engines():
     res = extract_page_research(url, title, text)
     assert res is None
 
+
+
+def test_extract_page_research_keeps_valid_og_image_and_rejects_unsafe_ones():
+    """The product image comes from the page's og:image (collected by
+    the extension). A valid CDN URL is kept — the image host is
+    deliberately NOT the page host, because a store's product images
+    live on its image CDN. Unsafe values are dropped, never trusted
+    on arrival; no image at all yields None, not a placeholder."""
+    url = "https://www.flipkart.com/samsung-galaxy-fit3/p/itm123"
+    title = "Samsung Galaxy Fit3 Online at Best Price on Flipkart"
+    text = "Samsung Galaxy Fit3\n₹3,899\nSeller: RetailNet\n"
+    res = extract_page_research(
+        url, title, text,
+        image_url="https://rukminim2.flixcart.com/image/600/600/fit3.jpg")
+    assert res is not None
+    assert res["image"] == "https://rukminim2.flixcart.com/image/600/600/fit3.jpg"
+    assert extract_page_research(url, title, text)["image"] is None
+    for bad in ("javascript:alert(1)", "data:image/png;base64,AAAA",
+                "https://user:pass@cdn.example.com/x.jpg",
+                "ftp://cdn.example.com/x.jpg", ""):
+        assert extract_page_research(url, title, text, image_url=bad)["image"] is None

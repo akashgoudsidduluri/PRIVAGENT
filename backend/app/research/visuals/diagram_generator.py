@@ -23,7 +23,6 @@ def sanitize_mermaid_id(name: str) -> str:
 
 def generate_mermaid_diagram(
     topic: str,
-    diagram_type: str = "architecture",
     custom_nodes: Optional[list[dict[str, str]]] = None,
 ) -> str:
     """Generate deterministic, syntactically valid Mermaid diagram syntax."""

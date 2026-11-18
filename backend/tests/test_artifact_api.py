@@ -109,3 +109,85 @@ def test_artifact_path_traversal_rejection():
     finally:
         db.delete_artifact(malicious_art_id)
 
+
+
+def test_comparison_package_renders_xlsx_from_tracker():
+    """A browser comparison task's tracker facts render into a real
+    .xlsx through the research artifact pipeline (SIH review demo
+    item 2: research/compare + a document).
+
+    Before this, browser comparison tasks never reached the document
+    pipeline, so "give the comparison in a xcel" produced no file —
+    and the classifier did not even recognise the "xcel" spelling.
+    """
+    import shutil
+
+    import openpyxl
+
+    from app.loop_research import _finalize_research_artifacts, build_comparison_package
+
+    instruction = (
+        "Find the lowest price for the Logitech MX Master 3S wireless mouse "
+        "across Amazon.in, Flipkart and Croma. For each store, give the price, "
+        "a link to the listing, and the delivery estimate. Tell me which store "
+        "is cheapest and give the detailed comparison in a xcel."
+    )
+    tracker = {"required_sites": {
+        "amazon": {"site_key": "amazon", "name": "Amazon", "domains": ["amazon.in"],
+                   "default_url": "https://www.amazon.in/s?k=logitech+mx+master+3s",
+                   "status": "completed",
+                   "data": {"price": "₹8,499", "url": "https://www.amazon.in/dp/B09X", "variant": "Graphite",
+                            "image": "https://m.media-amazon.com/images/I/amz.jpg"},
+                   "visited_urls": ["https://www.amazon.in/s?k=logitech+mx+master+3s"]},
+        "flipkart": {"site_key": "flipkart", "name": "Flipkart", "domains": ["flipkart.com"],
+                     "default_url": "https://www.flipkart.com/search?q=logitech+mx+master+3s",
+                     "status": "completed",
+                     "data": {"price": "₹8,999", "url": "https://www.flipkart.com/product/p/itm271ade01ff274", "variant": "Graphite",
+                            "image": "https://rukminim2.flixcart.com/image/600/600/fk.jpg"},
+                     "visited_urls": []},
+        "croma": {"site_key": "croma", "name": "Croma", "domains": ["croma.com"],
+                  "default_url": "https://www.croma.com/search/?text=logitech+mx+master+3s",
+                  "status": "pending", "data": None, "visited_urls": []},
+    }, "total_count": 3}
+
+    pkg = build_comparison_package("task_cmp_xlsx", instruction, tracker, summary_msg="Amazon is cheapest at ₹8,499.")
+    assert pkg is not None
+    assert "MX Master 3S" in pkg.topic.title
+    assert len(pkg.tables) == 1
+    assert pkg.tables[0].headers == ["Store", "Price", "Variant", "Link", "Image"]
+    assert len(pkg.tables[0].rows) == 2
+    assert pkg.tables[0].rows[0][0] == "Amazon"
+    assert pkg.tables[0].rows[0][4] == "https://m.media-amazon.com/images/I/amz.jpg"
+    assert pkg.tables[0].rows[1][4] == "https://rukminim2.flixcart.com/image/600/600/fk.jpg"
+    assert len(pkg.sources) == 2 and len(pkg.claims) == 2
+
+    # Nothing verified -> no package (never render an empty document).
+    assert build_comparison_package("task_cmp_empty", instruction, {"required_sites": {
+        "croma": {"site_key": "croma", "name": "Croma", "domains": ["croma.com"], "status": "pending", "data": None},
+    }}) is None
+
+    task_id = "task_cmp_xlsx_test"
+    wm = {"research_knowledge_package": pkg.to_dict(), "requested_format": "xlsx",
+          "instruction": instruction}
+    task_dir = ARTIFACTS_DIR / task_id
+    try:
+        art = _finalize_research_artifacts(task_id, "chat_cmp_xlsx", wm, summary_msg="Amazon is cheapest at ₹8,499.")
+        assert art is not None
+        assert art["file_format"] == "xlsx"
+        assert art["filename"].endswith(".xlsx")
+        f = Path(art["filepath"])
+        assert f.exists() and f.stat().st_size > 0
+        wb = openpyxl.load_workbook(f, read_only=True)
+        assert "Comparison & Metrics" in wb.sheetnames
+        ws = wb["Comparison & Metrics"]
+        rows = list(ws.iter_rows(values_only=True))
+        assert rows[0][:5] == ("Store", "Price", "Variant", "Link", "Image")
+        # The renderer parses price strings into real Excel numbers.
+        assert rows[1][0] == "Amazon" and rows[1][1] == 8499
+        assert rows[1][4] == "https://m.media-amazon.com/images/I/amz.jpg"
+        assert rows[2][0] == "Flipkart" and rows[2][1] == 8999
+        assert rows[2][4] == "https://rukminim2.flixcart.com/image/600/600/fk.jpg"
+        wb.close()
+    finally:
+        shutil.rmtree(task_dir, ignore_errors=True)
+        db.delete_artifact(f"art_{task_id}_xlsx")

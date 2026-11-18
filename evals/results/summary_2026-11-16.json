@@ -1,0 +1,25 @@
+{
+  "generated": "2026-11-16",
+  "provider": "mock",
+  "command": "scripts/eval_live.py",
+  "suites": {
+    "checker_asr": {
+      "n_total": 45,
+      "canonical_asr": 0.25,
+      "evasion_asr": 1,
+      "overall_asr": 0.5,
+      "benign_false_positive_rate": 0.0
+    },
+    "privacy_leak": {
+      "n_total": 23,
+      "leaked": 6,
+      "leak_rate": 0.2609
+    },
+    "mock_benchmark": {
+      "passed": 8,
+      "total": 8,
+      "average_fixture_duration_ms": 78.09
+    }
+  },
+  "elapsed_s": 1.15
+}

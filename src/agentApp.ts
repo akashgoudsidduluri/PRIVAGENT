@@ -1,32 +1,36 @@
 import "./styles/agent.css";
 import { escapeHtml, linkify, linkLabel, renderMarkdown, safeHttpUrl, safeImageSrc } from "./sanitize";
+import { taskRouteLabel } from "./routeLabel";
+import { apiFetch, artifactUrl, wsUrl } from "./auth";
+import { formatPlanStep, planPreviewTitle, type PlanPreviewStep } from "./planPreview";
+import { buildTimelineRows, formatDuration, timelineSummary } from "./timeline";
 
 const API = "http://localhost:8000";
 
 // Workspace & Sidebar Elements
-const agentWorkspace = document.getElementById("agentWorkspace") as HTMLElement | null;
+let agentWorkspace: HTMLElement | null = null;
 const btnToggleSidebarHeader = document.getElementById("btnToggleSidebarHeader") as HTMLButtonElement | null;
-const btnCollapseSidebar = document.getElementById("btnCollapseSidebar") as HTMLButtonElement | null;
-const btnNewMissionSidebar = document.getElementById("btnNewMissionSidebar") as HTMLButtonElement | null;
-const chatHistoryList = document.getElementById("chatHistoryList") as HTMLUListElement | null;
+let btnCollapseSidebar: HTMLButtonElement | null = null;
+let btnNewMissionSidebar: HTMLButtonElement | null = null;
+let chatHistoryList: HTMLUListElement | null = null;
 
 // Directive & Timeline Elements
-const missionInput = document.getElementById("missionInput") as HTMLTextAreaElement | null;
-const missionAttachment = document.getElementById("missionAttachment") as HTMLInputElement | null;
-const btnStartMission = document.getElementById("btnStartMission") as HTMLButtonElement | null;
-const btnCancelMission = document.getElementById("btnCancelMission") as HTMLButtonElement | null;
+let missionInput: HTMLTextAreaElement | null = null;
+let missionAttachment: HTMLInputElement | null = null;
+let btnStartMission: HTMLButtonElement | null = null;
+let btnCancelMission: HTMLButtonElement | null = null;
 const btnNewSession = document.getElementById("btnNewSession") as HTMLButtonElement | null;
-const missionSubtext = document.getElementById("missionSubtext") as HTMLElement | null;
-const stateBadge = document.getElementById("missionStateBadge") as HTMLElement | null;
-const stepsList = document.getElementById("agentStepsList") as HTMLOListElement | null;
-const stepsCount = document.getElementById("feedStepsCount") as HTMLElement | null;
-const resultCard = document.getElementById("agentResultCard") as HTMLElement | null;
-const resultContent = document.getElementById("resultContent") as HTMLElement | null;
-const resultBadge = document.getElementById("resultBadge") as HTMLElement | null;
-const resultTimestamp = document.getElementById("resultTimestamp") as HTMLElement | null;
-const artifactsCard = document.getElementById("agentArtifactsCard") as HTMLElement | null;
-const artifactsList = document.getElementById("agentArtifactsList") as HTMLElement | null;
-const artifactsCount = document.getElementById("artifactsCount") as HTMLElement | null;
+let missionSubtext: HTMLElement | null = null;
+let stateBadge: HTMLElement | null = null;
+let stepsList: HTMLOListElement | null = null;
+let stepsCount: HTMLElement | null = null;
+let resultCard: HTMLElement | null = null;
+let resultContent: HTMLElement | null = null;
+let resultBadge: HTMLElement | null = null;
+let resultTimestamp: HTMLElement | null = null;
+let artifactsCard: HTMLElement | null = null;
+let artifactsList: HTMLElement | null = null;
+let artifactsCount: HTMLElement | null = null;
 
 interface ArtifactItem {
   artifact_id: string;
@@ -46,7 +50,7 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-async function loadArtifacts(taskId?: string | null, chatId?: string | null): Promise<void> {
+async function loadArtifacts(taskId?: string | null, chatId?: string | null, isCurrent?: () => boolean): Promise<void> {
   if (!artifactsCard || !artifactsList) return;
   const targetUrl = taskId ? `${API}/api/tasks/${taskId}/artifacts` : (chatId ? `${API}/api/chats/${chatId}/artifacts` : null);
   if (!targetUrl) {
@@ -55,12 +59,15 @@ async function loadArtifacts(taskId?: string | null, chatId?: string | null): Pr
   }
 
   try {
-    const res = await fetch(targetUrl);
+    const res = await apiFetch(targetUrl);
     if (!res.ok) {
       artifactsCard.hidden = true;
       return;
     }
     const list = (await res.json()) as ArtifactItem[];
+    // A newer chat selection superseded this one while the fetch was
+    // in flight: never render the stale chat's artifacts.
+    if (isCurrent && !isCurrent()) return;
     if (!Array.isArray(list) || list.length === 0) {
       artifactsCard.hidden = true;
       return;
@@ -73,9 +80,16 @@ async function loadArtifacts(taskId?: string | null, chatId?: string | null): Pr
     list.forEach(art => {
       const itemEl = document.createElement("div");
       itemEl.className = "artifact-item";
-      const fmt = (art.file_format || "file").toLowerCase();
+      // Task 12 XSS audit: file_format is backend-supplied metadata, so
+      // it must never be interpolated raw into a class attribute. Only
+      // a known format token is used; anything else falls back to "file".
+      const KNOWN_FORMATS = new Set(["pdf", "docx", "pptx", "xlsx", "csv", "html", "md", "txt", "png", "jpg", "jpeg"]);
+      const fmt = KNOWN_FORMATS.has((art.file_format || "").toLowerCase()) ? (art.file_format || "file").toLowerCase() : "file";
       const badgeCls = `artifact-format-badge artifact-format-badge--${fmt}`;
       const sizeStr = formatBytes(art.file_size_bytes || 0);
+      // artifact_id is backend-generated hex, but encode it anyway so a
+      // compromised/compromising id can never break out of the href.
+      const artId = encodeURIComponent(art.artifact_id || "");
 
       itemEl.innerHTML = `
         <div class="artifact-info">
@@ -86,11 +100,11 @@ async function loadArtifacts(taskId?: string | null, chatId?: string | null): Pr
           </div>
         </div>
         <div class="artifact-actions">
-          <a href="${API}/api/artifacts/${art.artifact_id}/preview" target="_blank" rel="noopener noreferrer" class="btn-artifact btn-artifact--preview">Preview</a>
-          <a href="${API}/api/artifacts/${art.artifact_id}/download" class="btn-artifact btn-artifact--download" download>Download</a>
+          <a href="${artifactUrl(`${API}/api/artifacts/${artId}/preview`)}" target="_blank" rel="noopener noreferrer" class="btn-artifact btn-artifact--preview">Preview</a>
+          <a href="${artifactUrl(`${API}/api/artifacts/${artId}/download`)}" class="btn-artifact btn-artifact--download" download>Download</a>
         </div>
       `;
-      artifactsList.appendChild(itemEl);
+      artifactsList?.appendChild(itemEl);
     });
   } catch {
     artifactsCard.hidden = true;
@@ -98,28 +112,333 @@ async function loadArtifacts(taskId?: string | null, chatId?: string | null): Pr
 }
 
 // Human Gate
-const humanGate = document.getElementById("humanGate") as HTMLElement | null;
-const humanGateMsg = document.getElementById("humanGateMsg") as HTMLElement | null;
-const btnGateApprove = document.getElementById("btnGateApprove") as HTMLButtonElement | null;
-const btnGateReject = document.getElementById("btnGateReject") as HTMLButtonElement | null;
+let humanGate: HTMLElement | null = null;
+let humanGateMsg: HTMLElement | null = null;
+let btnGateApprove: HTMLButtonElement | null = null;
+let btnGateApproveStep: HTMLButtonElement | null = null;
+let btnGateReject: HTMLButtonElement | null = null;
+let planPreview: HTMLElement | null = null;
+let planPreviewTitleEl: HTMLElement | null = null;
+let planPreviewList: HTMLOListElement | null = null;
+let taskTimelineCard: HTMLElement | null = null;
+let taskTimelineList: HTMLOListElement | null = null;
+let timelineSummaryEl: HTMLElement | null = null;
+
+// Takeover Banner (Task 4: the agent is paused and not watching)
+let takeoverBanner: HTMLElement | null = null;
+let takeoverMsg: HTMLElement | null = null;
+let takeoverMeta: HTMLElement | null = null;
+let btnTakeoverResume: HTMLButtonElement | null = null;
+let btnTakeoverCancel: HTMLButtonElement | null = null;
 
 // Inspector
-const inspectorUrl = document.getElementById("inspectorUrl") as HTMLAnchorElement | null;
-const inspectorTitle = document.getElementById("inspectorTitle") as HTMLElement | null;
-const inspectorEvidence = document.getElementById("inspectorEvidence") as HTMLElement | null;
-const telStepsDone = document.getElementById("telStepsDone") as HTMLElement | null;
-const telRemoteVision = document.getElementById("telRemoteVision") as HTMLElement | null;
-const telPlannerLatency = document.getElementById("telPlannerLatency") as HTMLElement | null;
-const obstacleBadge = document.getElementById("obstacleBadge") as HTMLElement | null;
-const inspectorScreenshot = document.getElementById("inspectorScreenshot") as HTMLImageElement | null;
-const inspectorScreenshotPlaceholder = document.getElementById("inspectorScreenshotPlaceholder") as HTMLElement | null;
+let inspectorUrl: HTMLAnchorElement | null = null;
+let inspectorTitle: HTMLElement | null = null;
+let inspectorEvidence: HTMLElement | null = null;
+let telStepsDone: HTMLElement | null = null;
+let telRemoteVision: HTMLElement | null = null;
+let telPlannerLatency: HTMLElement | null = null;
+let obstacleBadge: HTMLElement | null = null;
+let inspectorScreenshot: HTMLImageElement | null = null;
+let inspectorScreenshotPlaceholder: HTMLElement | null = null;
 
 // WS status
 const wsDot = document.getElementById("wsDot") as HTMLElement | null;
 const wsText = document.getElementById("wsText") as HTMLElement | null;
+// ---------------------------------------------------------------------------
+// Lazy workspace mount (UI flicker fix).
+// The workspace markup lives inert inside <template id="workspaceTemplate">
+// in agent.html, so it is never painted until the operator opens the Agent
+// Workspace, Browser Inspector, or Activity view. No workspace node may be
+// resolved at module load: every workspace ref above starts null and is
+// resolved here, once, on first mount, before any listener wiring or data
+// load that touches those nodes. The static header (sidebar toggle, New
+// Mission, connection status) is wired at module load and stays live.
+// ---------------------------------------------------------------------------
+let workspaceMounted = false;
+
+export function ensureWorkspaceMounted(): HTMLElement | null {
+  if (workspaceMounted) return agentWorkspace;
+  const tpl = document.getElementById("workspaceTemplate") as HTMLTemplateElement | null;
+  if (!tpl) return null;
+  const frag = tpl.content.cloneNode(true) as DocumentFragment;
+  if (!frag.querySelector("#agentWorkspace")) return null;
+  // Replace the inert template with its live clone, in place.
+  tpl.replaceWith(frag);
+  workspaceMounted = true;
+  initWorkspaceElements();
+  return agentWorkspace;
+}
+
+function initWorkspaceElements(): void {
+  agentWorkspace = document.getElementById("agentWorkspace") as HTMLElement | null;
+  btnCollapseSidebar = document.getElementById("btnCollapseSidebar") as HTMLButtonElement | null;
+  btnNewMissionSidebar = document.getElementById("btnNewMissionSidebar") as HTMLButtonElement | null;
+  chatHistoryList = document.getElementById("chatHistoryList") as HTMLUListElement | null;
+  missionInput = document.getElementById("missionInput") as HTMLTextAreaElement | null;
+  missionAttachment = document.getElementById("missionAttachment") as HTMLInputElement | null;
+  btnStartMission = document.getElementById("btnStartMission") as HTMLButtonElement | null;
+  btnCancelMission = document.getElementById("btnCancelMission") as HTMLButtonElement | null;
+  missionSubtext = document.getElementById("missionSubtext") as HTMLElement | null;
+  stateBadge = document.getElementById("missionStateBadge") as HTMLElement | null;
+  stepsList = document.getElementById("agentStepsList") as HTMLOListElement | null;
+  stepsCount = document.getElementById("feedStepsCount") as HTMLElement | null;
+  resultCard = document.getElementById("agentResultCard") as HTMLElement | null;
+  resultContent = document.getElementById("resultContent") as HTMLElement | null;
+  resultBadge = document.getElementById("resultBadge") as HTMLElement | null;
+  resultTimestamp = document.getElementById("resultTimestamp") as HTMLElement | null;
+  artifactsCard = document.getElementById("agentArtifactsCard") as HTMLElement | null;
+  artifactsList = document.getElementById("agentArtifactsList") as HTMLElement | null;
+  artifactsCount = document.getElementById("artifactsCount") as HTMLElement | null;
+  humanGate = document.getElementById("humanGate") as HTMLElement | null;
+  humanGateMsg = document.getElementById("humanGateMsg") as HTMLElement | null;
+  btnGateApprove = document.getElementById("btnGateApprove") as HTMLButtonElement | null;
+  btnGateApproveStep = document.getElementById("btnGateApproveStep") as HTMLButtonElement | null;
+  btnGateReject = document.getElementById("btnGateReject") as HTMLButtonElement | null;
+  planPreview = document.getElementById("planPreview") as HTMLElement | null;
+  planPreviewTitleEl = document.getElementById("planPreviewTitle") as HTMLElement | null;
+  planPreviewList = document.getElementById("planPreviewList") as HTMLOListElement | null;
+  taskTimelineCard = document.getElementById("taskTimelineCard") as HTMLElement | null;
+  taskTimelineList = document.getElementById("taskTimelineList") as HTMLOListElement | null;
+  timelineSummaryEl = document.getElementById("timelineSummary") as HTMLElement | null;
+  takeoverBanner = document.getElementById("takeoverBanner") as HTMLElement | null;
+  takeoverMsg = document.getElementById("takeoverMsg") as HTMLElement | null;
+  takeoverMeta = document.getElementById("takeoverMeta") as HTMLElement | null;
+  btnTakeoverResume = document.getElementById("btnTakeoverResume") as HTMLButtonElement | null;
+  btnTakeoverCancel = document.getElementById("btnTakeoverCancel") as HTMLButtonElement | null;
+  inspectorUrl = document.getElementById("inspectorUrl") as HTMLAnchorElement | null;
+  inspectorTitle = document.getElementById("inspectorTitle") as HTMLElement | null;
+  inspectorEvidence = document.getElementById("inspectorEvidence") as HTMLElement | null;
+  telStepsDone = document.getElementById("telStepsDone") as HTMLElement | null;
+  telRemoteVision = document.getElementById("telRemoteVision") as HTMLElement | null;
+  telPlannerLatency = document.getElementById("telPlannerLatency") as HTMLElement | null;
+  obstacleBadge = document.getElementById("obstacleBadge") as HTMLElement | null;
+  inspectorScreenshot = document.getElementById("inspectorScreenshot") as HTMLImageElement | null;
+  inspectorScreenshotPlaceholder = document.getElementById("inspectorScreenshotPlaceholder") as HTMLElement | null;
+
+  // Workspace listeners — wired once, on first mount. The handlers below
+  // are unchanged from the old module-top-level wiring; they only moved.
+  btnCollapseSidebar?.addEventListener("click", () => {
+    agentWorkspace?.classList.add("sidebar-collapsed");
+  });
+
+  btnNewMissionSidebar?.addEventListener("click", () => {
+    createNewChat();
+  });
+
+  // Non-null assertions below: each handler is attached only when
+  // missionInput was non-null (the `?.` receiver), and the ref is never
+  // cleared afterwards — the element exists for the page's lifetime.
+  missionInput?.addEventListener("input", () => {
+    if (btnStartMission && !isWorking) btnStartMission.disabled = !missionInput!.value.trim();
+  });
+
+  missionInput?.addEventListener("keydown", (e: KeyboardEvent) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      if (!isWorking && missionInput!.value.trim() && btnStartMission && !btnStartMission.disabled) {
+        btnStartMission.click();
+      }
+    }
+  });
+
+  // Preset Chips & Suggested Action Pills
+  document.querySelectorAll(".preset-chip").forEach(chip => {
+    chip.addEventListener("click", () => {
+      const prompt = chip.getAttribute("data-prompt");
+      if (prompt && missionInput) {
+        missionInput.value = prompt;
+        if (btnStartMission && !isWorking) btnStartMission.disabled = false;
+        missionInput.focus();
+      }
+    });
+  });
+
+  btnStartMission?.addEventListener("click", async () => {
+    if (isWorking || !missionInput || !btnStartMission || !missionInput.value.trim()) return;
+    const instruction = missionInput.value.trim();
+    activeInstruction = instruction;
+
+    setButtonWorking(true);
+    if (btnCancelMission) btnCancelMission.hidden = false;
+    if (resultCard) resultCard.hidden = true;
+    hideHumanGate();
+    currentTaskId = null;
+    renderedTerminalTaskId = null;
+    cancelRequested = false;
+
+    // Append user instruction bubble immediately
+    addUserMessageItem(instruction);
+    missionInput.value = "";
+    if (btnStartMission) btnStartMission.disabled = true;
+
+    if (telPlannerLatency) telPlannerLatency.textContent = "—";
+    setTaskState("planning");
+
+    try {
+      let fileToken: string | undefined;
+      const selectedFile = missionAttachment?.files?.[0];
+      if (selectedFile) {
+        if (selectedFile.size > 5 * 1024 * 1024 || !/\.(pdf|png|jpe?g|txt|csv|docx|xlsx)$/i.test(selectedFile.name)) {
+          throw new Error("Attachment must be an allowed file under 5 MiB");
+        }
+        const encoded = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
+          reader.onerror = () => reject(new Error("Could not read attachment"));
+          reader.readAsDataURL(selectedFile);
+        });
+        const uploadResponse = await apiFetch(`${API}/api/attachments`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ fileName: selectedFile.name, base64: encoded }),
+        });
+        if (!uploadResponse.ok) throw new Error(`Attachment rejected (HTTP ${uploadResponse.status})`);
+        fileToken = ((await uploadResponse.json()) as { fileToken: string }).fileToken;
+      }
+      let res: Response;
+      if (activeChatId) {
+        res = await apiFetch(`${API}/api/chat/${activeChatId}/message`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ instruction, fileToken }),
+        });
+      } else {
+        res = await apiFetch(`${API}/api/task`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ instruction, fileToken }),
+        });
+      }
+
+      if (!res.ok) throw new Error(`Backend response HTTP ${res.status}`);
+      const data = (await res.json()) as { task_id?: string; taskId?: string; chat_id?: string; chatId?: string };
+      currentTaskId = data.task_id || data.taskId || null;
+      if (missionAttachment) missionAttachment.value = "";
+      activeChatId = activeChatId || data.chat_id || data.chatId || null;
+
+      // Refresh chat list to show active title and timestamp
+      loadChatList();
+
+      // Cancel clicked while POST was in flight
+      if (cancelRequested && currentTaskId) {
+        try {
+          await apiFetch(`${API}/api/task/${currentTaskId}/cancel`, { method: "POST" });
+        } catch { /* offline */ }
+        setTaskState("cancelled");
+        if (btnCancelMission) btnCancelMission.hidden = true;
+        setButtonWorking(false);
+        return;
+      }
+
+      // Start background sync / polling for active task
+      if (currentTaskId) {
+        startFallbackPolling(currentTaskId);
+        const stRes = await apiFetch(`${API}/api/task/${currentTaskId}`).catch(() => null);
+        if (stRes && stRes.ok) {
+          const t = (await stRes.json()) as { taskState: string; message: string; stepsDone?: number; screenshot?: string | null };
+          if (t.taskState && t.taskState !== "planning") {
+            setTaskState(t.taskState);
+          }
+          // Unconditional: a screenshot-less task must clear the frame
+          // rather than keep the previous chat's image.
+          updateVisualFrame(t.screenshot ?? null, t.message || "", t.taskState);
+          if (["completed", "failed", "cancelled"].includes(t.taskState)) {
+            stopFallbackPolling();
+            renderCompletion(t.taskState, t.message || "", true, t.stepsDone);
+            loadChatList();
+          }
+        }
+      }
+    } catch (err) {
+      stopFallbackPolling();
+      clearStalledNotice();
+      setTaskState("failed");
+      addStepItem(`⚠️ Backend connection failed: ${err}`);
+      setButtonWorking(false);
+      cancelRequested = false;
+      if (btnCancelMission) btnCancelMission.hidden = true;
+    }
+  });
+
+  btnCancelMission?.addEventListener("click", async () => {
+    const id = currentTaskId;
+    cancelRequested = true;
+    stopFallbackPolling();
+    clearStalledNotice();
+    if (btnCancelMission) btnCancelMission.hidden = true;
+    hideHumanGate();
+    if (id) {
+      try {
+        await apiFetch(`${API}/api/task/${id}/cancel`, { method: "POST" });
+      } catch {
+        // Offline
+      }
+    }
+    setTaskState("cancelled");
+    setButtonWorking(false);
+  });
+
+  btnGateApprove?.addEventListener("click", async () => {
+    if (!currentTaskId) return;
+    hideHumanGate();
+    await apiFetch(`${API}/api/task/${currentTaskId}/confirm`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "approve" }),
+    });
+  });
+
+  // Task 12: approve this step only — the backend runs the pending step
+  // and then re-plans, so the next step gets its own preview instead of
+  // running on as part of the pinned batch. This is a gate decision,
+  // not an override: the loop still enforces every safety gate.
+  btnGateApproveStep?.addEventListener("click", async () => {
+    if (!currentTaskId) return;
+    hideHumanGate();
+    await apiFetch(`${API}/api/task/${currentTaskId}/confirm`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "approve_step" }),
+    });
+  });
+
+  btnGateReject?.addEventListener("click", async () => {
+    if (!currentTaskId) return;
+    hideHumanGate();
+    await apiFetch(`${API}/api/task/${currentTaskId}/confirm`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "reject" }),
+    });
+  });
+
+  // Task 4: takeover resume / cancel. Resume tells the backend the
+  // operator finished the manual step; the loop re-observes from scratch
+  // (its first post-takeover observation carries no screenshot).
+  btnTakeoverResume?.addEventListener("click", async () => {
+    if (!currentTaskId) return;
+    hideTakeover();
+    await apiFetch(`${API}/api/task/${currentTaskId}/takeover/resume`, { method: "POST" });
+  });
+
+  btnTakeoverCancel?.addEventListener("click", async () => {
+    if (!currentTaskId) return;
+    hideTakeover();
+    await apiFetch(`${API}/api/task/${currentTaskId}/takeover/cancel`, { method: "POST" });
+  });
+
+  // Now that the nodes exist, load the data that renders into them.
+  void loadChatList();
+  void loadTelemetryConfig();
+}
 
 // Session & Task State
 let activeChatId: string | null = null;
+
+// Generation guard for selectChat: two rapid sidebar clicks resolve in
+// arbitrary order, and the slower (wrong) chat's messages must never
+// overwrite the newer selection's feed.
+let selectChatGeneration = 0;
 let currentTaskId: string | null = null;
 let renderedTerminalTaskId: string | null = null;
 let stepCounter = 0;
@@ -171,6 +490,8 @@ interface ActiveTaskInfo {
   primaryTabId?: number | null;
   childTabIds?: number[];
   steps?: ChatStepItem[];
+  // Task 4: the active takeover request, if any (kind/reason/url only).
+  takeover?: { kind?: string; reason?: string; url?: string } | null;
 }
 
 interface ChatDetail {
@@ -200,6 +521,11 @@ function setTaskState(state: string): void {
   } else if (state === "completed") {
     stateBadge.style.color = "#34d399";
     stateBadge.style.background = "rgba(52, 211, 153, 0.2)";
+  } else if (state === "awaiting_takeover") {
+    // Task 4: takeover is not an error — amber, distinct from the
+    // confirmation gate's default styling.
+    stateBadge.style.color = "#fbbf24";
+    stateBadge.style.background = "rgba(251, 191, 36, 0.2)";
   } else if (["failed", "cancelled"].includes(state)) {
     stateBadge.style.color = "#f87171";
     stateBadge.style.background = "rgba(248, 113, 113, 0.2)";
@@ -222,7 +548,7 @@ function renderStepBudget(): void {
 
 async function loadTelemetryConfig(): Promise<void> {
   try {
-    const res = await fetch(`${API}/api/health`);
+    const res = await apiFetch(`${API}/api/health`);
     if (!res.ok) return;
     const h = (await res.json()) as { maxSteps?: number; allowScreenshots?: boolean };
     if (typeof h.maxSteps === "number" && h.maxSteps > 0) stepBudget = h.maxSteps;
@@ -257,6 +583,13 @@ function updateVisualFrame(screenshot: string | null | undefined, message: strin
     inspectorScreenshot.src = dataUrl;
     inspectorScreenshot.hidden = false;
     if (inspectorScreenshotPlaceholder) inspectorScreenshotPlaceholder.hidden = true;
+  } else if (inspectorScreenshot) {
+    // No screenshot for this step: clear the frame instead of leaving
+    // the previous step's — or the previous chat's — image up as if it
+    // were this step's visual.
+    inspectorScreenshot.removeAttribute("src");
+    inspectorScreenshot.hidden = true;
+    if (inspectorScreenshotPlaceholder) inspectorScreenshotPlaceholder.hidden = false;
   }
 }
 
@@ -371,7 +704,10 @@ function formatResultHtml(rawMessage: string): string {
       <span class="suggested-moves__label">Suggested Next Moves:</span>
       <div class="suggested-moves__chips">
         <button class="suggested-chip" data-prompt="Export this comparison into a formatted Excel spreadsheet">📊 Export to Excel</button>
-        <button class="suggested-chip" data-prompt="Email this comparison summary to b21650406@gmail.com">📧 Email this to me</button>
+        <!-- "Email this to me": no address is baked in here. The operator's
+             address is resolved at runtime from the connected Gmail account
+             (or asked for); a personal address must never ship in source. -->
+        <button class="suggested-chip" data-prompt="Email this comparison summary to me">📧 Email this to me</button>
         <button class="suggested-chip" data-prompt="Continuously monitor this product price and notify me if it drops">🔔 Monitor price for drops</button>
         <button class="suggested-chip" data-prompt="What is on my calendar this week?">📅 Check Google Calendar</button>
       </div>
@@ -532,7 +868,7 @@ function addCompletionStepItem(taskState: string, message: string): void {
 
 async function syncActiveTask(taskId: string): Promise<boolean> {
   try {
-    const res = await fetch(`${API}/api/task/${taskId}`);
+    const res = await apiFetch(`${API}/api/task/${taskId}`);
     if (!res.ok) {
       if (res.status === 404 && currentTaskId === taskId) {
         stopFallbackPolling();
@@ -552,6 +888,10 @@ async function syncActiveTask(taskId: string): Promise<boolean> {
       primaryTabId?: number | null;
       childTabIds?: number[] | null;
       steps?: ChatStepItem[];
+      timings?: {
+        steps?: Array<{ step: number; action: string; batched: boolean; cache: string; checker_skipped: boolean; total_ms: number; overhead_ms: number }>;
+        overhead_ms?: number;
+      } | null;
     };
     if (currentTaskId !== taskId) return false;
     lastProgressTime = Date.now();
@@ -563,16 +903,23 @@ async function syncActiveTask(taskId: string): Promise<boolean> {
       } else if (t.sessionId) {
         const tabInfo = t.primaryTabId ? ` · Tab #${t.primaryTabId}` : "";
         const childInfo = t.childTabIds && t.childTabIds.length > 0 ? ` (+${t.childTabIds.length} child tabs)` : "";
-        missionSubtext.innerHTML = `<span style="color: #38bdf8; font-weight: 500;">🌐 Session: ${t.sessionId.slice(0, 8)}${tabInfo}${childInfo}</span>`;
+        missionSubtext.innerHTML = `<span style="color: #38bdf8; font-weight: 500;">🌐 Session: ${escapeHtml(t.sessionId.slice(0, 8))}${tabInfo}${childInfo}</span>`;
+      }
+      // Task 14: routing decision ("via Gmail connector" / "via
+      // WebMCP tool X" / "via UCP checkout"). The label is built from
+      // names only and escaped; the set above resets innerHTML on
+      // every poll, so appending here cannot accumulate.
+      const routeText = taskRouteLabel((t as any).route);
+      if (routeText) {
+        missionSubtext.innerHTML += ` <span style="color: #34d399; font-weight: 500;">${escapeHtml(routeText)}</span>`;
       }
     }
 
     if (t.taskState && t.taskState !== "planning") {
       setTaskState(t.taskState);
     }
-    if (t.screenshot) {
-      updateVisualFrame(t.screenshot, t.message || "", t.taskState);
-    }
+    // Unconditional: a screenshot-less poll must clear the frame.
+    updateVisualFrame(t.screenshot ?? null, t.message || "", t.taskState);
     // Rehydrate intermediate execution steps if missing from the timeline
     if (Array.isArray(t.steps) && t.steps.length > 0) {
       t.steps.forEach(st => {
@@ -581,6 +928,8 @@ async function syncActiveTask(taskId: string): Promise<boolean> {
         }
       });
     }
+    // Task 12: task timeline from the loop timings + history steps.
+    renderTaskTimeline(t);
     if (["completed", "failed", "cancelled"].includes(t.taskState)) {
       renderCompletion(t.taskState, t.message || "", true, t.stepsDone);
       loadChatList();
@@ -623,6 +972,7 @@ function renderCompletion(taskState: string, message: string, appendToTimeline =
   setButtonWorking(false);
   if (btnCancelMission) btnCancelMission.hidden = true;
   if (humanGate) humanGate.hidden = true;
+  if (takeoverBanner) takeoverBanner.hidden = true;
   if (typeof stepsDone === "number" && stepsDone > 0) {
     updateStepsCount(stepsDone);
   }
@@ -665,25 +1015,112 @@ function renderCompletion(taskState: string, message: string, appendToTimeline =
   }
 }
 
-function showHumanGate(msg: string): void {
+function showHumanGate(msg: string, plan?: PlanPreviewStep[] | null): void {
   if (!humanGate) return;
   if (humanGateMsg) humanGateMsg.textContent = msg || "Sign-in or authentication required to continue.";
+  // Task 12: plan preview — the whole validated plan, in plain
+  // language, before the operator decides. Each line is rendered
+  // with textContent (never innerHTML): a target name may echo page
+  // text, and page text is untrusted.
+  if (planPreview && planPreviewList && planPreviewTitleEl) {
+    if (Array.isArray(plan) && plan.length > 0) {
+      planPreviewTitleEl.textContent = planPreviewTitle(plan);
+      planPreviewList.replaceChildren();
+      for (const step of plan) {
+        const li = document.createElement("li");
+        li.textContent = formatPlanStep(step);
+        planPreviewList.appendChild(li);
+      }
+      planPreview.hidden = false;
+    } else {
+      planPreview.hidden = true;
+    }
+  }
   humanGate.hidden = false;
   humanGate.scrollIntoView({ behavior: "smooth", block: "center" });
 }
 
 function hideHumanGate(): void {
   if (humanGate) humanGate.hidden = true;
+  if (planPreview) planPreview.hidden = true;
+}
+
+// Task 12: task timeline — one row per executed step from the Task 11
+// loop timings joined to the checkpoint history (status). Timings
+// carry action types and durations only, so every cell is text.
+function renderTaskTimeline(t: {
+  timings?: { steps?: Array<{ step: number; action: string; batched: boolean; cache: string; checker_skipped: boolean; total_ms: number; overhead_ms: number }>; overhead_ms?: number } | null;
+  steps?: Array<{ stepNum: number; message?: string; status?: string; result_ok?: boolean }> | null;
+}): void {
+  if (!taskTimelineCard || !taskTimelineList || !timelineSummaryEl) return;
+  const rows = buildTimelineRows(t.timings?.steps, t.steps);
+  if (rows.length === 0) {
+    taskTimelineCard.hidden = true;
+    return;
+  }
+  timelineSummaryEl.textContent = timelineSummary(rows, t.timings?.overhead_ms);
+  taskTimelineList.replaceChildren();
+  for (const row of rows) {
+    const li = document.createElement("li");
+    li.className = "task-timeline__row";
+    const step = document.createElement("span");
+    step.className = "task-timeline__step";
+    step.textContent = `#${row.step}`;
+    const action = document.createElement("span");
+    action.className = "task-timeline__action";
+    action.textContent = row.action;
+    const status = document.createElement("span");
+    status.className = `task-timeline__status task-timeline__status--${row.status}`;
+    status.textContent = row.status;
+    const dur = document.createElement("span");
+    dur.className = "task-timeline__duration";
+    dur.textContent = formatDuration(row.durationMs);
+    const flags = document.createElement("span");
+    flags.className = "task-timeline__flags";
+    flags.textContent = [
+      row.batched ? "batched" : null,
+      row.cache !== "n/a" ? `cache ${row.cache}` : null,
+      row.checkerSkipped ? "checker skipped" : null,
+    ].filter(Boolean).join(" · ") || "—";
+    li.append(step, action, status, dur, flags);
+    taskTimelineList.appendChild(li);
+  }
+  taskTimelineCard.hidden = false;
+}
+
+// ----------------------------------------------------
+// Takeover (Task 4)
+// ----------------------------------------------------
+// While takeover is active the agent is paused and observes nothing:
+// no screenshots, no DOM snapshots, no page text to the planner. The
+// banner tells the operator what to do in the tab and offers Resume /
+// Cancel. The reason and URL shown here come from the backend's
+// takeover record (kind/reason/url only — never a secret).
+function showTakeover(takeover: { kind?: string; reason?: string; url?: string } | null | undefined): void {
+  if (!takeoverBanner) return;
+  const kind = takeover?.kind || "login";
+  const reason = takeover?.reason || "A login / payment step needs you to complete it in the browser.";
+  if (takeoverMsg) takeoverMsg.textContent = reason;
+  if (takeoverMeta) {
+    const where = takeover?.url ? ` · ${takeover.url}` : "";
+    takeoverMeta.textContent = `Takeover: ${kind}${where} — the agent is not watching the page while you do this.`;
+  }
+  takeoverBanner.hidden = false;
+  takeoverBanner.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+function hideTakeover(): void {
+  if (takeoverBanner) takeoverBanner.hidden = true;
 }
 
 // ----------------------------------------------------
 // Multi-Turn Chat & Session Isolation Management
 // ----------------------------------------------------
 
-async function loadChatList(): Promise<void> {
+async function loadChatList(options?: { autoSelect?: boolean }): Promise<void> {
   if (!chatHistoryList) return;
   try {
-    const res = await fetch(`${API}/api/chats`);
+    const res = await apiFetch(`${API}/api/chats`);
     if (!res.ok) return;
     const chats = (await res.json()) as ChatSummary[];
 
@@ -723,10 +1160,13 @@ async function loadChatList(): Promise<void> {
         deleteChat(chat.id);
       });
 
-      chatHistoryList.appendChild(li);
+      chatHistoryList?.appendChild(li);
     });
 
-    if (!activeChatId) {
+    // Auto-select only when asked: after deleting the active chat the
+    // workspace must stay on the blank New Mission state, not instantly
+    // re-open a different mission. First load still auto-selects.
+    if (!activeChatId && (options?.autoSelect ?? true)) {
       const savedChatId = localStorage.getItem("privagent_active_chat_id");
       if (savedChatId && chats.some(c => c.id === savedChatId)) {
         void selectChat(savedChatId);
@@ -740,6 +1180,7 @@ async function loadChatList(): Promise<void> {
 }
 
 async function selectChat(chatId: string): Promise<void> {
+  const gen = ++selectChatGeneration;
   activeChatId = chatId;
   try {
     localStorage.setItem("privagent_active_chat_id", chatId);
@@ -768,7 +1209,11 @@ async function selectChat(chatId: string): Promise<void> {
   if (stepsList) stepsList.innerHTML = "";
   if (resultCard) resultCard.hidden = true;
   if (artifactsCard) artifactsCard.hidden = true;
-  loadArtifacts(null, chatId);
+  // Switching chats must not leave the previous chat's screenshot in
+  // the Visual Perception frame; the detail fetch below re-shows the
+  // new chat's active task image if it has one.
+  updateVisualFrame(null, "", "ready");
+  loadArtifacts(null, chatId, () => gen === selectChatGeneration);
   if (stepsCount) stepsCount.textContent = "0 steps executed";
   renderStepBudget();
   setTaskState("ready");
@@ -780,9 +1225,12 @@ async function selectChat(chatId: string): Promise<void> {
   }
 
   try {
-    const res = await fetch(`${API}/api/chat/${chatId}`);
+    const res = await apiFetch(`${API}/api/chat/${chatId}`);
     if (!res.ok) return;
     const detail = (await res.json()) as ChatDetail;
+    // A newer selection superseded this one while the fetch was in
+    // flight: render nothing from the stale detail.
+    if (gen !== selectChatGeneration) return;
     // /api/chat/{id} returns a FLAT shape (chat fields + messages + memory),
     // not {chat: {...}, messages}. Read status defensively from either form.
     const chatStatus = (detail as unknown as { status?: string }).status
@@ -857,16 +1305,16 @@ async function selectChat(chatId: string): Promise<void> {
     }
 
     // Check if there is an active in-flight task for this chat to reconnect to
-    if (detail.active_task && ["planning", "running", "awaiting_confirmation"].includes(detail.active_task.taskState)) {
+    if (detail.active_task && ["planning", "running", "awaiting_confirmation", "awaiting_takeover"].includes(detail.active_task.taskState)) {
       const act = detail.active_task;
       currentTaskId = act.taskId;
       setButtonWorking(true);
       if (btnCancelMission) btnCancelMission.hidden = false;
       setTaskState(act.taskState);
       startFallbackPolling(currentTaskId);
-      if (act.screenshot) {
-        updateVisualFrame(act.screenshot, act.message || "", act.taskState);
-      }
+      // Unconditional: reconnecting to a screenshot-less task must not
+      // keep another chat's image in the frame.
+      updateVisualFrame(act.screenshot ?? null, act.message || "", act.taskState);
       // Rehydrate in-flight execution steps executed before tab was re-opened
       if (Array.isArray(act.steps) && act.steps.length > 0) {
         act.steps.forEach(st => {
@@ -883,13 +1331,23 @@ async function selectChat(chatId: string): Promise<void> {
       }
       if (resultCard) resultCard.hidden = true;
       if (act.taskState === "awaiting_confirmation") {
-        fetch(`${API}/api/task/${act.taskId}`)
+        apiFetch(`${API}/api/task/${act.taskId}`)
           .then(r => r.json())
           .then(t => {
             const m = t.pending_confirmation?.message ?? "Authentication / Sign-in required";
-            showHumanGate(m);
+            showHumanGate(m, t.pending_confirmation?.plan ?? null);
           })
           .catch(() => showHumanGate("Authentication / Sign-in required"));
+      }
+      if (act.taskState === "awaiting_takeover") {
+        if (act.takeover) {
+          showTakeover(act.takeover);
+        } else {
+          apiFetch(`${API}/api/task/${act.taskId}/takeover`)
+            .then(r => r.json())
+            .then(t => showTakeover(t.takeover))
+            .catch(() => showTakeover(null));
+        }
       }
     } else if (!isPendingUserTurn && lastAgentMsg) {
       activeInstruction = lastUserMsg;
@@ -900,6 +1358,7 @@ async function selectChat(chatId: string): Promise<void> {
       if (resultCard) resultCard.hidden = true;
     }
   } catch (err) {
+    if (gen !== selectChatGeneration) return;
     addStepItem(`⚠️ Failed to load chat history: ${err}`);
   }
 }
@@ -913,7 +1372,7 @@ async function deleteChat(chatId: string): Promise<void> {
     // Storage restricted
   }
   try {
-    await fetch(`${API}/api/chat/${chatId}`, { method: "DELETE" });
+    await apiFetch(`${API}/api/chat/${chatId}`, { method: "DELETE" });
   } catch {
     // Offline
   }
@@ -921,7 +1380,9 @@ async function deleteChat(chatId: string): Promise<void> {
   if (activeChatId === chatId) {
     createNewChat();
   }
-  await loadChatList();
+  // No auto-select: deleting the active chat lands on the blank New
+  // Mission state instead of instantly re-opening another mission.
+  await loadChatList({ autoSelect: false });
 }
 
 function createNewChat(): void {
@@ -979,48 +1440,26 @@ function createNewChat(): void {
 }
 
 // ----------------------------------------------------
-// UI Events & Directive Execution
+// UI Events — static header + document-level handlers.
+// The header buttons and the delegated document handler are wired at
+// module load (their targets exist from the first paint). Every listener
+// that touches a workspace node lives in initWorkspaceElements() above
+// and is wired once, when the workspace template is first mounted.
 // ----------------------------------------------------
 
 btnToggleSidebarHeader?.addEventListener("click", () => {
   agentWorkspace?.classList.toggle("sidebar-collapsed");
 });
 
-btnCollapseSidebar?.addEventListener("click", () => {
-  agentWorkspace?.classList.add("sidebar-collapsed");
-});
-
-btnNewMissionSidebar?.addEventListener("click", () => {
-  createNewChat();
-});
-
 btnNewSession?.addEventListener("click", () => {
+  // From any Control Center view the workspace template is unmounted,
+  // so createNewChat() alone is a visible no-op: every node it touches
+  // is null. Mount first (synchronous), navigate to the workspace
+  // view, then start the new chat against the live nodes.
+  ensureWorkspaceMounted();
+  if (location.hash !== "#agent-workspace") location.hash = "agent-workspace";
   createNewChat();
-});
-
-missionInput?.addEventListener("input", () => {
-  if (btnStartMission && !isWorking) btnStartMission.disabled = !missionInput.value.trim();
-});
-
-missionInput?.addEventListener("keydown", (e: KeyboardEvent) => {
-  if (e.key === "Enter" && !e.shiftKey) {
-    e.preventDefault();
-    if (!isWorking && missionInput.value.trim() && btnStartMission && !btnStartMission.disabled) {
-      btnStartMission.click();
-    }
-  }
-});
-
-// Preset Chips & Suggested Action Pills
-document.querySelectorAll(".preset-chip").forEach(chip => {
-  chip.addEventListener("click", () => {
-    const prompt = chip.getAttribute("data-prompt");
-    if (prompt && missionInput) {
-      missionInput.value = prompt;
-      if (btnStartMission && !isWorking) btnStartMission.disabled = false;
-      missionInput.focus();
-    }
-  });
+  missionInput?.focus();
 });
 
 // Delegated click handler for Deliverable Export & Suggested Next Moves
@@ -1054,156 +1493,18 @@ document.addEventListener("click", event => {
   }
 });
 
-btnStartMission?.addEventListener("click", async () => {
-  if (isWorking || !missionInput || !btnStartMission || !missionInput.value.trim()) return;
-  const instruction = missionInput.value.trim();
-  activeInstruction = instruction;
 
-  setButtonWorking(true);
-  if (btnCancelMission) btnCancelMission.hidden = false;
-  if (resultCard) resultCard.hidden = true;
-  hideHumanGate();
-  currentTaskId = null;
-  renderedTerminalTaskId = null;
-  cancelRequested = false;
 
-  // Append user instruction bubble immediately
-  addUserMessageItem(instruction);
-  missionInput.value = "";
-  if (btnStartMission) btnStartMission.disabled = true;
 
-  if (telPlannerLatency) telPlannerLatency.textContent = "—";
-  setTaskState("planning");
 
-  try {
-    let fileToken: string | undefined;
-    const selectedFile = missionAttachment?.files?.[0];
-    if (selectedFile) {
-      if (selectedFile.size > 5 * 1024 * 1024 || !/\.(pdf|png|jpe?g|txt|csv|docx|xlsx)$/i.test(selectedFile.name)) {
-        throw new Error("Attachment must be an allowed file under 5 MiB");
-      }
-      const encoded = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
-        reader.onerror = () => reject(new Error("Could not read attachment"));
-        reader.readAsDataURL(selectedFile);
-      });
-      const uploadResponse = await fetch(`${API}/api/attachments`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ fileName: selectedFile.name, base64: encoded }),
-      });
-      if (!uploadResponse.ok) throw new Error(`Attachment rejected (HTTP ${uploadResponse.status})`);
-      fileToken = ((await uploadResponse.json()) as { fileToken: string }).fileToken;
-    }
-    let res: Response;
-    if (activeChatId) {
-      res = await fetch(`${API}/api/chat/${activeChatId}/message`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ instruction, fileToken }),
-      });
-    } else {
-      res = await fetch(`${API}/api/task`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ instruction, fileToken }),
-      });
-    }
 
-    if (!res.ok) throw new Error(`Backend response HTTP ${res.status}`);
-    const data = (await res.json()) as { task_id?: string; taskId?: string; chat_id?: string; chatId?: string };
-    currentTaskId = data.task_id || data.taskId || null;
-    if (missionAttachment) missionAttachment.value = "";
-    activeChatId = activeChatId || data.chat_id || data.chatId || null;
-
-    // Refresh chat list to show active title and timestamp
-    loadChatList();
-
-    // Cancel clicked while POST was in flight
-    if (cancelRequested && currentTaskId) {
-      try {
-        await fetch(`${API}/api/task/${currentTaskId}/cancel`, { method: "POST" });
-      } catch { /* offline */ }
-      setTaskState("cancelled");
-      if (btnCancelMission) btnCancelMission.hidden = true;
-      setButtonWorking(false);
-      return;
-    }
-
-    // Start background sync / polling for active task
-    if (currentTaskId) {
-      startFallbackPolling(currentTaskId);
-      const stRes = await fetch(`${API}/api/task/${currentTaskId}`).catch(() => null);
-      if (stRes && stRes.ok) {
-        const t = (await stRes.json()) as { taskState: string; message: string; stepsDone?: number; screenshot?: string | null };
-        if (t.taskState && t.taskState !== "planning") {
-          setTaskState(t.taskState);
-        }
-        if (t.screenshot) {
-          updateVisualFrame(t.screenshot, t.message || "", t.taskState);
-        }
-        if (["completed", "failed", "cancelled"].includes(t.taskState)) {
-          stopFallbackPolling();
-          renderCompletion(t.taskState, t.message || "", true, t.stepsDone);
-          loadChatList();
-        }
-      }
-    }
-  } catch (err) {
-    stopFallbackPolling();
-    clearStalledNotice();
-    setTaskState("failed");
-    addStepItem(`⚠️ Backend connection failed: ${err}`);
-    setButtonWorking(false);
-    cancelRequested = false;
-    if (btnCancelMission) btnCancelMission.hidden = true;
-  }
-});
-
-btnCancelMission?.addEventListener("click", async () => {
-  const id = currentTaskId;
-  cancelRequested = true;
-  stopFallbackPolling();
-  clearStalledNotice();
-  if (btnCancelMission) btnCancelMission.hidden = true;
-  hideHumanGate();
-  if (id) {
-    try {
-      await fetch(`${API}/api/task/${id}/cancel`, { method: "POST" });
-    } catch {
-      // Offline
-    }
-  }
-  setTaskState("cancelled");
-  setButtonWorking(false);
-});
-
-btnGateApprove?.addEventListener("click", async () => {
-  if (!currentTaskId) return;
-  hideHumanGate();
-  await fetch(`${API}/api/task/${currentTaskId}/confirm`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ decision: "approve" }),
-  });
-});
-
-btnGateReject?.addEventListener("click", async () => {
-  if (!currentTaskId) return;
-  hideHumanGate();
-  await fetch(`${API}/api/task/${currentTaskId}/confirm`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ decision: "reject" }),
-  });
-});
 
 // ----------------------------------------------------
 // WebSocket Client
 // ----------------------------------------------------
 
 function connectWebSocket(): void {
-  const ws = new WebSocket(`ws://localhost:8000/ws/client`);
+  const ws = new WebSocket(wsUrl(`ws://localhost:8000/ws/client`));
 
   ws.onopen = () => {
     setConnectionStatus(true, "Online");
@@ -1231,6 +1532,8 @@ function connectWebSocket(): void {
           sessionId?: string | null;
           primaryTabId?: number | null;
           childTabIds?: number[] | null;
+          // Task 4: the active takeover request, if any.
+          takeover?: { kind?: string; reason?: string; url?: string } | null;
         };
       };
       if (env.type !== "PROGRESS") return;
@@ -1257,6 +1560,11 @@ function connectWebSocket(): void {
           const childInfo = p.childTabIds && p.childTabIds.length > 0 ? ` (+${p.childTabIds.length} child tabs)` : "";
           missionSubtext.innerHTML = `<span style="color: #38bdf8; font-weight: 500;">🌐 Session: ${escapeHtml(p.sessionId.slice(0, 8))}${tabInfo}${childInfo}</span>`;
         }
+        // Task 14: routing decision — see the polling path above.
+        const routeText = taskRouteLabel((p as any).route);
+        if (routeText) {
+          missionSubtext.innerHTML += ` <span style="color: #34d399; font-weight: 500;">${escapeHtml(routeText)}</span>`;
+        }
       }
 
       if (["completed", "failed", "cancelled"].includes(p.taskState)) {
@@ -1274,12 +1582,27 @@ function connectWebSocket(): void {
       }
 
       if (p.taskState === "awaiting_confirmation") {
-        fetch(`${API}/api/task/${env.taskId}`)
+        apiFetch(`${API}/api/task/${env.taskId}`)
           .then(r => r.json())
           .then(t => {
             const msg = t.pending_confirmation?.message ?? "Authentication / Sign-in required";
-            showHumanGate(msg);
+            showHumanGate(msg, t.pending_confirmation?.plan ?? null);
           });
+      }
+
+      if (p.taskState === "awaiting_takeover") {
+        // The broadcast already carries the takeover record; fetch only
+        // as a fallback (e.g. a reconnect that missed the first frame).
+        if (p.takeover) {
+          showTakeover(p.takeover);
+        } else {
+          apiFetch(`${API}/api/task/${env.taskId}/takeover`)
+            .then(r => r.json())
+            .then(t => showTakeover(t.takeover))
+            .catch(() => showTakeover(null));
+        }
+      } else if (takeoverBanner && !takeoverBanner.hidden) {
+        hideTakeover();
       }
     } catch {
       // non-JSON frame
@@ -1298,8 +1621,353 @@ function connectWebSocket(): void {
 
 // Initial Load
 connectWebSocket();
+// loadChatList() no-ops until the workspace mounts; initWorkspaceElements()
+// re-runs it once the nodes exist.
 loadChatList();
 initLlmSettings();
+initVaultSettings();
+
+// ---------------------------------------------------------------------------
+// Credential vault (Task 4) — /api/vault/credentials.
+// Values are password-typed, sent once over the authenticated API, and
+// never rendered back: the list endpoint returns metadata (domain /
+// kind / label / placeholder) only, and the value field is cleared
+// after every save. OTP / one-time-code kinds are rejected by the
+// backend vault, not here.
+// ---------------------------------------------------------------------------
+
+interface VaultCredentialMeta {
+  domain: string;
+  kind: string;
+  label: string;
+  username?: string | null;
+  placeholder: string;
+}
+
+async function refreshVaultList(): Promise<void> {
+  const list = $("vaultList") as HTMLUListElement | null;
+  if (!list) return;
+  list.innerHTML = "";
+  try {
+    const res = await apiFetch(`${API}/api/vault/credentials`);
+    if (!res.ok) return;
+    const data = (await res.json()) as { credentials: VaultCredentialMeta[] };
+    for (const cred of data.credentials || []) {
+      const li = document.createElement("li");
+      li.textContent = `${cred.domain} · ${cred.kind} · ${cred.label} — ${cred.placeholder}`;
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "btn btn--sm btn--ghost";
+      del.textContent = "Delete";
+      del.addEventListener("click", async () => {
+        await apiFetch(
+          `${API}/api/vault/credentials/${encodeURIComponent(cred.domain)}/${encodeURIComponent(cred.kind)}/${encodeURIComponent(cred.label)}`,
+          { method: "DELETE" },
+        );
+        await refreshVaultList();
+      });
+      li.appendChild(del);
+      list.appendChild(li);
+    }
+    if (list.children.length === 0) {
+      const li = document.createElement("li");
+      li.textContent = "No saved credentials yet.";
+      list.appendChild(li);
+    }
+  } catch {
+    // Offline: leave the list empty rather than showing stale data.
+  }
+}
+
+async function saveVaultCredential(): Promise<void> {
+  const status = $("vaultSaveStatus");
+  const domain = ($("vaultDomain") as HTMLInputElement | null)?.value.trim() || "";
+  const kind = ($("vaultKind") as HTMLSelectElement | null)?.value || "login";
+  const label = ($("vaultLabel") as HTMLInputElement | null)?.value.trim() || "";
+  const username = ($("vaultUsername") as HTMLInputElement | null)?.value.trim() || "";
+  const valueInput = $("vaultValue") as HTMLInputElement | null;
+  const value = valueInput?.value || "";
+  if (!domain || !label || !value) {
+    if (status) status.textContent = "Domain, label, and the secret are all required.";
+    return;
+  }
+  if (status) status.textContent = "Saving…";
+  try {
+    const res = await apiFetch(`${API}/api/vault/credentials`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ domain, kind, label, username: username || null, value }),
+    });
+    if (!res.ok) {
+      const detail = await res.json().catch(() => null) as { detail?: string } | null;
+      if (status) status.textContent = detail?.detail || `Could not save (backend ${res.status}).`;
+      return;
+    }
+    if (status) status.textContent = "Saved — the value is encrypted and will never be shown again.";
+    // The secret must not linger in the page: clear the field at once.
+    if (valueInput) valueInput.value = "";
+    await refreshVaultList();
+  } catch {
+    if (status) status.textContent = "Backend offline — could not save.";
+  }
+}
+
+function initVaultSettings(): void {
+  const overlay = $("vaultOverlay");
+  const openBtn = $("btnVaultSettings");
+  const closeBtn = $("btnVaultClose");
+  if (!overlay || !openBtn || !closeBtn) return;
+
+  openBtn.addEventListener("click", () => { overlay.hidden = false; void refreshVaultList(); });
+  closeBtn.addEventListener("click", () => { overlay.hidden = true; });
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.hidden = true; });
+  $("btnVaultSave")?.addEventListener("click", () => { void saveVaultCredential(); });
+}
+
+initMemorySettings();
+
+// ---------------------------------------------------------------------------
+// Long-term memory (Task 9) — /api/memory/long/*.
+// Facts / skills / files, all operator-owned: the list endpoints return
+// metadata and text the operator wrote (never secrets — the backend
+// rejects credentials and PII at write time), and file listings never
+// include file content. All rendering uses textContent, never innerHTML.
+// Proposals from a finished task appear only after the operator opens
+// this dialog; accepting one stores it as a confirmed fact/skill.
+// ---------------------------------------------------------------------------
+
+interface MemoryFact { id: string; text: string; category: string; source: string; }
+interface MemorySkill { id: string; name: string; version: number; success_count: number; }
+interface MemoryFileMeta { id: string; file_name: string; summary: string; size_bytes: number; }
+interface MemoryProposal { kind: string; text?: string; name?: string; steps?: string; }
+
+function memoryListItem(label: string, onDelete: () => void): HTMLLIElement {
+  const li = document.createElement("li");
+  li.textContent = label;
+  const del = document.createElement("button");
+  del.type = "button";
+  del.className = "btn btn--sm btn--ghost";
+  del.textContent = "Delete";
+  del.addEventListener("click", () => { void onDelete(); });
+  li.appendChild(del);
+  return li;
+}
+
+async function refreshMemoryLists(): Promise<void> {
+  const factsList = $("memoryFactsList") as HTMLUListElement | null;
+  const skillsList = $("memorySkillsList") as HTMLUListElement | null;
+  const filesList = $("memoryFilesList") as HTMLUListElement | null;
+  const proposalsSection = $("memoryProposalsSection");
+  const proposalsList = $("memoryProposalsList") as HTMLUListElement | null;
+  try {
+    const [factsRes, skillsRes, filesRes] = await Promise.all([
+      apiFetch(`${API}/api/memory/long/facts`),
+      apiFetch(`${API}/api/memory/long/skills`),
+      apiFetch(`${API}/api/memory/long/files`),
+    ]);
+    if (factsList) {
+      factsList.innerHTML = "";
+      if (factsRes.ok) {
+        const data = (await factsRes.json()) as { facts: MemoryFact[] };
+        for (const fact of data.facts || []) {
+          factsList.appendChild(memoryListItem(
+            `${fact.text} — ${fact.category} · ${fact.source}`,
+            async () => {
+              await apiFetch(`${API}/api/memory/long/facts/${encodeURIComponent(fact.id)}`, { method: "DELETE" });
+              await refreshMemoryLists();
+            },
+          ));
+        }
+        if (factsList.children.length === 0) {
+          const li = document.createElement("li");
+          li.textContent = "No saved facts yet.";
+          factsList.appendChild(li);
+        }
+      }
+    }
+    if (skillsList) {
+      skillsList.innerHTML = "";
+      if (skillsRes.ok) {
+        const data = (await skillsRes.json()) as { skills: MemorySkill[] };
+        for (const skill of data.skills || []) {
+          skillsList.appendChild(memoryListItem(
+            `${skill.name} — v${skill.version} · ${skill.success_count} success${skill.success_count === 1 ? "" : "es"}`,
+            async () => {
+              await apiFetch(`${API}/api/memory/long/skills/${encodeURIComponent(skill.id)}`, { method: "DELETE" });
+              await refreshMemoryLists();
+            },
+          ));
+        }
+        if (skillsList.children.length === 0) {
+          const li = document.createElement("li");
+          li.textContent = "No learned skills yet.";
+          skillsList.appendChild(li);
+        }
+      }
+    }
+    if (filesList) {
+      filesList.innerHTML = "";
+      if (filesRes.ok) {
+        const data = (await filesRes.json()) as { files: MemoryFileMeta[] };
+        for (const file of data.files || []) {
+          filesList.appendChild(memoryListItem(
+            `${file.file_name} — ${file.summary} (${Math.round(file.size_bytes / 1024)} KB)`,
+            async () => {
+              await apiFetch(`${API}/api/memory/long/files/${encodeURIComponent(file.id)}`, { method: "DELETE" });
+              await refreshMemoryLists();
+            },
+          ));
+        }
+        if (filesList.children.length === 0) {
+          const li = document.createElement("li");
+          li.textContent = "No reference files yet.";
+          filesList.appendChild(li);
+        }
+      }
+    }
+    // Pending proposals from the current task's checkpoint, if any.
+    if (proposalsSection && proposalsList) {
+      proposalsList.innerHTML = "";
+      proposalsSection.hidden = true;
+      if (currentTaskId) {
+        const taskRes = await apiFetch(`${API}/api/task/${encodeURIComponent(currentTaskId)}`);
+        if (taskRes.ok) {
+          const task = (await taskRes.json()) as { checkpoint?: { proposals?: MemoryProposal[] } | null };
+          const proposals = task.checkpoint?.proposals || [];
+          if (proposals.length > 0) {
+            proposalsSection.hidden = false;
+            proposals.forEach((proposal, index) => {
+              const label = proposal.kind === "fact"
+                ? `Fact: ${proposal.text || ""}`
+                : `Skill: ${proposal.name || ""}`;
+              const li = document.createElement("li");
+              li.textContent = label;
+              const accept = document.createElement("button");
+              accept.type = "button";
+              accept.className = "btn btn--sm btn--primary";
+              accept.textContent = "Remember";
+              accept.addEventListener("click", async () => {
+                // REVIEW (Task 9 audit): this used to send
+                // {accepted_indices: [index]} while the backend only
+                // reads "accepted" — pydantic silently dropped the
+                // unknown field, so "Remember" did nothing at all.
+                await apiFetch(`${API}/api/memory/long/proposals/${encodeURIComponent(currentTaskId as string)}/confirm`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ accepted: [index] }),
+                });
+                await refreshMemoryLists();
+              });
+              li.appendChild(accept);
+              proposalsList.appendChild(li);
+            });
+          }
+        }
+      }
+    }
+  } catch {
+    // Offline: leave the lists empty rather than showing stale data.
+  }
+}
+
+async function saveMemoryFact(): Promise<void> {
+  const status = $("memoryFactStatus");
+  const text = ($("memoryFactText") as HTMLInputElement | null)?.value.trim() || "";
+  const category = ($("memoryFactCategory") as HTMLSelectElement | null)?.value || "general";
+  if (!text) {
+    if (status) status.textContent = "Write the fact first.";
+    return;
+  }
+  if (status) status.textContent = "Saving…";
+  try {
+    const res = await apiFetch(`${API}/api/memory/long/facts`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, category }),
+    });
+    if (!res.ok) {
+      const detail = await res.json().catch(() => null) as { detail?: string } | null;
+      if (status) status.textContent = detail?.detail || `Could not save (backend ${res.status}).`;
+      return;
+    }
+    if (status) status.textContent = "Saved.";
+    const input = $("memoryFactText") as HTMLInputElement | null;
+    if (input) input.value = "";
+    await refreshMemoryLists();
+  } catch {
+    if (status) status.textContent = "Backend offline — could not save.";
+  }
+}
+
+async function uploadMemoryFile(): Promise<void> {
+  const status = $("memoryFileStatus");
+  const input = $("memoryFileInput") as HTMLInputElement | null;
+  const file = input?.files?.[0];
+  const summary = ($("memoryFileSummary") as HTMLInputElement | null)?.value.trim() || "";
+  if (!file) {
+    if (status) status.textContent = "Choose a file first.";
+    return;
+  }
+  if (status) status.textContent = "Uploading…";
+  try {
+    const base64 = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = String(reader.result || "");
+        resolve(result.includes(",") ? result.split(",").pop() || "" : result);
+      };
+      reader.onerror = () => reject(new Error("could not read file"));
+      reader.readAsDataURL(file);
+    });
+    const res = await apiFetch(`${API}/api/memory/long/files`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fileName: file.name, base64, summary, taskId: currentTaskId || "" }),
+    });
+    if (!res.ok) {
+      const detail = await res.json().catch(() => null) as { detail?: string } | null;
+      if (status) status.textContent = detail?.detail || `Could not attach (backend ${res.status}).`;
+      return;
+    }
+    if (status) status.textContent = "Attached — the planner will see the summary only.";
+    if (input) input.value = "";
+    const summaryInput = $("memoryFileSummary") as HTMLInputElement | null;
+    if (summaryInput) summaryInput.value = "";
+    await refreshMemoryLists();
+  } catch {
+    if (status) status.textContent = "Could not read or upload that file.";
+  }
+}
+
+async function forgetAllMemory(): Promise<void> {
+  const status = $("memoryForgetStatus");
+  if (!window.confirm("Forget everything the agent remembers about you — all facts, skills, and reference files? This cannot be undone.")) return;
+  try {
+    const res = await apiFetch(`${API}/api/memory`, { method: "DELETE" });
+    if (!res.ok) {
+      if (status) status.textContent = `Could not forget (backend ${res.status}).`;
+      return;
+    }
+    if (status) status.textContent = "Forgotten — all memory tiers are empty.";
+    await refreshMemoryLists();
+  } catch {
+    if (status) status.textContent = "Backend offline — could not forget.";
+  }
+}
+
+function initMemorySettings(): void {
+  const overlay = $("memoryOverlay");
+  const openBtn = $("btnMemorySettings");
+  const closeBtn = $("btnMemoryClose");
+  if (!overlay || !openBtn || !closeBtn) return;
+
+  openBtn.addEventListener("click", () => { overlay.hidden = false; void refreshMemoryLists(); });
+  closeBtn.addEventListener("click", () => { overlay.hidden = true; });
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.hidden = true; });
+  $("btnMemorySaveFact")?.addEventListener("click", () => { void saveMemoryFact(); });
+  $("btnMemoryUploadFile")?.addEventListener("click", () => { void uploadMemoryFile(); });
+  $("btnMemoryForgetAll")?.addEventListener("click", () => { void forgetAllMemory(); });
+}
 
 // ---------------------------------------------------------------------------
 // LLM provider settings — runtime provider/model selection via /api/llm/*.
@@ -1361,7 +2029,7 @@ async function initLlmSettings(): Promise<void> {
 
 async function refreshLlmSettings(): Promise<void> {
   try {
-    const res = await fetch(`${API}/api/llm/config`);
+    const res = await apiFetch(`${API}/api/llm/config`);
     if (!res.ok) return;
     const cfg = (await res.json()) as LlmConfig;
     const providerSelect = $("llmProviderSelect") as HTMLSelectElement | null;
@@ -1428,7 +2096,7 @@ async function discoverLlmModels(): Promise<void> {
     return;
   }
   try {
-    const res = await fetch(`${API}/api/llm/models`);
+    const res = await apiFetch(`${API}/api/llm/models`);
     if (!res.ok) {
       if (status) status.textContent = `Discovery failed (HTTP ${res.status}). Manual entry still available.`;
       return;
@@ -1473,7 +2141,7 @@ async function saveLlmSettings(opts: { silentStatus?: boolean } = {}): Promise<b
     if (apiKey.trim()) body.apiKey = apiKey.trim();
   }
   try {
-    const res = await fetch(`${API}/api/llm/config`, {
+    const res = await apiFetch(`${API}/api/llm/config`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),

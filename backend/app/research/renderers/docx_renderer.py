@@ -33,8 +33,8 @@ from typing import Any, Optional
 import docx  # type: ignore
 from docx.enum.table import WD_TABLE_ALIGNMENT  # type: ignore
 from docx.enum.text import WD_ALIGN_PARAGRAPH  # type: ignore
-from docx.oxml import OxmlElement, parse_xml  # type: ignore
-from docx.oxml.ns import nsdecls, qn  # type: ignore
+from docx.oxml import parse_xml  # type: ignore
+from docx.oxml.ns import nsdecls  # type: ignore
 from docx.shared import Inches, Pt, RGBColor  # type: ignore
 
 from ..document_plan import (

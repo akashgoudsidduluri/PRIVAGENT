@@ -7,9 +7,10 @@
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='10' fill='%23061032'/%3E%3Ccircle cx='12' cy='12' r='6.5' fill='none' stroke='%2346d7ff' stroke-width='1.8'/%3E%3Ccircle cx='12' cy='12' r='2.4' fill='%23a06bff'/%3E%3C/svg%3E" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=IBM+Plex+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/src/styles/main.css" />
-  <link rel="stylesheet" href="/src/styles/agent.css" />
+  <!-- Fonts load async (preload + onload rel-swap): a plain stylesheet
+       <link> to Google Fonts would block first paint on a third-party
+       fetch (GLM review 2026-11-17). display=swap keeps text visible. -->
+  <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=IBM+Plex+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&display=swap" onload="this.onload=null;this.rel='stylesheet'" />
 </head>
 <body class="agent-body">
   <!-- Top App Bar -->
@@ -30,6 +31,14 @@
         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
         <span id="llmSettingsLabel">Provider</span>
       </button>
+      <button id="btnVaultSettings" class="btn btn--sm btn--ghost" title="Saved Credentials (Vault)" aria-haspopup="dialog">
+        <span aria-hidden="true">🔐</span>
+        <span>Vault</span>
+      </button>
+      <button id="btnMemorySettings" class="btn btn--sm btn--ghost" title="Long-term Memory (facts, skills, files)" aria-haspopup="dialog">
+        <span aria-hidden="true">🧠</span>
+        <span>Memory</span>
+      </button>
     </div>
     <div class="agent-header__right">
       <div class="agent-ws-indicator" id="wsIndicator">
@@ -44,6 +53,11 @@
   <!-- Workspace Split Grid -->
   <nav id="controlNav" class="control-nav" aria-label="Control center"></nav>
   <div id="controlPage" class="control-page"></div>
+  <!-- Agent workspace (UI flicker fix): kept inert inside a <template> —
+       template content is never painted, so the first paint is the
+       control center only. controlCenter mounts it (once) when the
+       operator opens the Agent Workspace, Inspector, or Activity view. -->
+  <template id="workspaceTemplate">
   <main class="agent-workspace" id="agentWorkspace">
     <!-- Left: Collapsible Missions History Sidebar -->
     <aside class="agent-chat-sidebar" id="chatSidebar" aria-label="Mission History Sidebar">
@@ -110,9 +124,30 @@
           <h4 id="humanGateTitle">Sign-in or Payment Confirmation Required</h4>
           <p id="humanGateMsg">This site requires your credentials or authentication in your Chrome browser tab. Please switch to the tab, complete sign-in/verification, and click Continue.</p>
           <pre id="humanGateAction" class="human-gate__action" hidden></pre>
+          <!-- Task 12: plan preview — the validated plan in plain language, rendered as text -->
+          <div class="plan-preview" id="planPreview" hidden>
+            <h5 id="planPreviewTitle">Plan preview</h5>
+            <ol class="plan-preview__list" id="planPreviewList"></ol>
+            <p class="plan-preview__note">“Approve plan” runs the plan. “This step only” approves one step, then shows a fresh plan for the next step. Approval never overrides a safety gate.</p>
+          </div>
           <div class="human-gate__buttons">
             <button id="btnGateApprove" class="btn btn--primary btn--sm">✓ I Have Completed This / Continue</button>
+            <button id="btnGateApproveStep" class="btn btn--sm">✓ Approve this step only</button>
             <button id="btnGateReject" class="btn btn--ghost btn--sm">Abort Mission</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Takeover Banner (Task 4: the agent is paused and not watching) -->
+      <div class="human-gate" id="takeoverBanner" hidden>
+        <div class="human-gate__icon">🧑‍💻</div>
+        <div class="human-gate__content">
+          <h4 id="takeoverTitle">Takeover — You're in Control</h4>
+          <p id="takeoverMsg">The agent has paused and stopped watching the page. Complete the step in your Chrome tab, then resume.</p>
+          <p class="human-gate__meta" id="takeoverMeta"></p>
+          <div class="human-gate__buttons">
+            <button id="btnTakeoverResume" class="btn btn--primary btn--sm">✓ I Have Completed This / Resume</button>
+            <button id="btnTakeoverCancel" class="btn btn--ghost btn--sm">Cancel Mission</button>
           </div>
         </div>
       </div>
@@ -150,6 +185,15 @@
           <div class="agent-artifacts-list" id="agentArtifactsList">
             <!-- Dynamically populated with downloadable deliverable cards -->
           </div>
+        </div>
+
+        <!-- Task 12: per-step timeline (type, status, duration, batch/cache flags) -->
+        <div class="agent-timeline-card" id="taskTimelineCard" hidden>
+          <div class="agent-feed-header">
+            <h3>TASK TIMELINE</h3>
+            <span id="timelineSummary" class="agent-counter"></span>
+          </div>
+          <ol class="task-timeline" id="taskTimelineList"></ol>
         </div>
       </div>
     </section>
@@ -246,6 +290,7 @@
       </div>
     </aside>
   </main>
+  </template>
 
   <!-- LLM Provider Settings Dialog -->
   <div class="llm-settings-overlay" id="llmSettingsOverlay" hidden>
@@ -290,6 +335,114 @@
           <span id="llmSaveStatus" class="llm-status"></span>
         </div>
         <p class="llm-note">The API key is stored only in the backend process (never sent back to this page or written to task history). Model changes apply to the next mission without a restart.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Credential Vault Dialog (Task 4) -->
+  <div class="llm-settings-overlay" id="vaultOverlay" hidden>
+    <div class="llm-settings" role="dialog" aria-modal="true" aria-labelledby="vaultTitle">
+      <div class="llm-settings__header">
+        <h3 id="vaultTitle">Saved Credentials (Vault)</h3>
+        <button id="btnVaultClose" class="btn btn--sm btn--ghost" aria-label="Close">✕</button>
+      </div>
+      <div class="llm-settings__body">
+        <p class="llm-note">Credentials are stored encrypted on this machine and are never shown again — not even to you. The agent only ever sees a placeholder like {{CREDENTIAL:example.com:login:personal}}. One-time codes (OTP / TOTP) are never stored: the agent hands the browser to you instead.</p>
+        <label class="llm-field">
+          <span>Site domain</span>
+          <input id="vaultDomain" type="text" placeholder="example.com" spellcheck="false" />
+        </label>
+        <label class="llm-field">
+          <span>Kind</span>
+          <select id="vaultKind">
+            <option value="login">Login (username + password)</option>
+            <option value="card">Card (last 4 digits only)</option>
+          </select>
+        </label>
+        <label class="llm-field">
+          <span>Label</span>
+          <input id="vaultLabel" type="text" placeholder="personal" spellcheck="false" />
+        </label>
+        <label class="llm-field">
+          <span>Username (login only)</span>
+          <input id="vaultUsername" type="text" placeholder="you@example.com" autocomplete="off" spellcheck="false" />
+        </label>
+        <label class="llm-field">
+          <span>Password / last 4 digits</span>
+          <input id="vaultValue" type="password" placeholder="••••••••" autocomplete="off" />
+        </label>
+        <div class="llm-actions">
+          <button id="btnVaultSave" class="btn btn--primary btn--sm" type="button">Save to vault</button>
+          <span id="vaultSaveStatus" class="llm-status"></span>
+        </div>
+        <div class="llm-field">
+          <span>Saved credentials</span>
+          <ul id="vaultList" class="vault-list"></ul>
+        </div>
+        <p class="llm-note">You can also use Chrome's built-in password manager / autofill instead — the agent will never ask for a password in chat.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Long-term Memory Dialog (Task 9) -->
+  <div class="llm-settings-overlay" id="memoryOverlay" hidden>
+    <div class="llm-settings" role="dialog" aria-modal="true" aria-labelledby="memoryTitle">
+      <div class="llm-settings__header">
+        <h3 id="memoryTitle">Long-term Memory</h3>
+        <button id="btnMemoryClose" class="btn btn--sm btn--ghost" aria-label="Close">✕</button>
+      </div>
+      <div class="llm-settings__body">
+        <p class="llm-note">The agent remembers durable facts about you, reusable skills it has learned, and reference files — all stored encrypted on this machine. Memory is only ever written by you, or from a finished task's confirmed outcomes after you approve it here. Page content can never write memory. Facts and skills are recalled into the planner prompt (top 5 facts / 800 chars, top 2 skills); files are never sent wholesale — the planner sees a short summary only.</p>
+        <div class="llm-field" id="memoryProposalsSection" hidden>
+          <span>Suggested from the last task — accept to remember</span>
+          <ul id="memoryProposalsList" class="vault-list"></ul>
+        </div>
+        <label class="llm-field">
+          <span>Add a fact (e.g. “my home airport is DEL”)</span>
+          <input id="memoryFactText" type="text" placeholder="I prefer window seats" spellcheck="false" />
+        </label>
+        <label class="llm-field">
+          <span>Category</span>
+          <select id="memoryFactCategory">
+            <option value="general">General</option>
+            <option value="personal">Personal</option>
+            <option value="retail">Retail</option>
+            <option value="coding">Coding</option>
+            <option value="travel">Travel</option>
+          </select>
+        </label>
+        <div class="llm-actions">
+          <button id="btnMemorySaveFact" class="btn btn--primary btn--sm" type="button">Save fact</button>
+          <span id="memoryFactStatus" class="llm-status"></span>
+        </div>
+        <div class="llm-field">
+          <span>Saved facts</span>
+          <ul id="memoryFactsList" class="vault-list"></ul>
+        </div>
+        <div class="llm-field">
+          <span>Learned skills</span>
+          <ul id="memorySkillsList" class="vault-list"></ul>
+        </div>
+        <div class="llm-field">
+          <span>Reference files</span>
+          <ul id="memoryFilesList" class="vault-list"></ul>
+        </div>
+        <label class="llm-field">
+          <span>Attach a reference file for the current task (max 5 MiB)</span>
+          <input id="memoryFileInput" type="file" />
+        </label>
+        <label class="llm-field">
+          <span>File summary (what the planner will see)</span>
+          <input id="memoryFileSummary" type="text" placeholder="Goa trip itinerary" spellcheck="false" />
+        </label>
+        <div class="llm-actions">
+          <button id="btnMemoryUploadFile" class="btn btn--sm" type="button">Attach file</button>
+          <span id="memoryFileStatus" class="llm-status"></span>
+        </div>
+        <div class="llm-actions">
+          <button id="btnMemoryForgetAll" class="btn btn--sm btn--ghost" type="button">Forget everything</button>
+          <span id="memoryForgetStatus" class="llm-status"></span>
+        </div>
       </div>
     </div>
   </div>

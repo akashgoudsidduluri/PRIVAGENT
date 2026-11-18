@@ -4,17 +4,41 @@ import type {
   BrowserAction,
   BrowserObservation,
   TabInfo,
+  WebMCPTool,
 } from "./contracts";
 import { validateAction } from "./contracts";
-import { classifySearchTarget, findTarget, type Candidate } from "./targeting";
+import { isAllowedNavigationUrl } from "./allowlist";
+import { classifySearchTarget, findTarget, getLastTargetAmbiguity, type Candidate } from "./targeting";
 import { sanitizeObservation } from "./observer";
+
+// --- Task 4: takeover ------------------------------------------------------
+// While the operator is completing a login / OTP / payment step in the
+// tab, the agent must not observe anything: no DOM list, no page text,
+// no screenshot, and no action may execute. The backend sends
+// TAKEOVER_START / TAKEOVER_END over the relay (background.ts sets this
+// flag); the backend loop is the authoritative gate — this flag is the
+// extension's defence in depth, so a stray observe during takeover
+// returns an empty observation instead of page data.
+let takeoverActive = false;
+
+export function setTakeoverActive(active: boolean): void {
+  takeoverActive = active;
+}
+
+export function isTakeoverActive(): boolean {
+  return takeoverActive;
+}
 
 /** Injected content-script API shape (see lib/content.ts). */
 interface AgentElement {
   targetId: string;
+  /** Task 7: element reference for this observation's accessibility tree. */
+  elementRef: string;
   semantic?: import("./contracts").SemanticElement;
   role: string;
   name: string;
+  /** Pre-glyph-strip accessible name, when it differs. Debugging only. */
+  rawName?: string;
   tag: string;
   inputType?: string;
   search?: boolean;
@@ -23,6 +47,8 @@ interface AgentElement {
   visible: boolean;
   bounds?: { x: number; y: number; width: number; height: number };
   href?: string;
+  /** Task 7: element state (checked/selected/expanded). */
+  state?: { checked?: boolean; selected?: boolean; expanded?: boolean };
 }
 
 interface ValueProbe {
@@ -47,6 +73,7 @@ interface PageStateProbe {
 interface AgentApi {
   list: () => Promise<AgentElement[]>;
   click: (targetId: string, name?: string) => Promise<{ ok: boolean; error?: string }>;
+  linkTarget: (targetId: string, name?: string) => Promise<string>;
   clickCoords: (x: number, y: number) => Promise<{ ok: boolean; targetId?: string; error?: string }>;
   getCoords: (targetId: string, name?: string) => Promise<{ x: number; y: number; width: number; height: number } | null>;
   clickPoint: (targetId: string, name?: string) => Promise<{ x: number; y: number; width: number; height: number } | null>;
@@ -159,6 +186,14 @@ export async function withAgent(tabId: number): Promise<AgentApi> {
         args: [targetId ?? "", name ?? ""],
       });
       return (r?.result as { ok: boolean; error?: string }) ?? { ok: false, error: "execution failed" };
+    },
+    linkTarget: async (targetId: string, name?: string) => {
+      const [r] = await execScript({
+        target: { tabId },
+        func: (id: string, nm?: string) => (window as unknown as { __navigatorAgent?: { linkTarget: (i: string, n?: string) => string } }).__navigatorAgent?.linkTarget(id, nm) ?? "",
+        args: [targetId ?? "", name ?? ""],
+      });
+      return typeof r?.result === "string" ? r.result : "";
     },
     clickCoords: async (x: number, y: number) => {
       if (typeof x !== "number" || typeof y !== "number" || !Number.isFinite(x) || !Number.isFinite(y)) {
@@ -346,15 +381,38 @@ export function clearExtensionSessions(): void {
   extensionSessions.clear();
 }
 
+/** Keep a session's tab pointers live when a tab closes. Exported for
+ * tests; the module-level onRemoved listener calls it.
+ * - A closed child leaves the child set.
+ * - A closed active tab falls back to the primary.
+ * - A closed primary promotes the earliest surviving child to primary
+ *   (the task keeps its live tabs); with no child left the session is
+ *   dropped — a session with no live tab cannot run actions, and
+ *   keeping it would let every later resume report a dead primary. */
+export function handleTabRemoved(tabId: number): void {
+  for (const [sessionId, sess] of extensionSessions.entries()) {
+    if (sess.childTabIds.has(tabId)) {
+      sess.childTabIds.delete(tabId);
+    }
+    if (sess.activeTabId === tabId) {
+      sess.activeTabId = sess.primaryTabId;
+    }
+    if (sess.primaryTabId === tabId) {
+      const next = sess.childTabIds.values().next().value as number | undefined;
+      if (next !== undefined) {
+        sess.childTabIds.delete(next);
+        sess.primaryTabId = next;
+        sess.activeTabId = next;
+      } else {
+        extensionSessions.delete(sessionId);
+      }
+    }
+  }
+}
+
 if (typeof chrome !== "undefined" && chrome?.tabs?.onRemoved?.addListener) {
   try {
-    chrome.tabs.onRemoved.addListener((tabId) => {
-      for (const sess of extensionSessions.values()) {
-        if (sess.childTabIds.has(tabId)) {
-          sess.childTabIds.delete(tabId);
-        }
-      }
-    });
+    chrome.tabs.onRemoved.addListener((tabId) => handleTabRemoved(tabId));
   } catch {}
 }
 
@@ -363,11 +421,32 @@ export async function initSession(params: {
   useExistingTab?: boolean;
   tabHint?: string;
   tabId?: number;
-}): Promise<ActionResult & { primaryTabId?: number }> {
+}, signal?: AbortSignal): Promise<ActionResult & { primaryTabId?: number }> {
   const { sessionId, useExistingTab, tabHint, tabId } = params;
 
   if (extensionSessions.has(sessionId)) {
     const existing = extensionSessions.get(sessionId)!;
+    // A resume must verify the home tab still exists: the tab may have
+    // closed while the listener was not registered (extension reload),
+    // and a stale "resumed" would send every later action at a dead tab.
+    let primary: chrome.tabs.Tab | null = null;
+    try {
+      primary = await chrome.tabs.get(existing.primaryTabId);
+    } catch {
+      primary = null;
+    }
+    if (!primary || !isDrivableTabUrl(primary.url ?? "")) {
+      extensionSessions.delete(sessionId);
+      return {
+        ok: false,
+        error: { code: "TAB_UNAVAILABLE", message: `Session ${sessionId}'s primary tab ${existing.primaryTabId} is closed or unavailable; start a new session`, recoverable: false },
+      };
+    }
+    // The active tab may have died without the listener firing; fall
+    // back to the verified primary rather than a dangling pointer.
+    if (existing.activeTabId !== undefined && existing.activeTabId !== existing.primaryTabId && !existing.childTabIds.has(existing.activeTabId)) {
+      existing.activeTabId = existing.primaryTabId;
+    }
     existing.lastActivityAt = Date.now();
     return {
       ok: true,
@@ -428,6 +507,7 @@ export async function initSession(params: {
       }
     }
   } else {
+    throwIfAborted(signal);
     try {
       const created = await chrome.tabs.create({ url: "about:blank", active: true });
       resolvedTabId = created.id;
@@ -586,9 +666,12 @@ async function pageStatus(tabId: number): Promise<PageSettlement | null> {
         return {
           ready: document.readyState !== "loading",
           interactiveCount: document.querySelectorAll(
-            'button, input, textarea, a[href], [role="button"], [contenteditable], [data-testid], ytd-thumbnail'
+            'button, input, textarea, a[href], [role="button"], [contenteditable], [data-testid]'
           ).length,
-          isConnecting: text.includes("Connecting to WhatsApp") || text.includes("Loading your chats"),
+          // Generic "still connecting" text: a chat app that shows a
+          // connecting/loading state is not settled yet (Task 8: no
+          // per-app strings).
+          isConnecting: /connecting|loading your chats|loading chats/i.test(text),
         };
       },
     }, 1_500);
@@ -680,23 +763,19 @@ async function networkStatusSince(tabId: number, since: number): Promise<number 
   } catch { return undefined; }
 }
 
-async function detectNewTab(tabId: number, tabIdsBefore: Set<number>, windowId?: number): Promise<chrome.tabs.Tab | null> {
+async function detectNewTab(tabId: number, tabIdsBefore: Set<number>): Promise<chrome.tabs.Tab | null> {
   const currentTabs = await chrome.tabs.query({}).catch(() => [] as chrome.tabs.Tab[]);
   const newTabs = currentTabs.filter(t => t.id !== undefined && !tabIdsBefore.has(t.id) && isDrivableTabUrl(t.url ?? ""));
   if (newTabs.length === 0) return null;
 
-  // 1. Direct parent/opener match: tab explicitly designated as opened by tabId
-  const openerMatch = newTabs.find(t => t.openerTabId === tabId);
-  if (openerMatch) return openerMatch;
-
-  // 2. Same window match
-  if (windowId !== undefined) {
-    const windowMatch = newTabs.find(t => t.windowId === windowId);
-    if (windowMatch) return windowMatch;
-  }
-
-  // 3. Fallback to newest drivable tab
-  return newTabs[newTabs.length - 1] ?? null;
+  // Only a tab this tab actually opened (target=_blank, window.open —
+  // Chrome sets openerTabId for both) is the click's destination.
+  // A new tab that merely shares the window, or the last tab in query
+  // order, may be an ad pop-under, a tab another session opened, or
+  // the user's own tab: adopting it would observe the wrong page and
+  // report it as the click's result. If no tab names this tab as its
+  // opener, the click did not open a tab.
+  return newTabs.find(t => t.openerTabId === tabId) ?? null;
 }
 
 /**
@@ -709,20 +788,20 @@ async function settleAfterAction(
   tabId: number,
   beforeUrl: string,
   timeoutMs: number,
-  tabIdsBefore?: Set<number>
+  tabIdsBefore?: Set<number>,
+  signal?: AbortSignal
 ): Promise<number> {
   // 1. Check if a newly created tab appeared (target=_blank, window.open, etc.)
   if (tabIdsBefore && tabIdsBefore.size > 0) {
-    const originTab = await chrome.tabs.get(tabId).catch(() => null);
-    const windowId = originTab?.windowId;
     let newTab: chrome.tabs.Tab | null = null;
     for (let i = 0; i < 10; i++) {
-      newTab = await detectNewTab(tabId, tabIdsBefore, windowId);
+      newTab = await detectNewTab(tabId, tabIdsBefore);
       if (newTab && newTab.id !== undefined) break;
       await sleep(40);
     }
     if (newTab && newTab.id !== undefined) {
       const destinationTabId = newTab.id;
+      throwIfAborted(signal);
       await chrome.tabs.update(destinationTabId, { active: true }).catch(() => {});
       await waitForStable(destinationTabId, timeoutMs);
       return destinationTabId;
@@ -771,10 +850,10 @@ export function isBlockedUrl(url: string): boolean {
   return BLOCKED_SCHEMES.some(s => u.startsWith(s));
 }
 
-export async function executeAction(action: BrowserAction, taskId: string): Promise<ActionResult> {
+export async function executeAction(action: BrowserAction, taskId: string, allowedDomains?: string[], signal?: AbortSignal): Promise<ActionResult> {
   const raw = action as any;
   if (raw?.type === "init_session") {
-    return await initSession(raw);
+    return await initSession(raw, signal);
   }
   if (raw?.type === "close_session") {
     const sId = raw?.sessionId;
@@ -788,21 +867,44 @@ export async function executeAction(action: BrowserAction, taskId: string): Prom
   if (!v.ok) {
     return { ok: false, error: { code: "PLAN_INVALID", message: `invalid action: ${v.error}`, recoverable: false } };
   }
+  // Task 4: while the operator has the browser (takeover), no agent
+  // action may execute — not even a read. Recoverable: the action was
+  // not executed, and the loop retries or fails honestly once the
+  // takeover resolves.
+  if (takeoverActive) {
+    return err("TAKEOVER_ACTIVE", "takeover in progress — the operator is completing a login / payment step in the browser", true);
+  }
+  // Task 3: defence-in-depth allow-list. The backend loop is the
+  // authoritative gate; this refuses a disallowed navigation here too,
+  // without executing it. An empty/undefined list means "not configured".
+  if ((action.type === "navigate" || action.type === "new_tab") && action.params?.url) {
+    if (!isAllowedNavigationUrl(action.params.url, allowedDomains)) {
+      return err("NAVIGATION_FAILED", `blocked by domain allow-list: ${action.params.url}`, false);
+    }
+  }
   try {
     if (action.type === "new_tab") {
       return await doNewTab(action);
     }
-    if (action.type === "select_tab") {
+    if (action.type === "select_tab" || action.type === "switch_tab") {
       if (action.sessionId) {
         const session = extensionSessions.get(action.sessionId);
         if (session) {
           if (action.params.tabId !== session.primaryTabId && !session.childTabIds.has(action.params.tabId)) {
             return err("TAB_UNAUTHORIZED", `Tab ${action.params.tabId} is not in session ${action.sessionId}`, false);
           }
+        }
+      }
+      throwIfAborted(signal);
+      await chrome.tabs.update(action.params.tabId, { active: true });
+      // Record the switch only once the update succeeded: assigning
+      // first left activeTabId pointing at a tab that failed to activate.
+      if (action.sessionId) {
+        const session = extensionSessions.get(action.sessionId);
+        if (session) {
           session.activeTabId = action.params.tabId;
         }
       }
-      await chrome.tabs.update(action.params.tabId, { active: true });
       await waitForStable(action.params.tabId, action.timeoutMs);
       return {
         ok: true,
@@ -826,6 +928,7 @@ export async function executeAction(action: BrowserAction, taskId: string): Prom
           session.activeTabId = session.primaryTabId;
         }
       }
+      throwIfAborted(signal);
       await chrome.tabs.remove(action.params.tabId);
       let nextTabId: number;
       if (session) {
@@ -845,19 +948,21 @@ export async function executeAction(action: BrowserAction, taskId: string): Prom
       return resolved;
     }
     const tabId = (resolved as { tabId: number }).tabId;
+    throwIfAborted(signal);
 
     switch (action.type) {
-      case "navigate": return await doNavigate(action, tabId);
-      case "click": return await doClick(action, taskId, tabId);
-      case "type": return await doType(action, taskId, tabId);
-      case "select_option": return await doSpecialInput(action, tabId, "selectOption");
-      case "set_date": return await doSpecialInput(action, tabId, "setDate");
-      case "upload_file": return await doSpecialInput(action, tabId, "uploadFile");
-      case "press": return await doPress(action, tabId);
-      case "scroll": return await doScroll(action, tabId);
-      case "zoom": return await doZoom(action, tabId);
+      case "navigate": return await doNavigate(action, tabId, signal);
+      case "click": return await doClick(action, taskId, tabId, signal);
+      case "type": return await doType(action, taskId, tabId, signal);
+      case "select_option": return await doSpecialInput(action, tabId, "selectOption", signal);
+      case "set_date": return await doSpecialInput(action, tabId, "setDate", signal);
+      case "upload_file": return await doSpecialInput(action, tabId, "uploadFile", signal);
+      case "press": return await doPress(action, tabId, signal);
+      case "scroll": return await doScroll(action, tabId, signal);
+      case "zoom": return await doZoom(action, tabId, signal);
       case "wait": {
-        await ensureTabActive(tabId);
+        throwIfAborted(signal);
+        await ensureTabActive(tabId, signal);
         await new Promise(r => setTimeout(r, Math.min(action.timeoutMs, 10_000)));
         return {
           ok: true,
@@ -868,8 +973,15 @@ export async function executeAction(action: BrowserAction, taskId: string): Prom
       case "observe": {
         return { ok: true, observation: await observe(tabId) };
       }
+      case "webmcp_tool": return await doWebMCPTool(action, tabId, signal);
+      case "ucp_checkout":
+        // Task 14: a UCP checkout is executed by the backend and must
+        // never reach the extension. If one does, reject it outright
+        // rather than guessing at a checkout in the page.
+        return err("UNKNOWN", "ucp_checkout must be executed by the backend, never by the extension", false);
     }
   } catch (e) {
+    if (e instanceof ActionAborted) return err("TIMEOUT", "action aborted after its deadline", true);
     return err("UNKNOWN", String(e), true);
   }
 }
@@ -878,12 +990,14 @@ async function doSpecialInput(
   action: Extract<BrowserAction, { type: "select_option" | "set_date" | "upload_file" }>,
   tabId: number,
   method: "selectOption" | "setDate" | "uploadFile",
+  signal?: AbortSignal,
 ): Promise<ActionResult> {
-  await ensureTabActive(tabId);
+  await ensureTabActive(tabId, signal);
   const agent = await withAgent(tabId);
   const target = findTarget(action.target, await agent.list(), "click");
-  if (!target) return err("STALE_TARGET", "special input target missing or ambiguous", true);
+  if (!target) return err("STALE_TARGET", `special input target missing or ambiguous${ambiguitySuffix()}`, true);
   const p = action.params as any;
+  throwIfAborted(signal);
   const result = method === "selectOption" ? await agent.selectOption(target.targetId, p.option, target.name)
     : method === "setDate" ? await agent.setDate(target.targetId, p.date, target.name)
     : await agent.uploadFile(target.targetId, p.fileName, p.base64, target.name);
@@ -898,13 +1012,102 @@ function err(code: AgentError["code"], message: string, recoverable: boolean): A
   return { ok: false, error: { code, message, recoverable } };
 }
 
-async function doNavigate(action: Extract<BrowserAction, { type: "navigate" }>, tabId: number): Promise<ActionResult> {
+/**
+ * Thrown when a deadline-aborted action attempts its next side effect.
+ * executeAction maps it to a TIMEOUT result. Without this, a timed-out
+ * action keeps running after withDeadline has already reported the
+ * timeout, and its clicks/types interleave with the next step.
+ */
+class ActionAborted extends Error {
+  constructor() {
+    super("action aborted after its deadline");
+    this.name = "ActionAborted";
+  }
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new ActionAborted();
+}
+
+/** Task 14: call a page-declared WebMCP tool in the tab.
+ *
+ * The call runs inside the tab (injected function) because the
+ * background worker cannot see the page's `document.modelContext`.
+ * The tool name and arguments were already validated by the backend
+ * against this observation's declared tools — this function trusts
+ * nothing and fails honestly (WEBMCP_UNAVAILABLE, recoverable) when
+ * the API is absent, the method shape differs, or the tool throws.
+ * The tool's return value is truncated and reported as evidence
+ * text only; it is never executed as code. */
+async function doWebMCPTool(
+  action: Extract<BrowserAction, { type: "webmcp_tool" }>,
+  tabId: number,
+  signal?: AbortSignal,
+): Promise<ActionResult> {
+  await ensureTabActive(tabId, signal);
+  const tool = action.params.tool;
+  const args = action.params.arguments ?? {};
+  let outcome: { ok: boolean; result?: string; error?: string } | undefined;
+  try {
+    throwIfAborted(signal);
+    const [r] = await execScript({
+      target: { tabId },
+      func: async (toolName: string, toolArgs: Record<string, unknown>) => {
+        const mc = (document as unknown as Record<string, unknown>).modelContext
+          ?? (navigator as unknown as Record<string, unknown>).modelContext;
+        if (!mc) return { ok: false, error: "this page exposes no WebMCP modelContext API" };
+        try {
+          const m = mc as Record<string, unknown>;
+          let out: unknown;
+          if (typeof m.callTool === "function") {
+            out = await (m.callTool as (n: string, a: Record<string, unknown>) => Promise<unknown>)(toolName, toolArgs);
+          } else if (typeof m.invokeTool === "function") {
+            out = await (m.invokeTool as (n: string, a: Record<string, unknown>) => Promise<unknown>)(toolName, toolArgs);
+          } else if (typeof m.executeTool === "function") {
+            out = await (m.executeTool as (n: string, a: Record<string, unknown>) => Promise<unknown>)(toolName, toolArgs);
+          } else {
+            return { ok: false, error: "the page's modelContext API has no tool-call method this build knows (callTool/invokeTool/executeTool)" };
+          }
+          const text = typeof out === "string" ? out : JSON.stringify(out ?? null);
+          return { ok: true, result: (text ?? "").slice(0, 4000) };
+        } catch (e) {
+          return { ok: false, error: `WebMCP tool ${toolName} failed: ${String(e)}` };
+        }
+      },
+      args: [tool, args],
+    });
+    outcome = r?.result as { ok: boolean; result?: string; error?: string } | undefined;
+  } catch (e) {
+    return err("WEBMCP_UNAVAILABLE", `could not invoke WebMCP tool ${tool}: ${String(e)}`, true);
+  }
+  if (!outcome) return err("WEBMCP_UNAVAILABLE", `no result from WebMCP tool ${tool}`, true);
+  if (!outcome.ok) return err("WEBMCP_UNAVAILABLE", outcome.error ?? `WebMCP tool ${tool} failed`, true);
+  await settleDom(tabId);
+  return {
+    ok: true,
+    observation: await observe(tabId),
+    evidence: `WebMCP tool ${tool} returned: ${(outcome.result ?? "").slice(0, 500)}`,
+  };
+}
+
+/** Honest ambiguity detail for a failed target resolution (Moodle fix):
+ * " — 8 elements are named 'I-SEM'; quote the element ref instead".
+ * Empty when the last resolution failed for another reason. */
+function ambiguitySuffix(): string {
+  const amb = getLastTargetAmbiguity();
+  return amb
+    ? ` — ${amb.count} elements are named '${amb.name}'; quote the element ref from the accessibility tree instead of the bare name`
+    : "";
+}
+
+async function doNavigate(action: Extract<BrowserAction, { type: "navigate" }>, tabId: number, signal?: AbortSignal): Promise<ActionResult> {
   const p = action.params;
   const existing = tabId;
 
   // Browser-history navigation needs a tab that exists; there is nowhere to
   // go back to otherwise, so this stays a recoverable error.
   if (p.direction === "back" || p.direction === "forward" || p.direction === "reload") {
+    throwIfAborted(signal);
     if (p.direction === "back") { await chrome.tabs.goBack(existing); }
     else if (p.direction === "forward") { await chrome.tabs.goForward(existing); }
     else { await chrome.tabs.reload(existing); }
@@ -919,12 +1122,14 @@ async function doNavigate(action: Extract<BrowserAction, { type: "navigate" }>, 
     return err("NAVIGATION_FAILED", `blocked scheme: ${p.url}`, false);
   }
 
+  throwIfAborted(signal);
   await chrome.tabs.update(existing, { url: p.url });
   const url = await waitForStable(existing, action.timeoutMs, p.url);
   return { ok: true, observation: await observe(existing), evidence: url };
 }
 
-async function ensureTabActive(tabId: number): Promise<void> {
+async function ensureTabActive(tabId: number, signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
   if (typeof chrome === "undefined" || !chrome.tabs) return;
   try {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
@@ -1346,50 +1551,75 @@ async function cdpPressKey(tabId: number, key: string): Promise<boolean> {
 }
 
 /**
- * Detect visible modal/dialog overlays and dismiss them if an unambiguous
- * safe close control (e.g. '✕', aria-label="Close", button.close, button._2doB4z) is present.
+ * In-page modal dismissal. Runs in the page via execScript, so it must
+ * not reference module scope. Returns true when a modal was dismissed.
+ * A modal that CONTAINS the protected target is never dismissed: the
+ * target lives inside it (a login form's field, a dialog's input), and
+ * dismissing it would strand the action — that is what doType used to
+ * do to targets inside login popups.
+ *
+ * Close detection is by accessible name / generic class only
+ * (Task 8: no per-site classes).
  */
-export async function dismissObstructiveModalIfPresent(tabId: number): Promise<boolean> {
+export function dismissModalInPage(protectedId: string): boolean {
+  const modal = document.querySelector('[role="dialog"], [aria-modal="true"], .modal, [class*="dialog" i], [class*="modal" i], [class*="overlay" i], [class*="popup" i]') as HTMLElement | null;
+  if (!modal) return false;
+
+  if (protectedId) {
+    let protectedEl: Element | null = null;
+    try {
+      protectedEl = document.querySelector(`[data-navigator-id="${CSS.escape(protectedId)}"]`);
+    } catch {
+      protectedEl = null;
+    }
+    if (!protectedEl) protectedEl = document.getElementById(protectedId);
+    if (protectedEl && modal.contains(protectedEl)) return false;
+  }
+
+  const rect = modal.getBoundingClientRect();
+  if (rect.width < 50 || rect.height < 50) return false;
+  const style = window.getComputedStyle(modal);
+  if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+
+  const closeSelectors = [
+    'button[aria-label*="close" i]',
+    'button.close',
+    '[data-testid*="close"]',
+    '[aria-label="Close" i]',
+    '[aria-label*="dismiss" i]',
+    'button[class*="close" i]',
+  ];
+  let closeBtn: HTMLElement | null = modal.querySelector(closeSelectors.join(', '));
+  if (!closeBtn) {
+    const allBtns = modal.querySelectorAll('button, span[role="button"], div[role="button"]');
+    for (const btn of Array.from(allBtns)) {
+      const txt = (btn.textContent || "").trim();
+      if (txt === "✕" || txt === "×" || txt === "X") {
+        closeBtn = btn as HTMLElement;
+        break;
+      }
+    }
+  }
+  if (closeBtn) {
+    closeBtn.click();
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Detect visible modal/dialog overlays and dismiss them if an unambiguous
+ * safe close control (e.g. '✕', aria-label="Close", button.close) is
+ * present. Pass the action's target id to protect a target that lives
+ * inside the modal.
+ */
+export async function dismissObstructiveModalIfPresent(tabId: number, protectTargetId?: string): Promise<boolean> {
   if (typeof chrome === "undefined" || !chrome.scripting) return false;
   try {
     const [r] = await execScript({
       target: { tabId },
-      func: () => {
-        const modal = document.querySelector('[role="dialog"], [aria-modal="true"], .modal, ._2KpZ6l, [class*="dialog" i], [class*="modal" i], [class*="overlay" i], [class*="popup" i]') as HTMLElement | null;
-        if (!modal) return false;
-
-        const rect = modal.getBoundingClientRect();
-        if (rect.width < 50 || rect.height < 50) return false;
-        const style = window.getComputedStyle(modal);
-        if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
-
-        const closeSelectors = [
-          'button._2doB4z',
-          'button._2KpZ6l._2doB4z',
-          'button[aria-label*="close" i]',
-          'button.close',
-          '[data-testid*="close"]',
-          '[aria-label="Close" i]',
-          '[aria-label*="dismiss" i]',
-          'button[class*="close" i]',
-        ];
-        let closeBtn: HTMLElement | null = modal.querySelector(closeSelectors.join(', '));
-        if (!closeBtn) {
-          const allBtns = modal.querySelectorAll('button, span[role="button"], div[role="button"]');
-          for (const btn of Array.from(allBtns)) {
-            const txt = (btn.textContent || "").trim();
-            if (txt === "✕" || txt === "×" || txt === "X") {
-              closeBtn = btn as HTMLElement;
-              break;
-            }
-          }
-        }
-        if (closeBtn) {
-          closeBtn.click();
-          return true;
-        }
-        return false;
-      },
+      func: dismissModalInPage,
+      args: [protectTargetId ?? ""],
     });
     return Boolean(r?.result);
   } catch {
@@ -1397,8 +1627,8 @@ export async function dismissObstructiveModalIfPresent(tabId: number): Promise<b
   }
 }
 
-async function doClick(action: Extract<BrowserAction, { type: "click" }>, taskId: string, tabId: number): Promise<ActionResult> {
-  await ensureTabActive(tabId);
+async function doClick(action: Extract<BrowserAction, { type: "click" }>, taskId: string, tabId: number, signal?: AbortSignal): Promise<ActionResult> {
+  await ensureTabActive(tabId, signal);
   const before = await currentUrl(tabId);
   const tabsBefore = await chrome.tabs.query({}).catch(() => [] as chrome.tabs.Tab[]);
   const tabIdsBefore = new Set(tabsBefore.map(t => t.id).filter((id): id is number => typeof id === "number"));
@@ -1426,16 +1656,26 @@ async function doClick(action: Extract<BrowserAction, { type: "click" }>, taskId
   }
 
   if (!target && action.target.coords) {
+    // Review (Moodle fix): never fall back to coordinates after an
+    // ambiguity failure. The coords come from an older observation; if
+    // the name is shared by N elements, clicking at stale coordinates
+    // is exactly the guess the ambiguity guard exists to prevent.
+    // A plain not-found (no ambiguity recorded) still recovers via
+    // coordinates, as before.
+    if (getLastTargetAmbiguity()) {
+      return err("STALE_TARGET", `no matching element for ${JSON.stringify(action.target)}${ambiguitySuffix()}`, true);
+    }
     // Exactly one click: trusted CDP input, with a single in-page fallback.
     const p = action.target.coords;
     const clicked = await cdpClick(tabId, p.x, p.y);
+    if (!clicked) throwIfAborted(signal);
     const res = clicked
       ? { ok: true, targetId: undefined as string | undefined, error: undefined as string | undefined }
       : await agent.clickCoords(p.x, p.y);
     if (!res.ok) {
       return err("STALE_TARGET", res.error ?? "coordinate click failed", true);
     }
-    const obsTab = await settleAfterAction(tabId, before, action.timeoutMs, tabIdsBefore);
+    const obsTab = await settleAfterAction(tabId, before, action.timeoutMs, tabIdsBefore, signal);
     if (action.sessionId && obsTab !== tabId) {
       extensionSessions.get(action.sessionId)?.childTabIds.add(obsTab);
     }
@@ -1464,7 +1704,7 @@ async function doClick(action: Extract<BrowserAction, { type: "click" }>, taskId
   }
 
   if (!target) {
-    return err("STALE_TARGET", `no matching element for ${JSON.stringify(action.target)}`, true);
+    return err("STALE_TARGET", `no matching element for ${JSON.stringify(action.target)}${ambiguitySuffix()}`, true);
   }
 
   const targetId = target.targetId;
@@ -1473,6 +1713,7 @@ async function doClick(action: Extract<BrowserAction, { type: "click" }>, taskId
 
   // 1. Activation point: a chat row's true centre when the planner matched an
   //    inner label, so list selection handlers fire reliably.
+  throwIfAborted(signal);
   const coords = await agent.clickPoint(targetId, targetName);
   let cdpSuccess = false;
   if (coords && coords.x > 0 && coords.y > 0) {
@@ -1482,12 +1723,13 @@ async function doClick(action: Extract<BrowserAction, { type: "click" }>, taskId
 
   // 3. In-page click only if CDP was unavailable — never both.
   if (!cdpSuccess) {
+    throwIfAborted(signal);
     const res = await agent.click(targetId, targetName);
     if (!res.ok) {
       return err("STALE_TARGET", res.error ?? `no matching element for ${JSON.stringify(action.target)}`, true);
     }
   }
-  let obsTab = await settleAfterAction(tabId, before, action.timeoutMs, tabIdsBefore);
+  let obsTab = await settleAfterAction(tabId, before, action.timeoutMs, tabIdsBefore, signal);
   if (action.sessionId && obsTab !== tabId) {
     extensionSessions.get(action.sessionId)?.childTabIds.add(obsTab);
   }
@@ -1497,24 +1739,33 @@ async function doClick(action: Extract<BrowserAction, { type: "click" }>, taskId
   let navDetected = isNewTab || after !== before;
 
   // Fallback for link clicks where browser popup blocker suppresses synthetic target="_blank":
+  // ONLY a _blank link to a different page qualifies. A same-page anchor
+  // (#reviews) or a JS-handled link (modal, menu, accordion) legitimately
+  // does not navigate — opening a duplicate tab for it is wrong, and the
+  // step already reports "click accepted; no navigation detected" honestly.
   if (!navDetected && target.href && /^https?:\/\//.test(target.href)) {
-    try {
-      const created = await chrome.tabs.create({ url: target.href, active: true, openerTabId: tabId });
-      if (created.id !== undefined) {
-        await waitForStable(created.id, action.timeoutMs);
-        obsTab = created.id;
-        after = await currentUrl(obsTab);
-        isNewTab = true;
-        navDetected = true;
-        if (action.sessionId) {
-          const sess = extensionSessions.get(action.sessionId);
-          if (sess) {
-            sess.childTabIds.add(obsTab);
-            sess.activeTabId = obsTab;
+    const samePage = target.href.split("#")[0] === before.split("#")[0];
+    const anchorTarget = samePage ? "" : await agent.linkTarget(targetId, targetName).catch(() => "");
+    if (anchorTarget === "_blank") {
+      try {
+        throwIfAborted(signal);
+        const created = await chrome.tabs.create({ url: target.href, active: true, openerTabId: tabId });
+        if (created.id !== undefined) {
+          await waitForStable(created.id, action.timeoutMs);
+          obsTab = created.id;
+          after = await currentUrl(obsTab);
+          isNewTab = true;
+          navDetected = true;
+          if (action.sessionId) {
+            const sess = extensionSessions.get(action.sessionId);
+            if (sess) {
+              sess.childTabIds.add(obsTab);
+              sess.activeTabId = obsTab;
+            }
           }
         }
-      }
-    } catch {}
+      } catch {}
+    }
   }
 
   const expectsNav = /navigat|load\s*page|open\s*(tab|page)/i.test(action.verify || "");
@@ -1579,7 +1830,7 @@ export function searchTransitionChanged(
 
 /**
  * Give a search submit time to take effect. Real navigations land immediately,
- * but SPAs (Flipkart) may route several seconds after the form event. Poll URL
+ * but SPAs may route several seconds after the form event. Poll URL
  * and page state instead of failing on the first quiet sample.
  */
 async function waitForSearchOutcome(
@@ -1615,8 +1866,8 @@ async function waitForSearchOutcome(
   return { url: await currentUrl(tabId).catch(() => beforeUrl), state };
 }
 
-async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: string, tabId: number): Promise<ActionResult> {
-  await ensureTabActive(tabId);
+async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: string, tabId: number, signal?: AbortSignal): Promise<ActionResult> {
+  await ensureTabActive(tabId, signal);
   const before = await currentUrl(tabId);
   const tabsBefore = await chrome.tabs.query({}).catch(() => [] as chrome.tabs.Tab[]);
   const tabIdsBefore = new Set(tabsBefore.map(t => t.id).filter((id): id is number => typeof id === "number"));
@@ -1641,7 +1892,7 @@ async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: 
     target = resolveType(cands);
   }
   if (!target) {
-    return err("STALE_TARGET", `no safely identifiable element for ${JSON.stringify(action.target)}`, true);
+    return err("STALE_TARGET", `no safely identifiable element for ${JSON.stringify(action.target)}${ambiguitySuffix()}`, true);
   }
   const targetId = target.targetId;
   const targetName = target.name || action.target.name || "";
@@ -1650,20 +1901,25 @@ async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: 
   const submitRequested = Boolean(action.params.submit);
   searchIntent = searchIntent || classifySearchTarget(action.target, target);
 
-  // If a modal popped up after listing, dismiss it so input field is reachable
+  // If a modal popped up after listing, dismiss it so input field is reachable —
+  // unless the target lives INSIDE that modal (a login form's field, a
+  // dialog's input): dismissing it would strand the action.
   if (!action.target.name?.toLowerCase().includes("close")) {
-    const dismissed = await dismissObstructiveModalIfPresent(tabId);
+    const dismissed = await dismissObstructiveModalIfPresent(tabId, targetId);
     if (dismissed) {
       await settleDom(tabId, 150, 300);
     }
   }
 
   const findSubmitPoint = async (): Promise<FocusPoint | null> => {
-    // Poll for the Send/Search button instead of sleeping a fixed 150ms: exit
-    // as soon as React/DOM exposes it, capped so a missing control still falls
-    // back to Enter.
+    // Task 11: reuse the candidate list already collected for target
+    // resolution — the submit control is usually on the same page, so
+    // re-collecting it first is a wasted round trip. Poll for the
+    // Send/Search button with fresh lists only if it is not there yet
+    // (React may expose it a moment later), capped so a missing
+    // control still falls back to Enter.
     const renderDeadline = Date.now() + 400;
-    let sendBtn = findSubmitControl(await agent.list());
+    let sendBtn = findSubmitControl(cands);
     while (!sendBtn && Date.now() < renderDeadline) {
       await sleep(40);
       sendBtn = findSubmitControl(await agent.list());
@@ -1702,6 +1958,7 @@ async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: 
 
   if (target.tag !== "select") {
     const coords = await agent.getCoords(targetId, targetName);
+    throwIfAborted(signal);
     const native = await cdpType(tabId, coords, typedText, clear, {
       targetId,
       targetName,
@@ -1720,6 +1977,7 @@ async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: 
   if (!verified) {
     let res: { ok: boolean; error?: string; value?: string };
     try {
+      throwIfAborted(signal);
       res = await agent.type(targetId, typedText, clear, targetName);
     } catch (e) {
       const detail = String(e instanceof Error ? e.message : e).slice(0, 120);
@@ -1735,12 +1993,21 @@ async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: 
         return err("STALE_TARGET", "typed value could not be read back from the page", true);
       }
       if (!typedValueMatches(actual, typedText, clear)) {
+        // Never embed the values: the typed text and the DOM value
+        // can both be secrets (a password, PIN, OTP). The mismatch
+        // itself is all the planner needs to retry or re-ground.
         return err(
           "STALE_TARGET",
-          `typed value not confirmed in the DOM (expected ${JSON.stringify(typedText.slice(0, 60))}, got ${JSON.stringify(String(actual ?? "").slice(0, 60))})`,
+          "typed value not confirmed in the DOM",
           true,
         );
       }
+      // The read-back just confirmed the value in the DOM — that IS
+      // verification. Without this, the SPA search-outcome poll below
+      // is skipped (it requires `verified`) and the evidence instead
+      // asserts "search state changed" with surfaceChanged: true
+      // although nothing was ever observed.
+      verified = true;
     }
 
     // Native submission was unavailable; try one CDP submit, then the
@@ -1749,8 +2016,9 @@ async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: 
       await captureBaseline();
       const point = await findSubmitPoint();
       if (point) submitted = await cdpClick(tabId, point.x, point.y);
-      if (!submitted) submitted = await cdpPressKey(tabId, "Enter");
+      if (!submitted) { throwIfAborted(signal); submitted = await cdpPressKey(tabId, "Enter"); }
       if (!submitted) {
+        throwIfAborted(signal);
         const fallback = await agent.submit(targetId, targetName);
         submitted = fallback.ok;
       }
@@ -1766,11 +2034,12 @@ async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: 
     if (!submitted) {
       // CDP was entirely unavailable: one in-page submit is the honest fallback.
       await captureBaseline();
+      throwIfAborted(signal);
       const fallback = await agent.submit(targetId, targetName);
       submitted = fallback.ok;
     }
     if (submitted) {
-      obsTab = await settleAfterAction(tabId, before, Math.min(action.timeoutMs, 2500), tabIdsBefore);
+      obsTab = await settleAfterAction(tabId, before, Math.min(action.timeoutMs, 2500), tabIdsBefore, signal);
       if (action.sessionId && obsTab !== tabId) {
         const sess = extensionSessions.get(action.sessionId);
         if (sess) {
@@ -1836,21 +2105,24 @@ async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: 
   };
 }
 
-async function doPress(action: Extract<BrowserAction, { type: "press" }>, tabId: number): Promise<ActionResult> {
-  await ensureTabActive(tabId);
+async function doPress(action: Extract<BrowserAction, { type: "press" }>, tabId: number, signal?: AbortSignal): Promise<ActionResult> {
+  await ensureTabActive(tabId, signal);
   const before = await currentUrl(tabId);
   const tabsBefore = await chrome.tabs.query({}).catch(() => [] as chrome.tabs.Tab[]);
   const tabIdsBefore = new Set(tabsBefore.map(t => t.id).filter((id): id is number => typeof id === "number"));
   const key = action.params.key;
 
   if (key === "Enter") {
+    throwIfAborted(signal);
     const trusted = await cdpPressKey(tabId, "Enter");
     if (!trusted) {
       const agent = await withAgent(tabId);
+      throwIfAborted(signal);
       const fallback = await agent.submit("", "");
       if (!fallback.ok) return err("UNKNOWN", fallback.error ?? "Enter dispatch failed", true);
     }
   } else {
+    throwIfAborted(signal);
     await execScript({
       target: { tabId },
       func: (k: string) => {
@@ -1863,7 +2135,7 @@ async function doPress(action: Extract<BrowserAction, { type: "press" }>, tabId:
       args: [key ?? ""],
     });
   }
-  const obsTab = await settleAfterAction(tabId, before, action.timeoutMs, tabIdsBefore);
+  const obsTab = await settleAfterAction(tabId, before, action.timeoutMs, tabIdsBefore, signal);
   if (action.sessionId && obsTab !== tabId) {
     const sess = extensionSessions.get(action.sessionId);
     if (sess) {
@@ -1874,9 +2146,10 @@ async function doPress(action: Extract<BrowserAction, { type: "press" }>, tabId:
   return { ok: true, observation: await observe(obsTab), evidence: `pressed ${key}` };
 }
 
-async function doScroll(action: Extract<BrowserAction, { type: "scroll" }>, tabId: number): Promise<ActionResult> {
-  await ensureTabActive(tabId);
+async function doScroll(action: Extract<BrowserAction, { type: "scroll" }>, tabId: number, signal?: AbortSignal): Promise<ActionResult> {
+  await ensureTabActive(tabId, signal);
   const agent = await withAgent(tabId);
+  throwIfAborted(signal);
   const res = await agent.scroll(action.params.direction, action.params.containerId);
   // Infinite/lazy lists render after the scroll event; give them one paint so
   // the cached observation actually contains the newly revealed items.
@@ -1889,7 +2162,7 @@ async function doScroll(action: Extract<BrowserAction, { type: "scroll" }>, tabI
   };
 }
 
-async function doZoom(action: Extract<BrowserAction, { type: "zoom" }>, tabId: number): Promise<ActionResult> {
+async function doZoom(action: Extract<BrowserAction, { type: "zoom" }>, tabId: number, signal?: AbortSignal): Promise<ActionResult> {
   const p = action.params;
   const current = await chrome.tabs.getZoom(tabId);
   let newZoom = current;
@@ -1897,13 +2170,15 @@ async function doZoom(action: Extract<BrowserAction, { type: "zoom" }>, tabId: n
   else if (p.direction === "out") newZoom = Math.max(current - 0.25, 0.25);
   else if (p.direction === "reset") newZoom = 1.0;
   else if (p.factor !== undefined) newZoom = p.factor;
+  throwIfAborted(signal);
   await chrome.tabs.setZoom(tabId, newZoom);
   const after = await chrome.tabs.getZoom(tabId);
   return { ok: true, observation: await observe(tabId), evidence: `zoom=${after.toFixed(2)}` };
 }
 
-async function doNewTab(action: Extract<BrowserAction, { type: "new_tab" }>): Promise<ActionResult> {
+async function doNewTab(action: Extract<BrowserAction, { type: "new_tab" }>, signal?: AbortSignal): Promise<ActionResult> {
   if (isBlockedUrl(action.params.url)) return err("NAVIGATION_FAILED", `blocked scheme: ${action.params.url}`, false);
+  throwIfAborted(signal);
   const tab = await chrome.tabs.create({ url: action.params.url, active: true });
   if (action.sessionId && tab.id !== undefined) {
     const sess = extensionSessions.get(action.sessionId);
@@ -1970,6 +2245,9 @@ async function waitForStable(tabId: number, timeoutMs: number, expectedUrl?: str
 }
 
 async function captureScreenshot(tabId: number): Promise<string | undefined> {
+  // Task 4: never screenshot while the operator is completing a login /
+  // OTP / payment step — the screen may show a password, card, or code.
+  if (takeoverActive) return undefined;
   if (typeof chrome === "undefined" || !chrome.tabs?.captureVisibleTab) return undefined;
   try {
     const tab = await chrome.tabs.get(tabId);
@@ -2013,6 +2291,13 @@ export async function observe(tabId: number, sessionId?: string): Promise<Browse
   const url = tab.url ?? "";
   const title = tab.title ?? "";
 
+  // Task 4: during takeover, observe nothing — not even the tab's own
+  // DOM list or page text. Only the URL/title metadata is returned so
+  // the caller still knows which tab it holds.
+  if (takeoverActive) {
+    return emptyObservation(tabId, url, title);
+  }
+
   if (!isScriptableUrl(url)) {
     return emptyObservation(tabId, url, title);
   }
@@ -2053,6 +2338,82 @@ export async function observe(tabId: number, sessionId?: string): Promise<Browse
     return emptyObservation(tabId, url, title);
   }
 
+    // Task 14: page-declared standards — WebMCP tools + UCP profile
+    // link. Collected in the tab via an injected function (the
+    // background worker's own `document` is not the page's). The
+    // function runs in the tab's isolated world, where a spec'd
+    // WebIDL `document.modelContext` is visible; a page-JS expando
+    // is not, and is treated as "no tools declared". Never throws:
+    // a missing API is an empty list, not an observation failure.
+    let webmcpTools: WebMCPTool[] = [];
+    let ucpProfileUrl: string | undefined;
+    let ogImage: string | undefined;
+    try {
+      const [std] = await execScript({
+        target: { tabId },
+        func: async () => {
+          const mc = (document as unknown as Record<string, unknown>).modelContext
+            ?? (navigator as unknown as Record<string, unknown>).modelContext;
+          let raw: unknown = undefined;
+          try {
+            if (mc && Array.isArray((mc as Record<string, unknown>).tools)) {
+              raw = (mc as Record<string, unknown>).tools;
+            } else if (mc && typeof (mc as Record<string, unknown>).listTools === "function") {
+              raw = await ((mc as Record<string, unknown>).listTools as () => Promise<unknown>)();
+            }
+          } catch { raw = undefined; }
+          const tools = (Array.isArray(raw) ? raw : []).slice(0, 50).map((t) => {
+            const d = (t ?? {}) as Record<string, unknown>;
+            // REVIEW (Task 14 audit): the bounds here are one past the
+            // backend's limits on purpose — the backend DROPS (never
+            // truncates) a name over 64 chars or a description over
+            // 2000, because a truncated description could cut a
+            // credential lure mid-sentence and change what the checker
+            // sees. Slicing exactly at the limit would silently
+            // truncate a 5,000-char description into a valid 2,000-char
+            // one and defeat that rule; one past the limit keeps the
+            // wire bounded while the over-long value still arrives
+            // over-long and gets dropped.
+            return {
+              name: String(d.name ?? "").slice(0, 65),
+              description: String(d.description ?? "").slice(0, 2001),
+              inputSchema: (d.inputSchema ?? {}) as Record<string, unknown>,
+              outputSchema: d.outputSchema as Record<string, unknown> | undefined,
+            };
+          }).filter((t) => t.name.length > 0);
+          let ucp: string | undefined;
+          try {
+            const link = document.querySelector('link[rel~="ucp"]') as HTMLLinkElement | null;
+            if (link?.href) {
+              const u = new URL(link.href, location.href);
+              if (u.origin === location.origin) ucp = u.href;
+            }
+          } catch { /* no UCP link */ }
+          // Product image the page declares for sharing. Resolved
+          // against the page URL (og:image is often relative) and
+          // restricted to credential-free http(s); the backend
+          // re-validates it before anything renders it. A product
+          // image usually lives on the store's image CDN, not the
+          // page host, so this is deliberately NOT same-origin.
+          let og: string | undefined;
+          try {
+            const meta = document.querySelector('meta[property="og:image"]') as HTMLMetaElement | null;
+            if (meta?.content) {
+              const u = new URL(meta.content, location.href);
+              if ((u.protocol === "http:" || u.protocol === "https:") && !u.username && !u.password) og = u.href;
+            }
+          } catch { /* no og:image */ }
+          return { tools, ucpProfileUrl: ucp, ogImage: og };
+        },
+      });
+      const r = std?.result as { tools?: WebMCPTool[]; ucpProfileUrl?: string; ogImage?: string } | undefined;
+      if (r) {
+        webmcpTools = Array.isArray(r.tools) ? r.tools : [];
+        ucpProfileUrl = r.ucpProfileUrl;
+        ogImage = r.ogImage;
+      }
+    } catch { /* standards collection is best-effort */ }
+
   const screenshot = await captureScreenshot(tabId);
 
   let openTabs: TabInfo[] | undefined;
@@ -2089,10 +2450,19 @@ export async function observe(tabId: number, sessionId?: string): Promise<Browse
     title,
     tabs: openTabs,
     pageText,
+    // Task 14: page-declared standards for this observation (only
+    // when the page actually declares them — an empty list / missing
+    // URL is the normal case and is omitted from the wire payload by
+    // the backend's optional fields).
+    ...(webmcpTools.length > 0 ? { webmcpTools } : {}),
+    ...(ucpProfileUrl ? { ucpProfileUrl } : {}),
+    ...(ogImage ? { ogImage } : {}),
     interactive: list.map(e => ({
       targetId: e.targetId,
+      elementRef: e.elementRef,
       role: e.role,
       name: e.name,
+      rawName: e.rawName,
       tag: e.tag || "el",
       inputType: e.inputType,
       search: e.search,
@@ -2103,7 +2473,33 @@ export async function observe(tabId: number, sessionId?: string): Promise<Browse
       // a second line of defense.
       value: undefined,
       bounds: e.bounds,
+      state: e.state,
+      cssSelector: e.cssSelector,
       semantic: e.semantic,
+    })),
+    // Task 7: the grounded accessibility tree for this observation —
+    // the same refs the planner quotes, with the live locator for each.
+    // The backend re-validates the refs and falls back to deriving the
+    // tree from `interactive` if this block is ever malformed.
+    axTree: list.map(e => ({
+      ref: e.elementRef,
+      role: e.role,
+      name: e.name,
+      rawName: e.rawName,
+      tag: e.tag || "el",
+      inputType: e.inputType,
+      targetId: e.targetId,
+      cssSelector: e.cssSelector,
+      xpath: e.targetId && !e.targetId.startsWith("nav-el-")
+        ? `//*[@id="${e.targetId.replace(/"/g, "")}"]`
+        : "",
+      disabled: !e.enabled,
+      checked: e.state?.checked,
+      selected: e.state?.selected,
+      expanded: e.state?.expanded,
+      bounds: e.bounds,
+      href: e.href,
+      source: "dom-ax",
     })),
     scroll: { y: meta.y, viewport: { w: meta.w, h: meta.h } },
     dpr: meta.dpr,

@@ -40,6 +40,20 @@ describe("Relay", () => {
     expect(got).toEqual([{ type: "EXECUTE_ACTION", taskId: "t1", payload: {} }]);
   });
 
+  it("dispatches TAKEOVER_START / TAKEOVER_END (Task 4)", () => {
+    const sock = new FakeSocket();
+    const relay = new Relay();
+    const got: InboundMessage[] = [];
+    relay.onMessage(m => got.push(m));
+    relay.attach(sock as unknown as WebSocket);
+    sock.emit(JSON.stringify({ type: "TAKEOVER_START", taskId: "t1" }));
+    sock.emit(JSON.stringify({ type: "TAKEOVER_END", taskId: "t1" }));
+    expect(got).toEqual([
+      { type: "TAKEOVER_START", taskId: "t1", payload: {} },
+      { type: "TAKEOVER_END", taskId: "t1", payload: {} },
+    ]);
+  });
+
   it("drops unknown inbound message types silently", () => {
     const sock = new FakeSocket();
     const relay = new Relay();

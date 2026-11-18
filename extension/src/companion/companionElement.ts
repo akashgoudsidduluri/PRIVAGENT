@@ -157,7 +157,7 @@ export function mountCompanion(): HTMLElement | null {
       button.setAttribute("aria-expanded", String(!drawer.hidden));
 
       // If drawer is now open, show a fresh conversational thought
-      if (!drawer.hidden && !button.dataset.state.includes("executing")) {
+      if (!drawer.hidden && !(button.dataset.state ?? "").includes("executing")) {
         const thought = isReturningUser ? "Welcome back buddy! Ready to search or monitor." : getRandomBanter();
         bubble.textContent = thought;
         bubble.hidden = false;

@@ -314,6 +314,9 @@ def test_detect_requested_format():
     assert detect_requested_format("Create a slide deck for the board") == "pptx"
     assert detect_requested_format("Compare databases in Excel.") == "xlsx"
     assert detect_requested_format("Export comparison spreadsheet") == "xlsx"
+    # "xcel" is the common misspelling of Excel (live price-hunt
+    # prompt: "give the detailed comparison in a xcel").
+    assert detect_requested_format("give the detailed comparison in a xcel") == "xlsx"
     assert detect_requested_format("Generate a CSV table of all specs") == "csv"
     assert detect_requested_format("Write technical notes in Markdown") == "markdown"
     assert detect_requested_format("Save as .md file") == "markdown"

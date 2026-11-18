@@ -1,0 +1,23 @@
+{
+  "suite": "webarena",
+  "full_name": "WebArena-Verified",
+  "status": "blocked",
+  "adapter": "not_implemented",
+  "present": [],
+  "missing": [
+    "env GEMINI_API_KEY not set",
+    "env GROQ_API_KEY not set",
+    "env OPENAI_API_KEY not set",
+    "no Chrome/Chromium binary on PATH",
+    "PrivAgent backend not reachable at http://127.0.0.1:8000 (start it first)",
+    "PrivAgent adapter for this harness: not implemented"
+  ],
+  "needs": [
+    "web-arena repo cloned (https://github.com/web-arena-x/webarena)",
+    "hosted or self-hosted WebArena sites (Shopping, Reddit, GitLab, Maps, Wikipedia)",
+    "Chrome + PrivAgent extension connected to the backend",
+    "LLM API key: GEMINI_API_KEY or GROQ_API_KEY or OPENAI_API_KEY",
+    "PrivAgent adapter mapping WebArena's agent interface onto the PrivAgent loop"
+  ],
+  "command": "git clone https://github.com/web-arena-x/webarena && cd webarena && pip install -r requirements.txt && python run.py --instruction_path <webarena-verified-tasks.json> --agent privagent --model <model>  # adapter not implemented yet"
+}

@@ -188,7 +188,7 @@ class GeminiProvider:
         raise ProviderUnavailable(f"Gemini chat call failed: {last_exc}")
 
     def plan_call(self, instruction: str, payload: PrivacyFilteredPayload, history: list[dict[str, Any]], working_memory: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-        prompt = f"{SYSTEM_FRAME}\n\n{build_prompt(instruction, payload, history, working_memory=working_memory)}"
+        prompt = f"{SYSTEM_FRAME}\n\n{build_prompt(instruction, payload, history, working_memory=working_memory, allowed_domains=(working_memory or {}).get('allowed_domains'))}"
         contents: list[Any] = []
         # Defense in depth: privacy.py already drops screenshots unless the
         # operator opted in. Re-check here so a caller that bypasses the

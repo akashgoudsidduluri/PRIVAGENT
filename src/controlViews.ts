@@ -1,4 +1,5 @@
 import { escapeHtml, safeImageSrc } from './sanitize';
+import { apiFetch, artifactUrl } from './auth';
 
 const API = 'http://localhost:8000';
 const safe = (value: unknown) => escapeHtml(String(value ?? ''));
@@ -11,7 +12,7 @@ async function request(path: string, options?: RequestInit, timeoutMs = 15000): 
   let lastError: any;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const response = await fetch(API + path, { ...options, signal: AbortSignal.timeout(timeoutMs) });
+      const response = await apiFetch(API + path, { ...options, signal: AbortSignal.timeout(timeoutMs) });
       if (!response.ok) throw Error('Backend returned ' + response.status);
       return await response.json();
     } catch (err: any) {
@@ -228,18 +229,82 @@ export async function mountControlView(index: number, content: HTMLElement, isCu
       const sample = (chats || []).slice(0, 10);
       const groups = await Promise.all(sample.map((c: any) => request('/api/chats/' + encodeURIComponent(c.id) + '/artifacts').catch(() => [])));
       if (!isCurrent()) return;
-      content.innerHTML = card('Deliverables', groups.flat().map((a: any) => '<article class="cc-row"><div><small>' + safe(a.file_format?.toUpperCase()) + ' · ' + safe(a.file_size_bytes) + ' bytes</small><h3>' + safe(a.title || a.filename) + '</h3><p>' + safe(a.summary) + '</p></div><a class="cc-button" href="' + API + '/api/artifacts/' + encodeURIComponent(a.artifact_id) + '/download">Download ↗</a></article>').join('') || empty('Room for your next discovery', 'Completed research exports will appear here.'), 'ARTIFACT MEMORY');
+      content.innerHTML = card('Deliverables', groups.flat().map((a: any) => '<article class="cc-row"><div><small>' + safe(a.file_format?.toUpperCase()) + ' · ' + safe(a.file_size_bytes) + ' bytes</small><h3>' + safe(a.title || a.filename) + '</h3><p>' + safe(a.summary) + '</p></div><a class="cc-button" href="' + artifactUrl(API + '/api/artifacts/' + encodeURIComponent(a.artifact_id) + '/download') + '">Download ↗</a></article>').join('') || empty('Room for your next discovery', 'Completed research exports will appear here.'), 'ARTIFACT MEMORY');
     }
     if (index === 10) {
+      // Preserve the operator's audit filter/limit across the 5s live
+      // refresh: the full re-mount below rebuilds the selects, and
+      // without this both reset to their defaults every interval tick.
+      const prevAuditEvent = content.querySelector<HTMLSelectElement>('#auditEventFilter')?.value;
+      const prevAuditLimit = content.querySelector<HTMLSelectElement>('#auditLimit')?.value;
       const info = await request('/api/control/privacy');
       if (!isCurrent()) return;
       const counts = info.counters;
-      content.innerHTML = '<div class="cc-grid cc-metrics">' + card('Observations filtered', '<strong class="cc-number">' + safe(counts.observations) + '</strong><p>This backend process</p>') + card('Redacted observations', '<strong class="cc-number">' + safe(counts.redactedObservations) + '</strong><p>Pattern-based masking</p>') + card('Screenshots withheld', '<strong class="cc-number">' + safe(counts.screenshotsWithheld) + '</strong><p>Privacy policy decisions</p>') + '</div>' + card('Screenshot consent', '<div class="cc-toggle-row"><div><h3>Remote vision input</h3><p>Screenshots are withheld by default and when detected sensitive content is present. This setting resets when the backend restarts.</p></div><label class="cc-switch"><input type="checkbox" id="screenshotToggle" ' + (info.screenshotsAllowed ? 'checked' : '') + '><span aria-hidden="true"></span><b>' + (info.screenshotsAllowed ? 'On' : 'Off') + '</b></label></div>', 'OPERATOR CONTROL') + card('Recent privacy decisions', (info.events || []).slice(0, 25).map((e: any) => '<article class="cc-row"><div><h3>' + safe(String(e.type).replaceAll('_', ' ')) + '</h3><p>' + new Date(e.at * 1000).toLocaleString() + '</p></div>' + tag('Local') + '</article>').join('') || empty('No redactions recorded', 'Privacy decisions from this backend process will appear here.'), 'NO RAW VALUES STORED') + card('Privacy policy', '<div class="cc-grid">' + ['Local redaction before planning','Credential and PII storage boundaries','One-use mutation approvals'].map(x => '<div class="cc-policy"><span>✓</span><p>' + x + '</p></div>').join('') + '</div><p class="cc-note">Counters report detections, not a guarantee that every private value in arbitrary pixels was recognized.</p>', 'SENTINEL');
+      const planner = info.planner || {};
+      const trackerByCategory: Record<string, string[]> = {};
+      for (const h of info.trackerHosts || []) {
+        (trackerByCategory[h.category] ||= []).push(h.host);
+      }
+      // Task 12: Privacy Center — planner status, audit viewer, tracker
+      // blocklist, DPIA summary, alongside the existing counters.
+      // Planner / zero-retention flags are backend env vars: read-only
+      // here, and the UI says so instead of pretending a toggle
+      // changes the server.
+      const plannerLine = planner.provider
+        ? safe(planner.provider) + (planner.model ? ' · ' + safe(planner.model) : '')
+          + (planner.local ? ' · runs on this machine' : ' · cloud')
+          + (planner.keyConfigured ? '' : ' · no key configured')
+        : 'No planner configured';
+      const plannerCard = card('Planner status', '<div class="cc-settings-grid"><div><small>ACTIVE PLANNER</small><strong>' + plannerLine + '</strong></div><div><small>LOCAL-ONLY MODE</small><strong>' + (planner.localOnly ? 'On' : 'Off') + '</strong></div><div><small>ZERO RETENTION</small><strong>' + (info.zeroRetention ? 'On' : 'Off') + '</strong></div></div><p>Local-only and zero retention are set by PRIVAGENT_PLANNER_LOCAL_ONLY and PRIVAGENT_ZERO_RETENTION on the backend — read-only here. ' + (planner.localOnly ? 'Local-only is on: the planner never falls back to a cloud provider.' : 'Local-only is off: the planner may use a cloud provider.') + ' ' + (info.zeroRetention ? 'Zero retention is on: tasks leave no checkpoints, screenshots, or history.' : 'Zero retention is off: checkpoints and trajectories are kept on this machine.') + '</p>', 'TASK 10 · LOCAL FIRST');
+      // Task 14: connector configuration status. `configured` is a
+      // local check (credentials present in the encrypted store) —
+      // liveness is only known when a call is made, and the router
+      // fails honestly when the connector is not configured.
+      const googleConfigured = Boolean((info.connectors || {}).google?.configured);
+      const connectorsCard = card('Connectors', '<div class="cc-settings-grid"><div><small>GOOGLE (GMAIL · CALENDAR · DRIVE)</small><strong>' + (googleConfigured ? 'Configured' : 'Not connected') + '</strong></div></div><p>' + (googleConfigured ? 'Google credentials are stored locally, so Gmail, Calendar and Drive tasks route through the native API connectors instead of driving the web UI. This is not a live sign-in check — a task still fails honestly if no account token is present.' : 'No Google account is connected, so Gmail, Calendar and Drive tasks fail honestly instead of driving the web UI with your credentials. Connect it in the Connectors tab of the Control Center.') + '</p>', 'TASK 14 · NATIVE APIS');
+      const auditCard = card('Audit log', '<div class="cc-audit-controls"><label>Event <select id="auditEventFilter"><option value="">All events</option>' + ['auth_failure', 'allowlist_denied', 'confirmation_approved', 'confirmation_denied', 'takeover_started', 'takeover_ended', 'payment_attempt', 'memory_write', 'memory_delete', 'memory_forget_all', 'scheduler_claim'].map(e => '<option value="' + e + '">' + e + '</option>').join('') + '</select></label><label>Limit <select id="auditLimit"><option value="25">25</option><option value="50">50</option><option value="100">100</option></select></label><button class="cc-button cc-button--outline" id="auditRefresh">Refresh</button><span id="auditChain" class="cc-tag">Checking chain…</span></div><div id="auditEntries" aria-live="polite"><p class="cc-note">Loading audit entries…</p></div><p class="cc-note">Append-only, hash-chained log on the backend. Summaries are scrubbed — no secret ever lands in the file. A broken chain means the log was edited after the fact.</p>', 'TASK 10 · TAMPER-EVIDENT');
+      const trackerCard = card('Tracker blocklist', '<p>' + safe(info.trackerNote || 'The agent profile blocks known tracker, ad, session-replay and fingerprinting hosts.') + '</p>' + Object.entries(trackerByCategory).map(([cat, hosts]) => '<div class="cc-tracker-group"><h3>' + safe(cat) + ' (' + hosts.length + ')</h3><p>' + hosts.map(h => safe(h)).join(', ') + '</p></div>').join('') || empty('No tracker hosts', 'The blocklist is empty.'), 'TASK 10 · 24 HOSTS');
+      const dpiaCard = card('Data protection impact assessment', '<p>' + safe((info.dpia || {}).summary || '') + '</p><p><a class="cc-button cc-button--outline" href="' + safe((info.dpia || {}).url || 'https://github.com/Prateek2007-cmd/PRIVAGENT/blob/main/docs/DPIA.md') + '" target="_blank" rel="noopener noreferrer">Read the full DPIA ↗</a></p>', 'DPIA');
+      content.innerHTML = '<div class="cc-grid cc-metrics">' + card('Observations filtered', '<strong class="cc-number">' + safe(counts.observations) + '</strong><p>This backend process</p>') + card('Redacted observations', '<strong class="cc-number">' + safe(counts.redactedObservations) + '</strong><p>Pattern-based masking</p>') + card('Screenshots withheld', '<strong class="cc-number">' + safe(counts.screenshotsWithheld) + '</strong><p>Privacy policy decisions</p>') + '</div>' + card('Screenshot consent', '<div class="cc-toggle-row"><div><h3>Remote vision input</h3><p>Screenshots are withheld by default and when detected sensitive content is present. This setting resets when the backend restarts.</p></div><label class="cc-switch"><input type="checkbox" id="screenshotToggle" ' + (info.screenshotsAllowed ? 'checked' : '') + '><span aria-hidden="true"></span><b>' + (info.screenshotsAllowed ? 'On' : 'Off') + '</b></label></div>', 'OPERATOR CONTROL') + card('Recent privacy decisions', (info.events || []).slice(0, 25).map((e: any) => '<article class="cc-row"><div><h3>' + safe(String(e.type).replaceAll('_', ' ')) + '</h3><p>' + new Date(e.at * 1000).toLocaleString() + '</p></div>' + tag('Local') + '</article>').join('') || empty('No redactions recorded', 'Privacy decisions from this backend process will appear here.'), 'NO RAW VALUES STORED') + card('Privacy policy', '<div class="cc-grid">' + ['Local redaction before planning','Credential and PII storage boundaries','One-use mutation approvals'].map(x => '<div class="cc-policy"><span>✓</span><p>' + x + '</p></div>').join('') + '</div><p class="cc-note">Counters report detections, not a guarantee that every private value in arbitrary pixels was recognized.</p>', 'SENTINEL') + plannerCard + connectorsCard + auditCard + trackerCard + dpiaCard;
+      // Restore the operator's audit filter/limit (read above) so the
+      // audit list below loads with their selection, not the defaults.
+      if (prevAuditEvent !== undefined) {
+        const eventFilter = content.querySelector<HTMLSelectElement>('#auditEventFilter');
+        if (eventFilter) eventFilter.value = prevAuditEvent;
+      }
+      if (prevAuditLimit !== undefined) {
+        const limitSel = content.querySelector<HTMLSelectElement>('#auditLimit');
+        if (limitSel) limitSel.value = prevAuditLimit;
+      }
       content.querySelector<HTMLInputElement>('#screenshotToggle')?.addEventListener('change', async event => {
         const input = event.currentTarget as HTMLInputElement;
         try { await request('/api/control/privacy/screenshot', jsonOptions('POST', { enabled: input.checked })); rerender(); }
         catch (error) { input.checked = !input.checked; showError(input.closest('.cc-card') || content, error); }
       });
+      const loadAudit = async () => {
+        const entriesEl = content.querySelector<HTMLElement>('#auditEntries');
+        const chainEl = content.querySelector<HTMLElement>('#auditChain');
+        const eventFilter = content.querySelector<HTMLSelectElement>('#auditEventFilter')?.value || '';
+        const limit = content.querySelector<HTMLSelectElement>('#auditLimit')?.value || '25';
+        if (!entriesEl) return;
+        try {
+          const audit = await request('/api/audit?limit=' + encodeURIComponent(limit) + (eventFilter ? '&event=' + encodeURIComponent(eventFilter) : ''));
+          if (chainEl) {
+            chainEl.textContent = audit.chainOk ? '✓ Chain intact' : '⚠ Chain broken at entry ' + audit.brokenIndex;
+          }
+          const entries = audit.entries || [];
+          entriesEl.innerHTML = entries.length
+            ? entries.map((e: any) => '<article class="cc-row"><div><small>' + safe(e.event) + ' · ' + new Date((e.ts || 0) * 1000).toLocaleString() + '</small><p>' + safe(e.summary || '') + '</p></div>' + tag('Local') + '</article>').join('')
+            : empty('No audit entries', 'No events match this filter yet.');
+        } catch (error) {
+          if (chainEl) chainEl.textContent = 'Audit unavailable';
+          entriesEl.innerHTML = empty('Audit unavailable', safe(error));
+        }
+      };
+      content.querySelector<HTMLSelectElement>('#auditEventFilter')?.addEventListener('change', () => void loadAudit());
+      content.querySelector<HTMLSelectElement>('#auditLimit')?.addEventListener('change', () => void loadAudit());
+      content.querySelector<HTMLButtonElement>('#auditRefresh')?.addEventListener('click', () => void loadAudit());
+      void loadAudit();
     }
     if (index === 11) {
       const [health, config, timeouts] = await Promise.all([request('/api/health'), request('/api/llm/config'), request('/api/control/settings')]);
@@ -388,6 +453,20 @@ async function mountEmailIntelligence(content: HTMLElement, isCurrent: () => boo
 
   const { mission, stats, sections } = payload;
   const isAuth = mission.policy_authorized;
+
+  // The auto-sync countdown runs on the mission's own frequency, not a
+  // hardcoded 5 minutes: a 60-minute Gmail sweep used to sync every 5
+  // minutes anyway while the banner printed the real frequency.
+  const syncPeriodSeconds = Number.isFinite(mission.frequency_seconds) && mission.frequency_seconds >= 60
+    ? Math.floor(mission.frequency_seconds)
+    : 300;
+  const formatSyncPeriod = (secs: number): string =>
+    secs % 3600 === 0 ? `${secs / 3600} hr${secs === 3600 ? "" : "s"}` : secs % 60 === 0 ? `${secs / 60} mins` : `${secs}s`;
+  const formatCountdown = (secs: number): string => {
+    const m = String(Math.floor(secs / 60)).padStart(2, "0");
+    const s = String(secs % 60).padStart(2, "0");
+    return `${m}:${s}`;
+  };
   const modeBadge = isAuth
     ? '<span class="cc-tag" style="background:#1b3d2b;border-color:#357a53;color:#8cf2ac">✓ AUTONOMOUS DELETION ACTIVE</span>'
     : '<span class="cc-tag" style="background:#3d2f1b;border-color:#7a5a35;color:#ffcb65">⚠ DRY-RUN MODE (NO DELETIONS)</span>';
@@ -400,15 +479,15 @@ async function mountEmailIntelligence(content: HTMLElement, isCurrent: () => boo
     card('Important Handled', '<strong class="cc-number" style="color:#8cf2ac">' + safe(stats.important_handled) + '</strong><p>Attended / replied</p>') +
     '</div>';
 
-  // Policy & Controls Banner with Live 5-Minute Timer
+  // Policy & Controls Banner with Live Timer (mission frequency)
   const controlsHtml = card('Monitoring Controls & Deletion Policy',
     '<div class="cc-row"><div>' +
-    '<small>' + safe(mission.provider.toUpperCase()) + ' · ' + safe(mission.account_email) + ' · auto-sync every 5 mins (' + safe(mission.frequency_seconds) + 's)</small>' +
+    '<small>' + safe(mission.provider.toUpperCase()) + ' · ' + safe(mission.account_email) + ' · auto-sync every ' + formatSyncPeriod(syncPeriodSeconds) + ' (' + safe(syncPeriodSeconds) + 's)</small>' +
     '<h3>Status: ' + safe(mission.status.toUpperCase()) + ' ' + modeBadge + '</h3>' +
     '<div style="display:flex;align-items:center;gap:10px;margin:10px 0;padding:8px 14px;background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.25);border-radius:6px;width:fit-content">' +
     '<span style="font-size:16px">⏱</span>' +
     '<span style="color:#cbd5e1;font-size:13px;font-weight:500">Auto-sync timer:</span>' +
-    '<strong id="emailSyncCountdown" style="font-family:monospace;font-size:16px;color:#6ee7b7;background:rgba(0,0,0,0.35);padding:2px 8px;border-radius:4px;border:1px solid rgba(110,231,183,0.3)">05:00</strong>' +
+    '<strong id="emailSyncCountdown" style="font-family:monospace;font-size:16px;color:#6ee7b7;background:rgba(0,0,0,0.35);padding:2px 8px;border-radius:4px;border:1px solid rgba(110,231,183,0.3)">' + formatCountdown(syncPeriodSeconds) + '</strong>' +
     '</div>' +
     '<p>Protected categories (<strong>Banking, Financial, Security, Academic, Recruitment, Personal, Deadlines</strong>) are strictly locked and never automatically deleted.</p>' +
     '</div><div class="cc-row-actions">' +
@@ -569,11 +648,11 @@ async function mountEmailIntelligence(content: HTMLElement, isCurrent: () => boo
     } catch (err) { showError(content, err); }
   });
 
-  // 5-minute Auto-Sync Countdown and Manual Sync logic
-  let remainingSeconds = 300;
+  // Auto-Sync Countdown (mission frequency) and Manual Sync logic
+  let remainingSeconds = syncPeriodSeconds;
   if (mission.next_run_at) {
     const diff = Math.round(Number(mission.next_run_at) - (Date.now() / 1000));
-    if (diff > 0 && diff <= 300) {
+    if (diff > 0 && diff <= syncPeriodSeconds) {
       remainingSeconds = diff;
     }
   }
@@ -584,9 +663,7 @@ async function mountEmailIntelligence(content: HTMLElement, isCurrent: () => boo
 
   const updateCountdownDisplay = (secs: number) => {
     if (!countdownEl) return;
-    const m = String(Math.floor(secs / 60)).padStart(2, '0');
-    const s = String(secs % 60).padStart(2, '0');
-    countdownEl.textContent = `${m}:${s}`;
+    countdownEl.textContent = formatCountdown(secs);
   };
 
   let isSyncing = false;
@@ -605,7 +682,7 @@ async function mountEmailIntelligence(content: HTMLElement, isCurrent: () => boo
       isSyncing = false;
       if (syncBtn) syncBtn.disabled = false;
       if (syncBtnText) syncBtnText.textContent = 'Sync Now (Manual)';
-      remainingSeconds = 300;
+      remainingSeconds = syncPeriodSeconds;
       updateCountdownDisplay(remainingSeconds);
     }
   };
@@ -626,7 +703,7 @@ async function mountEmailIntelligence(content: HTMLElement, isCurrent: () => boo
         remainingSeconds--;
         updateCountdownDisplay(remainingSeconds);
       } else {
-        remainingSeconds = 300;
+        remainingSeconds = syncPeriodSeconds;
         executeSync(false);
       }
     }, 1000);
@@ -653,7 +730,12 @@ export async function mountInspector(content: HTMLElement, isCurrent: () => bool
     const image = document.querySelector<HTMLImageElement>('#inspectorScreenshot');
     const placeholder = document.querySelector<HTMLElement>('#inspectorScreenshotPlaceholder');
     const src = safeImageSrc(state.screenshot);
-    if (src && image) { image.src = src; image.hidden = false; if (placeholder) placeholder.hidden = true; }
+    if (src && image) {
+      // Re-assigning the same data URL every 4s re-decodes the image
+      // and flickers the frame; only swap it when it actually changed.
+      if (image.getAttribute("src") !== src) image.src = src;
+      image.hidden = false; if (placeholder) placeholder.hidden = true;
+    }
   } catch (error) { if (isCurrent()) stage.innerHTML = empty('Inspector unavailable', safe(error)); }
 }
 

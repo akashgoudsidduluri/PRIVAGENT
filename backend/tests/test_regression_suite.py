@@ -235,16 +235,16 @@ def test_search_query_generation_smartphone_india():
     assert any("iphone 16 pro" in q.lower() for q in queries)
 
 
-def test_source_selection_appropriate_for_subject():
+def test_source_selection_appropriate_for_subject(sandbox_resolver):
     """Case A, C, D, E hub routing: software architecture must NOT route to nature.com."""
     # Software architecture: should route to Wikipedia or Google Technical Docs
-    res_arch = website_resolver.discover_websites_for_task("Compare monolithic and microservices architectures")
+    res_arch = sandbox_resolver.discover_websites_for_task("Compare monolithic and microservices architectures")
     selected_arch = [s["domain"] for s in res_arch["selected_sources"]]
     assert "nature.com" not in selected_arch
     assert any("wikipedia.org" in d or "google.com" in d for d in selected_arch)
 
     # Smartphone shopping: should route to Amazon India / Flipkart
-    res_phone = website_resolver.discover_websites_for_task("Compare iPhone 16 Pro and Samsung S24 Ultra price", region="IN")
+    res_phone = sandbox_resolver.discover_websites_for_task("Compare iPhone 16 Pro and Samsung S24 Ultra price", region="IN")
     selected_phone = [s["domain"] for s in res_phone["selected_sources"]]
     assert any("amazon.in" in d or "flipkart.com" in d for d in selected_phone)
 
@@ -471,3 +471,46 @@ def test_artifact_renderers_all_formats():
         html_text = html_path.read_text(encoding="utf-8")
         assert "<!DOCTYPE html>" in html_text
         assert "Artificial Intelligence in Agriculture" in html_text
+
+
+# ============================================================================
+# Deterministic planner word-boundary patterns (backend flaw-hunt 1)
+# ============================================================================
+
+def test_deterministic_visual_controls_patterns_are_real_word_boundaries():
+    """planner.py:679-680,759 carried literal backspace bytes (0x08)
+    where \\b word boundaries belong, so 'select seat 14b' never
+    matched and the visual-controls demo concluded with a false
+    'success' having performed zero clicks. Also guards the file
+    against any control-byte corruption."""
+    import pathlib
+
+    source = pathlib.Path(__file__).resolve().parent.parent.joinpath("app", "planner.py").read_bytes()
+    assert b"\x08" not in source
+    from app.planner import PrivacyFilteredPayload, try_deterministic_plan
+
+    def _payload(url):
+        return PrivacyFilteredPayload(
+            tab_id=1, url=url, title="Test", scroll={"x": 0, "y": 0}, dpr=1.0,
+            elements_original=0, elements_sent=0, interactive=[], page_text="",
+        )
+
+    vc = "http://localhost:8000/demo/visual-controls.html"
+    plan = try_deterministic_plan("select seat 14b", _payload(vc), [])
+    assert plan is not None
+    assert len(plan.steps) == 1
+    assert plan.steps[0].action.target["coords"] == {"x": 270, "y": 225}
+    plan = try_deterministic_plan("select date 27 Nov", _payload(vc), [])
+    assert plan is not None
+    assert plan.steps[0].action.target["coords"] == {"x": 470, "y": 135}
+    # Neither seat nor date requested and nothing clicked: no false
+    # success claim — the deterministic planner declines and the
+    # normal planner handles it.
+    assert try_deterministic_plan("open the visual controls page", _payload(vc), []) is None
+    # Inbox routing.
+    plan = try_deterministic_plan("check my inbox", _payload("about:blank"), [])
+    assert plan is not None
+    assert plan.steps and plan.steps[0].action.params.url == "https://mail.google.com"
+    plan = try_deterministic_plan("check my inbox demo", _payload("about:blank"), [])
+    assert plan is not None
+    assert plan.steps and plan.steps[0].action.params.url == "http://localhost:8000/demo/inbox.html"

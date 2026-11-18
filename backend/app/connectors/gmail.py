@@ -14,16 +14,18 @@ class GmailConnector(NativeConnector):
         return self._request("GET", "/gmail/v1/users/me/profile")
 
     def search_threads(self, query: str, limit: int = 20) -> list[dict]:
-        data = self._request("GET", "/gmail/v1/users/me/threads", params={"q": query[:300], "maxResults": min(max(limit, 1), 100)})
+        data = self._request("GET", "/gmail/v1/users/me/threads", params={"q": (query or "")[:300], "maxResults": min(max(limit, 1), 100)})
         return data.get("threads", [])
 
-    def get_thread(self, thread_id: str) -> dict:
-        return self._request("GET", f"/gmail/v1/users/me/threads/{quote(thread_id, safe='')}", params={"format": "metadata"})
+    def get_thread(self, thread_id: str, format: str = "metadata") -> dict:
+        # Callers that need bodies/snippets use format="full": the metadata
+        # format returns headers only, and snippets may come back empty.
+        return self._request("GET", f"/gmail/v1/users/me/threads/{quote(thread_id, safe='')}", params={"format": format})
 
     def list_messages(self, query: str = "", limit: int = 50, page_token: str | None = None) -> dict:
         params: dict = {"maxResults": min(max(limit, 1), 100)}
         if query:
-            params["q"] = query[:300]
+            params["q"] = (query or "")[:300]
         if page_token:
             params["pageToken"] = page_token
         return self._request("GET", "/gmail/v1/users/me/messages", params=params)
@@ -41,13 +43,20 @@ class GmailConnector(NativeConnector):
         return self._request("POST", f"/gmail/v1/users/me/messages/{quote(message_id, safe='')}/untrash")
 
     def summarize_messages(self, query: str, limit: int = 10) -> list[dict]:
+        # One list call (its items already carry the snippet) plus one
+        # metadata fetch per message for From/Subject — not one thread
+        # fetch per thread. The old search_threads + get_thread path was
+        # N+1 on threads, returned whole threads, and silently stopped at
+        # the first page (nextPageToken discarded).
         summaries = []
-        for item in self.search_threads(query, limit):
-            thread = self.get_thread(item["id"])
-            for message in thread.get("messages", [])[:limit]:
-                headers = {h.get("name", "").lower(): h.get("value", "") for h in message.get("payload", {}).get("headers", [])}
-                summaries.append({"thread_id": item["id"], "from": headers.get("from", ""),
-                                  "subject": headers.get("subject", ""), "snippet": message.get("snippet", "")})
+        listing = self.list_messages(query, limit)
+        for item in listing.get("messages", [])[:limit]:
+            msg = self.get_message(item["id"], format="metadata")
+            headers = {h.get("name", "").lower(): h.get("value", "") for h in msg.get("payload", {}).get("headers", [])}
+            summaries.append({"thread_id": item.get("threadId", ""),
+                              "from": headers.get("from", ""),
+                              "subject": headers.get("subject", ""),
+                              "snippet": item.get("snippet", "")})
         return summaries[:limit]
 
     def draft_email(self, to: str, subject: str, body: str) -> dict:

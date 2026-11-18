@@ -112,3 +112,25 @@ def test_scheduler_dispatches_task_record_then_detects_change(database, monkeypa
     asyncio.run(execute_monitor(mission))
     with db.get_connection(database) as conn:
         assert conn.execute("SELECT COUNT(*) FROM monitoring_events WHERE mission_id=?", (mission_id,)).fetchone()[0] == 1
+
+
+# ---------------------------------------------------------------------------
+# Fix 6: absolute below-price trigger. A threshold is a state, not a
+# change — being under it alerts on the first run (the product may
+# already be cheap), then deduplicates while the state is unchanged.
+# ---------------------------------------------------------------------------
+
+def test_below_price_trigger_boundaries():
+    from app.change_detector import _triggered
+
+    assert _triggered("below_price", {"threshold": 5000}, {}, {"price": 4999})[0] is True
+    assert _triggered("below_price", {"threshold": 5000}, {}, {"price": 5000})[0] is False
+    assert _triggered("below_price", {"threshold": 5000}, {}, {"price": 5001})[0] is False
+    assert _triggered("below_price", {"threshold": 5000}, {}, {"price": None})[0] is False
+    with pytest.raises(ValueError):
+        _triggered("below_price", {}, {}, {"price": 100})
+    with pytest.raises(ValueError):
+        _triggered("below_price", {"threshold": 0}, {}, {"price": 100})
+    with pytest.raises(ValueError):
+        _triggered("below_price", {"threshold": -5}, {}, {"price": 100})
+

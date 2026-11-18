@@ -1,9 +1,33 @@
 {
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "enabled": true,
+        "id": "privagent-trackers",
+        "path": "rules/trackers.json"
+      }
+    ]
+  },
+  "description": "On-device orchestration relay for the NAVIGATOR browser agent (SIH 26171).",
+  "host_permissions": [
+    "<all_urls>"
+  ],
   "manifest_version": 3,
   "name": "NAVIGATOR — Privacy Browser Agent",
-  "version": "1.0.0",
-  "description": "On-device orchestration relay for the NAVIGATOR browser agent (SIH 26171).",
-  "permissions": ["tabs", "scripting", "debugger", "activeTab", "alarms", "webNavigation", "storage"],
-  "host_permissions": ["<all_urls>"],
-  "background": { "service_worker": "background.js", "type": "module" }
+  "permissions": [
+    "tabs",
+    "scripting",
+    "debugger",
+    "activeTab",
+    "alarms",
+    "webNavigation",
+    "storage",
+    "declarativeNetRequest",
+    "browsingData"
+  ],
+  "version": "1.0.0"
 }

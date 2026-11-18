@@ -26,7 +26,9 @@ def test_origin_allowlist_accepts_local_ui_and_extensions():
     assert _origin_allowed("http://127.0.0.1:8000")
     assert _origin_allowed("chrome-extension://abcdefghijklmnop")
     assert _origin_allowed("moz-extension://abc-123")
-    assert _origin_allowed(None)  # curl / tests
+    # Task 1: a missing Origin is no longer an allow-list pass — such
+    # requests must still present a valid auth token (see test_auth.py).
+    assert _origin_allowed(None) is False
 
 
 def test_origin_allowlist_rejects_remote_and_lookalike_origins():

@@ -1,7 +1,34 @@
-"""Persistent SQLite storage for multi-turn chats, messages, and session memory."""
+"""Persistent SQLite storage for multi-turn chats, messages, and session memory.
+
+Task 2 (secrets & storage): full-database encryption via SQLCipher is not
+available in this environment — ``pysqlcipher3`` fails to build because
+``sqlcipher/sqlite3.h`` is missing (no ``libsqlcipher-dev``) — so the DB
+is protected by two honest, weaker layers instead:
+
+1. File permissions: the database directory is mode ``0700`` and the
+   database, ``-wal`` and ``-shm`` files are forced to mode ``0600`` on
+   every connection (see :func:`get_connection`).
+2. Column-level encryption: the most sensitive columns are encrypted with
+   the Fernet store (``app.secrets``) at the accessor layer — message
+   content/evidence, chat-memory values, semantic-fact values, task
+   checkpoint history/working-memory, research-package payloads and email
+   classification content. Values carry an ``enc:v1:`` tag; rows written
+   before Task 2 (legacy plaintext) still read. See ``app/secrets.py``
+   for the key story.
+
+What is NOT encrypted: table structure, IDs, timestamps, titles, URLs,
+monitoring state (already scrubbed by ``privacy.scrub_persistent`` before
+storage) and audit hashes. A stolen ``.db`` file still reveals *that* a
+chat exists and its metadata. The documented follow-up is SQLCipher:
+``apt install libsqlcipher-dev && pip install pysqlcipher3``, then switch
+``get_connection`` to ``pysqlcipher3.dbapi2`` and run
+``PRAGMA key = '<master key>'`` before any other statement, with a
+one-time ``sqlcipher_export`` migration of the existing plaintext DB.
+"""
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import sys
@@ -9,6 +36,10 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Optional
+
+from . import secrets as secrets_store
+
+logger = logging.getLogger(__name__)
 
 DB_DIR = Path(__file__).resolve().parents[1] / "data"
 
@@ -29,16 +60,56 @@ def _get_db_path(override_path: Optional[str] = None) -> str:
     if override_path:
         return override_path
     DB_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        # Single-user local tool: nobody else on the machine should be
+        # able to list (let alone read) the database directory.
+        os.chmod(DB_DIR, 0o700)
+    except OSError:
+        pass
     return str(get_default_db_path())
+
+
+def _enforce_db_file_permissions(path: str) -> None:
+    """Force mode 0600 on the DB file and its WAL/SHM sidecars (Task 2).
+
+    The WAL/SHM files only exist after the first write, so this runs on
+    every connection, not just at creation. Failures are ignored: a
+    read-only filesystem must not break reads.
+    """
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.chmod(path + suffix, 0o600)
+        except OSError:
+            pass
+
+
+class _ClosingConnection(sqlite3.Connection):
+    """A connection that closes when its ``with`` block exits.
+
+    ``sqlite3.Connection.__exit__`` only commits (or rolls back) — it
+    never closes the handle. Every ``with get_connection(...)`` site in
+    the codebase therefore leaked its handle until the GC collected it.
+    On Linux that is invisible (an open file can still be unlinked), but
+    on Windows the open handle locks the file: deleting a temp DB at
+    test teardown then fails with ``PermissionError: [WinError 32]``.
+    Closing on exit makes the handle lifetime match the block.
+    """
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
 
 
 def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
     path = _get_db_path(db_path)
-    conn = sqlite3.connect(path, timeout=10.0)
+    conn = sqlite3.connect(path, timeout=10.0, factory=_ClosingConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
+    _enforce_db_file_permissions(path)
     return conn
 
 
@@ -83,6 +154,41 @@ def init_db(db_path: Optional[str] = None) -> None:
                 id TEXT PRIMARY KEY, category TEXT NOT NULL CHECK(category IN ('personal','retail','coding')),
                 fact_key TEXT NOT NULL, fact_value TEXT NOT NULL, created_at REAL NOT NULL,
                 expires_at REAL NOT NULL, UNIQUE(category, fact_key)
+            );
+
+            -- Task 9: long-term operator memory. Values are Fernet-
+            -- encrypted at the accessor layer (see app/long_memory.py),
+            -- like semantic facts; provenance is stored, never trusted
+            -- page content (source is 'user' or 'task:<id>:confirmed').
+            CREATE TABLE IF NOT EXISTS long_memory_facts (
+                id TEXT PRIMARY KEY, text TEXT NOT NULL, category TEXT NOT NULL DEFAULT 'general',
+                source TEXT NOT NULL, confidence REAL NOT NULL DEFAULT 1.0,
+                created_at REAL NOT NULL, updated_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS long_memory_skills (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, steps TEXT NOT NULL,
+                domain TEXT NOT NULL DEFAULT '', version INTEGER NOT NULL DEFAULT 1,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                source TEXT NOT NULL, created_at REAL NOT NULL, updated_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS long_memory_files (
+                id TEXT PRIMARY KEY, file_name TEXT NOT NULL, stored_path TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL, mime_type TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '', task_id TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL
+            );
+            -- Task 9: scheduled tasks. next_run_at is advanced when a
+            -- job is claimed (see app/scheduler.py); the in-process
+            -- runner is best-effort — a restart re-claims anything due.
+            CREATE TABLE IF NOT EXISTS scheduled_jobs (
+                id TEXT PRIMARY KEY, instruction TEXT NOT NULL,
+                schedule TEXT NOT NULL, schedule_kind TEXT NOT NULL,
+                cron TEXT, interval_seconds INTEGER,
+                status TEXT NOT NULL DEFAULT 'active',
+                next_run_at REAL, last_run_at REAL, last_task_id TEXT,
+                allowed_domains TEXT NOT NULL DEFAULT '[]',
+                long_horizon INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL, updated_at REAL NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS browser_sessions (
@@ -141,6 +247,7 @@ def init_db(db_path: Optional[str] = None) -> None:
                 condition_type TEXT NOT NULL DEFAULT 'text_change', condition_params TEXT NOT NULL DEFAULT '{}',
                 status TEXT NOT NULL DEFAULT 'paused', last_run_at REAL, next_run_at REAL,
                 last_state_hash TEXT, last_state_json TEXT, last_alert_hash TEXT, last_alert_at REAL,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
                 created_at REAL NOT NULL
             );
             CREATE TABLE IF NOT EXISTS monitoring_events (
@@ -158,6 +265,9 @@ def init_db(db_path: Optional[str] = None) -> None:
 
             CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id);
             CREATE INDEX IF NOT EXISTS idx_semantic_expiry ON user_semantic_facts(expires_at);
+            CREATE INDEX IF NOT EXISTS idx_long_facts_updated ON long_memory_facts(updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_long_skills_updated ON long_memory_skills(updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_scheduled_due ON scheduled_jobs(status, next_run_at);
             CREATE INDEX IF NOT EXISTS idx_chats_updated_at ON chats(updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_sessions_conv ON browser_sessions(conversation_id, last_activity_at DESC);
             CREATE INDEX IF NOT EXISTS idx_checkpoints_conv ON task_checkpoints(conversation_id, updated_at DESC);
@@ -264,6 +374,7 @@ def init_db(db_path: Optional[str] = None) -> None:
                 "schedule_cron": "TEXT", "condition_type": "TEXT NOT NULL DEFAULT 'text_change'",
                 "condition_params": "TEXT NOT NULL DEFAULT '{}'", "last_state_json": "TEXT",
                 "last_alert_hash": "TEXT", "last_alert_at": "REAL",
+                "consecutive_failures": "INTEGER NOT NULL DEFAULT 0",
             },
             "monitoring_events": {
                 "task_id": "TEXT", "title": "TEXT NOT NULL DEFAULT ''",
@@ -400,7 +511,10 @@ def add_message(
             INSERT INTO messages (id, chat_id, role, content, evidence, task_id)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (msg_id, chat_id, role, content, evidence, task_id),
+            # Task 2: content/evidence are encrypted at rest (scrubbed first,
+            # then Fernet-encrypted by secrets_store). Callers keep seeing
+            # plaintext via get_messages(); raw SQL sees ciphertext.
+            (msg_id, chat_id, role, secrets_store.encrypt_text(content), secrets_store.encrypt_text(evidence), task_id),
         )
         conn.execute(
             "UPDATE chats SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -416,6 +530,44 @@ def add_message(
     }
 
 
+#: Sentinel returned by :func:`_decrypt_or_none` when a value cannot be
+#: decrypted. ``None`` cannot serve as the signal: ``decrypt_text``
+#: legitimately returns ``None`` for a NULL column (e.g. a message
+#: with no evidence), and an empty string for ``""``.
+_UNDECRYPTABLE: Any = object()
+
+
+def _decrypt_or_none(value: Any, kind: str, row_id: str) -> Any:
+    """Decrypt one encrypted column, or ``_UNDECRYPTABLE`` when the row
+    is undecryptable (lost/rotated master key, corrupt data).
+
+    REVIEW (Task 13 audit): Task 13 fixed this failure mode only in
+    ``long_memory.list_facts``/``list_skills`` — the same ``ValueError``
+    still escaped from every other list read in this module, so ONE
+    bad row 500'd ``GET /api/chat/{id}`` (via ``get_chat`` →
+    ``get_messages``/``get_chat_memory``), ``GET /api/memory/facts``
+    (via ``SemanticMemory.recall``), and the email dashboard (via
+    ``get_email_classifications``/``get_email_notifications``).
+    Same contract as ``long_memory._decrypt_column``: only the LIST
+    read degrades gracefully — the skip is counted by the caller and
+    logged with the row id only, never the value. Writes stay
+    fail-closed and single-row reads (``get_email_classification_by_message_id``,
+    ``get_research_package``-style) still raise rather than silently
+    returning a partial row. This helper lives here (not imported
+    from ``long_memory``) because ``long_memory`` imports this module.
+    """
+    try:
+        return secrets_store.decrypt_text(value)
+    except ValueError:
+        logger.warning(
+            "db: skipping undecryptable %s row %s "
+            "(wrong master key or corrupt data; row kept in the "
+            "database, excluded from list results)",
+            kind, row_id,
+        )
+        return _UNDECRYPTABLE
+
+
 def get_messages(chat_id: str, limit: int = 50, db_path: Optional[str] = None) -> list[dict[str, Any]]:
     with get_connection(db_path) as conn:
         rows = conn.execute(
@@ -428,7 +580,20 @@ def get_messages(chat_id: str, limit: int = 50, db_path: Optional[str] = None) -
             """,
             (chat_id, limit),
         ).fetchall()
-        return [dict(r) for r in rows]
+        # Task 2: decrypt on read; legacy plaintext rows pass through.
+        # REVIEW (Task 13 audit): an undecryptable row is skipped,
+        # not fatal — one bad row must not 500 the whole transcript.
+        result = []
+        for r in rows:
+            d = dict(r)
+            content = _decrypt_or_none(d.get("content"), "message", str(d.get("id") or "?"))
+            evidence = _decrypt_or_none(d.get("evidence"), "message", str(d.get("id") or "?"))
+            if content is _UNDECRYPTABLE or evidence is _UNDECRYPTABLE:
+                continue
+            d["content"] = content
+            d["evidence"] = evidence
+            result.append(d)
+        return result
 
 
 def get_recent_messages(chat_id: str, limit: int = 6, db_path: Optional[str] = None) -> list[dict[str, Any]]:
@@ -449,7 +614,20 @@ def get_recent_messages(chat_id: str, limit: int = 6, db_path: Optional[str] = N
             """,
             (chat_id, max(1, int(limit))),
         ).fetchall()
-        return [dict(r) for r in reversed(rows)]
+        # Task 2: decrypt on read; legacy plaintext rows pass through.
+        # REVIEW (Task 13 audit): an undecryptable row is skipped,
+        # not fatal — see get_messages.
+        result = []
+        for r in reversed(rows):
+            d = dict(r)
+            content = _decrypt_or_none(d.get("content"), "message", str(d.get("id") or "?"))
+            evidence = _decrypt_or_none(d.get("evidence"), "message", str(d.get("id") or "?"))
+            if content is _UNDECRYPTABLE or evidence is _UNDECRYPTABLE:
+                continue
+            d["content"] = content
+            d["evidence"] = evidence
+            result.append(d)
+        return result
 
 
 def set_chat_memory(chat_id: str, key: str, value: str, db_path: Optional[str] = None) -> None:
@@ -462,7 +640,8 @@ def set_chat_memory(chat_id: str, key: str, value: str, db_path: Optional[str] =
             VALUES (?, ?, ?)
             ON CONFLICT(chat_id, key) DO UPDATE SET value = excluded.value
             """,
-            (chat_id, key.strip(), str(value).strip()),
+            # Task 2: memory values are encrypted at rest.
+            (chat_id, key.strip(), secrets_store.encrypt_text(str(value).strip())),
         )
 
 
@@ -472,15 +651,18 @@ def get_chat_memory(chat_id: str, db_path: Optional[str] = None) -> dict[str, st
             "SELECT key, value FROM chat_memory WHERE chat_id = ?",
             (chat_id,),
         ).fetchall()
-        return {r["key"]: r["value"] for r in rows}
-
-
-def delete_chat_memory(chat_id: str, key: str, db_path: Optional[str] = None) -> None:
-    with get_connection(db_path) as conn:
-        conn.execute(
-            "DELETE FROM chat_memory WHERE chat_id = ? AND key = ?",
-            (chat_id, key),
-        )
+        # Task 2: decrypt on read; legacy plaintext rows pass through.
+        # REVIEW (Task 13 audit): an undecryptable key is dropped, not
+        # fatal — one bad row must not 500 get_chat (which calls this)
+        # or lose the whole session memory in run_task. The key is
+        # logged (operator-chosen label); the value never is.
+        out: dict[str, str] = {}
+        for r in rows:
+            value = _decrypt_or_none(r["value"], "chat_memory", str(r["key"]))
+            if value is _UNDECRYPTABLE:
+                continue
+            out[r["key"]] = value
+        return out
 
 
 def get_user_preferences(db_path: Optional[str] = None) -> dict[str, str]:
@@ -601,8 +783,10 @@ def save_task_checkpoint(
 ) -> None:
     from .privacy import scrub_persistent, redact_url
     now = time.time()
-    hist_json = json.dumps(scrub_persistent(_json_serializable(history)))
-    wm_json = json.dumps(scrub_persistent(_json_serializable(working_memory)))
+    # Task 2: checkpoint payloads are encrypted at rest (scrubbed first,
+    # then Fernet-encrypted). Legacy plaintext rows still read.
+    hist_json = secrets_store.encrypt_text(json.dumps(scrub_persistent(_json_serializable(history))))
+    wm_json = secrets_store.encrypt_text(json.dumps(scrub_persistent(_json_serializable(working_memory))))
     last_url = redact_url(last_url)
     with get_connection(db_path) as conn:
         conn.execute(
@@ -630,11 +814,11 @@ def get_task_checkpoint(task_id: str, db_path: Optional[str] = None) -> Optional
             return None
         d = dict(row)
         try:
-            d["history"] = json.loads(d.get("history") or "[]")
+            d["history"] = json.loads(secrets_store.decrypt_text(d.get("history") or "[]") or "[]")
         except Exception:
             d["history"] = []
         try:
-            d["working_memory"] = json.loads(d.get("working_memory") or "{}")
+            d["working_memory"] = json.loads(secrets_store.decrypt_text(d.get("working_memory") or "{}") or "{}")
         except Exception:
             d["working_memory"] = {}
         return d
@@ -655,11 +839,11 @@ def get_latest_checkpoint_for_chat(conversation_id: str, db_path: Optional[str] 
             return None
         d = dict(row)
         try:
-            d["history"] = json.loads(d.get("history") or "[]")
+            d["history"] = json.loads(secrets_store.decrypt_text(d.get("history") or "[]") or "[]")
         except Exception:
             d["history"] = []
         try:
-            d["working_memory"] = json.loads(d.get("working_memory") or "{}")
+            d["working_memory"] = json.loads(secrets_store.decrypt_text(d.get("working_memory") or "{}") or "{}")
         except Exception:
             d["working_memory"] = {}
         return d
@@ -679,11 +863,11 @@ def get_checkpoints_for_chat(conversation_id: str, db_path: Optional[str] = None
         for row in rows:
             d = dict(row)
             try:
-                d["history"] = json.loads(d.get("history") or "[]")
+                d["history"] = json.loads(secrets_store.decrypt_text(d.get("history") or "[]") or "[]")
             except Exception:
                 d["history"] = []
             try:
-                d["working_memory"] = json.loads(d.get("working_memory") or "{}")
+                d["working_memory"] = json.loads(secrets_store.decrypt_text(d.get("working_memory") or "{}") or "{}")
             except Exception:
                 d["working_memory"] = {}
             result.append(d)
@@ -819,7 +1003,8 @@ def save_research_package(
     topic_obj = package.get("topic") or {}
     topic_title = topic_obj.get("title") if isinstance(topic_obj, dict) else getattr(topic_obj, "title", "Technical Research")
     from .privacy import scrub_persistent
-    data_json = json.dumps(scrub_persistent(_json_serializable(package)))
+    # Task 2: research payloads are encrypted at rest.
+    data_json = secrets_store.encrypt_text(json.dumps(scrub_persistent(_json_serializable(package))))
     topic_title = scrub_persistent(str(topic_title))
     now = time.time()
     created_at = float(package.get("created_at") or now)
@@ -854,7 +1039,7 @@ def get_research_package(package_id: str, db_path: Optional[str] = None) -> Opti
             return None
         res = dict(row)
         try:
-            res["data"] = json.loads(res["data_json"])
+            res["data"] = json.loads(secrets_store.decrypt_text(res["data_json"]) or "{}")
         except Exception:
             res["data"] = {}
         return res
@@ -871,7 +1056,7 @@ def get_latest_package_for_chat(conversation_id: str, db_path: Optional[str] = N
             return None
         res = dict(row)
         try:
-            res["data"] = json.loads(res["data_json"])
+            res["data"] = json.loads(secrets_store.decrypt_text(res["data_json"]) or "{}")
         except Exception:
             res["data"] = {}
         return res
@@ -888,7 +1073,7 @@ def list_packages_for_chat(conversation_id: str, db_path: Optional[str] = None) 
         for r in rows:
             d = dict(r)
             try:
-                d["data"] = json.loads(d["data_json"])
+                d["data"] = json.loads(secrets_store.decrypt_text(d["data_json"]) or "{}")
             except Exception:
                 d["data"] = {}
             results.append(d)
@@ -907,6 +1092,8 @@ def create_email_mission(
     notification_policy: Optional[dict[str, Any]] = None,
     conversation_id: Optional[str] = None,
     mission_id: Optional[str] = None,
+    policy_authorized: bool = False,
+    dry_run: bool = True,
     db_path: Optional[str] = None,
 ) -> dict[str, Any]:
     """Create or register an email monitoring mission in SQLite."""
@@ -934,9 +1121,10 @@ def create_email_mission(
                 status, policy_authorized, dry_run, cleanup_policy_json,
                 notification_policy_json, next_run_at, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, 'active', 0, 1, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)
             """,
             (ident, conversation_id, account_email, provider.lower(), frequency_seconds,
+             1 if policy_authorized else 0, 1 if dry_run else 0,
              clean_pol, notif_pol, now, now, now),
         )
         # Mirror into monitoring_missions so the shared continuous monitoring loop claims it
@@ -1055,7 +1243,8 @@ def save_email_classification(record: dict[str, Any], db_path: Optional[str] = N
     """Persist or update an email classification record."""
     ident = record.get("id") or f"cls_{uuid.uuid4().hex[:12]}"
     now = time.time()
-    headers_json = json.dumps(record.get("raw_headers", {}))
+    # Task 2: sender/subject/snippet/reasoning/headers are encrypted at rest.
+    headers_json = secrets_store.encrypt_text(json.dumps(record.get("raw_headers", {})))
 
     with get_connection(db_path) as conn:
         conn.execute(
@@ -1097,14 +1286,16 @@ def save_email_classification(record: dict[str, Any], db_path: Optional[str] = N
             (
                 ident, record["mission_id"], record["message_id"],
                 record.get("thread_id", record["message_id"]),
-                record.get("sender", ""), record.get("recipient", ""),
-                record.get("subject", ""), record.get("snippet", ""),
+                secrets_store.encrypt_text(record.get("sender", "")),
+                secrets_store.encrypt_text(record.get("recipient", "")),
+                secrets_store.encrypt_text(record.get("subject", "")),
+                secrets_store.encrypt_text(record.get("snippet", "")),
                 float(record.get("received_at") or now),
                 record.get("category", "uncertain"),
                 record.get("subcategory", "unknown"),
                 float(record.get("importance_score", 0.0)),
                 float(record.get("unnecessary_confidence", 0.0)),
-                record.get("reasoning", ""),
+                secrets_store.encrypt_text(record.get("reasoning", "")),
                 record.get("deadline"), record.get("required_action"),
                 int(bool(record.get("is_unread", 1))),
                 int(bool(record.get("is_replied", 0))),
@@ -1123,6 +1314,17 @@ def save_email_classification(record: dict[str, Any], db_path: Optional[str] = N
     return get_email_classification_by_message_id(record["mission_id"], record["message_id"], db_path=db_path) or record
 
 
+def _decrypt_email_classification_row(d: dict[str, Any]) -> dict[str, Any]:
+    """Decrypt the Task 2-encrypted columns of an email-classification row."""
+    for field in ("sender", "recipient", "subject", "snippet", "reasoning"):
+        d[field] = secrets_store.decrypt_text(d.get(field))
+    try:
+        d["raw_headers"] = json.loads(secrets_store.decrypt_text(d.get("raw_headers_json") or "{}") or "{}")
+    except Exception:
+        d["raw_headers"] = {}
+    return d
+
+
 def get_email_classification_by_message_id(mission_id: str, message_id: str, db_path: Optional[str] = None) -> Optional[dict[str, Any]]:
     """Retrieve classification record for a given message ID."""
     with get_connection(db_path) as conn:
@@ -1132,12 +1334,7 @@ def get_email_classification_by_message_id(mission_id: str, message_id: str, db_
         ).fetchone()
         if not row:
             return None
-        res = dict(row)
-        try:
-            res["raw_headers"] = json.loads(res.get("raw_headers_json") or "{}")
-        except Exception:
-            res["raw_headers"] = {}
-        return res
+        return _decrypt_email_classification_row(dict(row))
 
 
 def get_email_classifications(
@@ -1163,12 +1360,20 @@ def get_email_classifications(
         rows = conn.execute(query, params).fetchall()
         results = []
         for r in rows:
-            d = dict(r)
+            # REVIEW (Task 13 audit): an undecryptable row is skipped,
+            # not fatal — one bad row must not 500 the email dashboard.
+            # The single-row getter keeps raising (fail-closed); only
+            # this list read degrades. Logged id is the message id.
             try:
-                d["raw_headers"] = json.loads(d.get("raw_headers_json") or "{}")
-            except Exception:
-                d["raw_headers"] = {}
-            results.append(d)
+                results.append(_decrypt_email_classification_row(dict(r)))
+            except ValueError:
+                logger.warning(
+                    "db: skipping undecryptable email_classification row %s "
+                    "(wrong master key or corrupt data; row kept in the "
+                    "database, excluded from list results)",
+                    str(r["message_id"]),
+                )
+                continue
         return results
 
 
@@ -1239,8 +1444,11 @@ def save_email_notification(notif: dict[str, Any], db_path: Optional[str] = None
             """,
             (
                 ident, notif["mission_id"], notif["message_id"],
-                notif.get("sender", ""), notif.get("subject", ""),
-                notif.get("importance_reason", ""), notif.get("neglect_reason", ""),
+                # Task 2: sender/subject/reasons are encrypted at rest.
+                secrets_store.encrypt_text(notif.get("sender", "")),
+                secrets_store.encrypt_text(notif.get("subject", "")),
+                secrets_store.encrypt_text(notif.get("importance_reason", "")),
+                secrets_store.encrypt_text(notif.get("neglect_reason", "")),
                 float(notif.get("received_at") or now),
                 notif.get("deadline"), notif.get("recommended_action", "Review and respond"),
                 now, now,
@@ -1268,7 +1476,23 @@ def get_email_notifications(
 
     with get_connection(db_path) as conn:
         rows = conn.execute(query, params).fetchall()
-        return [dict(r) for r in rows]
+        # Task 2: decrypt on read; legacy plaintext rows pass through.
+        # REVIEW (Task 13 audit): an undecryptable row is skipped,
+        # not fatal — one bad row must not 500 the email dashboard.
+        results = []
+        for r in rows:
+            d = dict(r)
+            bad = False
+            for field in ("sender", "subject", "importance_reason", "neglect_reason"):
+                value = _decrypt_or_none(d.get(field), "email_notification", str(d.get("message_id") or "?"))
+                if value is _UNDECRYPTABLE:
+                    bad = True
+                    break
+                d[field] = value
+            if bad:
+                continue
+            results.append(d)
+        return results
 
 
 def update_email_notification_status(

@@ -14,7 +14,7 @@ from typing import Any, Optional
 import httpx
 from PIL import Image  # type: ignore
 
-from ...website_resolver import is_safe_public_url, validate_redirect_chain
+from ...website_resolver import is_safe_public_url
 
 
 # Supported authentic image magic byte signatures

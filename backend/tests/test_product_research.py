@@ -208,3 +208,45 @@ def test_smartphone_cross_retailer_comparison_with_emi():
     assert any("emi" in c.statement.lower() for c in claims)
 
 
+
+
+def test_extraction_never_invents_specs():
+    """Backend flaw-hunt finding 2: a listing whose page shows no
+    RAM/storage/display used to come back as '12 GB / 256 GB /
+    6.2 inch' (phone) or '16 GB / 512 GB SSD / 15.6 inch' (laptop)
+    — invented specs presented as verified findings. Unknown specs
+    are 'N/A' now, and the comparison table shows that, not guesses."""
+    phone_text = """
+    Samsung Galaxy A55 5G Awesome Navy
+    ₹39,999 M.R.P: ₹44,999 (11% off)
+    4.5 out of 5 stars
+    """
+    listings = extract_product_listings(phone_text, domain="amazon.in", url="https://www.amazon.in/dp/X1")
+    assert len(listings) >= 1
+    item = listings[0]
+    assert item["ram"] == "N/A"
+    assert item["storage"] == "N/A"
+    assert item["display"] == "N/A"
+    assert "12 GB" not in item["specs_summary"]
+    assert "256 GB" not in item["specs_summary"]
+    assert "6.2 inch" not in item["specs_summary"]
+    assert item["variant"] == "Standard"
+    table, _claims = compare_product_listings(listings, topic_title="Smartphone Comparison")
+    assert table.rows
+    assert not any("12 GB" in str(cell) or "256 GB" in str(cell) for row in table.rows for cell in row)
+
+    laptop_text = """
+    HP Victus Gaming Laptop
+    ₹65,990
+    """
+    lap = extract_product_listings(laptop_text, domain="amazon.in", url="https://www.amazon.in/dp/X2")
+    assert len(lap) >= 1
+    lap_item = lap[0]
+    assert lap_item["ram"] == "N/A"
+    assert lap_item["storage"] == "N/A"
+    assert lap_item["display"] == "N/A"
+    assert "16 GB" not in lap_item["specs_summary"]
+    assert "512 GB" not in lap_item["specs_summary"]
+    assert "15.6 inch" not in lap_item["specs_summary"]
+    assert "Integrated Graphics" not in lap_item["title"]
+    assert lap_item["title"] == "HP Victus Gaming Laptop"

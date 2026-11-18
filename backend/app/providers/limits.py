@@ -141,7 +141,20 @@ def log_provider_call(
     http_status: int,
     fallback_reason: Optional[str] = None,
 ) -> None:
-    """Structured telemetry logging for LLM provider operations and failovers."""
+    """Structured telemetry logging for LLM provider operations and failovers.
+
+    Task 10: under zero retention this is a no-op — even metadata-only
+    telemetry is silenced, because a fallback_reason can quote API
+    error text and the log line would otherwise pin a task's provider
+    activity to disk.
+    """
+    try:
+        from ..zero_retention import is_enabled as _zr_enabled
+
+        if _zr_enabled():
+            return
+    except Exception:
+        pass
     prompt_tokens = token_usage.get("prompt_tokens") or token_usage.get("prompt_token_count") or 0
     completion_tokens = token_usage.get("completion_tokens") or token_usage.get("candidates_token_count") or 0
     total_tokens = token_usage.get("total_tokens") or token_usage.get("total_token_count") or (prompt_tokens + completion_tokens)

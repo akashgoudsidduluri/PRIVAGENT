@@ -12,16 +12,25 @@ from pydantic import BaseModel, Field
 
 ACTION_TYPES = [
     "navigate", "click", "type", "press", "scroll", "zoom",
-    "wait", "observe", "select_tab", "new_tab", "close_tab", "select_option", "set_date", "upload_file",
+    "wait", "observe", "select_tab", "switch_tab", "new_tab", "close_tab", "select_option", "set_date", "upload_file",
+    # Task 14: standards actions. webmcp_tool calls a page-declared
+    # WebMCP tool in the tab; ucp_checkout runs a UCP checkout
+    # session — executed by the backend, never sent to the extension.
+    "webmcp_tool", "ucp_checkout",
 ]
 RISK_CLASSES = ["read", "write", "sensitive"]
 TASK_STATES = [
     "planning", "awaiting_confirmation", "running", "awaiting_input",
+    "awaiting_takeover",
     "completed", "failed", "cancelled", "paused",
 ]
 ERROR_CODES = [
     "STALE_TARGET", "TIMEOUT", "NAVIGATION_FAILED", "PRIVACY_VIOLATION",
-    "PLAN_INVALID", "BUDGET_EXCEEDED", "CANCELLED", "EXTENSION_DISCONNECTED",
+    "PLAN_INVALID", "BUDGET_EXCEEDED", "CANCELLED",
+    # Task 4: the operator has the browser (takeover); the action was not
+    # executed and is recoverable once the takeover resolves.
+    "TAKEOVER_ACTIVE",
+    "EXTENSION_DISCONNECTED",
     "TAB_UNAVAILABLE", "TAB_UNAUTHORIZED", "AMBIGUOUS_TAB",
     "UNKNOWN",
 ]
@@ -31,6 +40,37 @@ TaskState = Literal[*TASK_STATES]  # type: ignore[valid-type]
 AgentErrorCode = Literal[*ERROR_CODES]  # type: ignore[valid-type]
 
 ElementTarget = dict[str, Any]
+
+
+class AxNode(BaseModel):
+    """One grounded accessibility-tree node (Task 7).
+
+    Mirrors ``AxNode`` in extension/src/contracts.ts. Refs (``e0``,
+    ``e1``, ...) are scoped to the observation that produced them; the
+    planner quotes them and the loop resolves them just before execution.
+    """
+
+    ref: str
+    role: str
+    name: str
+    # Accessible name before icon-glyph stripping, when it differs from
+    # ``name``. Debugging aid only — never used for matching.
+    raw_name: Optional[str] = Field(default=None, alias="rawName")
+    tag: str = ""
+    input_type: Optional[str] = Field(default=None, alias="inputType")
+    value: Optional[str] = None
+    target_id: str = Field(default="", alias="targetId")
+    css_selector: str = Field(default="", alias="cssSelector")
+    xpath: str = ""
+    disabled: bool = False
+    checked: Optional[bool] = None
+    selected: Optional[bool] = None
+    expanded: Optional[bool] = None
+    bounds: Optional[dict[str, float]] = None
+    href: Optional[str] = None
+    source: str = "dom-ax"
+
+    model_config = {"populate_by_name": True}
 
 
 class ActionParams(BaseModel):
@@ -48,6 +88,16 @@ class ActionParams(BaseModel):
     file_name: Optional[str] = Field(default=None, alias="fileName")
     file_token: Optional[str] = Field(default=None, alias="fileToken")
     base64: Optional[str] = None
+    # Task 14: webmcp_tool params (tool name + JSON arguments) and
+    # ucp_checkout params (merchant host, amount as a decimal string,
+    # currency). Amount is a string in the contract so no float or
+    # Decimal ever crosses the TS boundary; the backend parses it
+    # with Decimal and fails closed on anything unparsable.
+    tool: Optional[str] = None
+    arguments: Optional[dict[str, Any]] = None
+    merchant: Optional[str] = None
+    amount: Optional[str] = None
+    currency: Optional[str] = None
 
     model_config = {"populate_by_name": True}
 
@@ -73,6 +123,9 @@ class SemanticElement(BaseModel):
     element_id: str = Field(alias="elementId")
     role: str
     semantic_name: str = Field(alias="semanticName")
+    # Accessible name before icon-glyph stripping, when it differs from
+    # ``semantic_name``. Debugging aid only — never used for matching.
+    raw_semantic_name: Optional[str] = Field(default=None, alias="rawSemanticName")
     control_type: str = Field(alias="controlType")
     interactability: dict[str, Any]
     context_text: str = Field(default="", alias="contextText")
@@ -84,6 +137,9 @@ class InteractiveElement(BaseModel):
     semantic: Optional[SemanticElement] = None
     role: str
     name: str
+    # Accessible name before icon-glyph stripping, when it differs from
+    # ``name``. Debugging aid only — never used for matching.
+    raw_name: Optional[str] = Field(default=None, alias="rawName")
     tag: str
     input_type: Optional[str] = Field(default=None, alias="inputType")
     # Explicit search semantic from the observer. Optional so older payloads
@@ -94,6 +150,11 @@ class InteractiveElement(BaseModel):
     visible: bool
     enabled: bool
     bounds: Optional[dict[str, float]] = None
+    # Task 7: element state (checked/selected/expanded/disabled) and the
+    # observer's stable locator, for the accessibility tree. Optional so
+    # older observations still validate.
+    state: Optional[dict[str, Any]] = None
+    css_selector: Optional[str] = Field(default=None, alias="cssSelector")
 
     model_config = {"populate_by_name": True}
 
@@ -108,6 +169,24 @@ class BrowserObservation(BaseModel):
     screenshot: Optional[str] = None
     tabs: Optional[list[dict[str, Any]]] = None
     page_text: Optional[str] = Field(default=None, alias="pageText")
+    # Task 7: the extension's accessibility tree for this observation
+    # (refs e0, e1, ...). Optional so observations from older extension
+    # versions still validate — the backend derives a legacy tree from
+    # ``interactive`` when this is absent.
+    ax_tree: Optional[list[AxNode]] = Field(default=None, alias="axTree")
+    # Task 14: page-declared WebMCP tools for this observation (raw
+    # declarations — the backend validates them before the planner
+    # sees them) and the UCP profile URL the page declares via
+    # <link rel="ucp">, if any. Optional so older observations still
+    # validate.
+    webmcp_tools: Optional[list[dict[str, Any]]] = Field(default=None, alias="webmcpTools")
+    ucp_profile_url: Optional[str] = Field(default=None, alias="ucpProfileUrl")
+    # Product image the page declares via <meta property="og:image">,
+    # if any. Optional so older observations still validate. The
+    # extractor re-validates it before it reaches a fact, a table or
+    # a document — an og:image is page-declared data, never trusted
+    # on arrival.
+    og_image: Optional[str] = Field(default=None, alias="ogImage")
 
     model_config = {"populate_by_name": True}
 

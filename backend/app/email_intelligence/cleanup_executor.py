@@ -140,15 +140,18 @@ def evaluate_and_execute_cleanup(
         logger.info("Executing move-to-trash for message %s (%s)", email.id, email.subject[:40])
         res = connector.trash_message(email.id)
         if res is not None:
-            # 9. Verify provider-side state
+            # 9. Verify provider-side state. ONLY the read-back
+            # counts: the trash call's own return says the POST was
+            # accepted, not that the message is in Trash, and a
+            # failed read-back must not be claimed as verified.
             try:
                 check = connector.get_message(email.id)
                 # Check for TRASH label (Gmail) or deleteditems (Outlook)
                 labels = check.get("labelIds") or []
                 parent = check.get("parentFolderId") or ""
-                verified = "TRASH" in labels or "deleteditems" in parent.lower() or bool(res)
+                verified = "TRASH" in labels or "deleteditems" in parent.lower()
             except Exception:
-                verified = True  # Provider accepted HTTP POST
+                verified = False
     except Exception as exc:
         logger.error("Failed to move message %s to trash: %s", email.id, exc)
         db.log_email_audit(
@@ -200,7 +203,15 @@ def restore_email_from_trash(
     try:
         res = connector.untrash_message(message_id)
         if res is not None:
-            verified = True
+            # Verify provider-side state, as for trash: the untrash
+            # call's own return is not proof the message left Trash.
+            try:
+                check = connector.get_message(message_id)
+                labels = check.get("labelIds") or []
+                parent = check.get("parentFolderId") or ""
+                verified = "TRASH" not in labels and "deleteditems" not in parent.lower()
+            except Exception:
+                verified = False
     except Exception as exc:
         logger.error("Failed to untrash message %s: %s", message_id, exc)
         return {"ok": False, "error": str(exc)}
@@ -209,7 +220,7 @@ def restore_email_from_trash(
     cls_record = db.get_email_classification_by_message_id(mission_id, message_id, db_path=db_path)
     if cls_record:
         cls_record["action_taken"] = "restored"
-        cls_record["action_verified"] = 1
+        cls_record["action_verified"] = 1 if verified else 0
         cls_record["action_timestamp"] = time.time()
         db.save_email_classification(cls_record, db_path=db_path)
 

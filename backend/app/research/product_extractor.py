@@ -98,7 +98,7 @@ def parse_price(text: str) -> tuple[Optional[str], float, str]:
     return formatted, val, currency
 
 
-def parse_emi_details(text: str, price_num: float = 0.0) -> tuple[bool, str]:
+def parse_emi_details(text: str) -> tuple[bool, str]:
     """Extract EMI availability and detailed monthly instalment terms."""
     if not text:
         return False, "Not advertised"
@@ -155,7 +155,7 @@ def extract_product_listings(text: str, domain: str, url: str) -> list[dict[str,
             if not price_str or price_val < 500:  # Filter accessories and noise
                 continue
 
-            emi_avail, emi_info = parse_emi_details(block, price_val)
+            emi_avail, emi_info = parse_emi_details(block)
             rat_m = RATING_RE.search(block)
             rating_val = float(rat_m.group(1)) if rat_m else None
 
@@ -184,25 +184,45 @@ def extract_product_listings(text: str, domain: str, url: str) -> list[dict[str,
 
             gpu_val = gpu_m.group(0).upper() if gpu_m else "N/A"
             cpu_val = cpu_m.group(0) if cpu_m else (soc_m.group(0) if soc_m else "N/A")
-            ram_val = ram_m.group(0).upper() if ram_m else ("12 GB" if category == "smartphone" else "16 GB")
-            storage_val = storage_m.group(0).upper() if storage_m else ("256 GB" if category == "smartphone" else "512 GB SSD")
-            disp_val = disp_m.group(0) if disp_m else ("6.2 inch" if category == "smartphone" else "15.6 inch")
+            # Unknown specs stay "N/A": the old defaults fabricated
+            # "12 GB / 256 GB / 6.2 inch" (phone) or "16 GB / 512 GB
+            # SSD / 15.6 inch" (laptop) for listings whose page never
+            # showed them, and the comparison then presented invented
+            # specs as verified findings.
+            ram_val = ram_m.group(0).upper() if ram_m else "N/A"
+            storage_val = storage_m.group(0).upper() if storage_m else "N/A"
+            disp_val = disp_m.group(0) if disp_m else "N/A"
             cam_val = cam_m.group(0) if cam_m else "N/A"
             bat_val = bat_m.group(0) if bat_m else "N/A"
 
             if len(clean_title) < 10:
                 if category == "smartphone":
-                    clean_title = f"{soc_m.group(0) if soc_m else '5G'} Smartphone ({ram_val} / {storage_val})"
+                    soc = soc_m.group(0) if soc_m else None
+                    known = [v for v in (ram_val, storage_val) if v != "N/A"]
+                    if soc and known:
+                        clean_title = f"{soc} Smartphone ({' / '.join(known)})"
+                    elif soc:
+                        clean_title = f"{soc} Smartphone"
+                    else:
+                        clean_title = "Smartphone"
                 else:
-                    clean_title = f"{cpu_m.group(0) if cpu_m else 'Gaming'} Laptop ({gpu_val if gpu_val != 'N/A' else 'Integrated Graphics'})"
+                    cpu = cpu_m.group(0) if cpu_m else None
+                    if cpu and gpu_val != "N/A":
+                        clean_title = f"{cpu} Laptop ({gpu_val})"
+                    elif cpu:
+                        clean_title = f"{cpu} Laptop"
+                    elif gpu_val != "N/A":
+                        clean_title = f"Laptop ({gpu_val})"
+                    else:
+                        clean_title = "Laptop"
 
             # Specification summary
             if category == "smartphone":
                 specs_summary = " / ".join(filter(lambda s: s and s != "N/A", [soc_m.group(0) if soc_m else None, ram_val, storage_val, cam_val]))
-                variant = f"{ram_val} / {storage_val}"
+                variant = " / ".join([v for v in (ram_val, storage_val) if v != "N/A"]) or "Standard"
             else:
-                specs_summary = f"{cpu_val} / {gpu_val} / {ram_val} / {storage_val}"
-                variant = f"{ram_val} / {storage_val} / {gpu_val}"
+                specs_summary = " / ".join([v for v in (cpu_val, gpu_val, ram_val, storage_val) if v != "N/A"]) or "N/A"
+                variant = " / ".join([v for v in (ram_val, storage_val, gpu_val) if v != "N/A"]) or "Standard"
 
             today_str = datetime.datetime.now().strftime("%Y-%m-%d")
 
@@ -295,7 +315,7 @@ def compare_product_listings(
             deal_tag = "⭐ Best Price" if is_best else "Alternative"
             emi_str = "Available" if l.get("emi_available") else "Not advertised"
             emi_det = l.get("emi_details") or "N/A"
-            specs_str = l.get("specs_summary") or f"{l.get('ram', '12 GB')} / {l.get('storage', '256 GB')}"
+            specs_str = l.get("specs_summary") or "N/A"
             link_str = l.get("url") or l.get("domain") or ""
             rows.append([
                 l["title"],

@@ -48,26 +48,50 @@ export function linkLabel(url: string): string {
   }
 }
 
-/** Escape the whole string, then wrap markdown/bare http(s) links. */
-export function linkify(text: string): string {
+/** Emphasis for already-escaped plain text. Must only ever run on
+ * escaped text with no markup in it: the regexes match `_`/`*` pairs,
+ * and a built `<a href="...my_file_name.pdf" target="_blank">` tag
+ * contains exactly those characters — running emphasis on built HTML
+ * rewrote the href into `my<em>file</em>name.pdf` (a 404) and mangled
+ * every bare `https://…/a_b_c` link. URLs are therefore never passed
+ * through here; linkify applies this to the text gaps only. */
+function emphasizeHtml(escaped: string): string {
+  return escaped
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/__([^_]+)__/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+    .replace(/(^|[^_])_([^_\n]+)_/g, "$1<em>$2</em>");
+}
+
+/** Escape the whole string, then wrap markdown/bare http(s) links.
+ *
+ * With `emphasize`, bold/italic is rendered in the text gaps and link
+ * labels (already-escaped plain text) — never in the URLs or the
+ * anchors built from them. Direct callers that render step/console
+ * text keep the default (no emphasis), exactly as before. */
+export function linkify(text: string, emphasize = false): string {
   const re = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<"')]+)/g;
   const parts: string[] = [];
   let last = 0;
   let m: RegExpExecArray | null;
+  const esc = (s: string): string => emphasize ? emphasizeHtml(escapeHtml(s)) : escapeHtml(s);
   while ((m = re.exec(text)) !== null) {
-    parts.push(escapeHtml(text.slice(last, m.index)));
+    parts.push(esc(text.slice(last, m.index)));
     const label = m[1] ?? m[3];
     const href = safeHttpUrl(m[2] ?? m[3]);
     if (href) {
+      // A markdown link's label is prose and may carry emphasis; a
+      // bare URL's label IS the URL and must never be emphasised.
+      const labelHtml = m[1] !== undefined ? esc(label) : escapeHtml(label);
       parts.push(
-        `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)} ↗</a>`
+        `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${labelHtml} ↗</a>`
       );
     } else {
       parts.push(escapeHtml(m[0]));
     }
     last = re.lastIndex;
   }
-  parts.push(escapeHtml(text.slice(last)));
+  parts.push(esc(text.slice(last)));
   return parts.join("");
 }
 
@@ -76,28 +100,54 @@ function splitTableRow(line: string): string[] {
   return line.replace(/^\|/, "").replace(/\|$/, "").split("|").map(cell => cell.trim());
 }
 
+/** Render Markdown images ![alt](url) as <img>, everything else via linkify.
+ *
+ * An image URL is only accepted when `safeHttpUrl` passes it
+ * (credential-free http(s)) — javascript:/data: URLs render as inert
+ * text, and the alt text is escaped like every other attribute value.
+ * Loading the image fetches it from the store's image CDN; the backend
+ * only ever supplies an og:image from a product page the agent
+ * actually visited. Images are consumed here, before `linkify`, so
+ * the `[alt](url)` inside `![alt](url)` is never also turned into a
+ * link (with a stray `!` left in front of it).
+ */
+function renderInlineImages(part: string): string {
+  const re = /!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g;
+  const out: string[] = [];
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(part)) !== null) {
+    out.push(linkify(part.slice(last, m.index), true));
+    const src = safeHttpUrl(m[2]);
+    if (src) {
+      out.push(`<img src="${escapeHtml(src)}" alt="${escapeHtml(m[1])}" loading="lazy" class="md-product-img">`);
+    } else {
+      out.push(escapeHtml(m[0]));
+    }
+    last = re.lastIndex;
+  }
+  out.push(linkify(part.slice(last), true));
+  return out.join("");
+}
+
 /** Inline Markdown that cannot emit arbitrary HTML.
  *
- * `linkify` escapes the text before anchors are added, and every other
- * replacement below only inserts a fixed tag around already-escaped text.
+ * Emphasis is rendered by `linkify(..., true)` on the escaped text
+ * gaps only — never on built anchors or images (see emphasizeHtml).
  */
 function renderInline(raw: string): string {
   return raw.split(/(`[^`]*`)/g).map(part => {
     if (part.length >= 2 && part.startsWith("`") && part.endsWith("`")) {
       return `<code>${escapeHtml(part.slice(1, -1))}</code>`;
     }
-    return linkify(part)
-      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-      .replace(/__([^_]+)__/g, "<strong>$1</strong>")
-      .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
-      .replace(/(^|[^_])_([^_\n]+)_/g, "$1<em>$2</em>");
+    return renderInlineImages(part);
   }).join("");
 }
 
 /** Render model Markdown without trusting it.
  *
  * Supports headings, paragraphs, bold/italic, inline and fenced code, lists,
- * blockquotes, tables and links. Raw HTML is always escaped, so a model answer
+ * blockquotes, tables, links and images. Raw HTML is always escaped, so a model answer
  * cannot inject markup. Unknown syntax is shown as plain text.
  */
 export function renderMarkdown(text: string): string {

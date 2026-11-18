@@ -1,0 +1,16 @@
+{
+  "task": "log in (type username, type password, click Log in) + search (type query, click Search)",
+  "runs": 3,
+  "planner_delay_ms": 200.0,
+  "planner_calls": 7,
+  "observation_calls": 2,
+  "actions_dispatched": 5,
+  "steps": 5,
+  "wall_ms_median": 1417.59,
+  "wall_ms_runs": [
+    1478.13,
+    1417.59,
+    1413.25
+  ],
+  "timings": null
+}

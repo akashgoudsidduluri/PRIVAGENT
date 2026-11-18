@@ -149,6 +149,14 @@ class OpenAICompatibleProvider:
     ) -> None:
         self._api_key = api_key or ""
         self.base_url = validate_base_url(base_url)
+        # Task 3: the egress gate lives in _check_egress (called by
+        # _completion and chat_stream, the actual HTTP call sites),
+        # not here: construction must stay free so tests can build a
+        # provider with a mock host and patch _completion, and so a
+        # misconfigured gateway fails at first use, before any key is
+        # sent. The base URL is operator-configurable, so at call time it
+        # must be loopback (a local gateway), a pinned provider host, or
+        # a host on the domain allow-list (PRIVAGENT_ALLOWED_DOMAINS).
         self._model = (model or "").strip()
         self._timeout_s = timeout_s
         self.provider_name = provider_name
@@ -236,10 +244,29 @@ class OpenAICompatibleProvider:
         )
         return content
 
+    def _check_egress(self) -> None:
+        """Task 3 egress gate: runs before ANY request is sent, so a
+        remote gateway whose host is not on the allow-list never
+        receives the API key. Shared by _completion and chat_stream —
+        a streaming call must not bypass the gate.
+        (Deliberately here, not in __init__: tests construct a
+        provider with a mock host and patch this method.)"""
+        from .. import config as _config
+        from ..allowlist import egress_allowed
+
+        if not egress_allowed(self.base_url, allowed_domains=getattr(_config, "ALLOWED_DOMAINS", [])):
+            raise ValueError(
+                f"Base URL host for {self.base_url!r} is not on the egress allow-list: "
+                "use a loopback gateway or add the host to PRIVAGENT_ALLOWED_DOMAINS."
+            )
+
     def chat_stream(
         self, prompt: str, history: Optional[list[dict[str, Any]]] = None
     ):
         """Stream completion tokens from the gateway."""
+        # Egress gate first: this is a generator, so this runs on the
+        # first next() — still before any HTTP request is sent.
+        self._check_egress()
         try:
             from ..capabilities import SYSTEM_CAPABILITY_PROMPT
             sys_prompt = SYSTEM_CAPABILITY_PROMPT
@@ -284,7 +311,7 @@ class OpenAICompatibleProvider:
         history: list[dict[str, Any]],
         working_memory: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        prompt = build_prompt(instruction, payload, history, working_memory=working_memory)
+        prompt = build_prompt(instruction, payload, history, working_memory=working_memory, allowed_domains=(working_memory or {}).get("allowed_domains"))
         base_payload = {
             "model": self._model,
             "messages": [
@@ -315,6 +342,10 @@ class OpenAICompatibleProvider:
         """
         if not self._model:
             raise ProviderUnavailable(f"{context}: no model id is configured.")
+        # Task 3 egress gate: runs before any request is sent, so a remote
+        # gateway whose host is not on the allow-list never receives the
+        # API key.
+        self._check_egress()
         started = time.perf_counter()
 
         try:

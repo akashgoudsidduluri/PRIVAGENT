@@ -1,13 +1,17 @@
 """Storage boundaries for memory tiers, with finite retention and privacy gates."""
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
 from .. import db
+from .. import secrets as secrets_store
 from ..privacy import Sensitivity, classify_sensitivity, scrub_persistent
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -50,7 +54,8 @@ class SemanticMemory:
                             VALUES(?,?,?,?,?,?) ON CONFLICT(category,fact_key) DO UPDATE SET
                             fact_value=excluded.fact_value, created_at=excluded.created_at,
                             expires_at=excluded.expires_at""",
-                         (identifier, category, key, value, now, now + ttl_days * 86400))
+                         # Task 2: fact values are encrypted at rest.
+                         (identifier, category, key, secrets_store.encrypt_text(value), now, now + ttl_days * 86400))
         return identifier
 
     def recall(self, category: str | None = None, *, db_path=None) -> list[dict]:
@@ -60,7 +65,26 @@ class SemanticMemory:
             rows = conn.execute("""SELECT id,category,fact_key,fact_value,created_at,expires_at
                                  FROM user_semantic_facts WHERE (? IS NULL OR category = ?)
                                  ORDER BY created_at DESC""", (category, category)).fetchall()
-        return [dict(row) for row in rows]
+        # Task 2: decrypt on read; legacy plaintext rows pass through.
+        # REVIEW (Task 13 audit): an undecryptable row is skipped, not
+        # fatal — one bad row must not 500 GET /api/memory/facts. Same
+        # contract as long_memory._decrypt_column: the row id is logged,
+        # never the value; writes stay fail-closed.
+        result = []
+        for row in rows:
+            d = dict(row)
+            try:
+                d["fact_value"] = secrets_store.decrypt_text(d.get("fact_value"))
+            except ValueError:
+                logger.warning(
+                    "tiers: skipping undecryptable semantic fact row %s "
+                    "(wrong master key or corrupt data; row kept in the "
+                    "database, excluded from list results)",
+                    str(d.get("id") or "?"),
+                )
+                continue
+            result.append(d)
+        return result
 
     def forget(self, identifier: str, *, db_path=None) -> bool:
         with db.get_connection(db_path) as conn:

@@ -1,0 +1,286 @@
+{
+  "task": "log in (type username, type password, click Log in) + search (type query, click Search)",
+  "runs": 3,
+  "planner_delay_ms": 200.0,
+  "planner_calls": 4,
+  "observation_calls": 1,
+  "actions_dispatched": 5,
+  "steps": 5,
+  "wall_ms_median": 832.79,
+  "wall_ms_runs": [
+    1060.58,
+    832.79,
+    827.15
+  ],
+  "timings": {
+    "planner_calls": 4,
+    "observation_calls": 1,
+    "cache_hits": 1,
+    "cache_misses": 1,
+    "stale_detected": 0,
+    "checker_skipped_steps": 3,
+    "batched_steps": 3,
+    "steps_executed": 5,
+    "totals_ms": {
+      "observe_ms": 0,
+      "redact_ms": 0,
+      "plan_ms": 801,
+      "checker_ms": 0,
+      "confirm_wait_ms": 0,
+      "takeover_wait_ms": 0,
+      "execute_ms": 0,
+      "checkpoint_ms": 23
+    },
+    "overhead_ms": 824,
+    "operator_wait_ms": 0,
+    "total_ms": 1059,
+    "steps": [
+      {
+        "step": 1,
+        "action": "type",
+        "batched": false,
+        "cache": "miss",
+        "checker_skipped": false,
+        "observe_ms": 0,
+        "redact_ms": 0,
+        "plan_ms": 201,
+        "checker_ms": 0,
+        "confirm_wait_ms": 0,
+        "takeover_wait_ms": 0,
+        "execute_ms": 0,
+        "checkpoint_ms": 10,
+        "total_ms": 219,
+        "overhead_ms": 211
+      },
+      {
+        "step": 2,
+        "action": "type",
+        "batched": true,
+        "cache": "n/a",
+        "checker_skipped": true,
+        "observe_ms": 0,
+        "redact_ms": 0,
+        "plan_ms": 0,
+        "checker_ms": 0,
+        "confirm_wait_ms": 0,
+        "takeover_wait_ms": 0,
+        "execute_ms": 0,
+        "checkpoint_ms": 3,
+        "total_ms": 3,
+        "overhead_ms": 3
+      },
+      {
+        "step": 3,
+        "action": "click",
+        "batched": true,
+        "cache": "n/a",
+        "checker_skipped": true,
+        "observe_ms": 0,
+        "redact_ms": 0,
+        "plan_ms": 0,
+        "checker_ms": 0,
+        "confirm_wait_ms": 0,
+        "takeover_wait_ms": 0,
+        "execute_ms": 0,
+        "checkpoint_ms": 3,
+        "total_ms": 4,
+        "overhead_ms": 3
+      },
+      {
+        "step": 4,
+        "action": "type",
+        "batched": false,
+        "cache": "hit",
+        "checker_skipped": false,
+        "observe_ms": 0,
+        "redact_ms": 0,
+        "plan_ms": 200,
+        "checker_ms": 0,
+        "confirm_wait_ms": 0,
+        "takeover_wait_ms": 0,
+        "execute_ms": 0,
+        "checkpoint_ms": 4,
+        "total_ms": 206,
+        "overhead_ms": 204
+      },
+      {
+        "step": 5,
+        "action": "click",
+        "batched": true,
+        "cache": "n/a",
+        "checker_skipped": true,
+        "observe_ms": 0,
+        "redact_ms": 0,
+        "plan_ms": 0,
+        "checker_ms": 0,
+        "confirm_wait_ms": 0,
+        "takeover_wait_ms": 0,
+        "execute_ms": 0,
+        "checkpoint_ms": 3,
+        "total_ms": 4,
+        "overhead_ms": 3
+      }
+    ]
+  },
+  "measured": "2026-11-17 (Task 4 latency). Mock bench only: scripted planner, mocked extension, no live Chrome, no live LLM. See demo_automation.py docstring.",
+  "automation_demo_after": {
+    "wall_ms": 1003.9,
+    "counts": {
+      "planner_calls": 4,
+      "observation_calls": 2,
+      "actions_dispatched": 4,
+      "steps": 3
+    },
+    "per_step_timings": [
+      {
+        "step": 1,
+        "action": "click",
+        "batched": false,
+        "cache": "miss",
+        "checker_skipped": false,
+        "observe_ms": 0,
+        "redact_ms": 1,
+        "plan_ms": 0,
+        "checker_ms": 0,
+        "confirm_wait_ms": 0,
+        "takeover_wait_ms": 0,
+        "execute_ms": 0,
+        "checkpoint_ms": 10,
+        "total_ms": 19,
+        "overhead_ms": 11
+      },
+      {
+        "step": 2,
+        "action": "click",
+        "batched": false,
+        "cache": "n/a",
+        "checker_skipped": false,
+        "observe_ms": 0,
+        "redact_ms": 1,
+        "plan_ms": 0,
+        "checker_ms": 0,
+        "confirm_wait_ms": 0,
+        "takeover_wait_ms": 0,
+        "execute_ms": 0,
+        "checkpoint_ms": 3,
+        "total_ms": 5,
+        "overhead_ms": 4
+      },
+      {
+        "step": 3,
+        "action": "click",
+        "batched": false,
+        "cache": "n/a",
+        "checker_skipped": false,
+        "observe_ms": 0,
+        "redact_ms": 0,
+        "plan_ms": 0,
+        "checker_ms": 0,
+        "confirm_wait_ms": 0,
+        "takeover_wait_ms": 0,
+        "execute_ms": 0,
+        "checkpoint_ms": 3,
+        "total_ms": 5,
+        "overhead_ms": 3
+      }
+    ],
+    "recoveries": [
+      {
+        "step": 3,
+        "kind": "stale_ref_retry",
+        "trigger": "STALE_TARGET",
+        "old_ref": "e0",
+        "new_ref": "e1",
+        "new_target_id": "summary-link-v2",
+        "result_ok": true
+      }
+    ],
+    "final": "completed"
+  },
+  "monitoring_demo_after": {
+    "cycles": [
+      {
+        "cycle": 1,
+        "label": "baseline",
+        "claimed": 2,
+        "events": 0,
+        "alerted": false
+      },
+      {
+        "cycle": 2,
+        "label": "no change",
+        "claimed": 2,
+        "events": 0,
+        "alerted": false
+      },
+      {
+        "cycle": 3,
+        "label": "content + price change",
+        "claimed": 2,
+        "events": 2,
+        "alerted": true,
+        "alerts": [
+          {
+            "mission": "Field Notes watch",
+            "summary": "Observed public page content changed",
+            "before": "Field Notes Field Notes On-device perception keeps page text local. Updated",
+            "after": "Field Notes Field Notes On-device perception now ships with a local planner. Updated"
+          },
+          {
+            "mission": "Widget Pro price watch",
+            "summary": "Price changed from 1299 to 999",
+            "old_price": 1299.0,
+            "new_price": 999.0,
+            "before": "Gadget Store Widget Pro The Widget Pro is in stock. Price: \u20b91,299 Buy now",
+            "after": "Gadget Store Widget Pro The Widget Pro is in stock. Price: \u20b9999 Buy now"
+          }
+        ]
+      }
+    ],
+    "real_public_page_ok": true,
+    "ui_list_check": {
+      "missions_listed": 2,
+      "watch_listed": true,
+      "events_listed": 1,
+      "alert_listed": true,
+      "renders_from": [
+        "/api/control/missions",
+        "/api/control/missions/{id}/events"
+      ]
+    }
+  },
+  "before": {
+    "bench_wall_ms_median": 827.6,
+    "bench_wall_ms_runs": [
+      1066.54,
+      826.5,
+      827.6
+    ],
+    "bench_totals_ms": {
+      "redact_ms": 60,
+      "plan_ms": 802,
+      "checkpoint_ms": 179
+    },
+    "bench_step1": {
+      "redact_ms": 60,
+      "plan_ms": 201,
+      "checkpoint_ms": 165,
+      "total_ms": 435
+    },
+    "automation_demo_wall_ms_runs": [
+      1506.8,
+      2004.9
+    ],
+    "automation_demo_counts": {
+      "planner_calls": 4,
+      "observation_calls": 2,
+      "actions_dispatched": 7,
+      "steps": 3
+    },
+    "automation_demo_step3_execute_ms": 1201,
+    "automation_demo_step1": {
+      "redact_ms": 58,
+      "checkpoint_ms": 172
+    }
+  }
+}

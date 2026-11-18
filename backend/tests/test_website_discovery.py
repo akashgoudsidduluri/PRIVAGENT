@@ -38,11 +38,22 @@ def test_scenario_a_specified_website():
     assert "https://www.amazon." in res["primary_navigation_url"]
 
 
-def test_scenario_b_shopping_discovery_no_website_specified():
-    """When user does not specify a website for shopping, autonomously discover and rank retail sources."""
+def test_scenario_b_shopping_discovery_no_website_specified(sandbox_resolver):
+    """When user does not specify a website for shopping, autonomously discover and rank retail sources.
+
+    Task 8: discovery is GENERIC — shopping is answered by general web
+    search hubs, never by per-retailer search URLs. The agent opens
+    whichever retailer the search results point at; no retailer search
+    URL is baked into discovery. Retailers ARE candidates, though:
+    their regional homepages come from the known-domains registry, so
+    a shopping task can go straight to the retailer. (Fixed 2026-11-18:
+    the sandbox DNS returns RFC 2544 addresses for every host, so the
+    test uses the ``sandbox_resolver`` fixture with stub DNS instead of
+    the global resolver.)
+    """
     instruction = "Find the cheapest laptop with an RTX 4060."
     context: dict = {}
-    res = website_resolver.discover_websites_for_task(instruction, context=context)
+    res = sandbox_resolver.discover_websites_for_task(instruction, context=context)
 
     assert res["scenario"] == "B"
     assert res["specified_website"] is None
@@ -62,22 +73,29 @@ def test_scenario_b_shopping_discovery_no_website_specified():
         assert cand["discoveredByQuery"] != ""
         assert not cand["isSpamOrAd"]
 
-    # Top selected sources must include independent domains
+    # Top selected sources must be independent. Retailers may be
+    # selected (their regional homepages come from the registry), but
+    # discovery must never fabricate a per-retailer SEARCH URL:
+    # only the search hubs may carry a query string.
     selected_domains = [s["domain"] for s in res["selected_sources"]]
     assert len(set(selected_domains)) >= 2  # Independent sources
-    assert any("amazon" in d for d in selected_domains)
-    assert any("flipkart" in d for d in selected_domains)
+    for source in res["selected_sources"]:
+        url = source["url"]
+        if "?" in url:
+            assert any(h in url for h in ("google.com", "duckduckgo.com", "wikipedia.org")), (
+                f"per-retailer search URL baked into discovery: {url}"
+            )
 
     # Discovery decisions recorded in context
     assert "discovery_log" in context
     assert len(context["discovery_log"]) == 1
 
 
-def test_scenario_b_research_prefers_primary_authoritative_sources():
+def test_scenario_b_research_prefers_primary_authoritative_sources(sandbox_resolver):
     """When user requests scientific/technical research without specifying a site, prefer primary sources."""
     instruction = "Research the latest developments in solid-state batteries and compare findings from reliable sources."
     context: dict = {}
-    res = website_resolver.discover_websites_for_task(instruction, context=context)
+    res = sandbox_resolver.discover_websites_for_task(instruction, context=context)
 
     assert res["scenario"] == "B"
     assert res["category"] == "research"

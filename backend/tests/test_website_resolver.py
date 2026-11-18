@@ -192,10 +192,10 @@ def test_cache_ttl_expiration():
     assert r2.primary_domain == "flipkart.com"
 
 
-def test_source_provenance_tracking():
+def test_source_provenance_tracking(sandbox_resolver):
     """Autonomous website discovery must record detailed source provenance."""
     instruction = "Find the best gaming monitor under 20000"
-    res = website_resolver.discover_websites_for_task(instruction)
+    res = sandbox_resolver.discover_websites_for_task(instruction)
 
     assert "source_provenance" in res
     provenance = res["source_provenance"]

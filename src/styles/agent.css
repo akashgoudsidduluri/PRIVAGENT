@@ -1,4 +1,29 @@
 /* NAVIGATOR Agent Workspace Stylesheet */
+
+/* Control-center shell base rules (UI flicker fix): agent.html no longer
+   loads the landing stylesheet (main.css), so the buttons and brand the
+   static header uses need their base rules here. Values copied verbatim
+   from src/styles/main.css; .btn--primary / .btn--ghost variants are
+   already provided by control-center.css / control-center-refresh.css,
+   which win on equal specificity as the later-loaded stylesheets. */
+.agent-body .btn {
+  display: inline-flex; align-items: center; gap: 0.55rem;
+  font-family: var(--font-display, "Chakra Petch", sans-serif); font-weight: 600; letter-spacing: 0.04em;
+  border-radius: 999px; padding: 0.8rem 1.7rem; cursor: pointer;
+  border: 1px solid transparent; transition: transform .2s ease, box-shadow .2s ease, background .2s ease, border-color .2s ease;
+}
+.agent-body .btn--sm { padding: 0.5rem 1.1rem; font-size: 0.85rem; }
+.agent-body .nav__brand { display: flex; align-items: center; gap: 0.6rem; color: var(--ink, #e8eeff); }
+.agent-body .nav__logo { display: grid; place-items: center; width: 36px; height: 36px; border: 1px solid rgba(70, 215, 255, 0.4); border-radius: 10px; background: rgba(70, 215, 255, 0.08); }
+.agent-body .nav__wordmark { font-weight: 700; font-size: 1.02rem; }
+.agent-body .nav__wordmark sup { font-size: 0.6rem; letter-spacing: 0.1em; margin-left: 2px; }
+/* Base resets main.css used to provide for this page (copied verbatim,
+   scoped to the agent page so the landing page is untouched). Without
+   these, dropping main.css would flip box-sizing to content-box and
+   restore browser bullets/padding on the vault/memory lists. */
+.agent-body *, .agent-body *::before, .agent-body *::after { box-sizing: border-box; }
+.agent-body ul, .agent-body ol { margin: 0; padding: 0; list-style: none; }
+
 .agent-body {
   margin: 0;
   padding: 0;
@@ -6,6 +31,8 @@
   background: var(--bg, #060b1e);
   color: var(--text, #e6ecff);
   font-family: var(--font-body, system-ui, sans-serif);
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
   display: flex;
   flex-direction: column;
 }
@@ -135,6 +162,35 @@
   background: var(--panel, rgba(14, 24, 64, 0.7));
   border: 1px solid var(--line, rgba(70, 215, 255, 0.15));
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+  /* Pinned composer (ChatGPT/Gemini-style): the mission input sits at
+     the BOTTOM of the timeline column and stays visible while the
+     execution feed scrolls above it. It used to sit at the top of the
+     column, so the operator had to scroll back up to type the next
+     mission. order: 10 moves it after the feed/result cards in the
+     flex column; sticky bottom pins it to the viewport bottom. Its own
+     background + shadow keep feed text sliding underneath readable.
+     z-index stays below the sticky header (50). */
+  order: 10;
+  position: sticky;
+  bottom: 12px;
+  z-index: 20;
+}
+
+/* Scroll compensation for the pinned composer: scrollIntoView targets
+   (step items, result cards) must stop ABOVE the sticky input card,
+   not at the viewport bottom edge underneath it. The document is the
+   scroller here, so the padding belongs on html — agent.html never
+   loads main.css, whose scroll-padding-top only covers the sticky
+   header on the landing page. Composer height: ~290px desktop (card
+   padding + label + textarea + presets + actions + subtext), ~360px
+   on small phones (44px chips/buttons, stacked actions). */
+html {
+  scroll-padding-top: 84px;
+  scroll-padding-bottom: 360px;
+}
+
+@media (max-width: 480px) {
+  html { scroll-padding-bottom: 420px; }
 }
 
 .agent-input-label {
@@ -262,6 +318,97 @@
 .human-gate__buttons {
   display: flex;
   gap: 12px;
+  flex-wrap: wrap;
+}
+
+/* Task 12: plan preview inside the confirmation gate. Steps are plain
+   text (textContent), so long target names wrap instead of overflowing. */
+.plan-preview {
+  margin: 0 0 14px;
+  padding: 14px 16px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(251, 191, 36, 0.35);
+}
+
+.plan-preview h5 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #fbbf24;
+}
+
+.plan-preview__list {
+  margin: 0 0 8px;
+  padding-left: 20px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #fef3c7;
+  overflow-wrap: anywhere;
+}
+
+.plan-preview__note {
+  margin: 0;
+  font-size: 12px;
+  color: rgba(254, 243, 199, 0.7);
+}
+
+/* Task 12: per-step task timeline (type, status, duration, flags). */
+.agent-timeline-card {
+  margin-top: 16px;
+  padding: 22px;
+  border-radius: 16px;
+  background: var(--panel, rgba(14, 24, 64, 0.7));
+  border: 1px solid var(--line, rgba(70, 215, 255, 0.15));
+}
+
+.task-timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.task-timeline__row {
+  display: grid;
+  grid-template-columns: 44px 1fr auto auto auto;
+  gap: 12px;
+  align-items: center;
+  padding: 10px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.task-timeline__row:first-child {
+  border-top: 0;
+}
+
+.task-timeline__step {
+  font-family: var(--font-display, monospace);
+  opacity: 0.6;
+}
+
+.task-timeline__status--verified {
+  color: #34d399;
+}
+
+.task-timeline__status--failed {
+  color: #f87171;
+}
+
+.task-timeline__status--completed_unverified {
+  color: #fbbf24;
+}
+
+.task-timeline__duration {
+  font-family: var(--font-display, monospace);
+  opacity: 0.75;
+}
+
+.task-timeline__flags {
+  font-size: 12px;
+  opacity: 0.6;
 }
 
 /* Execution Feed */
@@ -643,6 +790,15 @@
 .md-body > :first-child { margin-top: 0; }
 .md-body > :last-child { margin-bottom: 0; }
 .md-body p { margin: 0 0 0.7em; }
+.md-body img.md-product-img {
+  max-width: 180px;
+  max-height: 180px;
+  object-fit: contain;
+  border-radius: 8px;
+  background: rgba(148, 163, 184, 0.12);
+  display: block;
+  margin: 0.4em 0;
+}
 .md-body h1, .md-body h2, .md-body h3,
 .md-body h4, .md-body h5, .md-body h6 {
   margin: 0.9em 0 0.4em;
@@ -1520,3 +1676,74 @@
 .agent-attachment { display: flex; align-items: center; gap: .7rem; margin: .6rem 0 1rem; color: #a8bfda; font-size: .8rem; }
 .agent-attachment input { max-width: 15rem; color: #d8e9f9; font: inherit; }
 .agent-attachment input::file-selector-button { border: 1px solid #2e5c77; border-radius: .55rem; background: #102943; color: #d8f6ff; padding: .4rem .7rem; cursor: pointer; margin-right: .5rem; }
+
+/* Task 12: small-phone layout (~390px). The workspace must reflow with
+   no horizontal scroll, tap targets >= 44px, and no clipped controls.
+   Verified headlessly at 390px and 820px (see docs/UI.md). */
+@media (max-width: 480px) {
+  .agent-timeline {
+    padding: 16px 12px;
+  }
+  .agent-input-card,
+  .agent-feed-card,
+  .agent-timeline-card {
+    padding: 16px 12px;
+  }
+  .agent-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .agent-actions .btn {
+    min-height: 44px;
+    justify-content: center;
+  }
+  .agent-presets {
+    flex-wrap: wrap;
+  }
+  .preset-chip {
+    min-height: 44px;
+  }
+  .human-gate {
+    flex-direction: column;
+    gap: 10px;
+    padding: 16px 12px;
+  }
+  .human-gate__buttons {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .human-gate__buttons .btn {
+    min-height: 44px;
+    justify-content: center;
+  }
+  .plan-preview__list {
+    padding-left: 18px;
+  }
+  .task-timeline__row {
+    grid-template-columns: 36px 1fr auto;
+    grid-template-areas:
+      "step action status"
+      "step duration flags";
+    row-gap: 4px;
+  }
+  .task-timeline__step { grid-area: step; }
+  .task-timeline__action { grid-area: action; }
+  .task-timeline__status { grid-area: status; }
+  .task-timeline__duration { grid-area: duration; }
+  .task-timeline__flags { grid-area: flags; }
+  .agent-step-item__text {
+    overflow-wrap: anywhere;
+  }
+  .agent-result-card__body {
+    overflow-wrap: anywhere;
+  }
+  .comparison-grid {
+    grid-template-columns: 1fr;
+  }
+  .suggested-moves__chips {
+    flex-wrap: wrap;
+  }
+  .suggested-chip {
+    min-height: 44px;
+  }
+}

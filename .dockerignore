@@ -1,0 +1,20 @@
+# Keep secrets and local state out of every image build context.
+.git
+.github
+backend/.env
+backend/*.env
+backend/data/
+backend/venv/
+backend/__pycache__/
+backend/.pytest_cache/
+venv/
+node_modules/
+extension/node_modules/
+extension/dist/
+dist/
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
+.vscode/
+.idea/

@@ -105,3 +105,47 @@ test("renderMarkdown keeps markdown links inert when the scheme is unsafe", () =
   const safe = renderMarkdown("[docs](https://example.com/a)");
   assert.ok(safe.includes('href="https://example.com/a"'), safe);
 });
+
+test("renderMarkdown renders product images and refuses unsafe image URLs", () => {
+  const out = renderMarkdown(
+    "![Samsung Galaxy Fit3 — ₹3,899](https://m.media-amazon.com/images/I/fit3.jpg)"
+  );
+  assert.ok(out.includes('<img src="https://m.media-amazon.com/images/I/fit3.jpg"'), out);
+  assert.ok(out.includes('alt="Samsung Galaxy Fit3 — ₹3,899"'), out);
+  assert.ok(out.includes('class="md-product-img"'), out);
+
+  // An image is not also turned into a link with a stray "!" in front.
+  assert.ok(!out.includes("!"), out);
+
+  // Unsafe image URLs render as inert text, never an <img>.
+  for (const bad of [
+    "![x](javascript:alert(1))",
+    "![x](data:image/png;base64,AAAA)",
+    "![x](https://user:pass@cdn.example.com/x.jpg)",
+  ]) {
+    assert.ok(!renderMarkdown(bad).includes("<img"), bad);
+  }
+
+  // Alt text is escaped like any other attribute value.
+  const quoted = renderMarkdown('![a"b](https://cdn.example.com/x.jpg)');
+  assert.ok(quoted.includes('alt="a&quot;b"'), quoted);
+});
+
+test("renderMarkdown keeps underscores in links intact (no emphasis inside hrefs)", () => {
+  // Frontend flaw-hunt finding 1: the italic regex ran on the built
+  // HTML, so the `_` in target="_blank" paired with the `_` in
+  // my_file_name.pdf and rewrote the href to my<em>file</em>name.pdf.
+  const out = renderMarkdown("[the doc](https://example.com/my_file_name.pdf)");
+  assert.ok(out.includes('href="https://example.com/my_file_name.pdf"'), out);
+  assert.ok(!out.includes("<em>"), out);
+  const bare = renderMarkdown("see https://example.com/a_b_c for details");
+  assert.ok(bare.includes('href="https://example.com/a_b_c"'), bare);
+  assert.ok(!bare.includes("<em>"), bare);
+});
+
+test("renderMarkdown still renders emphasis in plain text", () => {
+  const out = renderMarkdown("This is *very* important and **bold** too, plus _italic_ text.");
+  assert.ok(out.includes("<em>very</em>"), out);
+  assert.ok(out.includes("<strong>bold</strong>"), out);
+  assert.ok(out.includes("<em>italic</em>"), out);
+});

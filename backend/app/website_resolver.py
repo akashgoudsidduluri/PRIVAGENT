@@ -17,6 +17,67 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 
+# Domain suffixes that mark a token as a hostname, never a search
+# keyword. A TLD list, not a site list: "node.js" keeps its ".js"
+# and "v1.2" keeps its version, but "nature.com" is stripped.
+_QUERY_DOMAIN_TLDS = r"(?:com|org|net|io|in|gov|edu|co|uk|ai|dev|app|info|me|tv|co\.in|org\.in|ac\.in|co\.uk|org\.uk|com\.au)"
+_QUERY_DOMAIN_RE = re.compile(
+    rf"\b[\w-]+(?:\.[\w-]+)*\.{_QUERY_DOMAIN_TLDS}\b", re.IGNORECASE
+)
+_QUERY_DOMAIN_WITH_PREP_RE = re.compile(
+    rf"\b(?:on|from|at|via|using)\s+[\w-]+(?:\.[\w-]+)*\.{_QUERY_DOMAIN_TLDS}\b",
+    re.IGNORECASE,
+)
+# References to the request itself, not its subject: "for the whole
+# topic", "on this topic", "the whole topic", "this topic".
+_TOPIC_META_RES = [
+    re.compile(
+        r"\b(?:for|on|about|of|across|throughout)\s+(?:(?:the|this|that)\s+)?(?:(?:whole|entire)\s+)?topic\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:(?:the|this|that)\s+)?(?:whole|entire)\s+topic\b", re.IGNORECASE),
+    re.compile(r"\b(?:the|this|that)\s+topic\b", re.IGNORECASE),
+]
+
+
+def _strip_query_filler(text: str) -> str:
+    """Remove tokens that can never be search keywords from a query:
+    domain names ("on nature.com", "nature.com") and references to
+    the request itself ("for the whole topic", "this topic"). Live
+    case: "research Aditya L1 for the whole topic on nature.com"
+    decomposed to queries[0] == "Aditya L1 for the whole topic on
+    nature.com ..." and discovery templated it verbatim into a
+    garbage nature.com search URL. A query that is only filler comes
+    back empty."""
+    out = text or ""
+    out = _QUERY_DOMAIN_WITH_PREP_RE.sub(" ", out)
+    out = _QUERY_DOMAIN_RE.sub(" ", out)
+    for pat in _TOPIC_META_RES:
+        out = pat.sub(" ", out)
+    # Edge cleanup, repeated until stable: each strip can expose a
+    # new dangling token ("Aditya L1 on and" -> "Aditya L1 on" ->
+    # "Aditya L1"; "and generate" -> ""). Mid-string conjunctions
+    # ("salt and pepper") are untouched.
+    for _ in range(4):
+        prev = out
+        # A trailing deliverable verb left behind when its artifact
+        # was stripped earlier ("and generate" from "... and generate
+        # a PDF report").
+        out = re.sub(
+            r"\s+(?:and\s+)?(?:generate|create|prepare|make|produce|export|build|write)\s*$",
+            "", out, flags=re.IGNORECASE,
+        )
+        out = re.sub(r"^(?:for|on|about|of|in|at|across|throughout|and|also|or)\s+", "", out, flags=re.IGNORECASE)
+        out = re.sub(r"\s+(?:for|on|about|of|in|at|across|throughout|and|also|or)$", "", out, flags=re.IGNORECASE)
+        out = re.sub(r"^(?:the|a|an)\s+", "", out, flags=re.IGNORECASE)
+        out = re.sub(r"\s+", " ", out).strip()
+        if out == prev:
+            break
+    if out.lower() in ("whole", "entire", "and", "also", "or"):
+        return ""
+    return out
+
+
 @dataclass
 class ResolvedWebsite:
     """Outcome of resolving an entity, brand, or query to a canonical website."""
@@ -118,219 +179,61 @@ class DiscoveredSource:
 
 
 # ---------------------------------------------------------------------------
-# Authoritative Known-Domain Registry
+# Known-Domain Directory (Task 8: DATA, not code)
 # ---------------------------------------------------------------------------
+# The registry of well-known public sites lives in known_domains.json next
+# to this module. Adding a site is a data edit, never a code change, and
+# never a behaviour playbook: the agent acts on ANY site via the
+# accessibility tree (Task 7); this directory only maps a name the user
+# spoke ("open X") to that site's canonical URL and verifies official
+# domains. The loader keeps the same in-memory shape, so every caller is
+# unchanged. Entries whose key starts with "_" are file metadata, not sites.
 
-KNOWN_DOMAINS_REGISTRY: dict[str, dict[str, Any]] = {
-    # Search & Knowledge
-    "google": {
-        "name": "Google",
-        "primary_domain": "google.com",
-        "allowed_domains": ["google.com", "google.co.in", "accounts.google.com"],
-        "regional_urls": {
-            "IN": "https://www.google.com",
-            "US": "https://www.google.com",
-            "GLOBAL": "https://www.google.com",
-        },
-        "patterns": [r"\bgoogle(?:\.co\.in|\.com)?\b"],
-        "category": "search",
-    },
-    "wikipedia": {
-        "name": "Wikipedia",
-        "primary_domain": "wikipedia.org",
-        "allowed_domains": ["wikipedia.org", "en.wikipedia.org", "wikimedia.org"],
-        "regional_urls": {
-            "GLOBAL": "https://en.wikipedia.org",
-        },
-        "patterns": [r"\bwikipedia(?:\.org)?\b"],
-        "category": "knowledge",
-    },
-    "arxiv": {
-        "name": "arXiv",
-        "primary_domain": "arxiv.org",
-        "allowed_domains": ["arxiv.org"],
-        "regional_urls": {
-            "GLOBAL": "https://arxiv.org",
-        },
-        "patterns": [r"\barxiv(?:\.org)?\b"],
-        "category": "academic",
-    },
-    "nature": {
-        "name": "Nature",
-        "primary_domain": "nature.com",
-        "allowed_domains": ["nature.com"],
-        "regional_urls": {
-            "GLOBAL": "https://www.nature.com",
-        },
-        "patterns": [r"\bnature(?:\.com)?\b", r"\bnature\s+(?:journal|publishing)\b"],
-        "category": "academic",
-    },
-    "youtube": {
-        "name": "YouTube",
-        "primary_domain": "youtube.com",
-        "allowed_domains": ["youtube.com", "youtu.be"],
-        "regional_urls": {
-            "GLOBAL": "https://www.youtube.com",
-        },
-        "patterns": [r"\byoutube(?:\.com)?\b"],
-        "category": "video",
-    },
-    "github": {
-        "name": "GitHub",
-        "primary_domain": "github.com",
-        "allowed_domains": ["github.com", "raw.githubusercontent.com"],
-        "regional_urls": {
-            "GLOBAL": "https://github.com",
-        },
-        "patterns": [r"\bgithub(?:\.com)?\b"],
-        "category": "code",
-    },
-    "reddit": {
-        "name": "Reddit",
-        "primary_domain": "reddit.com",
-        "allowed_domains": ["reddit.com", "old.reddit.com"],
-        "regional_urls": {
-            "GLOBAL": "https://www.reddit.com",
-        },
-        "patterns": [r"\breddit(?:\.com)?\b"],
-        "category": "social",
-    },
-    "leetcode": {
-        "name": "LeetCode",
-        "primary_domain": "leetcode.com",
-        "allowed_domains": ["leetcode.com"],
-        "regional_urls": {
-            "GLOBAL": "https://leetcode.com",
-        },
-        "patterns": [r"\bleetcode(?:\.com)?\b"],
-        "category": "coding",
-    },
+def _load_known_domains_registry() -> dict[str, dict[str, Any]]:
+    import json
+    from pathlib import Path
 
-    # Email & Communications
-    "gmail": {
-        "name": "Gmail",
-        "primary_domain": "mail.google.com",
-        "allowed_domains": ["mail.google.com", "accounts.google.com", "google.com"],
-        "regional_urls": {
-            "GLOBAL": "https://mail.google.com",
-        },
-        "patterns": [r"\bgmail\b", r"\bgoogle\s+mail\b", r"\bwebmail\b", r"^(?:open\s+)?(?:mail|email|inbox)$", r"\b(?:check|access|view)\s+(?:my\s+)?(?:mail|email|inbox)\b"],
-        "category": "email",
-    },
+    path = Path(__file__).with_name("known_domains.json")
+    with path.open(encoding="utf-8") as fh:
+        raw = json.load(fh)
+    return {k: v for k, v in raw.items() if not k.startswith("_")}
 
-    # Travel & Flights
-    "google_flights": {
-        "name": "Google Flights",
-        "primary_domain": "google.com",
-        "allowed_domains": ["google.com", "google.co.in"],
-        "regional_urls": {
-            "GLOBAL": "https://www.google.com/travel/flights",
-        },
-        "patterns": [r"\bgoogle\s+flights\b", r"\bflights\s+on\s+google\b"],
-        "category": "travel",
-    },
-    "google_hotels": {
-        "name": "Google Hotels",
-        "primary_domain": "google.com",
-        "allowed_domains": ["google.com", "google.co.in"],
-        "regional_urls": {
-            "GLOBAL": "https://www.google.com/travel/hotels",
-        },
-        "patterns": [r"\bgoogle\s+hotels\b", r"\bhotels\s+on\s+google\b"],
-        "category": "travel",
-    },
 
-    # E-Commerce & Retail
-    "amazon": {
-        "name": "Amazon",
-        "primary_domain": "amazon.in",
-        "allowed_domains": ["amazon.in", "amazon.com"],
-        "regional_urls": {
-            "IN": "https://www.amazon.in",
-            "US": "https://www.amazon.com",
-            "GLOBAL": "https://www.amazon.in",
-        },
-        "patterns": [r"\bamazon(?:\.in|\.com)?\b"],
-        "category": "retail",
-    },
-    "flipkart": {
-        "name": "Flipkart",
-        "primary_domain": "flipkart.com",
-        "allowed_domains": ["flipkart.com"],
-        "regional_urls": {
-            "IN": "https://www.flipkart.com",
-            "GLOBAL": "https://www.flipkart.com",
-        },
-        "patterns": [r"\bflipkart(?:\.com)?\b"],
-        "category": "retail",
-    },
-    "samsung": {
-        "name": "Samsung",
-        "primary_domain": "samsung.com",
-        "allowed_domains": ["samsung.com"],
-        "regional_urls": {
-            "IN": "https://www.samsung.com/in/",
-            "US": "https://www.samsung.com/us/",
-            "GLOBAL": "https://www.samsung.com",
-        },
-        "patterns": [r"\bsamsung(?:'s)?(?:\s+official)?\s+(?:store|shop|website|portal)\b", r"\bsamsung\.com\b"],
-        "category": "retail",
-    },
-    "croma": {
-        "name": "Croma",
-        "primary_domain": "croma.com",
-        "allowed_domains": ["croma.com"],
-        "regional_urls": {
-            "IN": "https://www.croma.com",
-            "GLOBAL": "https://www.croma.com",
-        },
-        "patterns": [r"\bcroma(?:\.com)?\b"],
-        "category": "retail",
-    },
-    "reliance_digital": {
-        "name": "Reliance Digital",
-        "primary_domain": "reliancedigital.in",
-        "allowed_domains": ["reliancedigital.in"],
-        "regional_urls": {
-            "IN": "https://www.reliancedigital.in",
-            "GLOBAL": "https://www.reliancedigital.in",
-        },
-        "patterns": [r"\breliance\s+digital\b", r"\breliancedigital(?:\.in)?\b"],
-        "category": "retail",
-    },
-    "best_buy": {
-        "name": "Best Buy",
-        "primary_domain": "bestbuy.com",
-        "allowed_domains": ["bestbuy.com"],
-        "regional_urls": {
-            "US": "https://www.bestbuy.com",
-            "GLOBAL": "https://www.bestbuy.com",
-        },
-        "patterns": [r"\bbest\s*buy(?:\.com)?\b"],
-        "category": "retail",
-    },
-    "walmart": {
-        "name": "Walmart",
-        "primary_domain": "walmart.com",
-        "allowed_domains": ["walmart.com"],
-        "regional_urls": {
-            "US": "https://www.walmart.com",
-            "GLOBAL": "https://www.walmart.com",
-        },
-        "patterns": [r"\bwalmart(?:\.com)?\b"],
-        "category": "retail",
-    },
-    "ebay": {
-        "name": "eBay",
-        "primary_domain": "ebay.com",
-        "allowed_domains": ["ebay.com", "ebay.in"],
-        "regional_urls": {
-            "GLOBAL": "https://www.ebay.com",
-        },
-        "patterns": [r"\bebay(?:\.com)?\b"],
-        "category": "retail",
-    },
-}
+KNOWN_DOMAINS_REGISTRY: dict[str, dict[str, Any]] = _load_known_domains_registry()
+
+
+def _shopping_retailers_for_region(region: str) -> list[dict[str, Any]]:
+    """Registry retailers that serve ``region`` directly.
+
+    A retailer qualifies only when its registry entry carries an
+    explicit regional URL for that region — a GLOBAL fallback does
+    not count, so an Indian shopping task never gets US retailers
+    (bestbuy.com, walmart.com) and vice versa. Returns the entry
+    plus its regional canonical URL and domain. The URL is the
+    retailer's homepage, never a per-retailer search URL: the agent
+    navigates there and searches on the site itself (Task 8 — no
+    baked-in search URLs). This is the shopping analogue of the
+    research hubs (nature.com / arxiv.org / science.org): for a
+    price comparison the retailer IS the primary source, and
+    discovery without it can never return a retailer.
+    """
+    reg = (region or "IN").upper()
+    out: list[dict[str, Any]] = []
+    for key, entry in KNOWN_DOMAINS_REGISTRY.items():
+        if entry.get("category") != "retail":
+            continue
+        regional_urls = entry.get("regional_urls") or {}
+        url = regional_urls.get(reg) or regional_urls.get(reg.lower())
+        if not url:
+            continue
+        try:
+            domain = urllib.parse.urlsplit(url).netloc.lower().replace("www.", "")
+        except Exception:
+            continue
+        if not domain:
+            continue
+        out.append({"key": key, "entry": entry, "url": url, "domain": domain})
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -530,7 +433,7 @@ def _is_ip_safe(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> tuple[bool
     return True, None
 
 
-def is_safe_public_url(url_or_domain: str) -> tuple[bool, Optional[str]]:
+def is_safe_public_url(url_or_domain: str, resolver=None) -> tuple[bool, Optional[str]]:
     """Determine whether a URL or domain target is a safe, publicly reachable destination.
 
     Rejects:
@@ -538,9 +441,20 @@ def is_safe_public_url(url_or_domain: str) -> tuple[bool, Optional[str]]:
     - Embedded credentials in the authority (user:pass@host)
     - Private, loopback, link-local, multicast, or reserved IP addresses
     - Known cloud metadata and internal hostnames (AWS/GCP/Azure metadata)
+
+    ``resolver`` is an injectable DNS lookup with the same call shape
+    as ``socket.getaddrinfo`` (``resolver(host, port, proto=...)``).
+    It defaults to the real resolver, so production SSRF/rebinding
+    behaviour is unchanged. Tests pass a stub that returns a public
+    IP, which makes discovery testable in sandboxes whose DNS returns
+    non-public addresses (e.g. the RFC 2544 benchmarking range
+    198.18.0.0/15) for every hostname — without weakening the check
+    itself. It also makes the rebinding defense testable: a resolver
+    returning 127.0.0.1 must still be rejected.
     """
     if not url_or_domain:
         return False, "Target URL or domain is empty."
+    resolve = resolver or socket.getaddrinfo
 
     target = url_or_domain.strip()
     m_scheme = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*):", target)
@@ -595,7 +509,7 @@ def is_safe_public_url(url_or_domain: str) -> tuple[bool, Optional[str]]:
 
         # DNS resolution and rebinding defense
         try:
-            addr_info = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
+            addr_info = resolve(hostname, None, proto=socket.IPPROTO_TCP)
             for _, _, _, _, sockaddr in addr_info:
                 resolved_ip_str = sockaddr[0]
                 resolved_ip = ipaddress.ip_address(resolved_ip_str)
@@ -609,14 +523,14 @@ def is_safe_public_url(url_or_domain: str) -> tuple[bool, Optional[str]]:
     return True, None
 
 
-def validate_redirect_chain(initial_url: str, redirect_urls: list[str]) -> tuple[bool, Optional[str]]:
+def validate_redirect_chain(initial_url: str, redirect_urls: list[str], resolver=None) -> tuple[bool, Optional[str]]:
     """Validate an entire HTTP redirect chain for SSRF, internal IPs, and scheme downgrades.
 
     Every single hop in the redirect chain must satisfy is_safe_public_url.
     Rejects any hop that attempts to redirect into loopback, private networks, cloud metadata,
     or dangerous protocols.
     """
-    safe_init, init_err = is_safe_public_url(initial_url)
+    safe_init, init_err = is_safe_public_url(initial_url, resolver=resolver)
     if not safe_init:
         return False, f"Initial target rejected: {init_err}"
 
@@ -624,7 +538,7 @@ def validate_redirect_chain(initial_url: str, redirect_urls: list[str]) -> tuple
         return False, f"Redirect chain exceeds maximum permitted hops ({len(redirect_urls)} > 10)."
 
     for idx, hop_url in enumerate(redirect_urls, start=1):
-        safe_hop, hop_err = is_safe_public_url(hop_url)
+        safe_hop, hop_err = is_safe_public_url(hop_url, resolver=resolver)
         if not safe_hop:
             return False, f"Redirect hop {idx} to '{hop_url}' rejected: {hop_err}"
 
@@ -676,9 +590,13 @@ def is_lookalike_or_suspicious(domain: str) -> tuple[bool, Optional[str]]:
 class WebsiteResolver:
     """Enterprise domain resolver, official verifier, and resolution cache."""
 
-    def __init__(self, default_region: str = "IN", cache_ttl: float = 3600.0) -> None:
+    def __init__(self, default_region: str = "IN", cache_ttl: float = 3600.0, resolver=None) -> None:
         self.default_region = default_region
         self.cache_ttl = cache_ttl
+        # Injectable DNS lookup (same call shape as socket.getaddrinfo),
+        # threaded into is_safe_public_url. None = real DNS (production
+        # behaviour unchanged). Tests pass a stub returning public IPs.
+        self._resolver = resolver
         self._memory_cache: dict[tuple[str, str], tuple[ResolvedWebsite, float]] = {}
 
     def resolve(
@@ -722,7 +640,7 @@ class WebsiteResolver:
 
         # 2. Direct URL handling
         if raw.startswith("http://") or raw.startswith("https://") or "://" in raw:
-            is_safe, safe_err = is_safe_public_url(raw)
+            is_safe, safe_err = is_safe_public_url(raw, resolver=self._resolver)
             if not is_safe:
                 resolved = ResolvedWebsite(
                     target_name=raw,
@@ -1044,6 +962,11 @@ class WebsiteResolver:
         clean = re.sub(r"\s+", " ", clean).strip()
         clean = re.sub(r"\s+(?:bro|man|dude|buddy|pal|friend|pls|please|thanks|thank\s+you|for\s+me|as\s+well|too)$", "", clean, flags=re.IGNORECASE).strip()
 
+        # 7b. Strip domain names and topic-meta filler: a domain is
+        # never a search keyword and "this topic" refers to the
+        # request, not its subject (see _strip_query_filler).
+        clean = _strip_query_filler(clean)
+
         # 8. Check context for prior research topic if clean is empty or generic
         prior_topic = None
         if context and isinstance(context, dict):
@@ -1070,6 +993,18 @@ class WebsiteResolver:
                     clean = prior_topic
             else:
                 clean = ""
+        elif len(words) != len(clean.split()):
+            # Deictic words ("this", "that", "it") survived mid-topic:
+            # the filter above only tested emptiness and never rebuilt
+            # clean, so they leaked into the query verbatim. Only
+            # deictics are removed here — content words that happen
+            # to be in generic_terms ("frameworks", "details",
+            # "overview") stay, or "node.js frameworks" would lose
+            # its subject.
+            deictic = {"it", "this", "that", "its", "their", "each", "bro", "man", "dude"}
+            rebuilt = [w for w in clean.split() if w.lower() not in deictic]
+            if rebuilt:
+                clean = " ".join(rebuilt)
 
         if not clean:
             return []
@@ -1078,6 +1013,8 @@ class WebsiteResolver:
         words = clean.split()
         if len(words) > 8:
             clean = " ".join(words[:8])
+            # The cap itself can strand a dangling token ("... and").
+            clean = _strip_query_filler(clean)
 
         queries: list[str] = []
 
@@ -1133,6 +1070,10 @@ class WebsiteResolver:
         seen = set()
         out = []
         for q in queries:
+            # Defence in depth: a subtopic clause can carry the same
+            # filler ("... on nature.com") even when the main topic
+            # was cleaned above.
+            q = _strip_query_filler(q)
             q_norm = q.lower().strip()
             if q_norm and q_norm not in seen:
                 seen.add(q_norm)
@@ -1153,43 +1094,57 @@ class WebsiteResolver:
         visited_domains = set((context or {}).get("visited_domains", []))
         reg_clean = (region or self.default_region).upper()
 
-        # Build candidate pools by category
+        # Build candidate pools by category.
+        #
+        # Task 8: hubs are GENERIC search endpoints, never per-retailer
+        # search URLs. Shopping used to build one search URL per retailer;
+        # that baked a site list into discovery. A shopping query is now
+        # answered by general web search, and the agent opens whichever
+        # retailer the results point at — or the one the user named, via
+        # resolve().
         primary_hubs: list[dict[str, Any]] = []
         if category == "shopping":
             primary_hubs = [
                 {
-                    "domain": "amazon.in" if reg_clean == "IN" else "amazon.com",
-                    "url_template": "https://www.amazon.in/s?k={query}" if reg_clean == "IN" else "https://www.amazon.com/s?k={query}",
-                    "name": "Amazon",
+                    "domain": "google.com",
+                    "url_template": "https://www.google.com/search?q={query}",
+                    "name": "Web Search (Google)",
                     "credibility": 0.95,
                     "suitability": 0.98,
-                    "is_primary": False,
+                    "is_primary": True,
                 },
                 {
-                    "domain": "flipkart.com",
-                    "url_template": "https://www.flipkart.com/search?q={query}",
-                    "name": "Flipkart",
-                    "credibility": 0.92,
-                    "suitability": 0.96,
-                    "is_primary": False,
-                },
-                {
-                    "domain": "croma.com",
-                    "url_template": "https://www.croma.com/searchB?q={query}",
-                    "name": "Croma",
-                    "credibility": 0.88,
+                    "domain": "duckduckgo.com",
+                    "url_template": "https://duckduckgo.com/?q={query}",
+                    "name": "Web Search (DuckDuckGo)",
+                    "credibility": 0.90,
                     "suitability": 0.90,
                     "is_primary": False,
                 },
                 {
-                    "domain": "reliancedigital.in",
-                    "url_template": "https://www.reliancedigital.in/search?q={query}",
-                    "name": "Reliance Digital",
-                    "credibility": 0.87,
-                    "suitability": 0.88,
+                    "domain": "en.wikipedia.org",
+                    "url_template": "https://en.wikipedia.org/wiki/Special:Search?search={query}",
+                    "name": "Wikipedia",
+                    "credibility": 0.92,
+                    "suitability": 0.85,
                     "is_primary": False,
                 },
             ]
+            # Retailers are candidates too, from the registry: for a
+            # price comparison the retailer is the primary source, the
+            # search engine only a starting point. Their URL is the
+            # regional homepage (never a per-retailer search URL —
+            # Task 8), and the region filter keeps Indian tasks on
+            # Indian retailers and US tasks on US ones.
+            for ret in _shopping_retailers_for_region(reg_clean):
+                primary_hubs.append({
+                    "domain": ret["domain"],
+                    "url_template": ret["url"],
+                    "name": ret["entry"].get("name") or ret["key"],
+                    "credibility": 0.93,
+                    "suitability": 0.97,
+                    "is_primary": True,
+                })
         elif category == "software_architecture":
             primary_hubs = [
                 {
@@ -1337,14 +1292,25 @@ class WebsiteResolver:
                     },
                 ]
         elif category == "travel":
+            # Task 8: no per-site travel URL template. Travel is answered
+            # by general web search; the agent opens the travel site the
+            # results (or the user) point at and works it via the AX tree.
             primary_hubs = [
                 {
                     "domain": "google.com",
-                    "url_template": "https://www.google.com/travel/flights?q={query}",
-                    "name": "Google Flights",
+                    "url_template": "https://www.google.com/search?q={query}",
+                    "name": "Web Search — travel",
                     "credibility": 0.95,
                     "suitability": 0.96,
                     "is_primary": True,
+                },
+                {
+                    "domain": "duckduckgo.com",
+                    "url_template": "https://duckduckgo.com/?q={query}",
+                    "name": "Web Search (DuckDuckGo)",
+                    "credibility": 0.90,
+                    "suitability": 0.90,
+                    "is_primary": False,
                 },
             ]
         else:
@@ -1369,7 +1335,13 @@ class WebsiteResolver:
 
         # Generate candidates from queries across candidate hubs
         seen_domains: set[str] = set()
-        primary_query = queries[0] if queries else "research"
+        # Gate: a query that is only filler ("whole on this topic")
+        # must never be templated into a hub search URL. Decomposition
+        # normally strips it; this is the backstop for callers that
+        # pass raw instruction words.
+        primary_query = _strip_query_filler(queries[0]) if queries else ""
+        if not primary_query:
+            primary_query = "research"
 
         for hub in primary_hubs:
             dom = hub["domain"]
@@ -1377,7 +1349,7 @@ class WebsiteResolver:
             target_url = hub["url_template"].format(query=q_encoded)
 
             # SSRF and private IP check
-            is_safe, safe_err = is_safe_public_url(dom)
+            is_safe, safe_err = is_safe_public_url(dom, resolver=self._resolver)
             if not is_safe:
                 if provenance_log is not None:
                     provenance_log.append({
@@ -1524,7 +1496,7 @@ class WebsiteResolver:
 
         # SCENARIO B: User did NOT specify a website -> Autonomous Discovery
         clean_inst = instruction.lower()
-        if any(w in clean_inst for w in ("laptop", "iphone", "phone", "price", "buy", "shop", "cheapest", "under ₹", "under rs", "under $", "samsung", "smartphone")):
+        if any(w in clean_inst for w in ("laptop", "iphone", "phone", "price", "buy", "shop", "cheapest", "under ₹", "under rs", "under $", "smartphone")):
             category = "shopping"
         elif any(w in clean_inst for w in ("flight", "hotel", "travel", "ticket", "train")):
             category = "travel"

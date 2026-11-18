@@ -529,3 +529,181 @@ async def test_dedicated_chat_binding_and_custom_topic_alerts(email_db, mailbox,
     alert_texts = [msg["content"] for msg in msgs]
     assert any("Important Email Alert" in txt for txt in alert_texts)
 
+
+
+# ==============================================================================
+# 8. Stated schedule + explicit delete authorization + urgent keyword
+#    (SIH review demo item 3: 60-minute sweep, trash promos, notify urgent)
+# ==============================================================================
+
+def test_parse_frequency_seconds():
+    from app.email_intelligence.mission_setup import parse_frequency_seconds
+
+    assert parse_frequency_seconds("scan email for every 60 minutes") == 3600
+    assert parse_frequency_seconds("check every 2 hours") == 7200
+    assert parse_frequency_seconds("every 90 minutes") == 5400
+    assert parse_frequency_seconds("every 30 seconds") == 60  # clamped to the 60s floor
+    assert parse_frequency_seconds("monitor my inbox") is None
+
+
+def test_explicit_delete_directive():
+    from app.email_intelligence.mission_setup import has_explicit_delete_directive
+
+    assert has_explicit_delete_directive("if u find any unnecessary promotion emails delete them") is True
+    assert has_explicit_delete_directive("trash promotional emails") is True
+    assert has_explicit_delete_directive("move them to trash") is True
+    # "remove" is ambiguous (remove from attention / flag) — setup stays
+    # dry-run until a separate authorization, as the original design holds.
+    assert has_explicit_delete_directive("Continuously scan my emails. Identify unnecessary emails and remove them.") is False
+    assert has_explicit_delete_directive("don't delete anything, just flag it") is False
+    assert has_explicit_delete_directive("monitor my inbox and notify me") is False
+
+
+@pytest.mark.asyncio
+async def test_sixty_minute_sweep_deletes_promos_notifies_urgent(email_db, mailbox, monkeypatch):
+    """The user's exact instruction, run against the demo sandbox mailbox.
+
+    Before this, the setup ignored the stated frequency (always 5 min),
+    ignored an explicit 'delete them' (always dry-run), and 'urgent' was
+    not a notification keyword — so the sweep never did what was asked.
+    """
+    from app.email_intelligence import sync_engine
+    monkeypatch.setattr(sync_engine, "_demo_mailbox", mailbox)
+
+    instruction = (
+        "scan email for every 60 minutes if u find any unnesary promotion "
+        "emails delete them, if u find any urgent mails then notify me"
+    )
+    assert is_email_mission_setup_instruction(instruction) is True
+
+    summary = await handle_email_intelligence_instruction(
+        instruction + " using demo sandbox",
+        chat_id=db.create_chat("Gmail sweep demo", db_path=email_db)["id"],
+        db_path=email_db,
+    )
+    assert "Autonomous Email Intelligence Mission Configured" in summary
+    assert "Every 60 minutes (3600 seconds)" in summary
+    assert "AUTONOMOUS CLEANUP ACTIVE" in summary
+
+    missions = db.list_email_missions(db_path=email_db)
+    assert len(missions) == 1
+    m = missions[0]
+    assert m["frequency_seconds"] == 3600
+    assert m["policy_authorized"] == 1
+    assert m["dry_run"] == 0
+    assert "urgent" in (m.get("notification_policy") or {}).get("custom_keywords", [])
+
+    # The setup already ran the first tick. Promo mail is in Trash, the
+    # urgent mail produced a chat notification, the protected bank OTP
+    # is untouched.
+    trash = db.get_email_classifications(m["id"], action_taken="moved_to_trash", db_path=email_db)
+    assert any("Mega Electronics Sale" in (c.get("subject") or "") for c in trash)
+    notifs = db.get_email_notifications(m["id"], db_path=email_db)
+    assert any("Urgent: Project handover" in (n.get("subject") or "") for n in notifs)
+    bank = [c for c in db.get_email_classifications(m["id"], db_path=email_db)
+            if "HDFC Bank Alert" in (c.get("subject") or "")]
+    assert bank and all(c.get("action_taken") != "moved_to_trash" for c in bank)
+
+
+# --- Backend flaw-hunt finding 5: cleanup "verification" was vacuous. ---
+# The trash call's own truthy return made verified=True even when the
+# read-back showed the message was NOT in Trash, and a failed
+# read-back was claimed verified ("Provider accepted HTTP POST").
+# Only the provider-side read-back may verify a trash/restore.
+
+class _LyingTrashConnector:
+    """Reports a successful trash/untrash while the message never
+    moves: get_message keeps returning the caller's chosen state."""
+
+    def __init__(self, label_ids=None, fail_readback=False):
+        self._label_ids = list(label_ids) if label_ids is not None else ["INBOX"]
+        self._fail_readback = fail_readback
+
+    def trash_message(self, message_id):
+        return {"id": message_id}  # truthy: the POST was accepted
+
+    def untrash_message(self, message_id):
+        return {"id": message_id}
+
+    def get_message(self, message_id):
+        if self._fail_readback:
+            raise RuntimeError("read-back unavailable")
+        return {"id": message_id, "labelIds": list(self._label_ids)}
+
+
+def _authorized_mission(email_db):
+    mission = db.create_email_mission(
+        account_email="tester.privagent@gmail.com", db_path=email_db)
+    db.update_email_mission(mission["id"], {"policy_authorized": 1, "dry_run": 0}, db_path=email_db)
+    return db.get_email_mission(mission["id"], db_path=email_db)
+
+
+def test_trash_not_verified_when_readback_shows_inbox(email_db, mailbox):
+    mission = _authorized_mission(email_db)
+    items = {item.id: item for item in mailbox.to_email_items()}
+    promo_item = items["msg_01_promo"]
+    decision = evaluate_and_execute_cleanup(
+        mission, promo_item, classify_email(promo_item),
+        _LyingTrashConnector(["INBOX"]), db_path=email_db)
+    assert decision.action == "moved_to_trash"
+    assert decision.verified is False
+    logs = db.get_email_audit_logs(mission["id"], db_path=email_db)
+    trash_log = next(entry for entry in logs if entry["action"] == "moved_to_trash")
+    assert trash_log["details"]["verified"] is False
+
+
+def test_trash_not_verified_when_readback_fails(email_db, mailbox):
+    mission = _authorized_mission(email_db)
+    items = {item.id: item for item in mailbox.to_email_items()}
+    promo_item = items["msg_01_promo"]
+    decision = evaluate_and_execute_cleanup(
+        mission, promo_item, classify_email(promo_item),
+        _LyingTrashConnector(fail_readback=True), db_path=email_db)
+    assert decision.action == "moved_to_trash"
+    assert decision.verified is False
+
+
+def test_restore_not_verified_when_still_in_trash(email_db, mailbox):
+    client = mailbox.make_mock_client()
+    connector = GmailConnector("demo-token", client=client)
+    mission = _authorized_mission(email_db)
+    items = {item.id: item for item in mailbox.to_email_items()}
+    promo_item = items["msg_01_promo"]
+    evaluate_and_execute_cleanup(mission, promo_item, classify_email(promo_item), connector, db_path=email_db)
+    assert "TRASH" in connector.get_message("msg_01_promo").get("labelIds", [])
+    res = restore_email_from_trash(
+        mission["id"], "msg_01_promo", _LyingTrashConnector(["TRASH", "INBOX"]), db_path=email_db)
+    assert res["ok"] is True
+    assert res["verified"] is False
+
+
+# --- Backend flaw-hunt finding 6: the tick silently substituted ---
+# --- the demo mailbox for a real account with no live OAuth. ---
+
+@pytest.mark.asyncio
+async def test_tick_for_real_account_without_oauth_fails_honestly(email_db):
+    """contester@gmail.com contains 'tester' but is a real account:
+    with no live OAuth the tick must fail honestly, not 'succeed'
+    against the demo mailbox."""
+    mission = db.create_email_mission(account_email="contester@gmail.com", db_path=email_db)
+    result = await run_email_mission_tick(mission["id"], db_path=email_db)
+    assert result["status"] == "error"
+    assert "contester@gmail.com" in result["reason"]
+    assert "not connected" in result["reason"]
+    stats = db.get_email_dashboard_stats(mission["id"], db_path=email_db)
+    assert stats["total_processed"] == 0
+    logs = db.get_email_audit_logs(mission["id"], db_path=email_db)
+    assert any(entry["action"] == "sync_failed" for entry in logs)
+    assert not any(entry["action"] == "sync_completed" for entry in logs)
+
+
+@pytest.mark.asyncio
+async def test_demo_account_still_uses_sandbox(email_db, mailbox, monkeypatch):
+    """Guard against over-correction: the exact demo address still
+    runs against the controlled mailbox."""
+    from app.email_intelligence import sync_engine
+    monkeypatch.setattr(sync_engine, "_demo_mailbox", mailbox)
+    mission = db.create_email_mission(account_email="demo.privagent@gmail.com", db_path=email_db)
+    result = await run_email_mission_tick(mission["id"], db_path=email_db)
+    assert result["status"] == "success"
+    assert result["mode"] == "sandbox"
