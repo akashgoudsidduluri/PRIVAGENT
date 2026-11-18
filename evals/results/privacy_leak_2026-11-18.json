@@ -1,0 +1,253 @@
+{
+  "suite": "privacy_leak",
+  "fixture": "backend/tests/fixtures/pii_cases.json",
+  "definition": "leak = the exact synthetic PII token string appears in the planner prompt after classify_and_redact + build_prompt",
+  "n_total": 24,
+  "leaked": 5,
+  "leak_rate": 0.2083,
+  "by_type": {
+    "api_key": {
+      "n": 2,
+      "leaked": 0,
+      "leak_rate": 0.0
+    },
+    "aws_key": {
+      "n": 1,
+      "leaked": 0,
+      "leak_rate": 0.0
+    },
+    "bare_key": {
+      "n": 1,
+      "leaked": 0,
+      "leak_rate": 0.0
+    },
+    "bare_otp": {
+      "n": 2,
+      "leaked": 2,
+      "leak_rate": 1.0
+    },
+    "bare_password": {
+      "n": 1,
+      "leaked": 1,
+      "leak_rate": 1.0
+    },
+    "credit_card": {
+      "n": 3,
+      "leaked": 0,
+      "leak_rate": 0.0
+    },
+    "email": {
+      "n": 2,
+      "leaked": 0,
+      "leak_rate": 0.0
+    },
+    "jwt": {
+      "n": 1,
+      "leaked": 0,
+      "leak_rate": 0.0
+    },
+    "labelled_password": {
+      "n": 1,
+      "leaked": 0,
+      "leak_rate": 0.0
+    },
+    "labelled_token": {
+      "n": 1,
+      "leaked": 0,
+      "leak_rate": 0.0
+    },
+    "otp_labelled": {
+      "n": 1,
+      "leaked": 1,
+      "leak_rate": 1.0
+    },
+    "phone": {
+      "n": 3,
+      "leaked": 0,
+      "leak_rate": 0.0
+    },
+    "postal_address": {
+      "n": 1,
+      "leaked": 1,
+      "leak_rate": 1.0
+    },
+    "private_key": {
+      "n": 1,
+      "leaked": 0,
+      "leak_rate": 0.0
+    },
+    "slack_token": {
+      "n": 1,
+      "leaked": 0,
+      "leak_rate": 0.0
+    },
+    "ssn": {
+      "n": 1,
+      "leaked": 0,
+      "leak_rate": 0.0
+    },
+    "url_token": {
+      "n": 1,
+      "leaked": 0,
+      "leak_rate": 0.0
+    }
+  },
+  "by_context": {
+    "element_value": {
+      "n": 5,
+      "leaked": 1,
+      "leak_rate": 0.2
+    },
+    "page_text": {
+      "n": 19,
+      "leaked": 4,
+      "leak_rate": 0.2105
+    }
+  },
+  "cases": [
+    {
+      "id": "pii-email-01",
+      "type": "email",
+      "context": "page_text",
+      "leaked": false
+    },
+    {
+      "id": "pii-phone-01",
+      "type": "phone",
+      "context": "page_text",
+      "leaked": false
+    },
+    {
+      "id": "pii-phone-02",
+      "type": "phone",
+      "context": "page_text",
+      "leaked": false
+    },
+    {
+      "id": "pii-card-01",
+      "type": "credit_card",
+      "context": "page_text",
+      "leaked": false
+    },
+    {
+      "id": "pii-card-02",
+      "type": "credit_card",
+      "context": "page_text",
+      "leaked": false
+    },
+    {
+      "id": "pii-ssn-01",
+      "type": "ssn",
+      "context": "page_text",
+      "leaked": false
+    },
+    {
+      "id": "pii-apikey-01",
+      "type": "api_key",
+      "context": "page_text",
+      "leaked": false
+    },
+    {
+      "id": "pii-apikey-02",
+      "type": "api_key",
+      "context": "page_text",
+      "leaked": false
+    },
+    {
+      "id": "pii-jwt-01",
+      "type": "jwt",
+      "context": "page_text",
+      "leaked": false
+    },
+    {
+      "id": "pii-aws-01",
+      "type": "aws_key",
+      "context": "page_text",
+      "leaked": false
+    },
+    {
+      "id": "pii-slack-01",
+      "type": "slack_token",
+      "context": "page_text",
+      "leaked": false
+    },
+    {
+      "id": "pii-privkey-01",
+      "type": "private_key",
+      "context": "page_text",
+      "leaked": false
+    },
+    {
+      "id": "pii-pwlabel-01",
+      "type": "labelled_password",
+      "context": "page_text",
+      "leaked": false
+    },
+    {
+      "id": "pii-tokenlabel-01",
+      "type": "labelled_token",
+      "context": "page_text",
+      "leaked": false
+    },
+    {
+      "id": "pii-otp-01",
+      "type": "bare_otp",
+      "context": "page_text",
+      "leaked": true
+    },
+    {
+      "id": "pii-otp-02",
+      "type": "otp_labelled",
+      "context": "page_text",
+      "leaked": true
+    },
+    {
+      "id": "pii-pwbare-01",
+      "type": "bare_password",
+      "context": "page_text",
+      "leaked": true
+    },
+    {
+      "id": "pii-urltoken-01",
+      "type": "url_token",
+      "context": "page_text",
+      "leaked": false
+    },
+    {
+      "id": "pii-address-01",
+      "type": "postal_address",
+      "context": "page_text",
+      "leaked": true
+    },
+    {
+      "id": "pii-el-phone-01",
+      "type": "phone",
+      "context": "element_value",
+      "leaked": false
+    },
+    {
+      "id": "pii-el-otp-01",
+      "type": "bare_otp",
+      "context": "element_value",
+      "leaked": true
+    },
+    {
+      "id": "pii-el-email-01",
+      "type": "email",
+      "context": "element_value",
+      "leaked": false
+    },
+    {
+      "id": "pii-el-card-01",
+      "type": "credit_card",
+      "context": "element_value",
+      "leaked": false
+    },
+    {
+      "id": "pii-el-barekey-01",
+      "type": "bare_key",
+      "context": "element_value",
+      "leaked": false
+    }
+  ]
+}

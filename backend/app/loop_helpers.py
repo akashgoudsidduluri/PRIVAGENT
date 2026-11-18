@@ -87,6 +87,7 @@ CANONICAL_FORMAT_MAP: dict[str, str] = {
     "ppt": "pptx",
     "powerpoint": "pptx",
     "excel": "xlsx",
+    "xcel": "xlsx",
     "spreadsheet": "xlsx",
     "workbook": "xlsx",
     "word": "docx",

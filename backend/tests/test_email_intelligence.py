@@ -707,3 +707,51 @@ async def test_demo_account_still_uses_sandbox(email_db, mailbox, monkeypatch):
     result = await run_email_mission_tick(mission["id"], db_path=email_db)
     assert result["status"] == "success"
     assert result["mode"] == "sandbox"
+
+
+def test_custom_topic_extraction_strips_sentence_punctuation():
+    """A topic taken from the end of a sentence must not keep the
+    sentence's full stop: 'notify me about urgent ones.' yielded the
+    topic 'urgent ones.' (with the period), which is sloppy in the
+    confirmation and never matches an email subject."""
+    from app.email_intelligence.mission_setup import extract_custom_topics
+
+    assert extract_custom_topics(
+        "Scan my inbox every 60 minutes, delete promo emails, and notify me about urgent ones."
+    ) == ["urgent ones"]
+    assert extract_custom_topics("Alert me about interviews, please.") == ["interviews"]
+    assert extract_custom_topics("Monitor my email for internships and jobs.") == [
+        "internships",
+        "jobs",
+    ]
+
+
+def test_custom_topic_extraction_rejects_compound_calendar_clause():
+    """The combined email+calendar test yielded the topic "it tomorrow
+    at 10am with a": extract_custom_topics matched "for" in the
+    calendar clause ("create a Google Calendar event for it tomorrow
+    at 10am with a reminder") and "remind" matched inside "reminder",
+    stopping the capture mid-word. A topic is a short noun phrase; a
+    pronoun, a time, a digit, or a reminder clause is not one."""
+    from app.email_intelligence.mission_setup import (
+        _is_plausible_topic,
+        extract_custom_topics,
+    )
+
+    assert extract_custom_topics(
+        "Monitor my email using demo sandbox, find the Microsoft interview "
+        "invitation, and create a Google Calendar event for it tomorrow at "
+        "10am with a reminder 3 days before."
+    ) == []
+    assert extract_custom_topics("Monitor my email for it tomorrow at 10am.") == []
+    # Stored garbage from a previous run is not plausible either, so a
+    # re-configuration drops it instead of carrying it forward.
+    assert not _is_plausible_topic("it tomorrow at 10am with a")
+    # Legitimate topics still extract.
+    assert _is_plausible_topic("urgent ones")
+    assert _is_plausible_topic("internships")
+    assert extract_custom_topics("Monitor my email for internships and jobs.") == [
+        "internships",
+        "jobs",
+    ]
+    assert extract_custom_topics("Alert me about interviews, please.") == ["interviews"]

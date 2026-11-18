@@ -3,7 +3,8 @@
 The numbers come from a real run of ``backend/scripts/eval_live.py``
 (2026-11-16, mock provider, offline) against
 ``backend/tests/fixtures/pii_cases.json``: 24 synthetic PII tokens,
-6 leaked into the planner prompt — leak rate 0.25.
+6 leaked into the planner prompt — leak rate 0.25. Re-measured
+2026-11-18 after the phone fix: 5 leaked — leak rate 0.2083.
 
 A leak = the exact token string survives ``classify_and_redact`` +
 ``build_prompt``. The fixture is split in two, and the split is the
@@ -12,18 +13,15 @@ point of the test:
 * ``PATTERN_COVERED`` — PII types the redactor's pattern set claims to
   handle (email, card, SSN, API keys, JWT, AWS, Slack, private key,
   labelled secrets, URL tokens, bare high-entropy tokens in element
-  values). These MUST NOT leak: the test asserts a zero leak rate
-  here. This is the fail-closed property.
+  values, phone numbers). These MUST NOT leak: the test asserts a zero
+  leak rate here. This is the fail-closed property.
 * ``KNOWN_GAPS`` — types the redactor does not cover today, measured
   leaking: bare 6-digit OTPs (no pattern matches a bare short code),
-  unlabelled passwords, postal addresses, and phone numbers in
-  *element values* (page-text phones are caught by
-  ``scrub_persistent`` inside ``cleanse_untrusted``; element values
-  only pass through ``_redact_text``, which has no phone pattern).
-  These are asserted to be *reported* with a leak-rate ceiling
-  (overall <= 0.27, i.e. at most the 6 measured leaks) — a fix may
-  close a gap (the test then needs updating deliberately, with the
-  docs), but leaks may not silently grow.
+  unlabelled passwords, and postal addresses. These are asserted to
+  be *reported* with a leak-rate ceiling (overall <= 0.27, i.e. at
+  most the 6 measured leaks) — a fix may close a gap (the test then
+  needs updating deliberately, with the docs), but leaks may not
+  silently grow.
 
 Closed 2026-11-18: a bare high-entropy token (24+ chars, two
 character classes) in an *element value* is now dropped by
@@ -32,7 +30,16 @@ in free page text is still a known non-goal: it is indistinguishable
 from a git SHA, an MD5 checksum, or a record ID, so redacting it
 there would mangle legitimate pages.
 
-If the committed results JSON (``evals/results/privacy_leak_2026-11-16.json``)
+Closed 2026-11-18: phone numbers. ``PATTERNS`` had no phone pattern,
+so a phone in a ``tel:`` href, in free text, or in an element name
+passed through unredacted (``pii-el-phone-01`` leaked). The fix adds
+a ``phone`` pattern (country-code, grouped, and bare Indian mobile
+forms) and makes ``redact_url`` return ``tel:[REDACTED]`` / 
+``sms:[REDACTED]`` — a tel:/sms: URL exists only to carry a number.
+Phone leak rate is now 0.0 (3/3 cases caught). Re-measured results
+are in ``evals/results/privacy_leak_2026-11-18.json`` (5/24, 0.2083).
+
+If the committed results JSON (``evals/results/privacy_leak_2026-11-18.json``)
 is present, its summary must match a fresh run.
 """
 from __future__ import annotations
@@ -42,22 +49,23 @@ from pathlib import Path
 
 from scripts.eval_live import run_privacy_leak
 
-RESULTS_PATH = Path(__file__).resolve().parents[1].parent / "evals" / "results" / "privacy_leak_2026-11-16.json"
+RESULTS_PATH = Path(__file__).resolve().parents[1].parent / "evals" / "results" / "privacy_leak_2026-11-18.json"
 
 PATTERN_COVERED = {
     "email", "credit_card", "ssn", "api_key", "jwt", "aws_key",
     "slack_token", "private_key", "labelled_password", "labelled_token",
-    "url_token", "bare_key",
+    "url_token", "bare_key", "phone",
 }
 
 # (type, context) pairs measured leaking on 2026-11-16, with the reason.
+# Phone was here until 2026-11-18; the phone pattern + tel:/sms: URL
+# redaction closed it (re-measured 5/24, 0.2083).
 KNOWN_GAPS = {
     ("bare_otp", "page_text"): "no pattern matches a bare 6-digit code",
     ("bare_otp", "element_value"): "element values only pass _redact_text (no OTP pattern)",
     ("otp_labelled", "page_text"): "sensitive_kv needs an 8+ char value; a 6-digit OTP is shorter",
     ("bare_password", "page_text"): "unlabelled password has no pattern to match",
     ("postal_address", "page_text"): "street addresses are not in the pattern set",
-    ("phone", "element_value"): "_redact_text has no phone pattern (page text is saved by scrub_persistent)",
 }
 
 
@@ -89,7 +97,7 @@ def test_known_gaps_are_reported_and_bounded():
     below the measured 0.2609 (ceiling 0.27), and every known gap is
     present in the results with its leaked status recorded."""
     result = run_privacy_leak()
-    assert result["leak_rate"] <= 0.27  # measured 0.25 (6/24)
+    assert result["leak_rate"] <= 0.27  # measured 0.2083 (5/24) after the phone fix; was 0.25 (6/24)
     by_key = {(r["type"], r["context"]): r for r in result["cases"]}
     for (pii_type, context), _reason in KNOWN_GAPS.items():
         assert (pii_type, context) in by_key

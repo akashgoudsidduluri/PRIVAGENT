@@ -20,19 +20,70 @@ SETUP_TRIGGER = re.compile(
 )
 
 
+# Words that mark a capture as a clause, not a topic: a pronoun or
+# determiner at the start ("for it"), a time expression ("tomorrow at
+# 10am"), a reminder ("with a reminder"), a calendar word, or a verb
+# ("create a ... event"). A topic is a short noun phrase
+# ("internships", "job offers", "SDE internships").
+_PRONOUN_START_RE = re.compile(
+    r"^(?:it|this|that|these|those|the|a|an|my|your|his|her|their|our|them|us|me)\b",
+    re.IGNORECASE,
+)
+_TIME_WORD_RE = re.compile(
+    r"\b(?:today|tomorrow|yesterday|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next|last)\b|\b\d",
+    re.IGNORECASE,
+)
+_CLAUSE_WORD_RE = re.compile(
+    r"\b(?:remind|reminder|calendar|event|create|monitor|scan|find|check|add|book|schedule|send|delete)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_plausible_topic(p: str) -> bool:
+    """True when a candidate string looks like an email alert topic.
+
+    Guards the extractor against a compound instruction's second half:
+    \"create a Google Calendar event for it tomorrow at 10am with a
+    reminder 3 days before\" used to yield the topic \"it tomorrow at
+    10am with a\" — the \"for\" introducer plus \"remind\" matching inside
+    \"reminder\". A topic is a short noun phrase; a pronoun, a time, a
+    digit, a reminder, or a clause verb means the capture is not one.
+    """
+    t = (p or "").strip().lower()
+    if len(t) <= 2 or len(t.split()) > 4:
+        return False
+    if _PRONOUN_START_RE.search(t):
+        return False
+    if _TIME_WORD_RE.search(t):
+        return False
+    if _CLAUSE_WORD_RE.search(t):
+        return False
+    return True
+
+
 def extract_custom_topics(text: str) -> list[str]:
     """Extract requested custom alert topics from the prompt (e.g. internships, jobs)."""
-    m = re.search(r"\b(?:rel+ated\s+to|about|for|regarding|concerning|on)\s+(.+?)(?:\s+(?:notify|alert|remind|then|please)|$)", text, re.IGNORECASE)
+    # The terminator words are whole words: without the trailing \b,
+    # "remind" matches inside "reminder" and the capture stops mid-word
+    # ("for it tomorrow at 10am with a reminder" -> "it tomorrow at
+    # 10am with a"). A capture that still looks like a clause is
+    # dropped by _is_plausible_topic below.
+    m = re.search(r"\b(?:rel+ated\s+to|about|for|regarding|concerning|on)\s+(.+?)(?:\s+(?:notify|alert|remind|then|please)\b|$)", text, re.IGNORECASE)
     if m:
         raw = m.group(1).strip()
         parts = re.split(r"\s*(?:,|and|\bor\b)\s*", raw)
         clean = []
         for p in parts:
-            p_clean = p.strip().lower()
+            # Strip trailing sentence punctuation: "notify me about
+            # urgent ones." must yield "urgent ones", not "urgent ones."
+            p_clean = p.strip().lower().strip(".,;:!?\"'").strip()
+            if p_clean in ("one", "ones"):
+                continue
             if len(p_clean) > 2 and p_clean not in ("mail", "email", "emails", "inbox", "important", "imp"):
                 if ("inter" in p_clean and "ship" in p_clean) or "interh" in p_clean:
                     p_clean = "internships"
-                clean.append(p_clean)
+                if _is_plausible_topic(p_clean):
+                    clean.append(p_clean)
         return clean
     return []
 
@@ -211,7 +262,11 @@ async def handle_email_intelligence_instruction(
         mission_id = existing_mission["id"]
         prev_pol = existing_mission.get("notification_policy") or {}
         prev_kws = prev_pol.get("custom_keywords") or []
-        combined_kws = list(dict.fromkeys(prev_kws + custom_topics))
+        # Re-validating the stored keywords drops garbage a previous
+        # run stored (e.g. "it tomorrow at 10am with a" from a
+        # compound instruction's calendar clause) instead of carrying
+        # it forward forever.
+        combined_kws = list(dict.fromkeys([k for k in prev_kws if _is_plausible_topic(k)] + custom_topics))
         base_notif["custom_keywords"] = combined_kws
 
         _update_fields: dict[str, Any] = {

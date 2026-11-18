@@ -3008,7 +3008,11 @@ async def run_task(task_id: str) -> None:
                 handle_email_intelligence_instruction,
             )
             from .email_intelligence.companion_queries import is_email_companion_query
-            from .connectors.calendar_companion import is_calendar_query, handle_calendar_instruction
+            from .connectors.calendar_companion import (
+                is_calendar_query,
+                handle_calendar_instruction,
+                handle_compound_calendar,
+            )
 
             from .continuous_monitoring_companion import (
                 is_continuous_monitoring_directive,
@@ -3027,6 +3031,17 @@ async def run_task(task_id: str) -> None:
 
             if is_email_mission_setup_instruction(record.instruction) or is_email_companion_query(record.instruction):
                 answer = await handle_email_intelligence_instruction(record.instruction, chat_id=chat_id)
+                # Compound: the same instruction may also ask for a
+                # calendar event ("...find the Microsoft interview
+                # invitation, and create a calendar event for it...").
+                # The email handler consumes the whole instruction, so
+                # without this the calendar half vanishes silently —
+                # no event, no message, nothing. Only for a mission
+                # setup, not a pure companion query.
+                if is_email_mission_setup_instruction(record.instruction):
+                    cal_section = await handle_compound_calendar(record.instruction, chat_id=chat_id)
+                    if cal_section:
+                        answer = f"{answer}\n\n---\n\n{cal_section}"
             elif is_calendar_query(record.instruction):
                 answer = await handle_calendar_instruction(record.instruction, chat_id=chat_id)
             elif is_continuous_monitoring_directive(
@@ -3055,9 +3070,39 @@ async def run_task(task_id: str) -> None:
             else:
                 provider = _provider_for_config()
                 history = initial_memory.get("conversation_history", [])
+                # Recall: the operator's stored facts must reach the
+                # conversational path too. The browser path gets them via
+                # working_memory, but chat_call only received the
+                # instruction and history — so a recall question ("do you
+                # remember my preferred language?") could never be
+                # answered from memory. Append the recalled facts (and
+                # preferences) to the system prompt; the model is told
+                # to say it does not remember when the fact is absent,
+                # never to invent one.
+                sys_prompt = None
+                mem_lines: list[str] = []
+                prefs = initial_memory.get("user_preferences") or {}
+                if prefs:
+                    mem_lines.append(f"Operator preferences: {json.dumps(prefs)}")
+                facts = initial_memory.get("semantic_facts") or []
+                if facts:
+                    mem_lines.append("Facts the operator asked you to remember:")
+                    for f in facts:
+                        mem_lines.append(
+                            f"- {f.get('category', '')}: {f.get('key', '')} = {f.get('value', '')}"
+                        )
+                if mem_lines:
+                    from .capabilities import SYSTEM_CAPABILITY_PROMPT
+
+                    sys_prompt = (
+                        SYSTEM_CAPABILITY_PROMPT
+                        + "\n\n<remembered-facts (operator-stated, trusted)>\n"
+                        + "\n".join(mem_lines)
+                        + "\nAnswer recall questions from these facts. If the fact is not listed, say you do not remember it — do not invent one.\n</remembered-facts>"
+                    )
                 if hasattr(provider, "chat_call"):
                     try:
-                        answer = provider.chat_call(record.instruction, history=history)
+                        answer = provider.chat_call(record.instruction, history=history, system_prompt=sys_prompt)
                     except Exception:
                         from .providers.mock import MockProvider
                         answer = MockProvider().chat_call(record.instruction, history=history)

@@ -135,6 +135,21 @@ PATTERNS = {
     "slack_token": re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
     "private_key": re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     "email": re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"),
+    # Phone numbers. A phone is PII: it must never reach the planner or
+    # the cloud. The country-code branches REQUIRE the "+" (or a
+    # separator after the code) — a bare 11-13 digit run is an order
+    # ID or a UUID tail, not a phone. The bare-10-digit branch is
+    # scoped to mobiles (area code 2-9); the planner never needs the
+    # digits (only that a phone exists). The credit-card pattern above
+    # already covers 13-16 digit runs, so this does not overlap it.
+    "phone": re.compile(
+        r"\+\d{1,3}[\s\-]?\d{5}[\s\-]\d{5}"          # +91 98765 43210
+        r"|\+\d{1,3}\d{10}\b"                        # +919876543210
+        r"|\b\d{1,3}[\s\-]\d{5}[\s\-]\d{5}\b"        # 91 98765 43210
+        r"|\(?\d{3}\)?[\s\-]\d{3}[\s\-]\d{4}"        # (555) 123-4567
+        r"|\b\d{5}[\s\-]\d{5}\b"                     # 98765 43210
+        r"|\b[2-9]\d{9}\b",                          # bare mobile
+    ),
     "sensitive_kv": re.compile(
         r"(?i)\b((?:session|auth|access|refresh|id|user|csrf|xsrf)_?token|client_?secret|api_?key|password|passwd|secret)\s*(?:[:=]|\bis\b)\s*([a-zA-Z0-9_\-\.]{8,})"
     ),
@@ -223,6 +238,12 @@ def redact_url(url: str) -> str:
         parts = urlsplit(url)
     except ValueError:
         return _redact_text(url, MAX_URL_LEN)
+
+    # tel: / sms: URLs exist ONLY to carry a phone number. The digits
+    # are the PII, and the planner never needs them — it only needs to
+    # know the link is a phone link. Redact the whole number.
+    if parts.scheme in ("tel", "sms"):
+        return f"{parts.scheme}:{REDACTED}"
 
     netloc = parts.netloc
     if "@" in netloc:

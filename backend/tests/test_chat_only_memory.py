@@ -102,3 +102,63 @@ def test_agent_loop_routes_remember_directive():
     source = loop_path.read_text(encoding="utf-8")
     assert "is_remember_directive(record.instruction)" in source
     assert "handle_remember_instruction(record.instruction)" in source
+
+
+@pytest.mark.asyncio
+async def test_recall_question_reaches_stored_fact(monkeypatch, tmp_path):
+    """A recall question must be answered from the stored fact. The
+    conversational fast-path used to call chat_call with only the
+    instruction and history — the recalled semantic facts (loaded into
+    initial_memory by run_task) never reached the model, so "do you
+    remember my preferred language?" could only get a generic reply.
+    The fix appends the facts to the system prompt. Verified live
+    against deepseek-v4.1-flash (2026-11-18): with the facts in the
+    system prompt it answers "Python"; for an unstored fact it says
+    it does not remember, without inventing one."""
+    import asyncio
+
+    from app import agentLoop
+    from app.agentLoop import real_hub, run_task
+    from app.hub import TaskRecord
+
+    temp_db = str(tmp_path / "recall.sqlite3")
+    db.init_db(db_path=temp_db)
+    old_init_db = db.init_db
+    original_get_conn = db.get_connection
+    db.init_db = lambda *args, **kwargs: None
+    db.get_connection = lambda p=None: original_get_conn(temp_db)
+    try:
+        SemanticMemory().remember("coding", "preferred language", "Python", db_path=temp_db)
+        assert SemanticMemory().recall(db_path=temp_db), "fact was not stored"
+
+        chat = db.create_chat(title="recall", db_path=temp_db)
+        task_id = "task_recall_python"
+        record = TaskRecord(
+            task_id=task_id,
+            instruction="do you remember my preferred language?",
+            state="created",
+            chat_id=chat["id"],
+        )
+        real_hub.tasks[task_id] = record
+
+        seen: dict = {}
+
+        class RecordingProvider:
+            def chat_call(self, prompt, history=None, system_prompt=None):
+                seen["prompt"] = prompt
+                seen["system_prompt"] = system_prompt
+                # Echo what the model would see: the fact must be in the
+                # system prompt for the answer to be possible.
+                return "Python" if system_prompt and "Python" in system_prompt else "I don't remember."
+
+        monkeypatch.setattr(agentLoop, "_provider_for_config", lambda: RecordingProvider())
+
+        await run_task(task_id)
+        await asyncio.sleep(0.05)
+        assert record.state == "completed", record.message
+        assert seen.get("system_prompt"), "chat_call got no system prompt"
+        assert "preferred language = Python" in seen["system_prompt"]
+        assert "Python" in (record.message or "")
+    finally:
+        db.init_db = old_init_db
+        db.get_connection = original_get_conn

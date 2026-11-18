@@ -274,3 +274,37 @@ def test_bare_continuation_with_deliverable_announced_completes():
         working_memory=_FAILED_HUNT_MEMORY,
     )
     assert res.state == "completed"
+
+
+def test_verifier_does_not_flag_companion_instruction_as_research():
+    """The combined email+calendar test got a "Research incomplete: No
+    substantive research sources were examined" prefix on the email
+    mission confirmation. classify_instruction_type labelled the
+    instruction RESEARCH because it contains "find" ("find the
+    Microsoft interview invitation"), and Rule 6 then demanded research
+    sources from a mission setup that never asked for research.
+    Companion-routed instructions are CONVERSATIONAL for verification:
+    their handlers either do the thing or say honestly they cannot."""
+    from app.completion_verifier import (
+        classify_instruction_type,
+        verify_task_completion,
+    )
+
+    instr = (
+        "Monitor my email using demo sandbox, find the Microsoft interview "
+        "invitation, and create a Google Calendar event for it tomorrow at "
+        "10am with a reminder 3 days before."
+    )
+    assert classify_instruction_type(instr) == "CONVERSATIONAL"
+    res = verify_task_completion(
+        instruction=instr,
+        candidate_state="completed",
+        message="### 📬 Autonomous Email Intelligence Mission Configured\n\nMonitoring is active.",
+        observation=None,
+        working_memory={},
+    )
+    assert res.state == "completed"
+    assert "Research incomplete" not in res.message
+    # Real research is still RESEARCH.
+    assert classify_instruction_type("Find the price of the MX Master 3S on Flipkart.") == "RESEARCH"
+    assert classify_instruction_type("Create a calendar event tomorrow at 10am for SIH review.") == "CONVERSATIONAL"
