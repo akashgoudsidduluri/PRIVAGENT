@@ -475,6 +475,64 @@ def test_repeated_failure_loop_detection_stops_stale_clicks():
     assert has_warning
 
 
+def test_repeated_failure_loop_detection_stops_icon_only_stale_clicks():
+    """The repeated-failure stop must fire when the target has no
+    usable identity. A popup close button is often an icon-only
+    control (name "✕" normalizes to ""), and the extension
+    re-renders it with a fresh targetId on every attempt — so
+    `_actions_match` (name / equal targetId / params) returns False
+    for every failure and the stop never fires.
+
+    Live run 2026-11-18 (merged PR #8): the price hunt ran to the
+    50-step cap with steps 9–49 all "checking for a popup on
+    Flipkart", each click failing STALE_TARGET. The named-target
+    regression test above passes for this shape, but it uses
+    name "Close" — this test uses the icon-only shape and must
+    also stop within a few failures.
+    """
+    failures = [
+        {"ok": False, "error": {
+            "code": "STALE_TARGET",
+            "message": 'no matching element for {"elementRef":"e%d","targetId":"popup-close-%d","name":"\u2715"}' % (12 + 3 * i, i + 1),
+            "recoverable": True,
+        }}
+        for i in range(60)
+    ]
+    hub = FakeHub({"click": failures})
+    calls = {"n": 0}
+
+    class Planner:
+        def __call__(self, i, p, h):
+            calls["n"] += 1
+            n = calls["n"]
+            return {
+                "goal": "dismiss popup",
+                "steps": [{
+                    "why": "close popup",
+                    "action": {
+                        "type": "click",
+                        "risk": "write",
+                        "verify": "v",
+                        "timeoutMs": 100,
+                        "target": {"targetId": f"popup-close-{n}", "name": "\u2715"},
+                    },
+                }],
+            }
+
+    state = asyncio.run(agentLoop.run_with_injection(
+        hub, planner=Planner(),
+        obs_factory=lambda: {
+            "tabId": 1, "url": "https://www.flipkart.com/search?q=logitech", "title": "Search",
+            "interactive": [],
+            "scroll": {}, "dpr": 1,
+        },
+    ))
+    assert state["final"] == "budget_exceeded"
+    assert "Loop detected" in state["summary"]
+    assert "failed" in state["summary"]
+    assert state["steps"] <= 5
+
+
 def test_tab_opened_by_click_registers_and_can_be_selected():
     """A tab opened by a click (not a `new_tab` action) must register
     in the task's tab registry, so a later select_tab to it is allowed.

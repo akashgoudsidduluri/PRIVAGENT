@@ -41,6 +41,7 @@ __all__ = [
     "_IDEMPOTENT_RETRY_TYPES",
     "_MESSAGING_DOMAINS",
     "_actions_match",
+    "_failure_action_matches",
     "_auto_complete_after_send",
     "_call_planner",
     "_enforce_date_integrity",
@@ -401,6 +402,42 @@ def _actions_match(a1: dict[str, Any], a2: dict[str, Any]) -> bool:
     if p1.get("url") and p1.get("url") == p2.get("url"):
         return True
     return False
+
+
+def _failure_action_matches(a1: dict[str, Any], a2: dict[str, Any]) -> bool:
+    """Match for the repeated-failure stop: same action, allowing for a
+    target whose identity churns.
+
+    `_actions_match` needs a stable identity — a normalized name, an
+    equal targetId, or equal params. A popup close button is often an
+    icon-only control (name "✕" normalizes to "", and the extension
+    re-renders it with a fresh targetId on every attempt), so there is
+    nothing stable to compare and `_actions_match` returns False for
+    41 identical failures in a row. The live Flipkart run 2026-11-18
+    (merged PR #8, 50 steps, steps 9–49 all "checking for a popup")
+    looped exactly this way: every click failed STALE_TARGET, but the
+    stop never fired because the target could not be matched.
+
+    Fall back to type-only when NEITHER action carries a usable
+    identity — no non-empty normalized name and no params text/url on
+    either side. The caller also requires the normalized error to
+    match, so this only fires for the same failure on the same kind
+    of action, not for unrelated failures. If either side DOES carry
+    a usable name or params, the fallback refuses: two different
+    named targets failing the same way are not the same loop.
+    """
+    if _actions_match(a1, a2):
+        return True
+    if a1.get("type") != a2.get("type"):
+        return False
+    for a in (a1, a2):
+        t = a.get("target") or {}
+        p = a.get("params") or {}
+        if _normalize_loop_name(t.get("name")):
+            return False
+        if p.get("text") or p.get("url"):
+            return False
+    return True
 
 
 def _is_redundant_completed_action(action: dict[str, Any], history: list[dict[str, Any]], current_url: str) -> bool:

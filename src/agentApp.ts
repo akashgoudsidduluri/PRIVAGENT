@@ -242,18 +242,6 @@ function initWorkspaceElements(): void {
     }
   });
 
-  // Preset Chips & Suggested Action Pills
-  document.querySelectorAll(".preset-chip").forEach(chip => {
-    chip.addEventListener("click", () => {
-      const prompt = chip.getAttribute("data-prompt");
-      if (prompt && missionInput) {
-        missionInput.value = prompt;
-        if (btnStartMission && !isWorking) btnStartMission.disabled = false;
-        missionInput.focus();
-      }
-    });
-  });
-
   btnStartMission?.addEventListener("click", async () => {
     if (isWorking || !missionInput || !btnStartMission || !missionInput.value.trim()) return;
     const instruction = missionInput.value.trim();

@@ -234,38 +234,6 @@ html {
   box-shadow: 0 0 16px rgba(70, 215, 255, 0.3);
 }
 
-.agent-presets {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  align-items: center;
-  margin-top: 12px;
-}
-
-.agent-presets__label {
-  font-size: 12px;
-  opacity: 0.6;
-  font-family: var(--font-display, monospace);
-}
-
-.preset-chip {
-  padding: 5px 12px;
-  border-radius: 8px;
-  font-size: 12px;
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  color: #cbd5e1;
-  cursor: pointer;
-  transition: all 0.15s ease;
-}
-
-.preset-chip:hover {
-  background: rgba(70, 215, 255, 0.12);
-  border-color: rgba(70, 215, 255, 0.35);
-  color: #fff;
-  transform: translateY(-1px);
-}
-
 .agent-actions {
   display: flex;
   align-items: center;
@@ -1696,12 +1664,6 @@ html {
   .agent-actions .btn {
     min-height: 44px;
     justify-content: center;
-  }
-  .agent-presets {
-    flex-wrap: wrap;
-  }
-  .preset-chip {
-    min-height: 44px;
   }
   .human-gate {
     flex-direction: column;
