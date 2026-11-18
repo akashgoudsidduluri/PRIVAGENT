@@ -892,6 +892,21 @@ def try_deterministic_plan(
     disc = (working_memory or {}).get("autonomous_discovery")
     if disc and disc.get("scenario") == "B" and (curr_url in ("", "about:blank") or not history):
         prim_url = disc.get("primary_navigation_url")
+        # No hub survived discovery (every hub filtered out by the
+        # domain allow-list, or all rejected). There is no navigable
+        # starting point, so answer honestly instead of building a
+        # navigate the allow-list gate will reject with PLAN_INVALID.
+        if not prim_url and disc.get("discovery_blocked_reason"):
+            reason = disc["discovery_blocked_reason"]
+            return TaskPlan(
+                goal="Research blocked: no source on the domain allow-list",
+                notes=reason,
+                steps=[],
+                answer=(
+                    "### Research blocked\n\n"
+                    f"{reason}\n"
+                ),
+            )
         if prim_url:
             cat = disc.get("category", "general")
             queries = disc.get("search_queries", [])

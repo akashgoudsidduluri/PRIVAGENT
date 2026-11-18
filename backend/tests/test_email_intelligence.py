@@ -755,3 +755,506 @@ def test_custom_topic_extraction_rejects_compound_calendar_clause():
         "jobs",
     ]
     assert extract_custom_topics("Alert me about interviews, please.") == ["interviews"]
+
+# ==============================================================================
+# Chat-control fixes (2026-11-19): interval changes, deletion receipts,
+# and stale topics. Before this fix the agent loop had NO deterministic
+# handler for a bare interval change ("check for every 5 minutes") or
+# for a deletion receipt ("send '.' when you delete"), so the LLM
+# hallucinated confirmations while nothing changed; and a re-bind
+# silently carried forward old custom topics the user never asked for.
+# ==============================================================================
+
+def test_interval_change_instruction_detector():
+    """A bare interval change is recognised; a setup instruction, and a
+    price-watch interval, are not (they have their own handlers)."""
+    from app.email_intelligence.mission_setup import is_email_interval_change_instruction
+
+    assert is_email_interval_change_instruction("check for every 5 minutes") is True
+    assert is_email_interval_change_instruction("check every 10 minutes") is True
+    assert is_email_interval_change_instruction("every 5 minutes") is True
+    assert is_email_interval_change_instruction("scan my mails and notify me for important mails") is False
+    assert is_email_interval_change_instruction("scan my mails every 60 minutes and delete promo") is False
+    assert is_email_interval_change_instruction("check the price every 5 minutes") is False
+
+
+@pytest.mark.asyncio
+async def test_interval_change_updates_mission(email_db, mailbox, monkeypatch):
+    """'check for every 5 minutes' must actually change the stored
+    interval to 300s. Before the fix there was no handler, so the LLM
+    claimed the update while the mission stayed at 3600s."""
+    from app.email_intelligence import sync_engine
+    from app.email_intelligence.mission_setup import handle_email_interval_change
+    monkeypatch.setattr(sync_engine, "_demo_mailbox", mailbox)
+
+    chat_id = db.create_chat("interval change demo", db_path=email_db)["id"]
+    await handle_email_intelligence_instruction(
+        "scan email for every 60 minutes if u find any unnesary promotion "
+        "emails delete them, if u find any urgent mails then notify me using demo sandbox",
+        chat_id=chat_id,
+        db_path=email_db,
+    )
+    missions = db.list_email_missions(db_path=email_db)
+    assert len(missions) == 1
+    assert missions[0]["frequency_seconds"] == 3600
+
+    reply = await handle_email_interval_change(
+        "check for every 5 minutes", chat_id=chat_id, db_path=email_db
+    )
+    assert "300" in reply
+    updated = db.get_email_mission(missions[0]["id"], db_path=email_db)
+    assert updated["frequency_seconds"] == 300
+
+
+@pytest.mark.asyncio
+async def test_interval_change_without_mission_is_honest(email_db):
+    """No active mission: the handler must say so, not invent an update."""
+    from app.email_intelligence.mission_setup import handle_email_interval_change
+
+    chat_id = db.create_chat("no mission", db_path=email_db)["id"]
+    reply = await handle_email_interval_change(
+        "check for every 5 minutes", chat_id=chat_id, db_path=email_db
+    )
+    assert "no active email monitoring mission" in reply.lower()
+
+
+def test_extract_custom_topics_rejects_any_important_mails():
+    """'notify for any important mails' is a generic reference, not a
+    topic. Before the fix it produced the topic 'any important mails'."""
+    from app.email_intelligence.mission_setup import extract_custom_topics
+
+    assert extract_custom_topics(
+        "scan through my mails and remove unnesary mails and notify for any important mails"
+    ) == []
+    assert extract_custom_topics("notify me about internships and jobs") == [
+        "internships",
+        "jobs",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_rebind_does_not_carry_forward_old_topics(email_db, mailbox, monkeypatch):
+    """A fresh setup instruction defines the topics. Before the fix a
+    re-bind merged old topics forward, so 'internships, jobs' from an
+    earlier mission persisted even though the new instruction never
+    mentioned them."""
+    from app.email_intelligence import sync_engine
+    monkeypatch.setattr(sync_engine, "_demo_mailbox", mailbox)
+    chat_id = db.create_chat("topics demo", db_path=email_db)["id"]
+
+    await handle_email_intelligence_instruction(
+        "monitor my email for internships and jobs using demo sandbox",
+        chat_id=chat_id,
+        db_path=email_db,
+    )
+    m = db.list_email_missions(db_path=email_db)[0]
+    assert "internships" in (m.get("notification_policy") or {}).get("custom_keywords", [])
+
+    await handle_email_intelligence_instruction(
+        "scan through my mails and remove unnesary mails and notify for any important mails using demo sandbox",
+        chat_id=chat_id,
+        db_path=email_db,
+    )
+    m = db.list_email_missions(db_path=email_db)[0]
+    kws = (m.get("notification_policy") or {}).get("custom_keywords", [])
+    assert "internships" not in kws
+    assert "jobs" not in kws
+    assert "any important mails" not in kws
+
+
+@pytest.mark.asyncio
+async def test_delete_receipt_instruction_sets_preference(email_db, mailbox, monkeypatch):
+    """'send .' when you delete' must record the receipt on the mission.
+    Before the fix there was no handler, so the LLM agreed in chat
+    while nothing was stored."""
+    from app.email_intelligence import sync_engine
+    from app.email_intelligence.mission_setup import (
+        handle_delete_receipt_instruction,
+        is_delete_receipt_instruction,
+    )
+    monkeypatch.setattr(sync_engine, "_demo_mailbox", mailbox)
+    chat_id = db.create_chat("receipt demo", db_path=email_db)["id"]
+
+    await handle_email_intelligence_instruction(
+        "scan email for every 60 minutes if u find any unnesary promotion "
+        "emails delete them, if u find any urgent mails then notify me using demo sandbox",
+        chat_id=chat_id,
+        db_path=email_db,
+    )
+    m = db.list_email_missions(db_path=email_db)[0]
+
+    assert is_delete_receipt_instruction(
+        "ok whenerver you delete any mail just send '.' here in this chat"
+    ) is True
+    assert is_delete_receipt_instruction("send 'deleted' everytime u delete too") is True
+
+    reply = await handle_delete_receipt_instruction(
+        "ok whenerver you delete any mail just send '.' here in this chat",
+        chat_id=chat_id,
+        db_path=email_db,
+    )
+    assert "'.'" in reply
+    m = db.get_email_mission(m["id"], db_path=email_db)
+    assert (m.get("notification_policy") or {}).get("delete_receipt_text") == "."
+
+
+@pytest.mark.asyncio
+async def test_tick_posts_delete_receipt_on_trash(email_db, mailbox, monkeypatch):
+    """End-to-end: with the receipt set, a background tick that moves a
+    promo mail to Trash posts '.' to the mission's chat. Before the fix
+    no code posted anything on deletion."""
+    from app.email_intelligence import sync_engine
+    from app.email_intelligence.mission_setup import handle_delete_receipt_instruction
+    monkeypatch.setattr(sync_engine, "_demo_mailbox", mailbox)
+    chat_id = db.create_chat("receipt tick demo", db_path=email_db)["id"]
+
+    await handle_email_intelligence_instruction(
+        "scan email for every 60 minutes if u find any unnesary promotion "
+        "emails delete them, if u find any urgent mails then notify me using demo sandbox",
+        chat_id=chat_id,
+        db_path=email_db,
+    )
+    m = db.list_email_missions(db_path=email_db)[0]
+    assert m["policy_authorized"] == 1
+
+    await handle_delete_receipt_instruction(
+        "ok whenerver you delete any mail just send '.' here in this chat",
+        chat_id=chat_id,
+        db_path=email_db,
+    )
+
+    # A new promo arrives after the receipt was set; the next tick
+    # trashes it and must post the receipt.
+    mailbox.add_incoming_message({
+        "sender": "marketing@store.amazon.in",
+        "subject": "Mega Electronics Sale: Up to 50% Off on Laptops & Smart TVs",
+        "snippet": "Don't miss the biggest sale of the season. Shop now before stock ends!",
+        "body_text": "Exclusive festive discounts! Unsubscribe here to stop receiving marketing emails. Terms and conditions apply.",
+    })
+    await run_email_mission_tick(m["id"], db_path=email_db)
+
+    contents = [msg.get("content", "") for msg in db.get_messages(chat_id, db_path=email_db)]
+    assert "." in contents
+
+# ==============================================================================
+# Mission-control fixes (2026-11-19, audit follow-up): re-bind interval
+# reset, pause/stop doing the opposite, dry-run / authorize / sync /
+# cancel / topics having no chat path, and provider selection ignoring
+# "Outlook". Before this fix the LLM hallucinated these confirmations
+# while nothing changed, or setup did the opposite of what was asked.
+# ==============================================================================
+
+def test_control_detector_routing():
+    """Control phrasings route to control, setup sentences route to
+    setup — never both, never neither for the cases that matter."""
+    from app.email_intelligence.mission_setup import (
+        is_email_mission_control_instruction,
+        is_email_mission_setup_instruction,
+    )
+
+    control_only = [
+        "pause email monitoring",
+        "stop email monitoring",
+        "pause email",
+        "resume email monitoring",
+        "switch to dry-run mode",
+        "stop deleting my emails",
+        "sync now",
+        "sync my email now",
+        "delete them",
+        "yes, delete them",
+        "only notify me about internships",
+        "change topics to scholarships",
+        "stop monitoring internships",
+    ]
+    for text in control_only:
+        assert is_email_mission_control_instruction(text) is True, text
+        assert is_email_mission_setup_instruction(text) is False, text
+    # The interval change has its own routing branch (guarded by the
+    # active-mission check), so it is an interval instruction, not a
+    # control instruction.
+    from app.email_intelligence.mission_setup import is_email_interval_change_instruction
+    assert is_email_interval_change_instruction("check for every 5 minutes") is True
+    assert is_email_mission_control_instruction("check for every 5 minutes") is False
+    setup_only = [
+        "scan my mails and notify me for important mails",
+        "monitor my email and delete unnecessary emails",
+        "monitor my email for internships and jobs",
+    ]
+    for text in setup_only:
+        assert is_email_mission_setup_instruction(text) is True, text
+        assert is_email_mission_control_instruction(text) is False, text
+
+
+@pytest.mark.asyncio
+async def test_rebind_preserves_interval_when_none_stated(email_db, mailbox, monkeypatch):
+    """A setup re-bind that states NO frequency must keep the existing
+    interval. Before the fix it silently reset a 3600s mission to 300s."""
+    from app.email_intelligence import sync_engine
+    monkeypatch.setattr(sync_engine, "_demo_mailbox", mailbox)
+    chat_id = db.create_chat("interval preserve demo", db_path=email_db)["id"]
+
+    await handle_email_intelligence_instruction(
+        "scan email for every 60 minutes if u find any unnesary promotion "
+        "emails delete them, if u find any urgent mails then notify me using demo sandbox",
+        chat_id=chat_id,
+        db_path=email_db,
+    )
+    m = db.list_email_missions(db_path=email_db)[0]
+    assert m["frequency_seconds"] == 3600
+
+    # A re-bind with no frequency stated (a plain "scan my mails").
+    await handle_email_intelligence_instruction(
+        "scan through my mails and remove unnesary mails and notify for any important mails using demo sandbox",
+        chat_id=chat_id,
+        db_path=email_db,
+    )
+    m = db.list_email_missions(db_path=email_db)[0]
+    assert m["frequency_seconds"] == 3600
+
+
+@pytest.mark.asyncio
+async def test_pause_email_monitoring_actually_pauses(email_db, mailbox, monkeypatch):
+    """'pause email monitoring' must pause. Before the fix it matched
+    setup and the re-bind set status='active' — the opposite."""
+    from app.email_intelligence import sync_engine
+    from app.email_intelligence.mission_setup import handle_email_mission_control
+    monkeypatch.setattr(sync_engine, "_demo_mailbox", mailbox)
+    chat_id = db.create_chat("pause demo", db_path=email_db)["id"]
+
+    await handle_email_intelligence_instruction(
+        "scan email for every 60 minutes if u find any unnesary promotion "
+        "emails delete them, if u find any urgent mails then notify me using demo sandbox",
+        chat_id=chat_id,
+        db_path=email_db,
+    )
+    m = db.list_email_missions(db_path=email_db)[0]
+    assert m["status"] == "active"
+
+    reply = await handle_email_mission_control("pause email monitoring", chat_id=chat_id, db_path=email_db)
+    assert "paused" in reply.lower()
+    m = db.get_email_mission(m["id"], db_path=email_db)
+    assert m["status"] == "paused"
+
+    reply = await handle_email_mission_control("resume email monitoring", chat_id=chat_id, db_path=email_db)
+    assert "resumed" in reply.lower()
+    m = db.get_email_mission(m["id"], db_path=email_db)
+    assert m["status"] == "active"
+    # Resume must not reset the interval to 300s either.
+    assert m["frequency_seconds"] == 3600
+
+
+@pytest.mark.asyncio
+async def test_dry_run_switch_and_authorize_short_forms(email_db, mailbox, monkeypatch):
+    """'switch to dry-run' and 'delete them' must actually flip the
+    authorization. Before the fix neither had a chat path."""
+    from app.email_intelligence import sync_engine
+    from app.email_intelligence.mission_setup import handle_email_mission_control
+    monkeypatch.setattr(sync_engine, "_demo_mailbox", mailbox)
+    chat_id = db.create_chat("dry-run demo", db_path=email_db)["id"]
+
+    await handle_email_intelligence_instruction(
+        "scan email for every 60 minutes if u find any unnesary promotion "
+        "emails delete them, if u find any urgent mails then notify me using demo sandbox",
+        chat_id=chat_id,
+        db_path=email_db,
+    )
+    m = db.list_email_missions(db_path=email_db)[0]
+    assert m["policy_authorized"] == 1 and m["dry_run"] == 0
+
+    reply = await handle_email_mission_control("switch to dry-run mode", chat_id=chat_id, db_path=email_db)
+    assert "dry-run" in reply.lower()
+    m = db.get_email_mission(m["id"], db_path=email_db)
+    assert m["policy_authorized"] == 0 and m["dry_run"] == 1
+
+    reply = await handle_email_mission_control("delete them", chat_id=chat_id, db_path=email_db)
+    assert "authorized" in reply.lower()
+    m = db.get_email_mission(m["id"], db_path=email_db)
+    assert m["policy_authorized"] == 1 and m["dry_run"] == 0
+
+
+@pytest.mark.asyncio
+async def test_sync_now_runs_tick_and_change_topics(email_db, mailbox, monkeypatch):
+    """'sync now' must run a tick; 'only notify me about X' must set
+    the topics. Before the fix neither had a chat path."""
+    from app.email_intelligence import sync_engine
+    from app.email_intelligence.mission_setup import handle_email_mission_control
+    monkeypatch.setattr(sync_engine, "_demo_mailbox", mailbox)
+    chat_id = db.create_chat("sync topics demo", db_path=email_db)["id"]
+
+    await handle_email_intelligence_instruction(
+        "monitor my email for internships and jobs using demo sandbox",
+        chat_id=chat_id,
+        db_path=email_db,
+    )
+    m = db.list_email_missions(db_path=email_db)[0]
+
+    reply = await handle_email_mission_control("sync now", chat_id=chat_id, db_path=email_db)
+    assert "sync complete" in reply.lower()
+    assert "messages processed" in reply.lower()
+
+    reply = await handle_email_mission_control(
+        "only notify me about scholarships", chat_id=chat_id, db_path=email_db
+    )
+    assert "scholarships" in reply.lower()
+    m = db.get_email_mission(m["id"], db_path=email_db)
+    assert (m.get("notification_policy") or {}).get("custom_keywords") == ["scholarships"]
+
+    reply = await handle_email_mission_control(
+        "stop monitoring scholarships", chat_id=chat_id, db_path=email_db
+    )
+    assert "stopped monitoring" in reply.lower()
+    m = db.get_email_mission(m["id"], db_path=email_db)
+    assert (m.get("notification_policy") or {}).get("custom_keywords") == []
+
+
+@pytest.mark.asyncio
+async def test_outlook_requested_but_not_connected_is_honest(email_db, monkeypatch):
+    """'monitor my Outlook inbox' with only Gmail connected must say
+    Outlook is not connected — not silently set up Gmail."""
+    from app.connectors.oauth import oauth_manager
+
+    def fake_verify(provider):
+        if provider == "google":
+            return {"connected": True, "account": "user@gmail.com"}
+        return {"connected": False, "account": None, "error": "not connected"}
+
+    monkeypatch.setattr(oauth_manager, "verify_connection", fake_verify)
+    chat_id = db.create_chat("outlook demo", db_path=email_db)["id"]
+    summary = await handle_email_intelligence_instruction(
+        "monitor my Outlook inbox and delete unnecessary emails",
+        chat_id=chat_id,
+        db_path=email_db,
+    )
+    assert "Outlook" in summary
+    assert "not connected" in summary.lower()
+    assert db.list_email_missions(db_path=email_db) == []
+
+
+@pytest.mark.asyncio
+async def test_outlook_requested_and_connected_uses_outlook(email_db, monkeypatch):
+    """'monitor my Outlook inbox' with Outlook connected must use
+    Outlook even when Gmail is also connected."""
+    from app.connectors.oauth import oauth_manager
+
+    def fake_verify(provider):
+        if provider == "microsoft":
+            return {"connected": True, "account": "user@outlook.com"}
+        return {"connected": True, "account": "user@gmail.com"}
+
+    monkeypatch.setattr(oauth_manager, "verify_connection", fake_verify)
+    chat_id = db.create_chat("outlook connected demo", db_path=email_db)["id"]
+    summary = await handle_email_intelligence_instruction(
+        "monitor my Outlook inbox and delete unnecessary emails",
+        chat_id=chat_id,
+        db_path=email_db,
+    )
+    missions = db.list_email_missions(db_path=email_db)
+    assert len(missions) == 1
+    assert missions[0]["account_email"] == "user@outlook.com"
+    assert missions[0]["provider"] == "outlook"
+
+# ==============================================================================
+# Review fixes (2026-11-19): the interval detector hijacked non-email
+# watches, and a question ("should I delete them?") authorized deletion.
+# Both are safety-relevant and must not regress.
+# ==============================================================================
+
+def test_interval_detector_does_not_hijack_non_email_watches():
+    """'monitor this product every 5 minutes' is a product watch,
+    'check my flight status every 5 minutes' is a flight check,
+    'refresh this page every 10 minutes' is a browser refresh — none
+    may silently change the email interval."""
+    from app.email_intelligence.mission_setup import is_email_interval_change_instruction
+    from app.continuous_monitoring_companion import is_continuous_monitoring_directive
+
+    assert is_email_interval_change_instruction("monitor this product every 5 minutes") is False
+    assert is_continuous_monitoring_directive("monitor this product every 5 minutes") is True
+    assert is_email_interval_change_instruction("refresh this page every 10 minutes") is False
+    assert is_email_interval_change_instruction("check my flight status every 5 minutes") is False
+    # The real email interval change still works.
+    assert is_email_interval_change_instruction("check for every 5 minutes") is True
+    assert is_email_interval_change_instruction("check my email every 5 minutes") is True
+
+
+def test_question_does_not_authorize_deletion():
+    """'should I delete them?' asks whether to delete — it must not
+    flip policy_authorized. Before the review fix it did."""
+    from app.email_intelligence.mission_setup import is_email_mission_control_instruction
+
+    assert is_email_mission_control_instruction("should I delete them?") is False
+    assert is_email_mission_control_instruction("can I delete them?") is False
+    assert is_email_mission_control_instruction("ok, should I delete them?") is False
+    # A real command still authorizes.
+    assert is_email_mission_control_instruction("delete them") is True
+    assert is_email_mission_control_instruction("yes, delete them") is True
+
+
+def test_sync_question_is_not_a_sync_command():
+    """'check my inbox now for the interview invite' asks whether the
+    invite arrived — a tick's stats do not answer it, so it must not
+    be treated as a sync command."""
+    from app.email_intelligence.mission_setup import is_email_mission_control_instruction
+
+    assert is_email_mission_control_instruction("check my inbox now for the interview invite") is False
+    assert is_email_mission_control_instruction("sync now") is True
+    assert is_email_mission_control_instruction("check my email now") is True
+
+
+@pytest.mark.asyncio
+async def test_stop_from_deleting_goes_to_dry_run_not_full_stop(email_db, mailbox, monkeypatch):
+    """'stop the email monitoring from deleting promos' must switch
+    to dry-run, not pause the whole mission."""
+    from app.email_intelligence import sync_engine
+    from app.email_intelligence.mission_setup import handle_email_mission_control
+    monkeypatch.setattr(sync_engine, "_demo_mailbox", mailbox)
+    chat_id = db.create_chat("dry-run phrase demo", db_path=email_db)["id"]
+
+    await handle_email_intelligence_instruction(
+        "scan email for every 60 minutes if u find any unnesary promotion "
+        "emails delete them, if u find any urgent mails then notify me using demo sandbox",
+        chat_id=chat_id,
+        db_path=email_db,
+    )
+    m = db.list_email_missions(db_path=email_db)[0]
+    assert m["policy_authorized"] == 1 and m["dry_run"] == 0
+
+    reply = await handle_email_mission_control(
+        "stop the email monitoring from deleting promos", chat_id=chat_id, db_path=email_db
+    )
+    assert "dry-run" in reply.lower()
+    m = db.get_email_mission(m["id"], db_path=email_db)
+    assert m["policy_authorized"] == 0 and m["dry_run"] == 1
+    assert m["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_receipt_off_switch_stops_receipt(email_db, mailbox, monkeypatch):
+    """'stop sending .' must clear the deletion receipt so background
+    deletions stop posting to the chat."""
+    from app.email_intelligence import sync_engine
+    from app.email_intelligence.mission_setup import (
+        handle_delete_receipt_instruction,
+        handle_email_mission_control,
+    )
+    monkeypatch.setattr(sync_engine, "_demo_mailbox", mailbox)
+    chat_id = db.create_chat("receipt off demo", db_path=email_db)["id"]
+
+    await handle_email_intelligence_instruction(
+        "scan email for every 60 minutes if u find any unnesary promotion "
+        "emails delete them, if u find any urgent mails then notify me using demo sandbox",
+        chat_id=chat_id,
+        db_path=email_db,
+    )
+    m = db.list_email_missions(db_path=email_db)[0]
+    await handle_delete_receipt_instruction(
+        "ok whenerver you delete any mail just send '.' here in this chat",
+        chat_id=chat_id, db_path=email_db,
+    )
+    m = db.get_email_mission(m["id"], db_path=email_db)
+    assert (m.get("notification_policy") or {}).get("delete_receipt_text") == "."
+
+    reply = await handle_email_mission_control("stop sending '.'", chat_id=chat_id, db_path=email_db)
+    assert "won't post" in reply.lower()
+    m = db.get_email_mission(m["id"], db_path=email_db)
+    assert (m.get("notification_policy") or {}).get("delete_receipt_text") is None

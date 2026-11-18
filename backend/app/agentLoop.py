@@ -3006,6 +3006,11 @@ async def run_task(task_id: str) -> None:
             from .email_intelligence.mission_setup import (
                 is_email_mission_setup_instruction,
                 handle_email_intelligence_instruction,
+                is_email_interval_change_instruction,
+                handle_email_interval_change,
+                is_email_mission_control_instruction,
+                handle_email_mission_control,
+                get_active_email_mission,
             )
             from .email_intelligence.companion_queries import is_email_companion_query
             from .connectors.calendar_companion import (
@@ -3029,7 +3034,24 @@ async def run_task(task_id: str) -> None:
 
             is_dispatch, dispatch_recip = is_email_dispatch_instruction(record.instruction)
 
-            if is_email_mission_setup_instruction(record.instruction) or is_email_companion_query(record.instruction):
+            # Chat control for an ACTIVE email mission, handled
+            # deterministically (not by the LLM): interval changes,
+            # deletion receipts, pause/resume, dry-run, authorize,
+            # sync-now, stop/cancel, topics. These previously fell
+            # through to the LLM, which hallucinated confirmations
+            # while nothing changed — or matched setup and did the
+            # opposite ("pause email monitoring" re-activated it).
+            # The interval change has its own branch guarded by the
+            # active-mission check: a bare "check every 5 minutes"
+            # with no email mission may be a product/flight/page
+            # watch, so it must fall through to the monitoring
+            # directive instead of silently changing the email
+            # interval.
+            if is_email_interval_change_instruction(record.instruction) and get_active_email_mission(chat_id):
+                answer = await handle_email_interval_change(record.instruction, chat_id=chat_id)
+            elif is_email_mission_control_instruction(record.instruction):
+                answer = await handle_email_mission_control(record.instruction, chat_id=chat_id)
+            elif is_email_mission_setup_instruction(record.instruction) or is_email_companion_query(record.instruction):
                 answer = await handle_email_intelligence_instruction(record.instruction, chat_id=chat_id)
                 # Compound: the same instruction may also ask for a
                 # calendar event ("...find the Microsoft interview
@@ -3196,6 +3218,12 @@ async def run_task(task_id: str) -> None:
             record.instruction,
             region=initial_memory.get("user_region", "IN"),
             context=initial_memory,
+            # The allow-list decides which hubs discovery may offer:
+            # offering a hub outside it builds a plan the gate then
+            # rejects with PLAN_INVALID (live case: research picked
+            # nature.com, which was not allow-listed, and the task
+            # died on the first step).
+            allowed_domains=record.allowed_domains,
         )
         initial_memory["autonomous_discovery"] = discovery_res
     except Exception:
