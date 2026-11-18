@@ -589,6 +589,10 @@ def build_structured_document_plan(
                 section_id=f"sec_{idx:02d}",
                 title=s_title,
                 level=1,
+                # Auto-inserted boilerplate, not evidence from the
+                # package. The PDF renderer may drop its text blocks
+                # first when fitting an exact page budget.
+                metadata={"filler": True},
             )
             new_sec.add_text(s_text)
             new_sec.add_text(

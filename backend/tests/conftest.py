@@ -22,10 +22,13 @@ New tests that want to be explicit can use ``AUTH_HEADERS`` or the
 from __future__ import annotations
 
 import os
+import socket
 from urllib.parse import urlparse
 
 import pytest
 from fastapi.testclient import TestClient
+
+from app.website_resolver import WebsiteResolver
 
 # Fixed token for the whole suite. Set unconditionally: tests must be
 # deterministic and must never pick up an operator's real token.
@@ -33,6 +36,43 @@ TEST_TOKEN = "test-local-token"
 os.environ["PRIVAGENT_LOCAL_TOKEN"] = TEST_TOKEN
 
 AUTH_HEADERS = {"Authorization": f"Bearer {TEST_TOKEN}"}
+
+
+def stub_dns_resolver(hostname, *args, **kwargs):
+    """DNS stub for discovery tests: every hostname resolves to a public IP.
+
+    This sandbox VM's DNS returns 198.18.0.0/15 (RFC 2544 benchmarking
+    range) for every hostname, which ``is_safe_public_url`` correctly
+    rejects as non-public — so discovery returns 0 candidates here.
+    The stub makes discovery testable in this environment without
+    weakening the production SSRF check: the default resolver is still
+    real ``socket.getaddrinfo``. The rebinding defense stays testable
+    too (see ``rebinding_dns_resolver``).
+    """
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+
+
+def rebinding_dns_resolver(hostname, *args, **kwargs):
+    """DNS stub that simulates a rebinding attack: every hostname resolves to loopback."""
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0))]
+
+
+# A WebsiteResolver wired to the stub DNS, for discovery tests that
+# must run in this sandbox. Use it instead of the global
+# ``website_resolver`` singleton in tests that call
+# ``discover_websites_for_task`` / ``discover_candidate_sources``.
+sandbox_website_resolver = WebsiteResolver(resolver=stub_dns_resolver)
+
+
+@pytest.fixture
+def sandbox_resolver():
+    """A WebsiteResolver wired to stub DNS (see stub_dns_resolver).
+
+    Request this fixture in any test that calls
+    ``discover_websites_for_task`` — the global ``website_resolver``
+    uses real DNS, which this sandbox answers with non-public IPs.
+    """
+    return WebsiteResolver(resolver=stub_dns_resolver)
 
 from app.main import app  # noqa: E402  (env token must be set first)
 

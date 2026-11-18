@@ -519,6 +519,102 @@ def test_tab_opened_by_click_registers_and_can_be_selected():
     assert "unknown tab" not in (state["summary"] or "")
 
 
+def test_closed_tab_pruned_from_registry_and_select_rejected():
+    """A tab the operator closed must leave the registry, so a later
+    select_tab to it is rejected as unknown — not let through the
+    gate to fail confusingly at the extension.
+
+    The extension sends the task's open tabs in every observation
+    (``tabs``). Tab 2 is registered when the loop observes it; the
+    next observation (back on tab 1) lists only tab 1, so tab 2 is
+    pruned. A select_tab to tab 2 must then fail the gate.
+    """
+    hub = FakeHub({"click": [{"ok": True}], "select_tab": [{"ok": True}]})
+    calls = {"n": 0, "obs": 0}
+
+    def obs_factory():
+        calls["obs"] += 1
+        if calls["obs"] == 1:
+            return {"tabId": 1, "url": "https://www.flipkart.com/search?q=logitech", "title": "Search",
+                    "tabs": [{"tabId": 1, "url": "https://www.flipkart.com/search?q=logitech", "title": "Search", "active": True}],
+                    "interactive": [{"targetId": "prod-link", "role": "link", "name": "Logitech MX Master 3S", "tag": "a", "visible": True, "enabled": True}],
+                    "scroll": {}, "dpr": 1}
+        if calls["obs"] == 2:
+            return {"tabId": 2, "url": "https://www.flipkart.com/product/p/itm271ade01ff274", "title": "Logitech MX Master 3S",
+                    "tabs": [{"tabId": 1, "url": "https://www.flipkart.com/search?q=logitech", "title": "Search", "active": False},
+                             {"tabId": 2, "url": "https://www.flipkart.com/product/p/itm271ade01ff274", "title": "Logitech MX Master 3S", "active": True}],
+                    "interactive": [], "scroll": {}, "dpr": 1}
+        # Tab 2 was closed by the operator: only tab 1 remains open.
+        return {"tabId": 1, "url": "https://www.flipkart.com/search?q=logitech", "title": "Search",
+                "tabs": [{"tabId": 1, "url": "https://www.flipkart.com/search?q=logitech", "title": "Search", "active": True}],
+                "interactive": [], "scroll": {}, "dpr": 1}
+
+    class Planner:
+        def __call__(self, i, p, h):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"goal": "open product", "steps": [{"why": "open product", "action": {
+                    "type": "click", "risk": "write", "verify": "v", "timeoutMs": 100,
+                    "target": {"targetId": "prod-link", "name": "Logitech MX Master 3S"}}}]}
+            if calls["n"] == 2:
+                return {"goal": "switch back", "steps": [{"why": "switch back", "action": {
+                    "type": "select_tab", "risk": "write", "verify": "v", "timeoutMs": 100,
+                    "params": {"tabId": 1}}}]}
+            # Tab 2 is closed now; the planner (working from stale
+            # memory) tries to switch to it. The gate must reject it.
+            return {"goal": "switch to closed tab", "steps": [{"why": "switch to closed tab", "action": {
+                "type": "select_tab", "risk": "write", "verify": "v", "timeoutMs": 100,
+                "params": {"tabId": 2}}}]}
+
+    state = asyncio.run(agentLoop.run_with_injection(
+        hub, planner=Planner(), obs_factory=obs_factory,
+        initial_memory={"primary_tab_id": 1},
+    ))
+    assert state["final"] == "failed"
+    assert "unknown tab" in (state["summary"] or "")
+
+
+def test_primary_tab_never_pruned_by_observation_tabs():
+    """A partial observation tab list that omits the primary tab must
+    not prune it: the primary is the task's anchor, and its closure
+    is a separate failure, not a prune. The planner must still be
+    able to select back to the primary."""
+    hub = FakeHub({"click": [{"ok": True}], "select_tab": [{"ok": True}]})
+    calls = {"n": 0, "obs": 0}
+
+    def obs_factory():
+        calls["obs"] += 1
+        if calls["obs"] == 1:
+            return {"tabId": 1, "url": "https://example.com/", "title": "Home",
+                    "tabs": [{"tabId": 1, "url": "https://example.com/", "title": "Home", "active": True}],
+                    "interactive": [{"targetId": "lnk", "role": "link", "name": "Docs", "tag": "a", "visible": True, "enabled": True}],
+                    "scroll": {}, "dpr": 1}
+        # Stale/partial list: only the observed tab 2, primary omitted.
+        return {"tabId": 2, "url": "https://example.com/docs", "title": "Docs",
+                "tabs": [{"tabId": 2, "url": "https://example.com/docs", "title": "Docs", "active": True}],
+                "interactive": [], "scroll": {}, "dpr": 1}
+
+    class Planner:
+        def __call__(self, i, p, h):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"goal": "open docs", "steps": [{"why": "open docs", "action": {
+                    "type": "click", "risk": "write", "verify": "v", "timeoutMs": 100,
+                    "target": {"targetId": "lnk", "name": "Docs"}}}]}
+            if calls["n"] == 2:
+                return {"goal": "back home", "steps": [{"why": "back home", "action": {
+                    "type": "select_tab", "risk": "write", "verify": "v", "timeoutMs": 100,
+                    "params": {"tabId": 1}}}]}
+            return {"goal": "back home", "steps": []}
+
+    state = asyncio.run(agentLoop.run_with_injection(
+        hub, planner=Planner(), obs_factory=obs_factory,
+        initial_memory={"primary_tab_id": 1},
+    ))
+    assert state["final"] == "completed"
+    assert "unknown tab" not in (state["summary"] or "")
+
+
 # ---------------------------------------------------------------------------
 # Fix 5 (live failure 2026-11-18 02:07 IST): after the Fit3 suggestion
 # the agent gave a verdict but never asked "do you want me to alert

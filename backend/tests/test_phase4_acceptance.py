@@ -179,7 +179,7 @@ def test_acceptance_1_transformer_pdf():
 # ===========================================================================
 # 2. TEST 2: Laptop Multi-Retailer Excel Comparison
 # ===========================================================================
-def test_acceptance_2_laptop_xlsx():
+def test_acceptance_2_laptop_xlsx(sandbox_resolver):
     """Compare the leading laptops with RTX 4060 and create an Excel comparison."""
     instruction = "Compare the leading laptops with RTX 4060 and create an Excel comparison."
 
@@ -189,7 +189,7 @@ def test_acceptance_2_laptop_xlsx():
     assert cl.requested_format == "xlsx"
 
     # 2. Autonomous discovery finds multiple retailers
-    disc = website_resolver.discover_websites_for_task(instruction)
+    disc = sandbox_resolver.discover_websites_for_task(instruction)
     assert disc["scenario"] == "B"
     assert disc["category"] == "shopping"
     selected_domains = [s["domain"] for s in disc["selected_sources"]]
@@ -270,7 +270,7 @@ def test_acceptance_2_laptop_xlsx():
 # ===========================================================================
 # 3. TEST 3: Solid-State Battery DOCX with Contradictions
 # ===========================================================================
-def test_acceptance_3_battery_docx():
+def test_acceptance_3_battery_docx(sandbox_resolver):
     """Research solid-state batteries and prepare a detailed report in Word docx."""
     instruction = "Research the latest developments in solid-state batteries and prepare a detailed report in Word docx."
 
@@ -280,7 +280,7 @@ def test_acceptance_3_battery_docx():
     assert cl.requested_format == "docx"
 
     # 2. Autonomous discovery
-    disc = website_resolver.discover_websites_for_task(instruction)
+    disc = sandbox_resolver.discover_websites_for_task(instruction)
     assert disc["scenario"] == "B"
     assert disc["category"] == "research"
     # Primary scientific hubs must be ranked top

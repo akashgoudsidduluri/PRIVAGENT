@@ -76,7 +76,7 @@ def _make_obs(url: str, title: str, text: str) -> BrowserObservation:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_audit_1_autonomous_transformer_research_pdf(tmp_path: Path):
+async def test_audit_1_autonomous_transformer_research_pdf(tmp_path: Path, sandbox_resolver):
     """Verify autonomous intent routing, query decomposition, discovery, harvesting, and PDF generation."""
     instruction = (
         "Research transformer architecture, explain self-attention, multi-head attention, "
@@ -92,7 +92,7 @@ async def test_audit_1_autonomous_transformer_research_pdf(tmp_path: Path):
     assert "transformer" in (cl.research_topic or "").lower()
 
     # 2. Autonomous search query decomposition & discovery
-    disc = website_resolver.discover_websites_for_task(instruction)
+    disc = sandbox_resolver.discover_websites_for_task(instruction)
     assert disc["scenario"] == "B"  # Autonomous discovery without hardcoded destination
     assert disc["category"] == "research"
     assert len(disc["search_queries"]) >= 2
@@ -193,7 +193,7 @@ async def test_audit_1_autonomous_transformer_research_pdf(tmp_path: Path):
 # 2. Genuine Indian Product Comparison in XLSX
 # ---------------------------------------------------------------------------
 
-def test_audit_2_indian_laptop_comparison_xlsx(tmp_path: Path):
+def test_audit_2_indian_laptop_comparison_xlsx(tmp_path: Path, sandbox_resolver):
     """Verify Indian retailer resolution, INR price extraction, specification parsing, and XLSX generation."""
     instruction = (
         "Find three good programming laptops under ₹80,000 in India. Compare their CPU, GPU, RAM, "
@@ -207,7 +207,7 @@ def test_audit_2_indian_laptop_comparison_xlsx(tmp_path: Path):
     assert cl.deliverable_type == "dataset"
 
     # 2. Indian retailer discovery
-    disc = website_resolver.discover_websites_for_task(instruction, region="IN")
+    disc = sandbox_resolver.discover_websites_for_task(instruction, region="IN")
     assert disc["scenario"] == "B"
     retailer_domains = [c["domain"] for c in disc["candidate_sources"]]
     # Indian retailers must be selected, NOT US retailers

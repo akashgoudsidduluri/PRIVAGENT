@@ -235,16 +235,16 @@ def test_search_query_generation_smartphone_india():
     assert any("iphone 16 pro" in q.lower() for q in queries)
 
 
-def test_source_selection_appropriate_for_subject():
+def test_source_selection_appropriate_for_subject(sandbox_resolver):
     """Case A, C, D, E hub routing: software architecture must NOT route to nature.com."""
     # Software architecture: should route to Wikipedia or Google Technical Docs
-    res_arch = website_resolver.discover_websites_for_task("Compare monolithic and microservices architectures")
+    res_arch = sandbox_resolver.discover_websites_for_task("Compare monolithic and microservices architectures")
     selected_arch = [s["domain"] for s in res_arch["selected_sources"]]
     assert "nature.com" not in selected_arch
     assert any("wikipedia.org" in d or "google.com" in d for d in selected_arch)
 
     # Smartphone shopping: should route to Amazon India / Flipkart
-    res_phone = website_resolver.discover_websites_for_task("Compare iPhone 16 Pro and Samsung S24 Ultra price", region="IN")
+    res_phone = sandbox_resolver.discover_websites_for_task("Compare iPhone 16 Pro and Samsung S24 Ultra price", region="IN")
     selected_phone = [s["domain"] for s in res_phone["selected_sources"]]
     assert any("amazon.in" in d or "flipkart.com" in d for d in selected_phone)
 

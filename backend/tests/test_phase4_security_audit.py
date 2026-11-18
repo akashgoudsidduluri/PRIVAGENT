@@ -38,6 +38,7 @@ from app.research.visuals.image_pipeline import (
     validate_image_bytes,
 )
 from app.website_resolver import is_safe_public_url, validate_redirect_chain
+from conftest import stub_dns_resolver
 
 
 client = TestClient(app)
@@ -50,36 +51,36 @@ client = TestClient(app)
 def test_ssrf_and_dns_rebinding_defenses():
     """Verify that private IPs, embedded IP domain patterns, metadata endpoints, and non-http schemes are blocked."""
     # Embedded IP / nip.io patterns
-    safe, err = is_safe_public_url("https://127.0.0.1.nip.io/api")
+    safe, err = is_safe_public_url("https://127.0.0.1.nip.io/api", resolver=stub_dns_resolver)
     assert safe is False
     assert "Embedded private IP pattern" in err or "blocked" in err
 
-    safe, err = is_safe_public_url("http://test.192.168.1.50.sslip.io")
+    safe, err = is_safe_public_url("http://test.192.168.1.50.sslip.io", resolver=stub_dns_resolver)
     assert safe is False
 
-    safe, err = is_safe_public_url("http://customer.10.0.0.1.nip.io")
+    safe, err = is_safe_public_url("http://customer.10.0.0.1.nip.io", resolver=stub_dns_resolver)
     assert safe is False
 
     # Direct private & loopback IPs
-    assert is_safe_public_url("http://127.0.0.1:8000")[0] is False
-    assert is_safe_public_url("http://192.168.0.1")[0] is False
-    assert is_safe_public_url("http://10.254.0.1")[0] is False
-    assert is_safe_public_url("http://172.16.5.1")[0] is False
+    assert is_safe_public_url("http://127.0.0.1:8000", resolver=stub_dns_resolver)[0] is False
+    assert is_safe_public_url("http://192.168.0.1", resolver=stub_dns_resolver)[0] is False
+    assert is_safe_public_url("http://10.254.0.1", resolver=stub_dns_resolver)[0] is False
+    assert is_safe_public_url("http://172.16.5.1", resolver=stub_dns_resolver)[0] is False
 
     # Cloud metadata endpoints
-    assert is_safe_public_url("http://169.254.169.254/latest/meta-data")[0] is False
-    assert is_safe_public_url("http://metadata.google.internal/computeMetadata/v1")[0] is False
+    assert is_safe_public_url("http://169.254.169.254/latest/meta-data", resolver=stub_dns_resolver)[0] is False
+    assert is_safe_public_url("http://metadata.google.internal/computeMetadata/v1", resolver=stub_dns_resolver)[0] is False
 
     # Malicious schemes
-    assert is_safe_public_url("file:///etc/passwd")[0] is False
-    assert is_safe_public_url("javascript:alert(1)")[0] is False
-    assert is_safe_public_url("data:text/html,<h1>PWNED</h1>")[0] is False
+    assert is_safe_public_url("file:///etc/passwd", resolver=stub_dns_resolver)[0] is False
+    assert is_safe_public_url("javascript:alert(1)", resolver=stub_dns_resolver)[0] is False
+    assert is_safe_public_url("data:text/html,<h1>PWNED</h1>", resolver=stub_dns_resolver)[0] is False
 
     # Embedded credentials
-    assert is_safe_public_url("https://admin:secret@trusted-site.com")[0] is False
+    assert is_safe_public_url("https://admin:secret@trusted-site.com", resolver=stub_dns_resolver)[0] is False
 
     # Valid public target
-    assert is_safe_public_url("https://nature.com/articles/s41586-024-001")[0] is True
+    assert is_safe_public_url("https://nature.com/articles/s41586-024-001", resolver=stub_dns_resolver)[0] is True
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +93,7 @@ def test_redirect_chain_validation():
     safe, _ = validate_redirect_chain(
         "http://nature.com",
         ["https://nature.com", "https://www.nature.com/en-us"],
+        resolver=stub_dns_resolver,
     )
     assert safe is True
 
@@ -99,6 +101,7 @@ def test_redirect_chain_validation():
     safe, err = validate_redirect_chain(
         "https://example.com/login",
         ["https://example.com/auth", "http://169.254.169.254/latest/meta-data"],
+        resolver=stub_dns_resolver,
     )
     assert safe is False
     assert any(w in err.lower() for w in ("blocked", "rejected", "private", "metadata"))
@@ -107,13 +110,14 @@ def test_redirect_chain_validation():
     safe, err = validate_redirect_chain(
         "https://example.com/click",
         ["http://127.0.0.1:8000/internal-status"],
+        resolver=stub_dns_resolver,
     )
     assert safe is False
     assert any(w in err.lower() for w in ("blocked", "rejected", "loopback", "private"))
 
     # Excessive redirect loop
     hops = [f"https://example.com/hop{i}" for i in range(12)]
-    safe, err = validate_redirect_chain("https://example.com/start", hops)
+    safe, err = validate_redirect_chain("https://example.com/start", hops, resolver=stub_dns_resolver)
     assert safe is False
     assert "exceeds maximum" in err.lower()
 

@@ -17,6 +17,7 @@ __all__ = [
     "_maybe_compact_history",
     "_persist_agent_message",
     "_persist_derived_memory",
+    "_prune_tabs_not_in_observation",
     "_register_tab_in_memory",
     "_remove_tab_from_memory",
     "_save_checkpoint_defensive",
@@ -61,6 +62,63 @@ def _remove_tab_from_memory(working_memory: dict[str, Any], tab_id: int) -> None
     remaining = working_memory["tabs"]
     if remaining and not any(t.get("active") for t in remaining):
         remaining[0]["active"] = True
+
+
+def _prune_tabs_not_in_observation(
+    working_memory: dict[str, Any],
+    open_tab_ids: list[int] | set[int],
+    observed_tab_id: Optional[int] = None,
+    primary_tab_id: Optional[int] = None,
+) -> list[int]:
+    """Drop registry tabs the extension says are no longer open.
+
+    The extension sends the task's open tabs in every observation
+    (``tabs``). A tab the operator — or the browser — closed is gone
+    from that list, but the registry is additive, so it would stay
+    there forever as a zombie: the select_tab gate lets it through
+    (it IS in the registry) and only the extension fails on it, with
+    a confusing error. Prune it here, from the extension's own list.
+
+    Guards, so a stale or partial list can never wipe the registry:
+    an empty ``open_tab_ids`` prunes nothing, and a list that does
+    not contain the observed tab is not a fresh snapshot for this
+    task, so it prunes nothing either. The primary tab is never
+    pruned here — its closure is a separate failure the loop handles
+    through its primary-tab logic. Returns the pruned tab ids. If a
+    pruned tab was the active one, the observed tab becomes active
+    (it is the tab the loop is looking at).
+    """
+    if not open_tab_ids:
+        return []
+    try:
+        keep = {int(t) for t in open_tab_ids}
+    except (TypeError, ValueError):
+        return []
+    if observed_tab_id is not None and int(observed_tab_id) not in keep:
+        return []
+    try:
+        primary = int(primary_tab_id) if primary_tab_id is not None else None
+    except (TypeError, ValueError):
+        primary = None
+    tabs = working_memory.get("tabs") or []
+    pruned: list[int] = []
+    remaining: list[dict[str, Any]] = []
+    for tab in tabs:
+        try:
+            tid = int(tab.get("tab_id"))
+        except (TypeError, ValueError):
+            remaining.append(tab)
+            continue
+        if tid not in keep and tid != primary:
+            pruned.append(tid)
+        else:
+            remaining.append(tab)
+    if not pruned:
+        return []
+    working_memory["tabs"] = remaining
+    if remaining and not any(t.get("active") for t in remaining) and observed_tab_id is not None:
+        _set_active_tab_in_memory(working_memory, int(observed_tab_id))
+    return pruned
 
 
 # -- Task 9: history compaction -------------------------------------------

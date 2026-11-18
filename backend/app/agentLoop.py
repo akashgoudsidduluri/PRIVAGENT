@@ -35,6 +35,7 @@ from .loop_checkpoints import (
     _maybe_compact_history,
     _persist_agent_message,
     _persist_derived_memory,
+    _prune_tabs_not_in_observation,
     _register_tab_in_memory,
     _remove_tab_from_memory,
     _save_checkpoint_defensive,
@@ -599,6 +600,37 @@ async def _run_loop(
                         session_manager.register_child_tab(session_id, int(_observed_tab_id))
                 except Exception:
                     pass
+            # Prune closed tabs: the observation carries the task's
+            # open tabs (``tabs``). A tab the operator closed is gone
+            # from that list but would otherwise stay in the registry
+            # as a zombie the select_tab gate lets through. Only a
+            # fresh snapshot prunes (non-empty, containing the
+            # observed tab); a missing list prunes nothing. The
+            # primary tab is never pruned here.
+            try:
+                _obs_tabs = raw_obs.get("tabs") if isinstance(raw_obs, dict) else getattr(raw_obs, "tabs", None)
+            except Exception:
+                _obs_tabs = None
+            if isinstance(_obs_tabs, list) and _obs_tabs:
+                _open_ids: list[int] = []
+                for _t in _obs_tabs:
+                    if isinstance(_t, dict):
+                        _tid = _t.get("tabId", _t.get("tab_id"))
+                        if isinstance(_tid, int):
+                            _open_ids.append(_tid)
+                if int(_observed_tab_id) in _open_ids:
+                    _pruned = _prune_tabs_not_in_observation(
+                        working_memory, _open_ids,
+                        observed_tab_id=int(_observed_tab_id),
+                        primary_tab_id=working_memory.get("primary_tab_id"),
+                    )
+                    if _pruned and session_id:
+                        try:
+                            from .session_manager import session_manager
+                            for _pid in _pruned:
+                                session_manager.unregister_child_tab(session_id, int(_pid))
+                        except Exception:
+                            pass
         try:
             if batch_continuation:
                 # The pinned payload is already redacted; re-running

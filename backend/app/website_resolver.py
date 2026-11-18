@@ -202,6 +202,40 @@ def _load_known_domains_registry() -> dict[str, dict[str, Any]]:
 KNOWN_DOMAINS_REGISTRY: dict[str, dict[str, Any]] = _load_known_domains_registry()
 
 
+def _shopping_retailers_for_region(region: str) -> list[dict[str, Any]]:
+    """Registry retailers that serve ``region`` directly.
+
+    A retailer qualifies only when its registry entry carries an
+    explicit regional URL for that region — a GLOBAL fallback does
+    not count, so an Indian shopping task never gets US retailers
+    (bestbuy.com, walmart.com) and vice versa. Returns the entry
+    plus its regional canonical URL and domain. The URL is the
+    retailer's homepage, never a per-retailer search URL: the agent
+    navigates there and searches on the site itself (Task 8 — no
+    baked-in search URLs). This is the shopping analogue of the
+    research hubs (nature.com / arxiv.org / science.org): for a
+    price comparison the retailer IS the primary source, and
+    discovery without it can never return a retailer.
+    """
+    reg = (region or "IN").upper()
+    out: list[dict[str, Any]] = []
+    for key, entry in KNOWN_DOMAINS_REGISTRY.items():
+        if entry.get("category") != "retail":
+            continue
+        regional_urls = entry.get("regional_urls") or {}
+        url = regional_urls.get(reg) or regional_urls.get(reg.lower())
+        if not url:
+            continue
+        try:
+            domain = urllib.parse.urlsplit(url).netloc.lower().replace("www.", "")
+        except Exception:
+            continue
+        if not domain:
+            continue
+        out.append({"key": key, "entry": entry, "url": url, "domain": domain})
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Ambiguous Entity Registry & Disambiguation Engine
 # ---------------------------------------------------------------------------
@@ -399,7 +433,7 @@ def _is_ip_safe(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> tuple[bool
     return True, None
 
 
-def is_safe_public_url(url_or_domain: str) -> tuple[bool, Optional[str]]:
+def is_safe_public_url(url_or_domain: str, resolver=None) -> tuple[bool, Optional[str]]:
     """Determine whether a URL or domain target is a safe, publicly reachable destination.
 
     Rejects:
@@ -407,9 +441,20 @@ def is_safe_public_url(url_or_domain: str) -> tuple[bool, Optional[str]]:
     - Embedded credentials in the authority (user:pass@host)
     - Private, loopback, link-local, multicast, or reserved IP addresses
     - Known cloud metadata and internal hostnames (AWS/GCP/Azure metadata)
+
+    ``resolver`` is an injectable DNS lookup with the same call shape
+    as ``socket.getaddrinfo`` (``resolver(host, port, proto=...)``).
+    It defaults to the real resolver, so production SSRF/rebinding
+    behaviour is unchanged. Tests pass a stub that returns a public
+    IP, which makes discovery testable in sandboxes whose DNS returns
+    non-public addresses (e.g. the RFC 2544 benchmarking range
+    198.18.0.0/15) for every hostname — without weakening the check
+    itself. It also makes the rebinding defense testable: a resolver
+    returning 127.0.0.1 must still be rejected.
     """
     if not url_or_domain:
         return False, "Target URL or domain is empty."
+    resolve = resolver or socket.getaddrinfo
 
     target = url_or_domain.strip()
     m_scheme = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*):", target)
@@ -464,7 +509,7 @@ def is_safe_public_url(url_or_domain: str) -> tuple[bool, Optional[str]]:
 
         # DNS resolution and rebinding defense
         try:
-            addr_info = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
+            addr_info = resolve(hostname, None, proto=socket.IPPROTO_TCP)
             for _, _, _, _, sockaddr in addr_info:
                 resolved_ip_str = sockaddr[0]
                 resolved_ip = ipaddress.ip_address(resolved_ip_str)
@@ -478,14 +523,14 @@ def is_safe_public_url(url_or_domain: str) -> tuple[bool, Optional[str]]:
     return True, None
 
 
-def validate_redirect_chain(initial_url: str, redirect_urls: list[str]) -> tuple[bool, Optional[str]]:
+def validate_redirect_chain(initial_url: str, redirect_urls: list[str], resolver=None) -> tuple[bool, Optional[str]]:
     """Validate an entire HTTP redirect chain for SSRF, internal IPs, and scheme downgrades.
 
     Every single hop in the redirect chain must satisfy is_safe_public_url.
     Rejects any hop that attempts to redirect into loopback, private networks, cloud metadata,
     or dangerous protocols.
     """
-    safe_init, init_err = is_safe_public_url(initial_url)
+    safe_init, init_err = is_safe_public_url(initial_url, resolver=resolver)
     if not safe_init:
         return False, f"Initial target rejected: {init_err}"
 
@@ -493,7 +538,7 @@ def validate_redirect_chain(initial_url: str, redirect_urls: list[str]) -> tuple
         return False, f"Redirect chain exceeds maximum permitted hops ({len(redirect_urls)} > 10)."
 
     for idx, hop_url in enumerate(redirect_urls, start=1):
-        safe_hop, hop_err = is_safe_public_url(hop_url)
+        safe_hop, hop_err = is_safe_public_url(hop_url, resolver=resolver)
         if not safe_hop:
             return False, f"Redirect hop {idx} to '{hop_url}' rejected: {hop_err}"
 
@@ -545,9 +590,13 @@ def is_lookalike_or_suspicious(domain: str) -> tuple[bool, Optional[str]]:
 class WebsiteResolver:
     """Enterprise domain resolver, official verifier, and resolution cache."""
 
-    def __init__(self, default_region: str = "IN", cache_ttl: float = 3600.0) -> None:
+    def __init__(self, default_region: str = "IN", cache_ttl: float = 3600.0, resolver=None) -> None:
         self.default_region = default_region
         self.cache_ttl = cache_ttl
+        # Injectable DNS lookup (same call shape as socket.getaddrinfo),
+        # threaded into is_safe_public_url. None = real DNS (production
+        # behaviour unchanged). Tests pass a stub returning public IPs.
+        self._resolver = resolver
         self._memory_cache: dict[tuple[str, str], tuple[ResolvedWebsite, float]] = {}
 
     def resolve(
@@ -591,7 +640,7 @@ class WebsiteResolver:
 
         # 2. Direct URL handling
         if raw.startswith("http://") or raw.startswith("https://") or "://" in raw:
-            is_safe, safe_err = is_safe_public_url(raw)
+            is_safe, safe_err = is_safe_public_url(raw, resolver=self._resolver)
             if not is_safe:
                 resolved = ResolvedWebsite(
                     target_name=raw,
@@ -1081,6 +1130,21 @@ class WebsiteResolver:
                     "is_primary": False,
                 },
             ]
+            # Retailers are candidates too, from the registry: for a
+            # price comparison the retailer is the primary source, the
+            # search engine only a starting point. Their URL is the
+            # regional homepage (never a per-retailer search URL —
+            # Task 8), and the region filter keeps Indian tasks on
+            # Indian retailers and US tasks on US ones.
+            for ret in _shopping_retailers_for_region(reg_clean):
+                primary_hubs.append({
+                    "domain": ret["domain"],
+                    "url_template": ret["url"],
+                    "name": ret["entry"].get("name") or ret["key"],
+                    "credibility": 0.93,
+                    "suitability": 0.97,
+                    "is_primary": True,
+                })
         elif category == "software_architecture":
             primary_hubs = [
                 {
@@ -1285,7 +1349,7 @@ class WebsiteResolver:
             target_url = hub["url_template"].format(query=q_encoded)
 
             # SSRF and private IP check
-            is_safe, safe_err = is_safe_public_url(dom)
+            is_safe, safe_err = is_safe_public_url(dom, resolver=self._resolver)
             if not is_safe:
                 if provenance_log is not None:
                     provenance_log.append({

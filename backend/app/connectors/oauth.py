@@ -14,8 +14,14 @@ import httpx
 from . import GmailConnector, OutlookConnector, GoogleCalendarConnector, GoogleDriveConnector, SlackConnector, GitHubConnector
 
 _PROVIDER = {
+    # drive.readonly is required for search/extract on the user's EXISTING
+    # files: drive.file only covers files this app created or opened, so
+    # "find X in Drive" returned empty/403 on real accounts. drive.file
+    # stays for uploads (upload_deliverable). Both are least-privilege:
+    # readonly for reads, file-scoped for writes. Adding readonly needs
+    # the user to re-consent on Google.
     "google": {"auth": "https://accounts.google.com/o/oauth2/v2/auth", "token": "https://oauth2.googleapis.com/token",
-               "scopes": "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/drive.file"},
+               "scopes": "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.file"},
     "microsoft": {"auth": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
                   "token": "https://login.microsoftonline.com/common/oauth2/v2.0/token",
                   "scopes": "offline_access Mail.ReadWrite Calendars.ReadWrite"},
