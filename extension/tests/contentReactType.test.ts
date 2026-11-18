@@ -71,3 +71,23 @@ describe("React-controlled input fallback typing", () => {
     expect(agent().readValue("react-append").value).toBe("blue shoes");
   });
 });
+
+describe("typing never redirects by name substring", () => {
+  it("a field named 'Type to search' gets its own text, not the footer composer's", () => {
+    document.body.innerHTML = `
+      <input id="search-box" type="text" aria-label="Type to search products">
+      <footer><div id="composer" contenteditable="true" role="textbox" aria-label="Type a message"></div></footer>`;
+    const result = agent().type("search-box", "titan watch", true, "Type to search products");
+    expect(result.ok).toBe(true);
+    expect((document.getElementById("search-box") as HTMLInputElement).value).toBe("titan watch");
+    expect(document.getElementById("composer")!.textContent).toBe("");
+  });
+
+  it("fails closed when the target cannot be resolved, instead of typing into the composer", () => {
+    document.body.innerHTML = `<footer><div id="composer" contenteditable="true" role="textbox"></div></footer>`;
+    const result = agent().type("gone", "hello", true, "Type a message");
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe("STALE_TARGET");
+    expect(document.getElementById("composer")!.textContent).toBe("");
+  });
+});

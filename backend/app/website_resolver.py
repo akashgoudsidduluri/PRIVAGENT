@@ -17,6 +17,67 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 
+# Domain suffixes that mark a token as a hostname, never a search
+# keyword. A TLD list, not a site list: "node.js" keeps its ".js"
+# and "v1.2" keeps its version, but "nature.com" is stripped.
+_QUERY_DOMAIN_TLDS = r"(?:com|org|net|io|in|gov|edu|co|uk|ai|dev|app|info|me|tv|co\.in|org\.in|ac\.in|co\.uk|org\.uk|com\.au)"
+_QUERY_DOMAIN_RE = re.compile(
+    rf"\b[\w-]+(?:\.[\w-]+)*\.{_QUERY_DOMAIN_TLDS}\b", re.IGNORECASE
+)
+_QUERY_DOMAIN_WITH_PREP_RE = re.compile(
+    rf"\b(?:on|from|at|via|using)\s+[\w-]+(?:\.[\w-]+)*\.{_QUERY_DOMAIN_TLDS}\b",
+    re.IGNORECASE,
+)
+# References to the request itself, not its subject: "for the whole
+# topic", "on this topic", "the whole topic", "this topic".
+_TOPIC_META_RES = [
+    re.compile(
+        r"\b(?:for|on|about|of|across|throughout)\s+(?:(?:the|this|that)\s+)?(?:(?:whole|entire)\s+)?topic\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:(?:the|this|that)\s+)?(?:whole|entire)\s+topic\b", re.IGNORECASE),
+    re.compile(r"\b(?:the|this|that)\s+topic\b", re.IGNORECASE),
+]
+
+
+def _strip_query_filler(text: str) -> str:
+    """Remove tokens that can never be search keywords from a query:
+    domain names ("on nature.com", "nature.com") and references to
+    the request itself ("for the whole topic", "this topic"). Live
+    case: "research Aditya L1 for the whole topic on nature.com"
+    decomposed to queries[0] == "Aditya L1 for the whole topic on
+    nature.com ..." and discovery templated it verbatim into a
+    garbage nature.com search URL. A query that is only filler comes
+    back empty."""
+    out = text or ""
+    out = _QUERY_DOMAIN_WITH_PREP_RE.sub(" ", out)
+    out = _QUERY_DOMAIN_RE.sub(" ", out)
+    for pat in _TOPIC_META_RES:
+        out = pat.sub(" ", out)
+    # Edge cleanup, repeated until stable: each strip can expose a
+    # new dangling token ("Aditya L1 on and" -> "Aditya L1 on" ->
+    # "Aditya L1"; "and generate" -> ""). Mid-string conjunctions
+    # ("salt and pepper") are untouched.
+    for _ in range(4):
+        prev = out
+        # A trailing deliverable verb left behind when its artifact
+        # was stripped earlier ("and generate" from "... and generate
+        # a PDF report").
+        out = re.sub(
+            r"\s+(?:and\s+)?(?:generate|create|prepare|make|produce|export|build|write)\s*$",
+            "", out, flags=re.IGNORECASE,
+        )
+        out = re.sub(r"^(?:for|on|about|of|in|at|across|throughout|and|also|or)\s+", "", out, flags=re.IGNORECASE)
+        out = re.sub(r"\s+(?:for|on|about|of|in|at|across|throughout|and|also|or)$", "", out, flags=re.IGNORECASE)
+        out = re.sub(r"^(?:the|a|an)\s+", "", out, flags=re.IGNORECASE)
+        out = re.sub(r"\s+", " ", out).strip()
+        if out == prev:
+            break
+    if out.lower() in ("whole", "entire", "and", "also", "or"):
+        return ""
+    return out
+
+
 @dataclass
 class ResolvedWebsite:
     """Outcome of resolving an entity, brand, or query to a canonical website."""
@@ -852,6 +913,11 @@ class WebsiteResolver:
         clean = re.sub(r"\s+", " ", clean).strip()
         clean = re.sub(r"\s+(?:bro|man|dude|buddy|pal|friend|pls|please|thanks|thank\s+you|for\s+me|as\s+well|too)$", "", clean, flags=re.IGNORECASE).strip()
 
+        # 7b. Strip domain names and topic-meta filler: a domain is
+        # never a search keyword and "this topic" refers to the
+        # request, not its subject (see _strip_query_filler).
+        clean = _strip_query_filler(clean)
+
         # 8. Check context for prior research topic if clean is empty or generic
         prior_topic = None
         if context and isinstance(context, dict):
@@ -878,6 +944,18 @@ class WebsiteResolver:
                     clean = prior_topic
             else:
                 clean = ""
+        elif len(words) != len(clean.split()):
+            # Deictic words ("this", "that", "it") survived mid-topic:
+            # the filter above only tested emptiness and never rebuilt
+            # clean, so they leaked into the query verbatim. Only
+            # deictics are removed here — content words that happen
+            # to be in generic_terms ("frameworks", "details",
+            # "overview") stay, or "node.js frameworks" would lose
+            # its subject.
+            deictic = {"it", "this", "that", "its", "their", "each", "bro", "man", "dude"}
+            rebuilt = [w for w in clean.split() if w.lower() not in deictic]
+            if rebuilt:
+                clean = " ".join(rebuilt)
 
         if not clean:
             return []
@@ -886,6 +964,8 @@ class WebsiteResolver:
         words = clean.split()
         if len(words) > 8:
             clean = " ".join(words[:8])
+            # The cap itself can strand a dangling token ("... and").
+            clean = _strip_query_filler(clean)
 
         queries: list[str] = []
 
@@ -941,6 +1021,10 @@ class WebsiteResolver:
         seen = set()
         out = []
         for q in queries:
+            # Defence in depth: a subtopic clause can carry the same
+            # filler ("... on nature.com") even when the main topic
+            # was cleaned above.
+            q = _strip_query_filler(q)
             q_norm = q.lower().strip()
             if q_norm and q_norm not in seen:
                 seen.add(q_norm)
@@ -1187,7 +1271,13 @@ class WebsiteResolver:
 
         # Generate candidates from queries across candidate hubs
         seen_domains: set[str] = set()
-        primary_query = queries[0] if queries else "research"
+        # Gate: a query that is only filler ("whole on this topic")
+        # must never be templated into a hub search URL. Decomposition
+        # normally strips it; this is the backstop for callers that
+        # pass raw instruction words.
+        primary_query = _strip_query_filler(queries[0]) if queries else ""
+        if not primary_query:
+            primary_query = "research"
 
         for hub in primary_hubs:
             dom = hub["domain"]

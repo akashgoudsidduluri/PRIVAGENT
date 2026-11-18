@@ -844,7 +844,9 @@ def classify_intent(
     # 4c2. Check for continuous background monitoring directive (price watch, page monitoring)
     try:
         from .continuous_monitoring_companion import is_continuous_monitoring_directive
-        if is_continuous_monitoring_directive(text):
+        if is_continuous_monitoring_directive(
+            text, history=(context or {}).get("conversation_history") or None
+        ):
             return IntentClassification(
                 intent=TaskIntent.NON_BROWSER,
                 confidence=0.99,

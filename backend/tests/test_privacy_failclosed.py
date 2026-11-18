@@ -156,3 +156,45 @@ def test_search_control_survives_element_truncation_on_ecommerce_page(monkeypatc
     # Controls precede the product links they compete with.
     assert interactive_lines.index(next(ln for ln in interactive_lines if "id=site-search" in ln)) == 0
 
+
+
+# ---------------------------------------------------------------------------
+# Unlabelled bare secrets in element values
+# ---------------------------------------------------------------------------
+
+BARE_HEX_KEY = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
+BARE_MIXED_KEY = "Ab3dEf7hIjKlMnOpQrStUvXyZ012"
+
+
+def test_bare_hex_token_value_is_dropped():
+    obs = make_obs({"api_field": {"type": "text", "value": BARE_HEX_KEY}})
+    obs.interactive[0].name = "Key"
+    payload, _ = classify_and_redact(obs, instruction="paste the key")
+    target = [e for e in payload.interactive if e.target_id == "api_field"]
+    assert target[0].value is None
+    # The element itself stays actionable — only its content is hidden.
+    assert target[0].name == "Key"
+
+
+def test_bare_mixed_case_token_value_is_dropped():
+    obs = make_obs({"field": {"type": "text", "value": BARE_MIXED_KEY}})
+    payload, _ = classify_and_redact(obs, instruction="paste the token")
+    assert payload.interactive[0].value is None
+
+
+def test_benign_long_values_survive():
+    # A UUID is a structured identifier, pure digits are an ID/order
+    # number, a long lowercase word is a word, and a short token is
+    # below the length threshold — none of these is a bare secret.
+    obs = make_obs({
+        "a": {"type": "text", "value": "123e4567-e89b-12d3-a456-426614174000"},
+        "b": {"type": "text", "value": "123456789012345678901234567890"},
+        "c": {"type": "text", "value": "supercalifragilisticexpialidocious"},
+        "d": {"type": "text", "value": "Ab3dEf7hIjKlMnOp"},
+    })
+    payload, _ = classify_and_redact(obs, instruction="read the page")
+    values = {e.target_id: e.value for e in payload.interactive}
+    assert values["a"] == "123e4567-e89b-12d3-a456-426614174000"
+    assert values["b"] == "123456789012345678901234567890"
+    assert values["c"] == "supercalifragilisticexpialidocious"
+    assert values["d"] == "Ab3dEf7hIjKlMnOp"

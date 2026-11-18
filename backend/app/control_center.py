@@ -31,7 +31,7 @@ class MonitorInput(BaseModel):
     trigger_type: Literal["interval", "cron", "webhook"] = "interval"
     schedule_cron: str | None = None
     interval_seconds: int = Field(default=300, ge=60, le=604800)
-    condition_type: Literal["price_drop", "text_change", "regex", "element"] = "text_change"
+    condition_type: Literal["price_drop", "below_price", "text_change", "regex", "element"] = "text_change"
     condition_params: dict[str, Any] = Field(default_factory=dict)
 
 

@@ -33,6 +33,8 @@ from .takeover import AUTH_PATH_TOKENS
 __all__ = [
     "CANONICAL_FORMAT_MAP",
     "MAX_HISTORY_TEXT_CHARS",
+    "MAX_TRANSIENT_PLAN_RETRIES",
+    "TRANSIENT_PLAN_BACKOFF_S",
     "_AUTH_HOSTS",
     "_AUTH_PATH_TOKENS",
     "_FORCE_REOBSERVE_ACTIONS",
@@ -62,6 +64,8 @@ __all__ = [
     "_to_obs",
     "canonical_format_map",
     "extract_mission_facts",
+    "is_transient_planner_error",
+    "transient_plan_backoff_s",
     "warm_loop_caches",
 ]
 
@@ -317,6 +321,65 @@ def _normalize_loop_error(error: Any) -> str:
     text = re.sub(r"[0-9]+", " ", text)
     text = re.sub(r"[^a-z0-9]+", " ", text.lower())
     return " ".join(text.split())
+
+
+# Transient planner failures: the model gateway could not be reached
+# at all (DNS lookup failed, connection refused/reset/timed out).
+# These are worth retrying with a backoff — a DNS blip of a few
+# seconds killed a live price hunt on the first attempt because the
+# old retry loop only waited 1.5s and gave up after 2 attempts.
+# NOT transient: auth failures, quota exhaustion, invalid plans —
+# those fail fast exactly as before.
+_TRANSIENT_PLANNER_RES = [
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"getaddrinfo",
+        r"name resolution",
+        r"name or service not known",
+        r"temporary failure in name resolution",
+        r"nodename nor servname",
+        r"\bgaierror\b",
+        r"nameresolutionerror",
+        r"\bdns\b",
+        r"connecttimeout",
+        r"connect timed out",
+        r"connection refused",
+        r"connection reset",
+        r"connection aborted",
+        r"network is unreachable",
+        r"remotedisconnected",
+        r"read timeout",
+        r"read timed out",
+        r"errno 1100[12]",
+        r"errno 111\b",
+        r"errno 104\b",
+        r"errno 101\b",
+    )
+]
+
+# Transient planner errors get more attempts with a growing backoff
+# (2s, then 5s, then 10s — ~17s of cover for a short network blip),
+# instead of the 2-attempt / 1.5s behaviour for other errors.
+# The shared planning deadline (PLANNER_TIMEOUT_S) still caps the
+# total wait: the loop checks it before every attempt.
+MAX_TRANSIENT_PLAN_RETRIES = 4
+TRANSIENT_PLAN_BACKOFF_S = (2.0, 5.0, 10.0)
+
+
+def is_transient_planner_error(error: Any) -> bool:
+    """True when a planner failure is a transient network/DNS blip
+    (the gateway was unreachable) rather than an auth, quota or
+    plan-shape failure. Only transient errors earn the extra
+    attempts and the longer backoff."""
+    if not isinstance(error, str) or not error:
+        return False
+    return any(p.search(error) for p in _TRANSIENT_PLANNER_RES)
+
+
+def transient_plan_backoff_s(plan_attempt: int) -> float:
+    """Backoff before retrying a transient planner failure."""
+    idx = min(max(int(plan_attempt), 0), len(TRANSIENT_PLAN_BACKOFF_S) - 1)
+    return TRANSIENT_PLAN_BACKOFF_S[idx]
 
 
 def _actions_match(a1: dict[str, Any], a2: dict[str, Any]) -> bool:

@@ -176,6 +176,23 @@
   z-index: 20;
 }
 
+/* Scroll compensation for the pinned composer: scrollIntoView targets
+   (step items, result cards) must stop ABOVE the sticky input card,
+   not at the viewport bottom edge underneath it. The document is the
+   scroller here, so the padding belongs on html — agent.html never
+   loads main.css, whose scroll-padding-top only covers the sticky
+   header on the landing page. Composer height: ~290px desktop (card
+   padding + label + textarea + presets + actions + subtext), ~360px
+   on small phones (44px chips/buttons, stacked actions). */
+html {
+  scroll-padding-top: 84px;
+  scroll-padding-bottom: 360px;
+}
+
+@media (max-width: 480px) {
+  html { scroll-padding-bottom: 420px; }
+}
+
 .agent-input-label {
   display: flex;
   justify-content: space-between;

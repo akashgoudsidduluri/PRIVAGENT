@@ -366,7 +366,11 @@ def resolve_fresh_ref(
     match order is deliberate:
 
     1. Same stable target id under a possibly new ref — a re-render
-       that re-assigns refs but keeps the element's identity.
+       that re-assigns refs but keeps the element's identity. The id
+       must be unique in the fresh tree: if a partial re-render
+       duplicated it, the id no longer identifies one control, so
+       the match falls through to the role+name path (which requires
+       exactly one candidate) instead of silently taking the first.
     2. Same role + normalised accessible name, *unambiguous* (exactly
        one candidate) — a re-render that re-assigns the target id too.
 
@@ -392,9 +396,15 @@ def resolve_fresh_ref(
         plan_name = plan_name or str(target.get("name") or "")
 
     if plan_target_id:
-        for node in nodes:
-            if node.target_id and str(node.target_id) == str(plan_target_id):
-                return node.ref, node
+        id_matches = [
+            node for node in nodes
+            if node.target_id and str(node.target_id) == str(plan_target_id)
+        ]
+        if len(id_matches) == 1:
+            return id_matches[0].ref, id_matches[0]
+        # Duplicate target ids after a partial re-render: the id no
+        # longer identifies one control. Fall through to the role+name
+        # match (exactly-one required) instead of guessing the first.
 
     if plan_name:
         wanted = normalize_accessible_name(plan_name).casefold()

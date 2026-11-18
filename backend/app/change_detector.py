@@ -76,6 +76,21 @@ def _triggered(condition: str, params: dict, before: dict, after: dict) -> tuple
         if old is None or new is None or old <= 0:
             return False, "Price unavailable"
         return new < old and (old - new) * 100 / old >= threshold, f"Price changed from {old:g} to {new:g}"
+    if condition == "below_price":
+        # Absolute threshold ("alert me when the price falls below
+        # ₹5000"): fires whenever the observed price is under the
+        # threshold — a state, not a change — so the first run can
+        # already alert when the product is cheap.
+        try:
+            threshold = float(params.get("threshold"))
+        except (TypeError, ValueError):
+            raise ValueError("below-price threshold must be a number") from None
+        if threshold <= 0:
+            raise ValueError("below-price threshold must be positive")
+        new = after.get("price")
+        if new is None:
+            return False, "Price unavailable"
+        return new < threshold, f"Price below ₹{threshold:g} (now ₹{new:g})"
     if condition == "regex":
         pattern = str(params.get("pattern") or "")
         # A narrow, useful regex subset avoids catastrophic backtracking in
@@ -114,13 +129,21 @@ def evaluate_observation(mission_id: str, observation: dict[str, Any], *,
         changed = bool(row["last_state_hash"] and row["last_state_hash"] != digest)
         # A daily-price digest reports on every scheduled run, even when
         # nothing changed (and even on the first run, when there is no
-        # baseline yet). Every other condition only fires on a change,
-        # and is deduplicated by the alert hash.
-        is_digest = row["condition_type"] == "daily_price"
-        if is_digest:
+        # baseline yet). A below-price threshold is likewise a state,
+        # not a change: being under the threshold is alert-worthy on
+        # the first run too (the product may already be cheap) — but
+        # unlike the digest it is deduplicated by state digest, so a
+        # steady below-threshold price alerts once, not every tick.
+        # Every other condition only fires on a change, and is
+        # deduplicated by the alert hash.
+        if row["condition_type"] == "daily_price":
             should_alert, summary = _triggered(row["condition_type"], json.loads(row["condition_params"] or "{}"),
                                                before, state)
             fire = should_alert
+        elif row["condition_type"] == "below_price":
+            should_alert, summary = _triggered(row["condition_type"], json.loads(row["condition_params"] or "{}"),
+                                               before, state)
+            fire = should_alert and digest != row["last_alert_hash"]
         elif changed:
             should_alert, summary = _triggered(row["condition_type"], json.loads(row["condition_params"] or "{}"),
                                                before, state)

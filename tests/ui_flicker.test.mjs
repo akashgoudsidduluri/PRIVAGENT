@@ -194,6 +194,18 @@ test("agent.html loads no landing stylesheet and agent.css exactly once", () => 
   assert.ok(!distHtml.includes("main.css"), "built agent.html still references main.css");
 });
 
+test("Google Fonts load async and never block first paint", () => {
+  // A plain <link rel="stylesheet" href="https://fonts.googleapis.com/...">
+  // is render-blocking on a third-party fetch. Fonts must arrive via
+  // preload + onload rel-swap instead (GLM review 2026-11-17).
+  for (const [label, html] of [["source", agentHtml], ["built", distHtml]]) {
+    assert.ok(!/<link[^>]*rel="stylesheet"[^>]*fonts\.googleapis/.test(html), `${label} agent.html still has a render-blocking Google Fonts stylesheet`);
+    assert.ok(!/<link[^>]*fonts\.googleapis[^>]*rel="stylesheet"/.test(html), `${label} agent.html still has a render-blocking Google Fonts stylesheet (reversed attrs)`);
+  }
+  assert.ok(agentHtml.includes('rel="preload" as="style"'), "fonts preload link missing from agent.html");
+  assert.ok(agentHtml.includes("this.rel='stylesheet'"), "fonts preload link does not swap to stylesheet on load");
+});
+
 // ---------------------------------------------------------------------------
 // Built bundles.
 // ---------------------------------------------------------------------------

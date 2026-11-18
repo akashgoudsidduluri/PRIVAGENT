@@ -50,7 +50,7 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-async function loadArtifacts(taskId?: string | null, chatId?: string | null): Promise<void> {
+async function loadArtifacts(taskId?: string | null, chatId?: string | null, isCurrent?: () => boolean): Promise<void> {
   if (!artifactsCard || !artifactsList) return;
   const targetUrl = taskId ? `${API}/api/tasks/${taskId}/artifacts` : (chatId ? `${API}/api/chats/${chatId}/artifacts` : null);
   if (!targetUrl) {
@@ -65,6 +65,9 @@ async function loadArtifacts(taskId?: string | null, chatId?: string | null): Pr
       return;
     }
     const list = (await res.json()) as ArtifactItem[];
+    // A newer chat selection superseded this one while the fetch was
+    // in flight: never render the stale chat's artifacts.
+    if (isCurrent && !isCurrent()) return;
     if (!Array.isArray(list) || list.length === 0) {
       artifactsCard.hidden = true;
       return;
@@ -336,9 +339,9 @@ function initWorkspaceElements(): void {
           if (t.taskState && t.taskState !== "planning") {
             setTaskState(t.taskState);
           }
-          if (t.screenshot) {
-            updateVisualFrame(t.screenshot, t.message || "", t.taskState);
-          }
+          // Unconditional: a screenshot-less task must clear the frame
+          // rather than keep the previous chat's image.
+          updateVisualFrame(t.screenshot ?? null, t.message || "", t.taskState);
           if (["completed", "failed", "cancelled"].includes(t.taskState)) {
             stopFallbackPolling();
             renderCompletion(t.taskState, t.message || "", true, t.stepsDone);
@@ -431,6 +434,11 @@ function initWorkspaceElements(): void {
 
 // Session & Task State
 let activeChatId: string | null = null;
+
+// Generation guard for selectChat: two rapid sidebar clicks resolve in
+// arbitrary order, and the slower (wrong) chat's messages must never
+// overwrite the newer selection's feed.
+let selectChatGeneration = 0;
 let currentTaskId: string | null = null;
 let renderedTerminalTaskId: string | null = null;
 let stepCounter = 0;
@@ -575,6 +583,13 @@ function updateVisualFrame(screenshot: string | null | undefined, message: strin
     inspectorScreenshot.src = dataUrl;
     inspectorScreenshot.hidden = false;
     if (inspectorScreenshotPlaceholder) inspectorScreenshotPlaceholder.hidden = true;
+  } else if (inspectorScreenshot) {
+    // No screenshot for this step: clear the frame instead of leaving
+    // the previous step's — or the previous chat's — image up as if it
+    // were this step's visual.
+    inspectorScreenshot.removeAttribute("src");
+    inspectorScreenshot.hidden = true;
+    if (inspectorScreenshotPlaceholder) inspectorScreenshotPlaceholder.hidden = false;
   }
 }
 
@@ -903,9 +918,8 @@ async function syncActiveTask(taskId: string): Promise<boolean> {
     if (t.taskState && t.taskState !== "planning") {
       setTaskState(t.taskState);
     }
-    if (t.screenshot) {
-      updateVisualFrame(t.screenshot, t.message || "", t.taskState);
-    }
+    // Unconditional: a screenshot-less poll must clear the frame.
+    updateVisualFrame(t.screenshot ?? null, t.message || "", t.taskState);
     // Rehydrate intermediate execution steps if missing from the timeline
     if (Array.isArray(t.steps) && t.steps.length > 0) {
       t.steps.forEach(st => {
@@ -1103,7 +1117,7 @@ function hideTakeover(): void {
 // Multi-Turn Chat & Session Isolation Management
 // ----------------------------------------------------
 
-async function loadChatList(): Promise<void> {
+async function loadChatList(options?: { autoSelect?: boolean }): Promise<void> {
   if (!chatHistoryList) return;
   try {
     const res = await apiFetch(`${API}/api/chats`);
@@ -1149,7 +1163,10 @@ async function loadChatList(): Promise<void> {
       chatHistoryList?.appendChild(li);
     });
 
-    if (!activeChatId) {
+    // Auto-select only when asked: after deleting the active chat the
+    // workspace must stay on the blank New Mission state, not instantly
+    // re-open a different mission. First load still auto-selects.
+    if (!activeChatId && (options?.autoSelect ?? true)) {
       const savedChatId = localStorage.getItem("privagent_active_chat_id");
       if (savedChatId && chats.some(c => c.id === savedChatId)) {
         void selectChat(savedChatId);
@@ -1163,6 +1180,7 @@ async function loadChatList(): Promise<void> {
 }
 
 async function selectChat(chatId: string): Promise<void> {
+  const gen = ++selectChatGeneration;
   activeChatId = chatId;
   try {
     localStorage.setItem("privagent_active_chat_id", chatId);
@@ -1191,7 +1209,11 @@ async function selectChat(chatId: string): Promise<void> {
   if (stepsList) stepsList.innerHTML = "";
   if (resultCard) resultCard.hidden = true;
   if (artifactsCard) artifactsCard.hidden = true;
-  loadArtifacts(null, chatId);
+  // Switching chats must not leave the previous chat's screenshot in
+  // the Visual Perception frame; the detail fetch below re-shows the
+  // new chat's active task image if it has one.
+  updateVisualFrame(null, "", "ready");
+  loadArtifacts(null, chatId, () => gen === selectChatGeneration);
   if (stepsCount) stepsCount.textContent = "0 steps executed";
   renderStepBudget();
   setTaskState("ready");
@@ -1206,6 +1228,9 @@ async function selectChat(chatId: string): Promise<void> {
     const res = await apiFetch(`${API}/api/chat/${chatId}`);
     if (!res.ok) return;
     const detail = (await res.json()) as ChatDetail;
+    // A newer selection superseded this one while the fetch was in
+    // flight: render nothing from the stale detail.
+    if (gen !== selectChatGeneration) return;
     // /api/chat/{id} returns a FLAT shape (chat fields + messages + memory),
     // not {chat: {...}, messages}. Read status defensively from either form.
     const chatStatus = (detail as unknown as { status?: string }).status
@@ -1287,9 +1312,9 @@ async function selectChat(chatId: string): Promise<void> {
       if (btnCancelMission) btnCancelMission.hidden = false;
       setTaskState(act.taskState);
       startFallbackPolling(currentTaskId);
-      if (act.screenshot) {
-        updateVisualFrame(act.screenshot, act.message || "", act.taskState);
-      }
+      // Unconditional: reconnecting to a screenshot-less task must not
+      // keep another chat's image in the frame.
+      updateVisualFrame(act.screenshot ?? null, act.message || "", act.taskState);
       // Rehydrate in-flight execution steps executed before tab was re-opened
       if (Array.isArray(act.steps) && act.steps.length > 0) {
         act.steps.forEach(st => {
@@ -1333,6 +1358,7 @@ async function selectChat(chatId: string): Promise<void> {
       if (resultCard) resultCard.hidden = true;
     }
   } catch (err) {
+    if (gen !== selectChatGeneration) return;
     addStepItem(`⚠️ Failed to load chat history: ${err}`);
   }
 }
@@ -1354,7 +1380,9 @@ async function deleteChat(chatId: string): Promise<void> {
   if (activeChatId === chatId) {
     createNewChat();
   }
-  await loadChatList();
+  // No auto-select: deleting the active chat lands on the blank New
+  // Mission state instead of instantly re-opening another mission.
+  await loadChatList({ autoSelect: false });
 }
 
 function createNewChat(): void {
@@ -1424,7 +1452,14 @@ btnToggleSidebarHeader?.addEventListener("click", () => {
 });
 
 btnNewSession?.addEventListener("click", () => {
+  // From any Control Center view the workspace template is unmounted,
+  // so createNewChat() alone is a visible no-op: every node it touches
+  // is null. Mount first (synchronous), navigate to the workspace
+  // view, then start the new chat against the live nodes.
+  ensureWorkspaceMounted();
+  if (location.hash !== "#agent-workspace") location.hash = "agent-workspace";
   createNewChat();
+  missionInput?.focus();
 });
 
 // Delegated click handler for Deliverable Export & Suggested Next Moves

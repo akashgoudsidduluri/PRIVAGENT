@@ -603,3 +603,107 @@ async def test_sixty_minute_sweep_deletes_promos_notifies_urgent(email_db, mailb
     bank = [c for c in db.get_email_classifications(m["id"], db_path=email_db)
             if "HDFC Bank Alert" in (c.get("subject") or "")]
     assert bank and all(c.get("action_taken") != "moved_to_trash" for c in bank)
+
+
+# --- Backend flaw-hunt finding 5: cleanup "verification" was vacuous. ---
+# The trash call's own truthy return made verified=True even when the
+# read-back showed the message was NOT in Trash, and a failed
+# read-back was claimed verified ("Provider accepted HTTP POST").
+# Only the provider-side read-back may verify a trash/restore.
+
+class _LyingTrashConnector:
+    """Reports a successful trash/untrash while the message never
+    moves: get_message keeps returning the caller's chosen state."""
+
+    def __init__(self, label_ids=None, fail_readback=False):
+        self._label_ids = list(label_ids) if label_ids is not None else ["INBOX"]
+        self._fail_readback = fail_readback
+
+    def trash_message(self, message_id):
+        return {"id": message_id}  # truthy: the POST was accepted
+
+    def untrash_message(self, message_id):
+        return {"id": message_id}
+
+    def get_message(self, message_id):
+        if self._fail_readback:
+            raise RuntimeError("read-back unavailable")
+        return {"id": message_id, "labelIds": list(self._label_ids)}
+
+
+def _authorized_mission(email_db):
+    mission = db.create_email_mission(
+        account_email="tester.privagent@gmail.com", db_path=email_db)
+    db.update_email_mission(mission["id"], {"policy_authorized": 1, "dry_run": 0}, db_path=email_db)
+    return db.get_email_mission(mission["id"], db_path=email_db)
+
+
+def test_trash_not_verified_when_readback_shows_inbox(email_db, mailbox):
+    mission = _authorized_mission(email_db)
+    items = {item.id: item for item in mailbox.to_email_items()}
+    promo_item = items["msg_01_promo"]
+    decision = evaluate_and_execute_cleanup(
+        mission, promo_item, classify_email(promo_item),
+        _LyingTrashConnector(["INBOX"]), db_path=email_db)
+    assert decision.action == "moved_to_trash"
+    assert decision.verified is False
+    logs = db.get_email_audit_logs(mission["id"], db_path=email_db)
+    trash_log = next(entry for entry in logs if entry["action"] == "moved_to_trash")
+    assert trash_log["details"]["verified"] is False
+
+
+def test_trash_not_verified_when_readback_fails(email_db, mailbox):
+    mission = _authorized_mission(email_db)
+    items = {item.id: item for item in mailbox.to_email_items()}
+    promo_item = items["msg_01_promo"]
+    decision = evaluate_and_execute_cleanup(
+        mission, promo_item, classify_email(promo_item),
+        _LyingTrashConnector(fail_readback=True), db_path=email_db)
+    assert decision.action == "moved_to_trash"
+    assert decision.verified is False
+
+
+def test_restore_not_verified_when_still_in_trash(email_db, mailbox):
+    client = mailbox.make_mock_client()
+    connector = GmailConnector("demo-token", client=client)
+    mission = _authorized_mission(email_db)
+    items = {item.id: item for item in mailbox.to_email_items()}
+    promo_item = items["msg_01_promo"]
+    evaluate_and_execute_cleanup(mission, promo_item, classify_email(promo_item), connector, db_path=email_db)
+    assert "TRASH" in connector.get_message("msg_01_promo").get("labelIds", [])
+    res = restore_email_from_trash(
+        mission["id"], "msg_01_promo", _LyingTrashConnector(["TRASH", "INBOX"]), db_path=email_db)
+    assert res["ok"] is True
+    assert res["verified"] is False
+
+
+# --- Backend flaw-hunt finding 6: the tick silently substituted ---
+# --- the demo mailbox for a real account with no live OAuth. ---
+
+@pytest.mark.asyncio
+async def test_tick_for_real_account_without_oauth_fails_honestly(email_db):
+    """contester@gmail.com contains 'tester' but is a real account:
+    with no live OAuth the tick must fail honestly, not 'succeed'
+    against the demo mailbox."""
+    mission = db.create_email_mission(account_email="contester@gmail.com", db_path=email_db)
+    result = await run_email_mission_tick(mission["id"], db_path=email_db)
+    assert result["status"] == "error"
+    assert "contester@gmail.com" in result["reason"]
+    assert "not connected" in result["reason"]
+    stats = db.get_email_dashboard_stats(mission["id"], db_path=email_db)
+    assert stats["total_processed"] == 0
+    logs = db.get_email_audit_logs(mission["id"], db_path=email_db)
+    assert any(entry["action"] == "sync_failed" for entry in logs)
+    assert not any(entry["action"] == "sync_completed" for entry in logs)
+
+
+@pytest.mark.asyncio
+async def test_demo_account_still_uses_sandbox(email_db, mailbox, monkeypatch):
+    """Guard against over-correction: the exact demo address still
+    runs against the controlled mailbox."""
+    from app.email_intelligence import sync_engine
+    monkeypatch.setattr(sync_engine, "_demo_mailbox", mailbox)
+    mission = db.create_email_mission(account_email="demo.privagent@gmail.com", db_path=email_db)
+    result = await run_email_mission_tick(mission["id"], db_path=email_db)
+    assert result["status"] == "success"
+    assert result["mode"] == "sandbox"

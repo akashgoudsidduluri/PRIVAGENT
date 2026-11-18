@@ -4,13 +4,77 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+import json
 import logging
 import time
+import uuid
 
 from . import db
 from .hub import hub
 
 logger = logging.getLogger(__name__)
+
+# A watch is not killed by one bad tick. A transient failure (DNS,
+# connect timeout, a site hiccup) keeps the mission active so it
+# retries on its normal cadence; only a permanent refusal, or this
+# many transient failures in a row, ends it — and the end is recorded
+# as a monitoring event so the user can see the watch died, instead
+# of it vanishing silently (claim_due only ever selects 'active').
+MAX_CONSECUTIVE_MONITOR_FAILURES = 5
+
+
+def _is_transient_refusal(reason: str | None) -> bool:
+    """Only a DNS-resolution refusal is transient; every other URL
+    refusal (malformed URL, disallowed scheme, private/internal
+    host) is a stable fact about the URL."""
+    return bool(reason) and "does not resolve" in reason
+
+
+def _record_monitor_failure(mission_id: str, reason: str, *, permanent: bool = False) -> tuple[str, dict | None]:
+    """Record one failed check tick. Returns (status, death_event).
+
+    Transient: count rises, mission stays 'active' and retries next
+    tick. Permanent, or MAX_CONSECUTIVE_MONITOR_FAILURES transient
+    failures in a row: status becomes 'failed' and a monitoring
+    event is recorded describing why the watch stopped."""
+    now = time.time()
+    with db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT consecutive_failures FROM monitoring_missions WHERE id=?", (mission_id,)
+        ).fetchone()
+        prior = int(row["consecutive_failures"] or 0) if row else 0
+        count = 0 if permanent else prior + 1
+        if permanent or count >= MAX_CONSECUTIVE_MONITOR_FAILURES:
+            conn.execute(
+                "UPDATE monitoring_missions SET status='failed', last_run_at=?, consecutive_failures=? WHERE id=?",
+                (now, count, mission_id),
+            )
+            event = {
+                "id": str(uuid.uuid4()), "mission_id": mission_id, "task_id": None,
+                "detected_at": now, "title": "Monitoring stopped",
+                "summary": f"Watch stopped after {count} consecutive failed check(s): {reason}",
+                "diff_data": {"reason": reason}, "state_hash": "",
+            }
+            conn.execute(
+                """INSERT INTO monitoring_events (id, mission_id, detected_at, title, summary, diff_data, state_hash)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (event["id"], mission_id, now, event["title"], event["summary"],
+                 json.dumps(event["diff_data"]), ""),
+            )
+            return "failed", event
+        conn.execute(
+            "UPDATE monitoring_missions SET last_run_at=?, consecutive_failures=? WHERE id=?",
+            (now, count, mission_id),
+        )
+        return "active", None
+
+
+def _record_monitor_success(mission_id: str) -> None:
+    """A clean check resets the consecutive-failure count."""
+    with db.get_connection() as conn:
+        conn.execute(
+            "UPDATE monitoring_missions SET consecutive_failures=0 WHERE id=?", (mission_id,)
+        )
 
 
 def _cron_part(raw: str, low: int, high: int) -> set[int]:
@@ -128,19 +192,26 @@ async def execute_monitor(mission: dict) -> None:
         ok, reason = _validate_monitor_url(target_url)
         if not ok:
             logger.warning("monitor %s: HTTP check refused (%s)", mission["id"], reason)
-            with db.get_connection() as conn:
-                conn.execute("UPDATE monitoring_missions SET status='failed',last_run_at=? WHERE id=?",
-                             (time.time(), mission["id"]))
+            # A DNS refusal is transient — the watch survives and
+            # retries next tick. A structural refusal (private host,
+            # bad scheme) ends it, with a recorded event.
+            _status, death_event = _record_monitor_failure(
+                mission["id"], reason or "URL refused",
+                permanent=not _is_transient_refusal(reason),
+            )
+            if death_event:
+                await broadcast_event(death_event)
             return
         try:
             event = await asyncio.to_thread(check_monitor_http, mission["id"], target_url)
+            _record_monitor_success(mission["id"])
             if event:
                 await broadcast_event(event)
         except Exception as exc:
             logger.warning("monitor %s: HTTP check failed: %s", mission["id"], exc)
-            with db.get_connection() as conn:
-                conn.execute("UPDATE monitoring_missions SET status='failed',last_run_at=? WHERE id=?",
-                             (time.time(), mission["id"]))
+            _status, death_event = _record_monitor_failure(mission["id"], str(exc))
+            if death_event:
+                await broadcast_event(death_event)
         return
 
     record = hub.new_task(f"Open {target_url} and observe its public visible page text and price. Report only observed facts.",
@@ -159,12 +230,14 @@ async def execute_monitor(mission: dict) -> None:
         text = observation.get("pageText", "") if isinstance(observation, dict) else getattr(observation, "page_text", "")
         interactive = observation.get("interactive", []) if isinstance(observation, dict) else getattr(observation, "interactive", [])
         names = [str(el.get("name", "") if isinstance(el, dict) else getattr(el, "name", "")) for el in interactive]
+        _record_monitor_success(mission["id"])
         event = evaluate_observation(mission["id"], {"text": text, "elements": names}, task_id=record.task_id)
         if event:
             await broadcast_event(event)
-    except Exception:
-        with db.get_connection() as conn:
-            conn.execute("UPDATE monitoring_missions SET status='failed',last_run_at=? WHERE id=?", (time.time(), mission["id"]))
+    except Exception as exc:
+        _status, death_event = _record_monitor_failure(mission["id"], str(exc))
+        if death_event:
+            await broadcast_event(death_event)
 
 
 async def scheduler_loop(stop: asyncio.Event, tick_seconds: float = 10.0) -> None:

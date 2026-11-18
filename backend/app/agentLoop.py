@@ -51,6 +51,7 @@ from .loop_gates import (
 from .loop_helpers import (
     CANONICAL_FORMAT_MAP,
     MAX_HISTORY_TEXT_CHARS,
+    MAX_TRANSIENT_PLAN_RETRIES,
     _AUTH_HOSTS,
     _AUTH_PATH_TOKENS,
     _FORCE_REOBSERVE_ACTIONS,
@@ -81,7 +82,9 @@ from .loop_helpers import (
     canonical_format_map,
     extract_mission_facts,
     fresh_tree_for_observation,
+    is_transient_planner_error,
     ref_freshness,
+    transient_plan_backoff_s,
     warm_loop_caches,
 )
 from .loop_research import (
@@ -686,9 +689,11 @@ async def _run_loop(
                 working_memory["webmcp_tools"] = []
                 working_memory["webmcp_origin"] = ""
             # UCP profile: fetched per origin, cached for the task. A
-            # missing/unusable profile is not an error — the merchant
-            # simply has no UCP checkout, and the planner plans
-            # without one.
+            # missing profile URL means the merchant has no UCP
+            # checkout. A FAILED fetch is different: the merchant
+            # declared a profile URL but it could not be read (DNS,
+            # egress, HTTP, invalid JSON) — record the reason instead
+            # of silently treating it as "no UCP checkout".
             try:
                 _page_origin = _origin_of(raw_url)
                 _ucp_url = getattr(payload, "ucp_profile_url", None)
@@ -709,10 +714,16 @@ async def _run_loop(
                     _prof = _ucp_cache.get(_page_origin)
                     payload.ucp_profile = _prof
                     working_memory["ucp_profile"] = _prof
+                    working_memory["ucp_profile_error"] = None
+                    payload.ucp_profile_error = None
                 else:
                     working_memory["ucp_profile"] = None
-            except Exception:
+                    working_memory["ucp_profile_error"] = None
+                    payload.ucp_profile_error = None
+            except Exception as exc:
                 working_memory["ucp_profile"] = None
+                working_memory["ucp_profile_error"] = str(exc)[:200] or "UCP profile fetch failed"
+                payload.ucp_profile_error = working_memory["ucp_profile_error"]
         # -- Task 4: takeover detection -----------------------------------
         # A login / payment / OTP / CAPTCHA surface must never be planned
         # on: the observation that detected it is the last one the agent
@@ -792,7 +803,10 @@ async def _run_loop(
 
         plan_deadline = time.monotonic() + PLANNER_TIMEOUT_S
         MAX_PLAN_RETRIES = 2
-        for plan_attempt in range(MAX_PLAN_RETRIES):
+        # The attempt loop covers the transient budget too: non-transient
+        # errors still stop after MAX_PLAN_RETRIES (the fail check
+        # below), transient ones get MAX_TRANSIENT_PLAN_RETRIES.
+        for plan_attempt in range(max(MAX_PLAN_RETRIES, MAX_TRANSIENT_PLAN_RETRIES)):
             if batch_continuation:
                 # Task 11: no planner call — execute the next step of
                 # the already-validated plan. The stub keeps the shared
@@ -855,18 +869,44 @@ async def _run_loop(
                 except Exception:
                     pass
 
+                # Transient network/DNS blips (the gateway unreachable)
+                # earn more attempts with a growing backoff (2s, 5s,
+                # 10s): the old 2-attempt / 1.5s loop killed a live
+                # price hunt on a DNS blip that lasted a few seconds.
+                # Auth, quota and plan-shape failures keep the old
+                # fast-fail behaviour.
+                is_transient = is_transient_planner_error(err_text)
+                limit = MAX_TRANSIENT_PLAN_RETRIES if is_transient else MAX_PLAN_RETRIES
+
                 # If cooldown is long (> 3.0s) or explicitly in quota exhaustion, do not repeatedly call providers still in cooldown
                 is_long_cooldown = retry_s > 3.0 or "quota exhausted" in err_text or "1m" in err_text
-                if is_long_cooldown or plan_attempt + 1 >= MAX_PLAN_RETRIES:
+                if is_long_cooldown or plan_attempt + 1 >= limit:
                     _save_checkpoint_defensive(task_id, conversation_id, session_id, steps_done, raw_url, history, working_memory)
+                    # Error attribution: name the failing hop. A
+                    # planner-call failure says nothing about the
+                    # requested sites — no browser navigation was
+                    # attempted in this step, so the sites were never
+                    # tested and must not be blamed for it.
+                    suffix = (
+                        " The planner call itself failed (the model gateway could not be reached); "
+                        "this says nothing about the requested sites, which were not tested."
+                        if is_transient else ""
+                    )
                     return {
                         "final": "failed",
                         "steps": steps_done,
-                        "summary": f"Planner unavailable: {redact_text_urls(err_text)[:400]} (step {steps_done} state preserved).", "history": history,
+                        "summary": f"Planner unavailable: {redact_text_urls(err_text)[:400]} (step {steps_done} state preserved).{suffix}", "history": history,
                     }
 
-                wait_time = max(retry_s + 0.5, 1.5)
-                progress(f"Provider unavailable; retrying ({plan_attempt + 1}/{MAX_PLAN_RETRIES})...")
+                if is_transient:
+                    wait_time = max(retry_s + 0.5, transient_plan_backoff_s(plan_attempt))
+                else:
+                    wait_time = max(retry_s + 0.5, 1.5)
+                # Never sleep past the shared planning deadline: the
+                # next iteration reports the timeout instead.
+                time_left = plan_deadline - time.monotonic()
+                wait_time = min(wait_time, max(0.0, time_left))
+                progress(f"Provider unavailable; retrying ({plan_attempt + 1}/{limit})...")
                 await asyncio.sleep(wait_time)
                 continue
             finally:
@@ -968,6 +1008,17 @@ async def _run_loop(
                         comp_table = format_comparison_table(ms_tracker, instruction)
                         if comp_table and "Price & Availability Comparison" not in summary_msg:
                             summary_msg = f"{summary_msg}\n\n{comp_table}" if summary_msg else comp_table
+                        # Fix 5: after a comparison with verified
+                        # listings finishes, proactively offer the
+                        # alert (live case: the Fit3 verdict never
+                        # asked "do you want me to alert you?", so
+                        # the user never reached the daily digest).
+                        # No offer when nothing was verified — the
+                        # verifier already fails that turn honestly.
+                        from .continuous_monitoring_companion import ALERT_OFFER_MARKER, ALERT_OFFER_TEXT
+                        from .extractors.research import get_completed_sites
+                        if get_completed_sites(ms_tracker) and ALERT_OFFER_MARKER not in summary_msg:
+                            summary_msg = f"{summary_msg}\n\n{ALERT_OFFER_TEXT}" if summary_msg else ALERT_OFFER_TEXT
                 except Exception:
                     pass
             if not steps:
@@ -2920,7 +2971,10 @@ async def run_task(task_id: str) -> None:
                 answer = await handle_email_intelligence_instruction(record.instruction, chat_id=chat_id)
             elif is_calendar_query(record.instruction):
                 answer = await handle_calendar_instruction(record.instruction, chat_id=chat_id)
-            elif is_continuous_monitoring_directive(record.instruction):
+            elif is_continuous_monitoring_directive(
+                record.instruction,
+                history=initial_memory.get("conversation_history", []),
+            ):
                 answer = await handle_continuous_monitoring_instruction(
                     record.instruction,
                     chat_id=chat_id,
@@ -2946,6 +3000,24 @@ async def run_task(task_id: str) -> None:
                         answer = MockProvider().chat_call(record.instruction, history=history)
                 else:
                     answer = "I have processed your request."
+                # Fix 5: a conversational product suggestion states
+                # prices no browsing ever verified (live case: the
+                # fitness-band suggestion answered from LLM knowledge
+                # with ₹3,899 and a Flipkart link). Say so plainly
+                # and offer the alert, so the daily-digest / watch
+                # path is reachable instead of ending in a bare
+                # verdict.
+                from .continuous_monitoring_companion import (
+                    ALERT_OFFER_MARKER,
+                    ALERT_OFFER_TEXT,
+                    UNVERIFIED_SUGGESTION_NOTE,
+                    needs_unverified_suggestion_note,
+                )
+                if needs_unverified_suggestion_note(record.instruction, answer):
+                    if "didn't check the stores" not in answer:
+                        answer = f"{answer}\n\n{UNVERIFIED_SUGGESTION_NOTE}"
+                    if ALERT_OFFER_MARKER not in answer:
+                        answer = f"{answer}\n\n{ALERT_OFFER_TEXT}"
 
             verified = verify_task_completion(
                 instruction=record.instruction,
@@ -3111,8 +3183,11 @@ async def run_task(task_id: str) -> None:
         # A terminal task must not be flipped back to running by a late step.
         if record.state not in ("completed", "failed", "cancelled", "paused"):
             record.state = "running"
-        if screenshot:
-            record.screenshot = screenshot
+        # The record tracks the CURRENT step's screenshot, including
+        # None: a screenshot-less step must clear the frame, not leave
+        # the previous step's image up as if it were this step's visual
+        # (the old `if screenshot:` guard made it sticky).
+        record.screenshot = screenshot
         real_hub.spawn(real_hub.broadcast_progress(record))
 
     def on_metrics(fields: dict[str, Any]) -> None:

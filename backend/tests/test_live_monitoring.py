@@ -141,6 +141,95 @@ def test_http_extraction_strips_boilerplate_and_keeps_names(database, fixture_se
     assert extract_visible("<p>Hello <b>world</b></p>")["text"] == "Hello world"
 
 
+class _FakeHeaders:
+    def __init__(self, ctype="text/html"):
+        self._ctype = ctype
+
+    def get_content_type(self):
+        return self._ctype
+
+    def get_content_charset(self):
+        return "utf-8"
+
+
+class _FakeResponse:
+    def __init__(self, body, ctype="text/html"):
+        self._body = body.encode("utf-8")
+        self.headers = _FakeHeaders(ctype)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, n=-1):
+        if not self._body:
+            return b""
+        chunk, self._body = self._body[:n], self._body[n:]
+        return chunk
+
+
+class _FlakyOpener:
+    """Fails the first `failures` opens with a DNS URLError, then serves `body`."""
+
+    def __init__(self, failures, body, ctype="text/html"):
+        self.failures = failures
+        self.calls = 0
+        self.body = body
+        self.ctype = ctype
+
+    def open(self, request, timeout=None):
+        self.calls += 1
+        if self.calls <= self.failures:
+            import urllib.error
+            raise urllib.error.URLError("Temporary failure in name resolution")
+        return _FakeResponse(self.body, self.ctype)
+
+
+def test_fetch_retries_transient_dns_blip_then_succeeds(monkeypatch):
+    """A transient DNS blip must not fail a watch: the old fetch
+    raised on the first URLError, so one blip marked the mission
+    failed in the scheduler. Now it retries twice (2s, 5s) first."""
+    opener = _FlakyOpener(2, "<html><body><p>Price: ₹1,299</p></body></html>")
+    monkeypatch.setattr("app.monitor_check.urllib.request.build_opener", lambda *a, **k: opener)
+    sleeps: list[float] = []
+    monkeypatch.setattr("time.sleep", lambda s: sleeps.append(round(float(s), 1)))
+
+    observation = fetch_observation("http://127.0.0.1/gadget")
+    assert "1,299" in observation["text"]
+    assert opener.calls == 3
+    assert sleeps == [2.0, 5.0]
+
+
+def test_fetch_gives_up_after_three_transient_failures(monkeypatch):
+    """A persistently unreachable page still fails honestly — but
+    only after all three attempts, not on the first blip."""
+    opener = _FlakyOpener(99, "<html><body><p>Price: ₹1,299</p></body></html>")
+    monkeypatch.setattr("app.monitor_check.urllib.request.build_opener", lambda *a, **k: opener)
+    sleeps: list[float] = []
+    monkeypatch.setattr("time.sleep", lambda s: sleeps.append(round(float(s), 1)))
+
+    with pytest.raises(RuntimeError, match="name resolution"):
+        fetch_observation("http://127.0.0.1/gadget")
+    assert opener.calls == 3
+    assert sleeps == [2.0, 5.0]
+
+
+def test_fetch_does_not_retry_refusals(monkeypatch):
+    """Refusals are definitive, not transient: a non-HTML body raises
+    at once with a single attempt and no backoff sleep."""
+    opener = _FlakyOpener(0, '{"price": 1299}', ctype="application/json")
+    monkeypatch.setattr("app.monitor_check.urllib.request.build_opener", lambda *a, **k: opener)
+    sleeps: list[float] = []
+    monkeypatch.setattr("time.sleep", lambda s: sleeps.append(round(float(s), 1)))
+
+    with pytest.raises(ValueError, match="non-HTML"):
+        fetch_observation("http://127.0.0.1/gadget")
+    assert opener.calls == 1
+    assert sleeps == []
+
+
 def test_noise_timestamp_and_counter_do_not_alert(database, fixture_server):
     mission = _insert_mission(database, fixture_server + "/notes")
     assert check_monitor_http(mission, fixture_server + "/notes", db_path=database) is None
@@ -326,3 +415,103 @@ def test_daily_price_digest_reports_every_run(database):
     # No price on the page: nothing to report.
     assert evaluate_observation(mission, {"text": "Samsung Galaxy Fit3 — out of stock"},
                                 observed_at=300, db_path=database) is None
+
+
+def test_below_price_fires_on_first_run_and_dedups(database):
+    """Fix 6: a below-price threshold is a state, not a change — being
+    under it alerts on the first run (the product may already be
+    cheap), then deduplicates while the state is unchanged. A further
+    drop alerts once more; at or above the threshold, nothing."""
+    mission = _insert_mission(database, "https://example.org/halio-strap",
+                              condition="below_price", params={"threshold": 5000})
+    # Already below on the first run: alerts immediately.
+    event = evaluate_observation(mission, {"text": "Halio strap ₹4,500"},
+                                 observed_at=100, db_path=database)
+    assert event is not None
+    assert "below" in event["summary"].lower()
+    assert event["diff_data"]["new_price"] == 4500
+    # Same state again: no duplicate alert.
+    assert evaluate_observation(mission, {"text": "Halio strap ₹4,500"},
+                                observed_at=160, db_path=database) is None
+    # Still below but cheaper: a new state, alerts once more.
+    assert evaluate_observation(mission, {"text": "Halio strap ₹4,200"},
+                                observed_at=220, db_path=database) is not None
+    # Above the threshold: no alert.
+    assert evaluate_observation(mission, {"text": "Halio strap ₹5,500"},
+                                observed_at=280, db_path=database) is None
+    # Exactly at the threshold: not below, no alert.
+    assert evaluate_observation(mission, {"text": "Halio strap ₹5,000"},
+                                observed_at=340, db_path=database) is None
+
+
+# --- Backend flaw-hunt finding 4: one transient failure must not ---
+# --- permanently kill a monitoring mission. -------------------------
+
+def _mission_row(database, mission_id):
+    with db.get_connection(database) as conn:
+        return dict(conn.execute("SELECT * FROM monitoring_missions WHERE id=?", (mission_id,)).fetchone())
+
+
+def test_one_transient_http_failure_keeps_watch_alive(database, monkeypatch):
+    """A DNS blip during a check must not end the watch: the mission
+    stays active, the failure count rises, and the next tick retries
+    it. Previously the first failure set status='failed' and
+    claim_due never selected it again."""
+    mission = _insert_mission(database, "http://127.0.0.1:9/unreachable")
+    row = _mission_row(database, mission)
+
+    def _boom(*args, **kwargs):
+        raise OSError("temporary failure in name resolution")
+
+    monkeypatch.setattr("app.monitor_check.check_monitor_http", _boom)
+    asyncio.run(execute_monitor(row))
+    after = _mission_row(database, mission)
+    assert after["status"] == "active"
+    assert after["consecutive_failures"] == 1
+    # Still due for the next tick.
+    assert claim_due(now=time.time() + 3600, db_path=database, limit=5)
+
+
+def test_five_consecutive_failures_end_watch_with_recorded_event(database, monkeypatch):
+    """After MAX_CONSECUTIVE_MONITOR_FAILURES transient failures the
+    watch does end — but the end is recorded as a monitoring event,
+    so the user can see why it stopped instead of it vanishing."""
+    mission = _insert_mission(database, "http://127.0.0.1:9/unreachable")
+    def _boom(*args, **kwargs):
+        raise OSError("temporary failure in name resolution")
+
+    monkeypatch.setattr("app.monitor_check.check_monitor_http", _boom)
+    for _ in range(4):
+        asyncio.run(execute_monitor(_mission_row(database, mission)))
+        assert _mission_row(database, mission)["status"] == "active"
+    asyncio.run(execute_monitor(_mission_row(database, mission)))
+    after = _mission_row(database, mission)
+    assert after["status"] == "failed"
+    assert after["consecutive_failures"] == 5
+    events = _events(database, mission)
+    assert len(events) == 1
+    assert events[0]["title"] == "Monitoring stopped"
+    assert "5 consecutive" in events[0]["summary"]
+
+
+def test_permanent_url_refusal_still_ends_watch_immediately(database):
+    """A structural refusal (private/internal host) is not transient:
+    the watch ends on the first tick, with the reason recorded."""
+    mission = _insert_mission(database, "http://localhost:9/notes")
+    asyncio.run(execute_monitor(_mission_row(database, mission)))
+    after = _mission_row(database, mission)
+    assert after["status"] == "failed"
+    assert "private" in _events(database, mission)[0]["summary"]
+
+
+def test_successful_check_resets_failure_count(database, fixture_server):
+    """A clean check after a failure resets the consecutive count,
+    so isolated blips never accumulate toward the cap."""
+    mission = _insert_mission(database, fixture_server + "/notes")
+    with db.get_connection(database) as conn:
+        conn.execute(
+            "UPDATE monitoring_missions SET consecutive_failures=3 WHERE id=?", (mission,))
+    asyncio.run(execute_monitor(_mission_row(database, mission)))
+    after = _mission_row(database, mission)
+    assert after["status"] == "active"
+    assert after["consecutive_failures"] == 0

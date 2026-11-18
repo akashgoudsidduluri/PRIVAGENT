@@ -56,6 +56,50 @@ def test_query_decomposition_extracts_explicit_subtopics():
     assert "multi-head" in q_text or "multi head" in q_text
 
 
+def test_query_decomposition_strips_domains_and_topic_meta():
+    """Fix 8 (live failure 2026-11-18): 'Research Aditya L1 for the
+    whole topic on nature.com ...' decomposed to queries[0] carrying
+    'for the whole topic on nature.com', which discovery templated
+    verbatim into a garbage nature.com search URL. Domains and
+    references to the request itself are never search keywords."""
+    prompt = "Research Aditya L1 for the whole topic on nature.com and generate a PDF report."
+    queries = website_resolver.decompose_search_queries(prompt, category="research")
+    assert queries
+    assert queries[0].startswith("Aditya L1")
+    for q in queries:
+        assert "nature.com" not in q
+        assert "whole topic" not in q.lower()
+        assert "this topic" not in q.lower()
+        assert "for the whole" not in q.lower()
+    # "on this topic" phrasing is stripped the same way.
+    queries2 = website_resolver.decompose_search_queries(
+        "Research Aditya L1 for the whole topic on this topic.", category="research"
+    )
+    assert queries2 and queries2[0].startswith("Aditya L1")
+    # No real topic at all: no queries, so no garbage URL can be built.
+    assert website_resolver.decompose_search_queries(
+        "Research the whole topic on nature.com and generate a PDF report.", category="research"
+    ) == []
+    # Non-filler topics are untouched: node.js keeps its ".js" and
+    # "frameworks" keeps its subject word.
+    node = website_resolver.decompose_search_queries(
+        "Research node.js frameworks and compare them.", category="research"
+    )
+    assert node and "node.js frameworks" in node[0]
+    # The discovery gate is the backstop: a raw filler query passed
+    # directly must never reach a hub search URL.
+    log: list[dict] = []
+    sources = website_resolver.discover_candidate_sources(
+        ["whole on this topic"], category="research", provenance_log=log
+    )
+    urls = [s.url for s in sources] + [e.get("url", "") for e in log]
+    assert urls, "expected at least one candidate or provenance entry"
+    for url in urls:
+        assert "whole" not in url.lower()
+        assert "whole+on+this+topic" not in url
+        assert "this+topic" not in url
+
+
 def test_is_search_results_page_detection():
     """Verify search-results URLs and titles are correctly identified across major academic/search engines."""
     assert is_search_results_page("https://www.nature.com/search?q=transformer+architecture") is True

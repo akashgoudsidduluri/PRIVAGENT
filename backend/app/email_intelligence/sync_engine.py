@@ -27,33 +27,40 @@ def get_demo_mailbox() -> ControlledTestMailbox:
 
 
 def _get_connector_for_mission(mission: dict[str, Any]):
-    """Return a live OAuth connector if configured, or a controlled test mailbox connector if demo."""
+    """Return a live OAuth connector if configured, or a controlled test mailbox connector if demo.
+
+    Raises RuntimeError for a real account whose OAuth is not
+    configured: silently falling back to the demo mailbox would make
+    the tick "succeed" against fake mail and report success.
+    """
     from app.connectors.oauth import oauth_manager
     provider_name = mission.get("provider", "gmail").lower()
     connector_key = "gmail" if provider_name == "gmail" else "outlook"
     account_email = str(mission.get("account_email", "")).lower()
 
-    # Test/demo accounts always use the controlled test mailbox
+    # Exact demo addresses only. A substring test ("tester" in the
+    # address) misroutes real accounts such as contester@gmail.com
+    # to the demo mailbox.
     is_test_account = (
         account_email in ("tester.privagent@gmail.com", "demo.privagent@gmail.com", "api.tester@gmail.com")
-        or "privagent" in account_email
-        or "tester" in account_email
         or provider_name in ("demo", "sandbox")
     )
-    if not is_test_account:
-        conn = oauth_manager.connector(connector_key)
-        if getattr(conn, "configured", False):
-            return conn, "live"
-
-    # Fallback to controlled protocol test mailbox if live OAuth is not configured
-    box = _demo_mailbox or get_demo_mailbox()
-    client = box.make_mock_client()
-    if provider_name == "gmail":
-        from app.connectors import GmailConnector
-        return GmailConnector("sandbox-demo-token", client=client), "sandbox"
-    else:
+    if is_test_account:
+        box = _demo_mailbox or get_demo_mailbox()
+        client = box.make_mock_client()
+        if provider_name == "gmail":
+            from app.connectors import GmailConnector
+            return GmailConnector("sandbox-demo-token", client=client), "sandbox"
         from app.connectors import OutlookConnector
         return OutlookConnector("sandbox-demo-token", client=client), "sandbox"
+
+    conn = oauth_manager.connector(connector_key)
+    if getattr(conn, "configured", False):
+        return conn, "live"
+    raise RuntimeError(
+        f"Email account {account_email or 'unknown'} is not connected: "
+        f"{connector_key} OAuth is not configured. Connect the account before running the email sweep."
+    )
 
 
 async def run_email_mission_tick(mission_id: str, db_path: Optional[str] = None) -> dict[str, Any]:
@@ -72,7 +79,18 @@ async def run_email_mission_tick(mission_id: str, db_path: Optional[str] = None)
     task_record.message = f"Connecting to email ({account_email})..."
     await hub.broadcast_progress(task_record)
 
-    connector, mode = _get_connector_for_mission(mission)
+    try:
+        connector, mode = _get_connector_for_mission(mission)
+    except RuntimeError as exc:
+        # A real account with no live OAuth: fail honestly instead of
+        # "succeeding" against the demo mailbox. The mission stays
+        # active and retries next tick, once the account is connected.
+        task_record.state = "failed"
+        task_record.message = str(exc)
+        await hub.broadcast_progress(task_record)
+        logger.warning("Email tick for mission %s failed: %s", mission_id, exc)
+        db.log_email_audit(mission_id, "sync_failed", {"error": str(exc)}, db_path=db_path)
+        return {"status": "error", "reason": str(exc)}
     logger.info("Email tick for mission %s in mode: %s", mission_id, mode)
 
     # 1. Mailbox Sync

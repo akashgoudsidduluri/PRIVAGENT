@@ -47,15 +47,23 @@ STORE_KEY = "local_auth_token"
 _bearer_scheme = HTTPBearer(auto_error=False)
 
 _token_cache: Optional[str] = None
+# The store-read warning below fires at most once per process: the
+# token is re-read from the store on every call now (see
+# get_local_token), so a corrupt store must not spam one warning per
+# request.
+_store_read_warned: bool = False
 
 
 def _store_token() -> Optional[str]:
     """Read the operator token from the encrypted store (best effort)."""
+    global _store_read_warned
     try:
         from . import secrets as secrets_store
         return secrets_store.get_secret(STORE_KEY)
     except Exception as exc:  # corrupt store / missing cryptography: fall through
-        logger.warning("Could not read local token from the encrypted store: %s", exc)
+        if not _store_read_warned:
+            _store_read_warned = True
+            logger.warning("Could not read local token from the encrypted store: %s", exc)
         return None
 
 
@@ -102,19 +110,32 @@ def get_local_token() -> str:
     """Return the operator token, generating and persisting one if needed.
 
     The environment variable wins on every call so tests and operators
-    can rotate the token without restarting the process. The generated
-    token is cached in-process after the first read.
+    can rotate the token without restarting the process. A token in
+    the encrypted store is re-read on every call, so rotating the
+    stored token also takes effect immediately — a running process
+    must not keep accepting a rotated-away token (DeepSeek review
+    2026-11-17). Only a freshly generated token is cached
+    in-process, and only as a fallback when the store cannot be read,
+    so a corrupt store neither locks the operator out nor mints a new
+    token on every request. A plaintext legacy file left behind by a
+    failed delete is removed once the store copy has been read back
+    successfully.
     """
     global _token_cache
     env_token = os.environ.get(ENV_VAR, "").strip()
     if env_token:
         return env_token
-    if _token_cache:
-        return _token_cache
     stored = _store_token()
     if stored:
         _token_cache = stored
+        if TOKEN_FILE.exists():
+            try:
+                TOKEN_FILE.unlink()
+            except OSError:
+                pass
         return stored
+    if _token_cache:
+        return _token_cache
     legacy = _migrate_legacy_file_token()
     if legacy:
         _token_cache = legacy

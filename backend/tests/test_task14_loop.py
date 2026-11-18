@@ -524,3 +524,65 @@ def test_connector_hook_skips_research_operations(monkeypatch):
     from app.intent_router import ResearchOperationType
 
     assert ResearchOperationType.EXPORT_EXISTING_PACKAGE is not None
+
+
+# ---------------------------------------------------------------------------
+# UCP profile fetch failure vs "no UCP checkout"
+# ---------------------------------------------------------------------------
+
+def _boom_fetch(origin):
+    raise ValueError("UCP profile returned HTTP 500")
+
+
+def test_ucp_profile_fetch_failure_is_recorded_not_silently_absent(monkeypatch):
+    """A merchant that declares a UCP profile URL but whose fetch fails
+    (DNS / egress / HTTP / bad JSON) must not be treated as a merchant
+    with no UCP checkout: the reason is recorded in working memory and
+    the planner is told UCP is unavailable, not absent."""
+    monkeypatch.setattr("app.ucp.fetch_ucp_profile", _boom_fetch)
+    hub = _Hub()
+    prompts = []
+
+    def planner(instruction, payload, history, working_memory=None):
+        prompts.append(build_prompt(instruction, payload, history, working_memory))
+        return {"goal": "g", "steps": []}
+
+    result = _run(
+        hub, planner,
+        lambda: _obs(ucp_url="https://shop.example.com/.well-known/ucp"),
+    )
+    wm = result["working_memory"]
+    assert wm["ucp_profile"] is None
+    assert wm["ucp_profile_error"] == "UCP profile returned HTTP 500"
+    prompt = "\n".join(prompts)
+    assert "<ucp-profile-fetch-failed>" in prompt
+    assert "UCP profile returned HTTP 500" in prompt
+    assert "do not claim the merchant has no UCP support" in prompt
+    assert "<ucp-profile untrusted" not in prompt
+
+
+def test_ucp_profile_error_clears_when_the_next_origin_has_no_profile(monkeypatch):
+    """A fetch failure on one origin must not linger as working memory
+    once the agent moves to a merchant that declares no profile at all."""
+    monkeypatch.setattr("app.ucp.fetch_ucp_profile", _boom_fetch)
+    hub = _Hub(after=_obs(url="https://other.example.com/home", title="Other"))
+    prompts = []
+    calls = [0]
+
+    def planner(instruction, payload, history, working_memory=None):
+        calls[0] += 1
+        prompts.append(build_prompt(instruction, payload, history, working_memory))
+        if calls[0] == 1:
+            return {"goal": "g", "steps": [_step({
+                "type": "click", "risk": "write", "verify": "clicked",
+                "timeoutMs": 100, "target": {"targetId": "q"},
+            })]}
+        return {"goal": "g", "steps": []}
+
+    result = _run(
+        hub, planner,
+        lambda: _obs(ucp_url="https://shop.example.com/.well-known/ucp"),
+    )
+    assert calls[0] == 2
+    assert result["working_memory"]["ucp_profile_error"] is None
+    assert "<ucp-profile-fetch-failed>" not in prompts[1]

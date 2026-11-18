@@ -355,3 +355,83 @@ def test_calendar_create_denied_creates_nothing(monkeypatch, audit_events):
     assert out.ok is False
     assert "declined" in out.message
     assert cal.created == []
+
+
+# -- Calendar time_text interpretation (fix 7) ----------------------
+#
+# "SIH review tomorrow 10:00 AM IST" used to book tomorrow 10:00 UTC
+# (15:30 IST): the named time was captured but never interpreted.
+
+
+def test_parse_calendar_create_time_text():
+    import datetime as _dt
+
+    from app.connectors.calendar_companion import parse_calendar_create
+
+    ist = _dt.timezone(_dt.timedelta(hours=5, minutes=30), "IST")
+    tomorrow_ist = (_dt.datetime.now(_dt.timezone.utc).astimezone(ist)
+                    + _dt.timedelta(days=1)).date()
+
+    # The demo case: tomorrow 10:00 AM IST books 10:00 IST, not 10:00 UTC.
+    parsed = parse_calendar_create("schedule a meeting called SIH review tomorrow at 10:00 AM IST")
+    assert parsed is not None
+    assert (parsed["start"].hour, parsed["start"].minute) == (10, 0)
+    assert parsed["start"].utcoffset() == _dt.timedelta(hours=5, minutes=30)
+    assert parsed["start"].tzname() == "IST"
+    assert parsed["start"].date() == tomorrow_ist
+    assert (parsed["end"] - parsed["start"]) == _dt.timedelta(hours=1)
+
+    # Explicit UTC stays UTC.
+    parsed_utc = parse_calendar_create("schedule a meeting called Sync tomorrow at 10:00 AM UTC")
+    assert parsed_utc["start"].utcoffset() == _dt.timedelta(0)
+    assert parsed_utc["start"].tzname() == "UTC"
+
+    # An unmarked time is the user's local time (IST), not UTC.
+    parsed_plain = parse_calendar_create("schedule a meeting called Standup tomorrow at 10am")
+    assert parsed_plain["start"].utcoffset() == _dt.timedelta(hours=5, minutes=30)
+    assert (parsed_plain["start"].hour, parsed_plain["start"].minute) == (10, 0)
+
+    # 24-hour time and an explicit date.
+    parsed_24 = parse_calendar_create("schedule a meeting called Review today at 14:30")
+    assert (parsed_24["start"].hour, parsed_24["start"].minute) == (14, 30)
+    parsed_date = parse_calendar_create("schedule a meeting called Demo on 2026-11-19 at 9am")
+    assert (parsed_date["start"].year, parsed_date["start"].month, parsed_date["start"].day) == (2026, 11, 19)
+    assert parsed_date["start"].hour == 9
+
+    # A weekday name books that weekday.
+    parsed_mon = parse_calendar_create("schedule a meeting called Standup on Monday at 10am")
+    assert parsed_mon["start"].weekday() == 0
+
+    # No usable time: tomorrow 10:00 IST, never silent UTC.
+    parsed_fallback = parse_calendar_create("schedule a meeting called Chat on whenever")
+    assert parsed_fallback is not None
+    assert (parsed_fallback["start"].hour, parsed_fallback["start"].minute) == (10, 0)
+    assert parsed_fallback["start"].utcoffset() == _dt.timedelta(hours=5, minutes=30)
+
+
+def test_calendar_create_ist_time_books_ist(monkeypatch, audit_events):
+    """End to end: the confirmation and the created invite both carry
+    10:00 IST for 'tomorrow 10:00 AM IST' — never 10:00 UTC."""
+    cal = FakeCalendarConnector()
+    oauth = FakeOAuth({"google_calendar": cal})
+    seen = []
+
+    async def _confirm(message, action):
+        seen.append(message)
+        return True
+
+    out = _run_calendar(
+        _route("google_calendar", "create"),
+        "schedule a meeting called SIH review tomorrow at 10:00 AM IST",
+        oauth, FakeCalendarOAuth(cal), confirm=_confirm, monkeypatch=monkeypatch,
+    )
+    assert out.ok is True
+    assert len(seen) == 1
+    assert "10:00 AM IST" in seen[0]
+    assert "UTC" not in seen[0]
+    assert "15:30" not in seen[0]
+    assert len(cal.created) == 1
+    title, start, end, _attendees = cal.created[0]
+    assert "SIH review" in title
+    assert "T10:00:00+05:30" in start
+    assert "T11:00:00+05:30" in end

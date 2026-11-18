@@ -2,9 +2,9 @@
   "suite": "privacy_leak",
   "fixture": "backend/tests/fixtures/pii_cases.json",
   "definition": "leak = the exact synthetic PII token string appears in the planner prompt after classify_and_redact + build_prompt",
-  "n_total": 23,
+  "n_total": 24,
   "leaked": 6,
-  "leak_rate": 0.2609,
+  "leak_rate": 0.25,
   "by_type": {
     "api_key": {
       "n": 2,
@@ -12,6 +12,11 @@
       "leak_rate": 0.0
     },
     "aws_key": {
+      "n": 1,
+      "leaked": 0,
+      "leak_rate": 0.0
+    },
+    "bare_key": {
       "n": 1,
       "leaked": 0,
       "leak_rate": 0.0
@@ -89,9 +94,9 @@
   },
   "by_context": {
     "element_value": {
-      "n": 4,
+      "n": 5,
       "leaked": 2,
-      "leak_rate": 0.5
+      "leak_rate": 0.4
     },
     "page_text": {
       "n": 19,
@@ -235,6 +240,12 @@
     {
       "id": "pii-el-card-01",
       "type": "credit_card",
+      "context": "element_value",
+      "leaked": false
+    },
+    {
+      "id": "pii-el-barekey-01",
+      "type": "bare_key",
       "context": "element_value",
       "leaked": false
     }

@@ -1,1 +1,156 @@
-{"cases":[{"context":"page_text","id":"pii-email-01","token":"jane.doe@example.com","type":"email"},{"context":"page_text","id":"pii-phone-01","token":"+1 555-123-4567","type":"phone"},{"context":"page_text","id":"pii-phone-02","token":"5551234567","type":"phone"},{"context":"page_text","id":"pii-card-01","token":"4111 1111 1111 1111","type":"credit_card"},{"context":"page_text","id":"pii-card-02","token":"4111111111111111","type":"credit_card"},{"context":"page_text","id":"pii-ssn-01","token":"123-45-6789","type":"ssn"},{"context":"page_text","id":"pii-apikey-01","token":"sk-live-abcdefghijklmnop","type":"api_key"},{"context":"page_text","id":"pii-apikey-02","token":"ghp_abcdefghij1234567890","type":"api_key"},{"context":"page_text","id":"pii-jwt-01","token":"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c","type":"jwt"},{"context":"page_text","id":"pii-aws-01","token":"AKIAIOSFODNN7EXAMPLE","type":"aws_key"},{"context":"page_text","id":"pii-slack-01","token":"xoxb-123456789012-abcdefghij","type":"slack_token"},{"context":"page_text","id":"pii-privkey-01","token":"-----BEGIN RSA PRIVATE KEY-----","type":"private_key"},{"context":"page_text","id":"pii-pwlabel-01","token":"password: hunter2-9x7q","type":"labelled_password"},{"context":"page_text","id":"pii-tokenlabel-01","token":"api_key = skfakekey12345678","type":"labelled_token"},{"context":"page_text","id":"pii-otp-01","token":"482910","type":"bare_otp"},{"context":"page_text","id":"pii-otp-02","token":"Your OTP is 482910","type":"otp_labelled"},{"context":"page_text","id":"pii-pwbare-01","token":"hunter2-9x7q","type":"bare_password"},{"context":"page_text","id":"pii-urltoken-01","token":"https://example.com/callback?token=abc123SECRET","type":"url_token"},{"context":"page_text","id":"pii-address-01","token":"221B Baker Street, London NW1 6XE","type":"postal_address"},{"context":"element_value","element_name":"Contact","id":"pii-el-phone-01","token":"+1 555-123-4567","type":"phone"},{"context":"element_value","element_name":"Code","id":"pii-el-otp-01","token":"482910","type":"bare_otp"},{"context":"element_value","element_name":"Email","id":"pii-el-email-01","token":"jane.doe@example.com","type":"email"},{"context":"element_value","element_name":"Card","id":"pii-el-card-01","token":"4111111111111111","type":"credit_card"}],"generated":"2026-11-16","note":"Synthetic PII only — every value is fake (example.com, 555 numbers, test card 4111..., AKIA...EXAMPLE, example JWT). A 'leak' means the exact token string survives classify_and_redact + build_prompt into the planner prompt. Page-text tokens are embedded in ordinary prose; element-value tokens are the value of a textbox named as given. Measured results live in evals/results/privacy_leak_2026-11-16.json — do not edit the expected numbers here by hand.","version":1}
+{
+  "cases": [
+    {
+      "context": "page_text",
+      "id": "pii-email-01",
+      "token": "jane.doe@example.com",
+      "type": "email"
+    },
+    {
+      "context": "page_text",
+      "id": "pii-phone-01",
+      "token": "+1 555-123-4567",
+      "type": "phone"
+    },
+    {
+      "context": "page_text",
+      "id": "pii-phone-02",
+      "token": "5551234567",
+      "type": "phone"
+    },
+    {
+      "context": "page_text",
+      "id": "pii-card-01",
+      "token": "4111 1111 1111 1111",
+      "type": "credit_card"
+    },
+    {
+      "context": "page_text",
+      "id": "pii-card-02",
+      "token": "4111111111111111",
+      "type": "credit_card"
+    },
+    {
+      "context": "page_text",
+      "id": "pii-ssn-01",
+      "token": "123-45-6789",
+      "type": "ssn"
+    },
+    {
+      "context": "page_text",
+      "id": "pii-apikey-01",
+      "token": "sk-live-abcdefghijklmnop",
+      "type": "api_key"
+    },
+    {
+      "context": "page_text",
+      "id": "pii-apikey-02",
+      "token": "ghp_abcdefghij1234567890",
+      "type": "api_key"
+    },
+    {
+      "context": "page_text",
+      "id": "pii-jwt-01",
+      "token": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+      "type": "jwt"
+    },
+    {
+      "context": "page_text",
+      "id": "pii-aws-01",
+      "token": "AKIAIOSFODNN7EXAMPLE",
+      "type": "aws_key"
+    },
+    {
+      "context": "page_text",
+      "id": "pii-slack-01",
+      "token": "xoxb-123456789012-abcdefghij",
+      "type": "slack_token"
+    },
+    {
+      "context": "page_text",
+      "id": "pii-privkey-01",
+      "token": "-----BEGIN RSA PRIVATE KEY-----",
+      "type": "private_key"
+    },
+    {
+      "context": "page_text",
+      "id": "pii-pwlabel-01",
+      "token": "password: hunter2-9x7q",
+      "type": "labelled_password"
+    },
+    {
+      "context": "page_text",
+      "id": "pii-tokenlabel-01",
+      "token": "api_key = skfakekey12345678",
+      "type": "labelled_token"
+    },
+    {
+      "context": "page_text",
+      "id": "pii-otp-01",
+      "token": "482910",
+      "type": "bare_otp"
+    },
+    {
+      "context": "page_text",
+      "id": "pii-otp-02",
+      "token": "Your OTP is 482910",
+      "type": "otp_labelled"
+    },
+    {
+      "context": "page_text",
+      "id": "pii-pwbare-01",
+      "token": "hunter2-9x7q",
+      "type": "bare_password"
+    },
+    {
+      "context": "page_text",
+      "id": "pii-urltoken-01",
+      "token": "https://example.com/callback?token=abc123SECRET",
+      "type": "url_token"
+    },
+    {
+      "context": "page_text",
+      "id": "pii-address-01",
+      "token": "221B Baker Street, London NW1 6XE",
+      "type": "postal_address"
+    },
+    {
+      "context": "element_value",
+      "element_name": "Contact",
+      "id": "pii-el-phone-01",
+      "token": "+1 555-123-4567",
+      "type": "phone"
+    },
+    {
+      "context": "element_value",
+      "element_name": "Code",
+      "id": "pii-el-otp-01",
+      "token": "482910",
+      "type": "bare_otp"
+    },
+    {
+      "context": "element_value",
+      "element_name": "Email",
+      "id": "pii-el-email-01",
+      "token": "jane.doe@example.com",
+      "type": "email"
+    },
+    {
+      "context": "element_value",
+      "element_name": "Card",
+      "id": "pii-el-card-01",
+      "token": "4111111111111111",
+      "type": "credit_card"
+    },
+    {
+      "context": "element_value",
+      "element_name": "Key",
+      "id": "pii-el-barekey-01",
+      "token": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+      "type": "bare_key"
+    }
+  ],
+  "generated": "2026-11-16",
+  "note": "Synthetic PII only \u2014 every value is fake (example.com, 555 numbers, test card 4111..., AKIA...EXAMPLE, example JWT). A 'leak' means the exact token string survives classify_and_redact + build_prompt into the planner prompt. Page-text tokens are embedded in ordinary prose; element-value tokens are the value of a textbox named as given. Measured results live in evals/results/privacy_leak_2026-11-16.json \u2014 do not edit the expected numbers here by hand.",
+  "version": 1
+}

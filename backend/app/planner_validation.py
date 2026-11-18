@@ -654,7 +654,22 @@ def _guard_multi_site_completion(
 
         if pending:
             next_site = pending[0]
-            is_on_next_site = curr_url and any(d in curr_url.lower() for d in next_site.get("domains", []))
+            # Hostname match, not substring: a Google search URL that
+            # merely mentions "flipkart.com" in its query string is
+            # not "on Flipkart".
+            curr_host = (urlsplit(curr_url).hostname or "").lower() if curr_url else ""
+            site_domains = [str(d).lower() for d in next_site.get("domains", [])]
+
+            def _on_site(url: str) -> bool:
+                try:
+                    host = (urlsplit(str(url or "")).hostname or "").lower()
+                except Exception:
+                    return False
+                return bool(host) and any(host == d or host.endswith("." + d) for d in site_domains)
+
+            is_on_next_site = bool(curr_host) and any(
+                curr_host == d or curr_host.endswith("." + d) for d in site_domains
+            )
 
             # If we are ALREADY on the next_site, do NOT navigate to its homepage again!
             if is_on_next_site:
@@ -670,10 +685,17 @@ def _guard_multi_site_completion(
                         break
 
                 query = extract_target_product_query(instruction)
+                # Count only genuine search attempts on this site: a
+                # navigate to it, or a search submission (type). A
+                # plain click — e.g. closing a login popup — is NOT a
+                # search attempt: counting it consumed the two
+                # attempts the guard allows and marked the site
+                # "unavailable" without ever searching it (live
+                # Flipkart pattern: navigate + popup-close click).
                 recent_actions_on_site = sum(
                     1 for h in history[-2:]
-                    if any(d in str((h.get("action") or {}).get("params", {}).get("url", "")) for d in next_site.get("domains", []))
-                    or (h.get("action") or {}).get("type") in ("type", "click")
+                    if _on_site((h.get("action") or {}).get("params", {}).get("url", ""))
+                    or (h.get("action") or {}).get("type") == "type"
                 )
 
                 if search_el and query and recent_actions_on_site < 2:

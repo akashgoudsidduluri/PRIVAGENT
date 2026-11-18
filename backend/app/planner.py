@@ -614,6 +614,21 @@ def build_prompt(instruction: str, payload: PrivacyFilteredPayload, history: lis
             "a service, never put payment details in the step.\n"
             "</ucp-profile>\n\n"
         )
+    _ucp_err = getattr(payload, "ucp_profile_error", None)
+    if _ucp_err:
+        # The merchant declared a UCP profile URL but it could not be
+        # read — this is a failed fetch, NOT "no UCP checkout". The
+        # planner must not assume the merchant has no UCP support; it
+        # simply cannot use UCP on this task.
+        ucp_str = (
+            "<ucp-profile-fetch-failed>\n"
+            "This merchant declared a UCP profile, but fetching it failed: "
+            f"{str(_ucp_err)[:200]}\n"
+            "UCP checkout is unavailable for this task. Use the normal "
+            "checkout flow instead, and do not claim the merchant has no "
+            "UCP support.\n"
+            "</ucp-profile-fetch-failed>\n\n"
+        )
     return (
         f"USER INSTRUCTION (trusted): {instruction}\n\n"
         f"{temporal_str}"
@@ -676,8 +691,8 @@ def try_deterministic_plan(
             for h in history
         )
 
-        wants_seat = bool(re.search(r"(?:14b|seat)", inst, re.IGNORECASE))
-        wants_date = bool(re.search(r"(?:27\s+nov|date)", inst, re.IGNORECASE))
+        wants_seat = bool(re.search(r"\b(?:14b|seat)\b", inst, re.IGNORECASE))
+        wants_date = bool(re.search(r"\b(?:27\s+nov|date)\b", inst, re.IGNORECASE))
 
         if wants_seat and not has_clicked_seat:
             return TaskPlan(
@@ -714,6 +729,13 @@ def try_deterministic_plan(
                 ],
             )
         # Both or requested controls clicked; conclude!
+        # (Only when a control was actually requested or clicked: an
+        # instruction that mentions neither seat nor date — e.g. just
+        # opening the page — must NOT conclude here claiming a
+        # selection was performed. It falls through to the normal
+        # planner instead.)
+        if not (wants_seat or wants_date or has_clicked_seat or has_clicked_date):
+            return None
         selected_desc = []
         if wants_date or has_clicked_date:
             selected_desc.append("Date: 27 Nov 2026 (coords: 470, 135)")
@@ -756,7 +778,7 @@ def try_deterministic_plan(
         )
 
     # 5. Smart Email Assistant Initial Direct Navigation: e.g. "Check my inbox, identify the three most important unread emails..."
-    if re.search(r"(?:check|inspect)\s+(?:my\s+)?(?:inbox|unread\s+emails?|emails?|mail)", inst, re.IGNORECASE):
+    if re.search(r"\b(?:check|inspect)\s+(?:my\s+)?(?:inbox|unread\s+emails?|emails?|mail)\b", inst, re.IGNORECASE):
         if curr_url in ("", "about:blank") or not history:
             target_url = "http://localhost:8000/demo/inbox.html" if "demo" in inst.lower() else "https://mail.google.com"
             return TaskPlan(

@@ -440,3 +440,77 @@ def test_comparison_table_shows_product_images():
     assert "![Samsung Galaxy Fit3 — ₹3,899](https://m.media-amazon.com/images/I/fit3.jpg)" in out
     assert out.count("![") == 1
     assert out.index("![Samsung Galaxy Fit3") < out.index("| Retailer |")
+
+
+# --- Popup-close click must not burn the site's search attempts -----
+# Backend flaw-hunt finding 3.
+
+def _amazon_done_tracker():
+    tracker = init_multi_site_tracker(COMPARISON_INSTRUCTION)
+    tracker["required_sites"]["amazon"]["status"] = "completed"
+    tracker["required_sites"]["amazon"]["data"] = {
+        "domain": "amazon.in",
+        "url": "https://www.amazon.in/samsung-a27",
+        "title": "Samsung Galaxy A27 5G",
+        "price": "₹30,700",
+        "variant": "128GB, 8GB RAM",
+    }
+    return tracker
+
+
+def test_popup_close_click_does_not_burn_search_attempts():
+    """The live Flipkart pattern — navigate to Flipkart, click the
+    login-popup Close — used to consume both search attempts the
+    guard allows (a navigate plus ANY click counted), so Flipkart was
+    marked 'unavailable' without ever being searched. A click is not
+    a search attempt: the site must be searched, not abandoned."""
+    wm = {"multi_site_research": _amazon_done_tracker()}
+    searchbox = {
+        "targetId": "search", "role": "searchbox",
+        "name": "Search for products, brands and more", "tag": "input",
+        "visible": True, "enabled": True,
+        "bounds": {"x": 10, "y": 10, "width": 80, "height": 30},
+    }
+    plan = _validate_plan(
+        _completion("Compared Amazon."),
+        payload=_payload(
+            "https://www.flipkart.com/",
+            title="Flipkart",
+            interactive=[searchbox],
+            instruction=COMPARISON_INSTRUCTION,
+        ),
+        history=[
+            {"action": {"type": "navigate", "params": {"url": "https://www.flipkart.com/"}}, "result_ok": True},
+            {"action": {"type": "click", "target": {"targetId": "close-btn", "name": "Close"}}, "result_ok": True},
+        ],
+        instruction=COMPARISON_INSTRUCTION,
+        working_memory=wm,
+    )
+    assert wm["multi_site_research"]["required_sites"]["flipkart"]["status"] == "pending"
+    assert len(plan.steps) == 1
+    assert plan.steps[0].action.type == "type"
+    assert "A27" in plan.steps[0].action.params.text
+
+
+def test_google_url_mentioning_site_is_not_on_the_site():
+    """A Google search URL that merely mentions flipkart.com in its
+    query string must not count as 'on Flipkart' (the old substring
+    test said it was). The guard must navigate to Flipkart, not type
+    into Google's search box."""
+    wm = {"multi_site_research": _amazon_done_tracker()}
+    plan = _validate_plan(
+        _completion("Compared Amazon."),
+        payload=_payload(
+            "https://www.google.com/search?q=flipkart.com+galaxy+a27",
+            title="Google Search",
+            instruction=COMPARISON_INSTRUCTION,
+        ),
+        history=[
+            {"action": {"type": "navigate", "params": {"url": "https://www.google.com/search?q=flipkart.com+galaxy+a27"}}, "result_ok": True},
+        ],
+        instruction=COMPARISON_INSTRUCTION,
+        working_memory=wm,
+    )
+    assert len(plan.steps) == 1
+    assert plan.steps[0].action.type == "navigate"
+    assert "flipkart.com" in plan.steps[0].action.params.url

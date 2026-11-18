@@ -53,6 +53,7 @@ interface PageStateProbe {
 interface NavigatorAgent {
   list: () => AgentElement[];
   click: (targetId: string, name?: string) => { ok: boolean; error?: string };
+  linkTarget: (targetId: string, name?: string) => string;
   clickCoords: (x: number, y: number) => { ok: boolean; targetId?: string; error?: string };
   getCoords: (targetId: string, name?: string) => { x: number; y: number; width: number; height: number } | null;
   getClickPoint: (targetId: string, name?: string) => { x: number; y: number; width: number; height: number } | null;
@@ -373,11 +374,18 @@ function candidates(): AgentElement[] {
     const href = anchor?.href || undefined;
 
     const accessible = accessibleName(el);
+    // A field's current VALUE must never become its name: an
+    // unlabelled password/PIN/OTP field's secret would be sent to the
+    // backend (and the planner) as the element's name on every
+    // observation. The same holds for a contenteditable's typed text
+    // (its textContent is user-entered data, not a label), so
+    // textContent is only a name source for non-editable elements
+    // (buttons, links). Unnamed fields fall through to derivedNameHint
+    // (the page's own field name/id/type), never the live value.
     const semanticFallback = (
       (el.getAttribute("data-icon") ? `icon ${el.getAttribute("data-icon")}` : "") ||
       (el.getAttribute("data-testid") && !el.textContent?.trim() ? el.getAttribute("data-testid") : "") ||
-      normText(el.textContent) ||
-      normText(input.value) ||
+      (isEditableElement(el) ? "" : normText(el.textContent)) ||
       derivedNameHint(el)
     );
     let name = (
@@ -685,15 +693,6 @@ window.__navigatorAgent = {
     };
   },
   click: (targetId, name) => {
-    // Generic chat-app handling (any site): clear a stale search filter
-    // before clicking a group filter or a chat row, by accessible name.
-    const nm = (name || "").toLowerCase();
-    if (nm === "groups" || nm === "group" || nm.includes("group") || nm.includes("chat")) {
-      const cancelSearch = document.querySelector('button[aria-label*="cancel search" i]') as HTMLElement | null;
-      if (cancelSearch && !nm.includes("cancel")) {
-        try { (cancelSearch.closest("button") || cancelSearch).click(); } catch {}
-      }
-    }
     const el = elementFor(targetId, name);
     if (!el) return { ok: false, error: "STALE_TARGET" };
     try {
@@ -742,6 +741,17 @@ window.__navigatorAgent = {
     }
     return { ok: true };
   },
+  /** The closest anchor's `target` attribute ("" when the element is not
+   * a link or has none). doClick uses it to decide whether a
+   * non-navigating link click is a popup-blocked `_blank` (worth
+   * rescuing with an explicit tab) or a same-page/JS-handled link
+   * (which legitimately does not navigate). */
+  linkTarget: (targetId, name) => {
+    const el = elementFor(targetId, name);
+    if (!el) return "";
+    const anchor = (el.tagName.toLowerCase() === "a" ? el : el.closest("a[href]")) as HTMLAnchorElement | null;
+    return anchor?.target || "";
+  },
   clickCoords: (x, y) => {
     const el = document.elementFromPoint(x, y) as HTMLElement | null;
     if (!el) return { ok: false, error: "STALE_TARGET" };
@@ -784,39 +794,23 @@ window.__navigatorAgent = {
     // unhandled exception: report it so the executor can surface STALE_TARGET.
     try {
       let el = elementFor(targetId, name, true);
-      const nm = (name || "").toLowerCase();
-
-      // Generic chat-app element resolution (any site): a message
-      // composer is a contenteditable textbox (usually in a footer), a
-      // chat search is a searchbox / search-named textbox. No host
-      // checks, no per-app data-testids.
-      if (nm.includes("type") || nm.includes("message") || nm.includes("composer") || !el) {
-        const composer = document.querySelector('footer [contenteditable="true"], [contenteditable="true"][role="textbox"]') as HTMLElement | null;
-        if (composer) el = composer;
-      } else if (nm.includes("search") || nm.includes("find")) {
-        const chatSearch = document.querySelector('[role="searchbox"], input[type="search"], [aria-label*="search" i]') as HTMLElement | null;
-        if (chatSearch) el = chatSearch;
-        if (clear || !text) {
-          const cancelSearch = document.querySelector('button[aria-label*="cancel search" i]') as HTMLElement | null;
-          if (cancelSearch) {
-            try { (cancelSearch.closest("button") || cancelSearch).click(); } catch {}
-          }
-        }
-      }
+      // The resolved element is authoritative. Never replace it by
+      // name substring: "type"/"message"/"composer" used to redirect
+      // typing into the footer chat composer (so a search box named
+      // "Type to search" got its query typed into a chat draft), and
+      // "search"/"find" into the first searchbox on the page — and
+      // never substitute another element when resolution fails. A
+      // stale target fails closed (STALE_TARGET) so the planner
+      // re-grounds, instead of "succeeding" against an element it
+      // never named.
+      if (!el) return { ok: false, error: "STALE_TARGET" };
 
       if (el && !(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement || el.isContentEditable)) {
         const inner = el.querySelector("input, textarea, select, [contenteditable='true'], [contenteditable]") as HTMLElement | null;
         if (inner) el = inner;
       }
-      if (!el) {
-        const active = document.activeElement as HTMLElement | null;
-        if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement || active?.isContentEditable) {
-          el = active;
-        }
-      }
       // A rich-text editor often keeps the caret in a child node while the
       // planner targeted the wrapper: trust the focused editable.
-      if (!el) return { ok: false, error: "STALE_TARGET" };
       const active = document.activeElement as HTMLElement | null;
       const editable =
         el.isContentEditable

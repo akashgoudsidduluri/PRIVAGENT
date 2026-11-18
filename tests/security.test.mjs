@@ -130,3 +130,22 @@ test("renderMarkdown renders product images and refuses unsafe image URLs", () =
   const quoted = renderMarkdown('![a"b](https://cdn.example.com/x.jpg)');
   assert.ok(quoted.includes('alt="a&quot;b"'), quoted);
 });
+
+test("renderMarkdown keeps underscores in links intact (no emphasis inside hrefs)", () => {
+  // Frontend flaw-hunt finding 1: the italic regex ran on the built
+  // HTML, so the `_` in target="_blank" paired with the `_` in
+  // my_file_name.pdf and rewrote the href to my<em>file</em>name.pdf.
+  const out = renderMarkdown("[the doc](https://example.com/my_file_name.pdf)");
+  assert.ok(out.includes('href="https://example.com/my_file_name.pdf"'), out);
+  assert.ok(!out.includes("<em>"), out);
+  const bare = renderMarkdown("see https://example.com/a_b_c for details");
+  assert.ok(bare.includes('href="https://example.com/a_b_c"'), bare);
+  assert.ok(!bare.includes("<em>"), bare);
+});
+
+test("renderMarkdown still renders emphasis in plain text", () => {
+  const out = renderMarkdown("This is *very* important and **bold** too, plus _italic_ text.");
+  assert.ok(out.includes("<em>very</em>"), out);
+  assert.ok(out.includes("<strong>bold</strong>"), out);
+  assert.ok(out.includes("<em>italic</em>"), out);
+});

@@ -183,3 +183,94 @@ def test_budget_exceeded_marker_is_failed():
     )
     assert res.state == "failed"
     assert res.is_verified is False
+
+
+# ---------------------------------------------------------------------------
+# Fix 3 (live failure 2026-11-18 02:07 IST): a bare continuation after a
+# failed mission with an outstanding deliverable is failed, never completed
+# ---------------------------------------------------------------------------
+
+_FAILED_HUNT_HISTORY = [
+    {
+        "role": "user",
+        "content": "Compare the Logitech MX Master 3S price across Amazon.in, Flipkart and Croma and give the comparison in a xcel",
+    },
+    {
+        "role": "assistant",
+        "content": "Planner unavailable: Planner call failed: [Errno 11002] getaddrinfo failed (step 1 state preserved).",
+    },
+]
+
+_FAILED_HUNT_MEMORY = {
+    "conversation_history": _FAILED_HUNT_HISTORY,
+    "requested_format": "xlsx",
+    "deliverable_type": "spreadsheet",
+}
+
+_DIAGNOSIS_ANSWER = (
+    "My browser automation can't resolve amazon.in, flipkart.com or "
+    "croma.com, so I couldn't compare the prices."
+)
+
+
+def test_bare_continuation_after_failed_mission_cannot_complete():
+    res = verify_task_completion(
+        instruction="yeah",
+        candidate_state="completed",
+        message=_DIAGNOSIS_ANSWER,
+        working_memory=_FAILED_HUNT_MEMORY,
+    )
+    assert res.state == "failed"
+    assert res.is_verified is False
+    assert "still outstanding" in res.message
+
+
+def test_bare_continuation_after_success_still_completes():
+    memory = {
+        "conversation_history": [
+            {"role": "user", "content": "compare the MX Master 3S price"},
+            {"role": "assistant", "content": "Deliverable Ready: comparison spreadsheet with Amazon.in ₹8,999, Flipkart ₹8,999, Croma ₹9,499."},
+        ],
+        "requested_format": "xlsx",
+    }
+    res = verify_task_completion(
+        instruction="yeah",
+        candidate_state="completed",
+        message="Happy to help — the spreadsheet is in the chat.",
+        working_memory=memory,
+    )
+    assert res.state == "completed"
+
+
+def test_real_question_after_failure_still_completes():
+    # "Why did it fail?" asks for an explanation; the explanation is
+    # that turn's deliverable, so it may complete even though the
+    # hunt's Excel is still outstanding.
+    res = verify_task_completion(
+        instruction="why did it fail?",
+        candidate_state="completed",
+        message="The planner call failed on a transient DNS error before any browsing started.",
+        working_memory=_FAILED_HUNT_MEMORY,
+    )
+    assert res.state == "completed"
+
+
+def test_bare_continuation_without_outstanding_deliverable_completes():
+    memory = {"conversation_history": _FAILED_HUNT_HISTORY}
+    res = verify_task_completion(
+        instruction="yeah",
+        candidate_state="completed",
+        message="Understood.",
+        working_memory=memory,
+    )
+    assert res.state == "completed"
+
+
+def test_bare_continuation_with_deliverable_announced_completes():
+    res = verify_task_completion(
+        instruction="yeah",
+        candidate_state="completed",
+        message="Deliverable Ready: the comparison spreadsheet is attached.",
+        working_memory=_FAILED_HUNT_MEMORY,
+    )
+    assert res.state == "completed"

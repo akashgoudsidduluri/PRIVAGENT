@@ -224,7 +224,12 @@ def restore_email(mission_id: str, message_id: str):
         raise HTTPException(404, "Email mission not found")
 
     from .email_intelligence.sync_engine import _get_connector_for_mission
-    connector, _ = _get_connector_for_mission(mission)
+    try:
+        connector, _ = _get_connector_for_mission(mission)
+    except RuntimeError as exc:
+        # A real account with no live OAuth must not silently restore
+        # from the demo mailbox.
+        raise HTTPException(503, str(exc))
     res = restore_email_from_trash(mission_id, message_id, connector)
     return res
 

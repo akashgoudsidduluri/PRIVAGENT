@@ -394,3 +394,29 @@ def test_loop_without_allow_list_behaves_as_before():
     ))
     assert state["final"] == "completed"
     assert hub.executed == ["navigate"]
+
+
+# --- Backend flaw-hunt finding 8: chat_stream bypassed the egress gate. ---
+
+def test_chat_stream_enforces_egress_gate(monkeypatch):
+    """chat_stream used to POST with the Bearer key without the Task 3
+    egress check, so a non-allow-listed gateway host would receive the
+    API key. It must raise before any request is sent."""
+    import httpx
+
+    calls: list = []
+
+    def _handler(request):
+        calls.append(request)
+        return httpx.Response(200, text="data: {}\n\ndata: [DONE]\n\n")
+
+    monkeypatch.setattr(config, "ALLOWED_DOMAINS", [])
+    provider = OpenAICompatibleProvider(
+        api_key="secret-test-key",
+        base_url="https://evil-gateway.example.com/v1",
+        model="deepseek-v4.1-flash",
+        transport=httpx.MockTransport(_handler),
+    )
+    with pytest.raises(ValueError, match="egress allow-list"):
+        list(provider.chat_stream("hello"))
+    assert calls == [], "no request — and no API key — may reach an unlisted host"

@@ -319,9 +319,11 @@ async def run_connector_route(
             # through to a listing for such input, so confirming it
             # would approve a creation and deliver a list of existing
             # events instead. The named time is shown as written AND
-            # as booked: the handler books tomorrow 10:00 AM UTC when
-            # the instruction gives no usable time, so the two can
-            # differ and the operator must see that before approving.
+            # as booked: the parser interprets the day, clock time and
+            # timezone (IST default), falling back to tomorrow 10:00
+            # IST when the instruction gives no usable time, so the
+            # two can differ and the operator must see that before
+            # approving.
             from .connectors.calendar_companion import parse_calendar_create
 
             _parsed = parse_calendar_create(instruction)
@@ -334,7 +336,7 @@ async def run_connector_route(
                     "on Monday at 10am'. Nothing was created.",
                     route,
                 )
-            _when = _parsed["start"].strftime("%A, %B %d, %Y at %I:%M %p UTC")
+            _when = _parsed["start"].strftime("%A, %B %d, %Y at %I:%M %p %Z")
             _attendees = _parsed["attendees"]
             approved = await _confirm(
                 "Create this calendar event?\n"

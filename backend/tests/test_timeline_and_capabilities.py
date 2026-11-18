@@ -128,6 +128,22 @@ def test_unsupported_capability_handling():
         assert res.is_verified is False
 
 
+def test_system_prompt_names_real_monitoring_channel_not_port_5173():
+    """Fix 4 (live failure 2026-11-18 02:07 IST): the agent offered to
+    'keep a watch running on port 5173 and ping you'. The system
+    prompt is what taught it that phrase — it must describe the real
+    channel (alerts as messages in the workspace conversation and in
+    the Control Center monitoring view) and must never present a port
+    as the monitoring channel or promise a phone ping."""
+    prompt = SYSTEM_CAPABILITY_PROMPT
+    assert "port 5173" not in prompt.lower()
+    assert "running on port" not in prompt.lower()
+    assert "ping you" not in prompt.lower()
+    assert "right here in the workspace conversation" in prompt
+    assert "Control Center monitoring view" in prompt
+    assert "no phone" in prompt.lower()
+
+
 # ============================================================================
 # 4. Refusal cannot produce successful completion
 # ============================================================================

@@ -170,3 +170,142 @@ test("mission composer is pinned to the bottom of the timeline", () => {
   );
   assert.ok(read("agent.html").includes('id="missionInput"'), "composer textarea missing from agent.html");
 });
+
+// ---------------------------------------------------------------------------
+// Frontend flaw-hunt finding 2: the pinned composer hides whatever
+// scrollIntoView just revealed — every step/completion scrolls to the
+// viewport bottom edge, under the ~290px sticky input card. The
+// document needs scroll-padding-bottom so targets stop above it.
+// ---------------------------------------------------------------------------
+
+test("scrollIntoView targets stop above the pinned composer", () => {
+  const agentCss = read("src/styles/agent.css");
+  const htmlRule = agentCss.match(/html\s*\{([\s\S]*?)\}/);
+  assert.ok(htmlRule, "no html scroll-padding rule in agent.css");
+  const bottom = htmlRule[1].match(/scroll-padding-bottom:\s*(\d+)px/);
+  assert.ok(bottom, "html rule has no scroll-padding-bottom");
+  assert.ok(
+    Number(bottom[1]) >= 320,
+    `scroll-padding-bottom is ${bottom[1]}px — below the ~290px composer, so scrolled-to steps would hide under it`,
+  );
+  assert.ok(/scroll-padding-top:\s*\d+px/.test(htmlRule[1]), "sticky header has no scroll-padding-top");
+  // Small phones stack the composer's actions and grow its chips, so
+  // the compensation must grow there too.
+  const phone = agentCss.match(/@media\s*\(max-width:\s*480px\)\s*\{[\s\S]*?html\s*\{([\s\S]*?)\}/);
+  assert.ok(phone, "no small-phone scroll-padding override in agent.css");
+  const phoneBottom = phone[1].match(/scroll-padding-bottom:\s*(\d+)px/);
+  assert.ok(
+    phoneBottom && Number(phoneBottom[1]) >= 400,
+    "small-phone scroll-padding-bottom is below the ~360px composer",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Frontend flaw-hunt finding 3: the header "New Mission" button was a
+// visible no-op from any Control Center view — it only called
+// createNewChat(), whose nodes are null until the workspace template
+// mounts. It must mount, navigate to the workspace view, then start
+// the new chat.
+// ---------------------------------------------------------------------------
+
+test("header New Mission mounts and navigates before starting a new chat", () => {
+  const src = read("src/agentApp.ts");
+  const handler = src.match(/btnNewSession\?\.addEventListener\("click", \(\) => \{([\s\S]*?)\}\);/);
+  assert.ok(handler, "no btnNewSession click handler in agentApp.ts");
+  const body = handler[1];
+  assert.ok(
+    body.includes("ensureWorkspaceMounted()"),
+    "handler never mounts the workspace template — a no-op from Control Center views",
+  );
+  assert.ok(body.includes("agent-workspace"), "handler never navigates to the workspace view");
+  // The comment mentions createNewChat() first, so compare the
+  // statements (with semicolons), not bare names.
+  assert.ok(
+    body.indexOf("ensureWorkspaceMounted();") < body.indexOf("createNewChat();"),
+    "new chat starts before the workspace is mounted",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Visual Perception Frame: a screenshot-less step or a chat switch must
+// clear the frame, never leave the previous step's/chat's image up.
+// ---------------------------------------------------------------------------
+
+test("updateVisualFrame clears the image when the step has no screenshot", () => {
+  const src = read("src/agentApp.ts");
+  const fn = src.match(/function updateVisualFrame\([\s\S]*?\n\}/);
+  assert.ok(fn, "no updateVisualFrame in agentApp.ts");
+  const body = fn[0];
+  assert.ok(
+    body.includes('inspectorScreenshot.removeAttribute("src")'),
+    "no-screenshot path never removes the stale src",
+  );
+  assert.ok(
+    body.includes("inspectorScreenshot.hidden = true"),
+    "no-screenshot path never hides the image",
+  );
+  assert.ok(
+    body.includes("inspectorScreenshotPlaceholder.hidden = false"),
+    "no-screenshot path never restores the placeholder",
+  );
+});
+
+test("task polling and restore always refresh the frame, even with no screenshot", () => {
+  const src = read("src/agentApp.ts");
+  assert.doesNotMatch(src, /if \(t\.screenshot\) \{\s*\n\s*updateVisualFrame/);
+  assert.doesNotMatch(src, /if \(act\.screenshot\) \{\s*\n\s*updateVisualFrame/);
+  assert.ok(
+    (src.match(/updateVisualFrame\(t\.screenshot \?\? null,/g) || []).length >= 2,
+    "poll/restore paths must call updateVisualFrame unconditionally",
+  );
+  assert.ok(
+    src.includes("updateVisualFrame(act.screenshot ?? null,"),
+    "reconnect path must call updateVisualFrame unconditionally",
+  );
+});
+
+test("selectChat clears the visual frame before loading the new chat", () => {
+  const src = read("src/agentApp.ts");
+  const fn = src.match(/async function selectChat\(chatId: string\)[\s\S]*?\n\}/);
+  assert.ok(fn, "no selectChat in agentApp.ts");
+  assert.ok(
+    fn[0].includes('updateVisualFrame(null, "", "ready")'),
+    "selectChat never clears the frame — the previous chat's screenshot stays up",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Chat switching: deleting the active chat must not re-open another one,
+// and a superseded selectChat must not render the wrong thread.
+// ---------------------------------------------------------------------------
+
+test("deleteChat reloads the list without auto-selecting another chat", () => {
+  const src = read("src/agentApp.ts");
+  const fn = src.match(/async function deleteChat\(chatId: string\)[\s\S]*?\n\}/);
+  assert.ok(fn, "no deleteChat in agentApp.ts");
+  assert.ok(
+    fn[0].includes("loadChatList({ autoSelect: false })"),
+    "deleteChat reloads with auto-select on — the blank state is instantly replaced by another mission",
+  );
+  assert.ok(
+    src.includes("options?.autoSelect ?? true"),
+    "loadChatList ignores the autoSelect option",
+  );
+});
+
+test("selectChat ignores a detail fetch superseded by a newer selection", () => {
+  const src = read("src/agentApp.ts");
+  assert.ok(src.includes("let selectChatGeneration = 0;"), "no selectChat generation counter");
+  const fn = src.match(/async function selectChat\(chatId: string\)[\s\S]*?\n\}/);
+  assert.ok(fn, "no selectChat in agentApp.ts");
+  const body = fn[0];
+  assert.ok(body.includes("const gen = ++selectChatGeneration;"), "selectChat never captures its generation");
+  assert.ok(
+    body.includes("if (gen !== selectChatGeneration) return;"),
+    "selectChat renders the detail without checking whether a newer selection superseded it",
+  );
+  assert.ok(
+    body.includes("loadArtifacts(null, chatId, () => gen === selectChatGeneration)"),
+    "selectChat loads artifacts without a currency guard",
+  );
+});

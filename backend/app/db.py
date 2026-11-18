@@ -247,6 +247,7 @@ def init_db(db_path: Optional[str] = None) -> None:
                 condition_type TEXT NOT NULL DEFAULT 'text_change', condition_params TEXT NOT NULL DEFAULT '{}',
                 status TEXT NOT NULL DEFAULT 'paused', last_run_at REAL, next_run_at REAL,
                 last_state_hash TEXT, last_state_json TEXT, last_alert_hash TEXT, last_alert_at REAL,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
                 created_at REAL NOT NULL
             );
             CREATE TABLE IF NOT EXISTS monitoring_events (
@@ -373,6 +374,7 @@ def init_db(db_path: Optional[str] = None) -> None:
                 "schedule_cron": "TEXT", "condition_type": "TEXT NOT NULL DEFAULT 'text_change'",
                 "condition_params": "TEXT NOT NULL DEFAULT '{}'", "last_state_json": "TEXT",
                 "last_alert_hash": "TEXT", "last_alert_at": "REAL",
+                "consecutive_failures": "INTEGER NOT NULL DEFAULT 0",
             },
             "monitoring_events": {
                 "task_id": "TEXT", "title": "TEXT NOT NULL DEFAULT ''",

@@ -7,7 +7,10 @@
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='10' fill='%23061032'/%3E%3Ccircle cx='12' cy='12' r='6.5' fill='none' stroke='%2346d7ff' stroke-width='1.8'/%3E%3Ccircle cx='12' cy='12' r='2.4' fill='%23a06bff'/%3E%3C/svg%3E" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=IBM+Plex+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&display=swap" rel="stylesheet" />
+  <!-- Fonts load async (preload + onload rel-swap): a plain stylesheet
+       <link> to Google Fonts would block first paint on a third-party
+       fetch (GLM review 2026-11-17). display=swap keeps text visible. -->
+  <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=IBM+Plex+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&display=swap" onload="this.onload=null;this.rel='stylesheet'" />
 </head>
 <body class="agent-body">
   <!-- Top App Bar -->

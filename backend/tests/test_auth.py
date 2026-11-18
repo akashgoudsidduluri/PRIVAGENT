@@ -240,3 +240,39 @@ def test_print_local_token_script_loads_dotenv():
     )
     assert "load_dotenv" in text
     assert text.index("load_dotenv") < text.index("print(get_local_token())")
+
+
+def test_stored_token_rotation_takes_effect_without_restart(monkeypatch):
+    """DeepSeek review 2026-11-17: get_local_token cached the stored
+    token after the first read, so rotating the secret in the store
+    left the old token valid in a running process until restart. The
+    store must be re-read on every call."""
+    from app import secrets as secrets_store
+
+    monkeypatch.delenv(auth.ENV_VAR, raising=False)
+    auth.reset_for_tests()
+    secrets_store.set_secret(auth.STORE_KEY, "first-token-0123456789abcdef")
+    assert auth.get_local_token() == "first-token-0123456789abcdef"
+    assert auth.verify_token("first-token-0123456789abcdef") is True
+    secrets_store.set_secret(auth.STORE_KEY, "second-token-0123456789abcdef")
+    assert auth.get_local_token() == "second-token-0123456789abcdef"
+    assert auth.verify_token("first-token-0123456789abcdef") is False
+    assert auth.verify_token("second-token-0123456789abcdef") is True
+    auth.reset_for_tests()
+
+
+def test_cached_token_survives_unreadable_store(monkeypatch):
+    """Fail safe: if the store becomes unreadable after a token was
+    cached, the running process keeps accepting the cached token
+    instead of minting a new one on every call (which would 401 every
+    request)."""
+    from app import secrets as secrets_store
+
+    monkeypatch.delenv(auth.ENV_VAR, raising=False)
+    auth.reset_for_tests()
+    secrets_store.set_secret(auth.STORE_KEY, "cached-token-0123456789abcdef")
+    assert auth.get_local_token() == "cached-token-0123456789abcdef"
+    monkeypatch.setattr(auth, "_store_token", lambda: None)
+    assert auth.get_local_token() == "cached-token-0123456789abcdef"
+    assert auth.verify_token("cached-token-0123456789abcdef") is True
+    auth.reset_for_tests()

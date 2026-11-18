@@ -148,6 +148,32 @@ def _has_sensitive_value(val: str) -> bool:
     return False
 
 
+# A bare secret with no label and no known prefix: one whitespace-free
+# token, 24+ chars, at least two character classes among lower / upper /
+# digit. UUIDs are structured identifiers, not secrets; pure digits and
+# single-class strings are words or IDs, not keys. This is used ONLY for
+# element values, where dropping the value costs the planner nothing
+# (the element stays actionable) — never for free page text, where the
+# same shape is a git SHA, an MD5 checksum, or a record ID.
+_BARE_SECRET_RE = re.compile(r"^[A-Za-z0-9_\-+/=]{24,}$")
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def _looks_like_bare_secret(value: str) -> bool:
+    v = (value or "").strip()
+    if not _BARE_SECRET_RE.match(v) or _UUID_RE.match(v):
+        return False
+    classes = sum((
+        any(c.islower() for c in v),
+        any(c.isupper() for c in v),
+        any(c.isdigit() for c in v),
+    ))
+    return classes >= 2
+
+
 def _redact_text(value: str, max_len: int) -> str:
     """Mask known secret patterns in free text, then truncate.
 
@@ -265,7 +291,10 @@ def _redact_element(el: InteractiveElement) -> InteractiveElement:
     if _is_sensitive_name(el.name):
         value = None
     if value is not None:
-        if _has_sensitive_value(value):
+        # A bare high-entropy token with no label and no known prefix
+        # (a pasted API key in a plain text field) is a secret even
+        # though no pattern names it.
+        if _has_sensitive_value(value) or _looks_like_bare_secret(value):
             value = None
         else:
             value = _redact_text(value, MAX_NAME_LEN)
@@ -282,7 +311,7 @@ def _redact_element(el: InteractiveElement) -> InteractiveElement:
             raise ValueError("invalid semantic bounds")
         update_dict["semantic"] = sem.model_copy(update={
             "semantic_name": _redact_text(sem.semantic_name, MAX_NAME_LEN),
-            "context_text": "" if el.input_type in SENSITIVE_INPUT_TYPES or _is_sensitive_name(el.name) or _has_sensitive_value(sem.context_text)
+            "context_text": "" if el.input_type in SENSITIVE_INPUT_TYPES or _is_sensitive_name(el.name) or _has_sensitive_value(sem.context_text) or _looks_like_bare_secret(sem.context_text)
                 or re.search(r"\b(?:token|secret|password|api[_-]?key|session|otp)\s*[:=]", sem.context_text, re.I)
                 else _redact_text(sem.context_text, 160),
             "interactability": {"bounds": safe_bounds, "visible": bool(ia.get("visible")),
@@ -552,6 +581,12 @@ def classify_and_redact(
         has_sensitive_element = has_sensitive_element or any(
             _has_sensitive_value(str(text or ""))
             for text in (obs.title, getattr(obs, "page_text", None))
+        )
+        # A bare-secret element value may be visible in the pixels too:
+        # withhold the screenshot when one is on the page.
+        has_sensitive_element = has_sensitive_element or any(
+            _looks_like_bare_secret(str(e.value or ""))
+            for e in obs.interactive
         )
         safe_screenshot = None
         if getattr(config, "ALLOW_SCREENSHOTS", False) and not has_sensitive_element:

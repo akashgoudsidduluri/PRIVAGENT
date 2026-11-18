@@ -208,6 +208,34 @@ def test_resolve_fresh_ref_by_target_id_then_name_role():
     assert (ref, found) == (None, None)
 
 
+def test_resolve_fresh_ref_duplicate_target_id_never_guesses():
+    # DeepSeek review 2026-11-17: the id path used to return the FIRST
+    # node with a matching target id. If a partial re-render duplicates
+    # an id, that silently clicks the wrong control. The id must now
+    # be unique; duplicates fall through to the role+name match.
+    plan = build_ax_tree([
+        _el("go", "link", "Go onward", tag="a"),
+        _el("back", "link", "Back", tag="a"),
+    ])
+    node = plan.nodes[0]
+    # Two nodes share the id: the name path must disambiguate, not
+    # the first id match.
+    dupes = AxTree(nodes=[
+        AxNode(ref="e0", role="link", name="Go elsewhere", target_id="go"),
+        AxNode(ref="e1", role="link", name="Go onward", target_id="go"),
+    ])
+    ref, found = resolve_fresh_ref(node, dupes)
+    assert ref == "e1" and found is not None and found.name == "Go onward"
+    # Duplicate id and no usable name: nothing to match on.
+    nameless_plan = build_ax_tree([_el("go", "link", "", tag="a")])
+    nameless = AxTree(nodes=[
+        AxNode(ref="e0", role="link", name="", target_id="go"),
+        AxNode(ref="e1", role="link", name="", target_id="go"),
+    ])
+    ref, found = resolve_fresh_ref(nameless_plan.nodes[0], nameless)
+    assert (ref, found) == (None, None)
+
+
 # ---------------------------------------------------------------------------
 # Loop: (a) a silent no-op does not advance the loop
 # ---------------------------------------------------------------------------

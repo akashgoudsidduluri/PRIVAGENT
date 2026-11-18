@@ -32,6 +32,7 @@ import html
 import ipaddress
 import re
 import socket
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -222,14 +223,18 @@ def extract_visible(html_text: str) -> dict[str, Any]:
     return parser.result()
 
 
-def fetch_observation(url: str, *, timeout: float = FETCH_TIMEOUT_S,
-                      max_bytes: int = MAX_BODY_BYTES) -> dict[str, Any]:
-    """GET a public page and return the observation for the detector.
+# A transient transport blip (DNS lookup failed, connection reset)
+# must not kill a watch: one failed fetch retries twice with a
+# growing backoff before the scheduler ever hears about it.
+_FETCH_ATTEMPTS = 3
+_FETCH_BACKOFF_S = (2.0, 5.0)
 
-    Raises ValueError on a refused URL or an oversized/non-HTML body,
-    and RuntimeError on transport/HTTP failures. The caller decides
-    what a failure means for the mission; nothing is persisted here.
-    """
+
+def _fetch_once(url: str, *, timeout: float, max_bytes: int) -> dict[str, Any]:
+    """Single GET attempt. Raises ValueError on a refused URL or an
+    oversized/non-HTML body, RuntimeError on an HTTP failure, and
+    lets URLError/timeout propagate so the caller can retry a
+    transient transport blip."""
     ok, reason = _validate_monitor_url(url)
     if not ok:
         raise ValueError(f"Monitor HTTP check refused {url}: {reason}")
@@ -258,16 +263,35 @@ def fetch_observation(url: str, *, timeout: float = FETCH_TIMEOUT_S,
             charset = response.headers.get_content_charset() or "utf-8"
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"Monitor HTTP check failed for {url}: HTTP {exc.code}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Monitor HTTP check failed for {url}: {exc.reason}") from exc
-    except (TimeoutError, socket.timeout) as exc:
-        raise RuntimeError(f"Monitor HTTP check timed out for {url}") from exc
     text = raw.decode(charset, errors="replace")
     # Unescape any entities the parser leaves behind in text nodes.
     observation = extract_visible(text)
     observation["text"] = html.unescape(observation["text"])
     observation["url"] = url
     return observation
+
+
+def fetch_observation(url: str, *, timeout: float = FETCH_TIMEOUT_S,
+                      max_bytes: int = MAX_BODY_BYTES) -> dict[str, Any]:
+    """GET a public page and return the observation for the detector.
+
+    Raises ValueError on a refused URL or an oversized/non-HTML body,
+    and RuntimeError on transport/HTTP failures. The caller decides
+    what a failure means for the mission; nothing is persisted here.
+
+    Transport failures (DNS, connect, timeout) are retried twice
+    with a 2s then 5s backoff first: a transient blip must not mark
+    a watch failed. Refusals (bad URL, non-HTML, oversize) and HTTP
+    errors are definitive and raise at once.
+    """
+    for attempt in range(_FETCH_ATTEMPTS):
+        try:
+            return _fetch_once(url, timeout=timeout, max_bytes=max_bytes)
+        except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+            if attempt + 1 >= _FETCH_ATTEMPTS:
+                reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+                raise RuntimeError(f"Monitor HTTP check failed for {url}: {reason}") from exc
+            time.sleep(_FETCH_BACKOFF_S[attempt])
 
 
 def check_monitor_http(mission_id: str, url: str, *, db_path: str | None = None,

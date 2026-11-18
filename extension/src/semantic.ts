@@ -51,8 +51,16 @@ export function rawAccessibleName(el: Element): string {
  const referenced = ids.map(id=>root.getElementById(id)?.textContent||'').join(' ');
  const labels = Array.from((el as HTMLInputElement).labels||[]).map(l=>l.textContent||'').join(' ');
  const wrapping = el.closest('label')?.textContent;
+ // An editable element's textContent is its user-entered content, not
+ // its name (a contenteditable draft, a textarea's text): using it as
+ // the name would send what the user typed to the backend/planner as
+ // the element's identity. Per the ARIA name computation an editable's
+ // name comes from label/aria-label/placeholder/title only.
+ const editable = el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement
+   || el instanceof HTMLSelectElement || (el as HTMLElement).isContentEditable
+   || el.getAttribute('contenteditable') === 'true';
  return clip(referenced)||clip(el.getAttribute('aria-label'))||clip(labels)||clip(wrapping)||
-        clip(el.getAttribute('placeholder'))||clip(el.getAttribute('title'))||clip(el.textContent);
+        clip(el.getAttribute('placeholder'))||clip(el.getAttribute('title'))||(editable ? '' : clip(el.textContent));
 }
 export function accessibleName(el: Element): string {
  return stripIconGlyphs(rawAccessibleName(el));

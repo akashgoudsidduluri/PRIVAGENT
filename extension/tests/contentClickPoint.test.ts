@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { describe, expect, it, afterEach } from "vitest";
+import { describe, expect, it, afterEach, vi } from "vitest";
 import "../lib/content";
 
 interface Point { x: number; y: number; width: number; height: number }
@@ -89,5 +89,49 @@ describe("chat-row click point promotion", () => {
   it("returns null for an unknown target", () => {
     document.body.innerHTML = `<div>plain page</div>`;
     expect(agent().getClickPoint("missing", "Nothing here")).toBeNull();
+  });
+});
+
+describe("clicking never fires a cancel-search side effect", () => {
+  it("clicking a chat-named target does not click the page's cancel-search button", () => {
+    // jsdom's PointerEvent rejects { view: window } outright, so the
+    // constructors are stubbed with plain Events for this test; the
+    // native .click() calls (the actual side effect under test) are
+    // real and observable.
+    class FakePointerEvent extends Event {
+      constructor(type: string, init?: PointerEventInit) { super(type, init); }
+    }
+    vi.stubGlobal("PointerEvent", FakePointerEvent);
+    vi.stubGlobal("MouseEvent", FakePointerEvent);
+    let cancelled = false;
+    document.body.innerHTML = `
+      <button aria-label="Cancel search">✕</button>
+      <button id="chat-btn">Chat with support</button>`;
+    document.querySelector('button[aria-label="Cancel search"]')!
+      .addEventListener("click", () => { cancelled = true; });
+    (window.__navigatorAgent as unknown as { list: () => unknown[] }).list();
+    const click = (window.__navigatorAgent as unknown as {
+      click: (targetId: string, name?: string) => { ok: boolean; error?: string };
+    }).click;
+    const result = click("chat-btn", "Chat with support");
+    expect(result.ok).toBe(true);
+    expect(cancelled).toBe(false);
+  });
+});
+
+describe("linkTarget reports the anchor's target", () => {
+  it("returns _blank only for a _blank anchor", () => {
+    document.body.innerHTML = `
+      <a id="blank-link" href="https://example.com/p" target="_blank">Product</a>
+      <a id="same-link" href="https://example.com/p">Same tab</a>
+      <a id="anchor-link" href="#reviews">Reviews</a>`;
+    (window.__navigatorAgent as unknown as { list: () => unknown[] }).list();
+    const linkTarget = (window.__navigatorAgent as unknown as {
+      linkTarget: (targetId: string, name?: string) => string;
+    }).linkTarget;
+    expect(linkTarget("blank-link", "Product")).toBe("_blank");
+    expect(linkTarget("same-link", "Same tab")).toBe("");
+    expect(linkTarget("anchor-link", "Reviews")).toBe("");
+    expect(linkTarget("missing", "Nope")).toBe("");
   });
 });

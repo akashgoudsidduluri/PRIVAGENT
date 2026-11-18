@@ -186,11 +186,13 @@ function timeoutError(ms: number): ActionResult {
 }
 
 /** Run one action under a hard deadline so a stuck tab cannot block the
- * relay (and the backend's 45s slot) forever. */
-async function withDeadline(promise: Promise<ActionResult>, ms: number): Promise<ActionResult> {
+ * relay (and the backend's 45s slot) forever. The deadline also aborts
+ * the in-flight action: without the signal, a timed-out click/type
+ * keeps running and its side effects interleave with the next step. */
+async function withDeadline(promise: Promise<ActionResult>, ms: number, onTimeout?: () => void): Promise<ActionResult> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<ActionResult>(resolve => {
-    timer = setTimeout(() => resolve(timeoutError(ms)), ms);
+    timer = setTimeout(() => { onTimeout?.(); resolve(timeoutError(ms)); }, ms);
   });
   try {
     return await Promise.race([promise, deadline]);
@@ -214,9 +216,11 @@ async function handleMessage(taskId: string, raw: unknown, allowedDomains?: stri
     ? Math.min(action.timeoutMs, 60_000)
     : 10_000;
   try {
+    const controller = new AbortController();
     const result = await withDeadline(
-      executeAction(action as Parameters<typeof executeAction>[0], taskId, allowedDomains),
+      executeAction(action as Parameters<typeof executeAction>[0], taskId, allowedDomains, controller.signal),
       actionMs + 5_000,
+      () => controller.abort(),
     );
     if (action?.type === "init_session" && typeof (result as any)?.primaryTabId === "number") {
       primaryTabId = (result as any).primaryTabId;

@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "test": "node tests/structure.test.mjs && node tests/console.test.mjs && node --experimental-strip-types tests/security.test.mjs && node --experimental-strip-types tests/task12_ui.test.mjs && node --experimental-strip-types tests/task14_ui.test.mjs && node tests/task15_ui.test.mjs && node tests/frontend_recovery.test.mjs && node tests/ui_flicker.test.mjs"
+    "test": "node tests/structure.test.mjs && node tests/console.test.mjs && node --experimental-strip-types tests/security.test.mjs && node --experimental-strip-types tests/task12_ui.test.mjs && node --experimental-strip-types tests/task14_ui.test.mjs && node tests/task15_ui.test.mjs && node tests/frontend_recovery.test.mjs && node tests/ui_flicker.test.mjs && node tests/email_sync_frequency.test.mjs && node --experimental-strip-types tests/auth_token_prompt.test.mjs && node tests/control_refresh.test.mjs"
   },
   "devDependencies": {
     "sharp": "0.35.5",

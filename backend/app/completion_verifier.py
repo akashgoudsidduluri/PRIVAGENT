@@ -143,6 +143,25 @@ def is_waiting_for_user(message: str, state: str) -> bool:
     return any(p.search(message) for p in AUTH_WAITING_PATTERNS)
 
 
+# A whole instruction that is only an acknowledgment / go-ahead, with
+# no new content of its own: "yeah", "yes please", "retry". Such a
+# turn continues whatever the conversation was doing — it never
+# states a new task that could complete on its own.
+_BARE_CONTINUATIONS = {
+    "yeah", "yes", "yep", "yup", "ok", "okay", "sure", "go ahead",
+    "retry", "try again", "do it", "continue", "proceed", "please do",
+    "go on", "yeah retry", "yes retry", "yes please", "yeah please",
+    "ok retry", "yes go ahead", "yeah go ahead", "sure go ahead",
+}
+
+
+def _is_bare_continuation(instruction: str) -> bool:
+    """True when the instruction is only an acknowledgment / go-ahead."""
+    text = (instruction or "").strip().lower()
+    text = re.sub(r"[.!?,\s]+$", "", text).strip()
+    return text in _BARE_CONTINUATIONS
+
+
 # Execution-failure markers produced by the agent loop itself. A summary
 # carrying any of these is an honest failure record, never a completion.
 _EXECUTION_FAILURE_MARKERS = (
@@ -545,6 +564,43 @@ def verify_task_completion(
             is_verified=False,
             reason="Execution reported failure; verifier does not override it.",
         )
+
+    # A bare acknowledgment ("yeah", "yes, retry") after a failed
+    # mission is a continuation of that mission, not a new
+    # conversational task. If the previous assistant message in the
+    # conversation is an execution failure and the failed mission's
+    # deliverable is still outstanding (requested_format /
+    # deliverable_type in working memory), this turn cannot complete:
+    # no browsing happened and no artifact was produced. Live case
+    # (2026-11-18 02:07 IST): the price hunt failed on a planner DNS
+    # blip, the user said "yeah" to retry, the LLM answered with a
+    # diagnosis — and the mission was recorded as "Mission Completed"
+    # with no prices and no Excel.
+    if _is_bare_continuation(instruction):
+        conv_hist = mem.get("conversation_history") or []
+        last_assistant = next(
+            (m for m in reversed(conv_hist) if isinstance(m, dict) and m.get("role") == "assistant"),
+            None,
+        )
+        if last_assistant and is_execution_failure(str(last_assistant.get("content") or "")):
+            session_mem = mem.get("session_memory") or {}
+            outstanding = (
+                mem.get("requested_format")
+                or mem.get("deliverable_type")
+                or (session_mem.get("requested_format") if isinstance(session_mem, dict) else None)
+                or (session_mem.get("deliverable_type") if isinstance(session_mem, dict) else None)
+            )
+            if outstanding and "Deliverable Ready" not in msg:
+                return VerificationResult(
+                    state="failed",
+                    message=(
+                        f"Previous mission failed and its {outstanding} deliverable is still "
+                        f"outstanding — this answer does not retry or deliver it.\n\n{msg}"
+                    ),
+                    is_verified=False,
+                    reason="Bare continuation after a failed mission with an undelivered deliverable.",
+                )
+
     final_state = "completed" if candidate_state in ("completed", "running") else candidate_state
     return VerificationResult(
         state=final_state,

@@ -40,27 +40,43 @@ export function authHeaders(): Record<string, string> {
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
-let promptShown = false;
+/** Prompt for the token on a 401 and store it. Returns null if the user cancels.
+ *
+ * A cancelled prompt does NOT latch the prompt off forever (the old
+ * `promptShown` flag did — one dismiss left the workspace 401ing with
+ * no way back short of reload). Instead, re-prompting is throttled:
+ * at most one prompt per cooldown window, so a polling loop cannot
+ * nag the operator every second. A successful (non-401) response
+ * clears the cooldown, so a later token rotation prompts at once. */
+let promptOpen = false;
+let lastPromptAt = 0;
+const PROMPT_COOLDOWN_MS = 60_000;
 
-/** Prompt once for the token (first 401) and store it. Returns null if the user cancels. */
 function promptForToken(): string | null {
-  if (promptShown) return null;
-  promptShown = true;
-  const entered = window.prompt(
-    "This workspace now needs the local operator token.\n" +
-      "Find it with (from backend/): venv\\Scripts\\python.exe scripts\\print_local_token.py\n" +
-      "(or the PRIVAGENT_LOCAL_TOKEN value in backend/.env)",
-  );
-  if (entered && entered.trim()) {
-    setToken(entered);
-    return entered.trim();
+  if (promptOpen) return null;
+  if (Date.now() - lastPromptAt < PROMPT_COOLDOWN_MS) return null;
+  promptOpen = true;
+  lastPromptAt = Date.now();
+  try {
+    const entered = window.prompt(
+      "This workspace now needs the local operator token.\n" +
+        "Find it with (from backend/): venv\\Scripts\\python.exe scripts\\print_local_token.py\n" +
+        "(or the PRIVAGENT_LOCAL_TOKEN value in backend/.env)",
+    );
+    if (entered && entered.trim()) {
+      setToken(entered);
+      return entered.trim();
+    }
+    return null;
+  } finally {
+    promptOpen = false;
   }
-  return null;
 }
 
 /**
  * fetch() wrapper for backend calls. Adds the Authorization header and,
- * on a first 401, prompts once for the token and retries once.
+ * on a 401, prompts for the token (throttled, see promptForToken) and
+ * retries once.
  */
 export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   const withAuth = (extra?: RequestInit): RequestInit => ({
@@ -77,6 +93,10 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
         headers: { ...(init?.headers as Record<string, string> | undefined), Authorization: `Bearer ${token}` },
       });
     }
+  } else {
+    // Healthy again: a later 401 (e.g. token rotation) prompts at once
+    // instead of waiting out a cooldown from an old dismissal.
+    lastPromptAt = 0;
   }
   return res;
 }
