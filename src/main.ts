@@ -2,20 +2,22 @@ import "./styles/main.css";
 import "./styles/landing-refresh.css";
 import "./taskconsole";
 
-// Starfield
-const starsEl = document.getElementById("stars");
-if (starsEl) {
-  const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
-  const count = Math.min(140, Math.floor((innerWidth * innerHeight) / 12000));
-  for (let i = 0; i < count; i++) {
-    const s = document.createElement("span");
-    s.className = "star";
-    const size = Math.random() * 2 + 1;
-    s.style.cssText = `left:${Math.random() * 100}%;top:${Math.random() * 100}%;width:${size}px;height:${size}px;--dur:${(Math.random() * 3 + 2).toFixed(1)}s;animation-delay:${(Math.random() * 3).toFixed(1)}s`;
-    if (reduced) s.style.animation = "none";
-    starsEl.appendChild(s);
-  }
-}
+// Workflow 3-step scrubber: click a tab to show its panel.
+const flowTabs = [...document.querySelectorAll<HTMLButtonElement>(".flow-tab")];
+const flowPanels = [...document.querySelectorAll<HTMLElement>(".flow-panel")];
+flowTabs.forEach(tab => {
+  tab.addEventListener("click", () => {
+    const idx = Number(tab.dataset.flow || 0);
+    flowTabs.forEach(t => {
+      const active = t === tab;
+      t.classList.toggle("is-active", active);
+      t.setAttribute("aria-selected", String(active));
+    });
+    flowPanels.forEach((p, i) => {
+      p.hidden = i !== idx;
+    });
+  });
+});
 
 // Nav mobile toggle
 const toggle = document.querySelector<HTMLButtonElement>(".nav__toggle");
@@ -49,25 +51,6 @@ const sectionObserver = new IntersectionObserver(
   { rootMargin: "-40% 0px -55% 0px" }
 );
 document.querySelectorAll("main section[id]").forEach(s => sectionObserver.observe(s));
-
-// Workflow scrubber: 3-step horizontal tabs.
-const flowTabs = [...document.querySelectorAll<HTMLButtonElement>(".flow-scrubber__tab")];
-const flowPanels = [...document.querySelectorAll<HTMLElement>(".flow-panel")];
-flowTabs.forEach(tab => {
-  tab.addEventListener("click", () => {
-    const step = tab.dataset.flowStep;
-    flowTabs.forEach(t => {
-      const active = t === tab;
-      t.classList.toggle("is-active", active);
-      t.setAttribute("aria-selected", String(active));
-    });
-    flowPanels.forEach(p => {
-      const active = p.dataset.flowPanel === step;
-      p.classList.toggle("is-active", active);
-      p.hidden = !active;
-    });
-  });
-});
 
 const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
 if (reducedMotion) {

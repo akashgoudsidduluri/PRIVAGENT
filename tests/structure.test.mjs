@@ -15,12 +15,11 @@ console.log("structure tests");
 const html = read("index.html");
 const css = read("src/styles/main.css");
 
-t("headline present", html.includes("That") && html.includes("Respects Your Privacy"));
+t("headline present", html.includes("A browser agent that never leaks your screen."));
 t("all 8 anchor targets exist", ["problem","solution","workflow","features","use-cases","tech","team","cta"].every(id => html.includes(`id="${id}"`)));
-t("hero redaction visual present", html.includes("redact-flow") && html.includes("LOCAL REDACTION LAYER") && html.includes("[CARD_REDACTED]"));
-t("hero image file exists", existsSync(join(root, "public/images/hero-space-02.png")));
-t("all 3 images staged", ["hero-space-01","hero-space-02","hero-space-03"].every(n => existsSync(join(root, `public/images/${n}.png`))));
-t("fonts: no Inter/Roboto", !/font-family[^;]*(Inter|Roboto|Arial)/.test(css));
+t("hero redaction visual present", html.includes("redact-flow") && html.includes("On-Device Redaction Layer") && html.includes("[CARD_REDACTED]"));
+t("hero headline is the Editorial line", html.includes("A browser agent that never leaks your screen."));
+t("fonts: Editorial stack (Source Serif 4 + Inter + JetBrains Mono), no Chakra Petch / IBM Plex Sans", css.includes("Source Serif 4") && css.includes("Inter") && css.includes("JetBrains Mono") && !css.includes("Chakra Petch") && !css.includes("IBM Plex Sans"));
 t("reduced-motion block present", css.includes("prefers-reduced-motion"));
 t("focus-visible styled", css.includes(":focus-visible"));
 t("skip link present", html.includes("skip-link"));

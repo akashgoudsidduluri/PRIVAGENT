@@ -22,8 +22,8 @@ let btnSendMission: HTMLButtonElement | null = null;
 let btnAttachMission: HTMLButtonElement | null = null;
 let composerChips: HTMLElement | null = null;
 // The mission submitter, wired in initWorkspaceElements(). Enter in the
-// input and the cobalt Send button both call this; while a mission
-// runs the Send arrow morphs into the crimson Stop button (see
+// input and the olive Send pill both call this; while a mission runs
+// the Send pill morphs into the crimson Stop pill (see
 // setButtonWorking). Assigned once, when the workspace mounts.
 let startMission: (() => Promise<void>) | null = null;
 const btnNewSession = document.getElementById("btnNewSession") as HTMLButtonElement | null;
@@ -140,11 +140,11 @@ let btnTakeoverCancel: HTMLButtonElement | null = null;
 
 // Inspector
 let inspectorUrl: HTMLAnchorElement | null = null;
-let inspectorTitle: HTMLElement | null = null;
-let inspectorEvidence: HTMLElement | null = null;
 let browserFrameUrlText: HTMLElement | null = null;
 let telDomNodes: HTMLElement | null = null;
 let telPiiMasked: HTMLElement | null = null;
+let inspectorTitle: HTMLElement | null = null;
+let inspectorEvidence: HTMLElement | null = null;
 let telStepsDone: HTMLElement | null = null;
 let telRemoteVision: HTMLElement | null = null;
 let telPlannerLatency: HTMLElement | null = null;
@@ -191,6 +191,9 @@ function initWorkspaceElements(): void {
   btnSendMission = document.getElementById("btnSendMission") as HTMLButtonElement | null;
   btnAttachMission = document.getElementById("btnAttachMission") as HTMLButtonElement | null;
   composerChips = document.getElementById("composerChips") as HTMLElement | null;
+  browserFrameUrlText = document.getElementById("browserFrameUrlText") as HTMLElement | null;
+  telDomNodes = document.getElementById("telDomNodes") as HTMLElement | null;
+  telPiiMasked = document.getElementById("telPiiMasked") as HTMLElement | null;
   missionSubtext = document.getElementById("missionSubtext") as HTMLElement | null;
   stateBadge = document.getElementById("missionStateBadge") as HTMLElement | null;
   stepsList = document.getElementById("agentStepsList") as HTMLOListElement | null;
@@ -221,9 +224,6 @@ function initWorkspaceElements(): void {
   inspectorUrl = document.getElementById("inspectorUrl") as HTMLAnchorElement | null;
   inspectorTitle = document.getElementById("inspectorTitle") as HTMLElement | null;
   inspectorEvidence = document.getElementById("inspectorEvidence") as HTMLElement | null;
-  browserFrameUrlText = document.getElementById("browserFrameUrlText") as HTMLElement | null;
-  telDomNodes = document.getElementById("telDomNodes") as HTMLElement | null;
-  telPiiMasked = document.getElementById("telPiiMasked") as HTMLElement | null;
   telStepsDone = document.getElementById("telStepsDone") as HTMLElement | null;
   telRemoteVision = document.getElementById("telRemoteVision") as HTMLElement | null;
   telPlannerLatency = document.getElementById("telPlannerLatency") as HTMLElement | null;
@@ -242,7 +242,7 @@ function initWorkspaceElements(): void {
   });
 
   // Enter submits the mission (Shift+Enter inserts a newline). The
-  // cobalt Send button is the same submit path.
+  // olive Send pill is the same submit path, for pointer users.
   missionInput?.addEventListener("keydown", (e: KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -250,24 +250,25 @@ function initWorkspaceElements(): void {
     }
   });
 
-  // Auto-expanding textarea (capped by CSS max-height).
+  // Auto-expanding textarea (capped at 160px, per the Editorial
+  // composer spec) so a long directive never hides the Send pill.
   missionInput?.addEventListener("input", () => {
     if (!missionInput) return;
     missionInput.style.height = "auto";
     missionInput.style.height = `${Math.min(missionInput.scrollHeight, 160)}px`;
   });
 
+  // The olive Send pill submits the mission.
   btnSendMission?.addEventListener("click", () => {
     void startMission?.();
   });
 
-  // Paperclip trigger opens the hidden file input.
+  // The Attach ghost pill opens the hidden native file input.
   btnAttachMission?.addEventListener("click", () => {
     missionAttachment?.click();
   });
 
-  // File chip preview: shows the attached file name with a remove
-  // button, so the user sees the agent received it before sending.
+  // Render the file chips when a file is chosen.
   missionAttachment?.addEventListener("change", () => {
     renderAttachmentChips();
   });
@@ -278,7 +279,6 @@ function initWorkspaceElements(): void {
     activeInstruction = instruction;
 
     setButtonWorking(true);
-    if (btnCancelMission) btnCancelMission.hidden = false;
     if (resultCard) resultCard.hidden = true;
     hideHumanGate();
     currentTaskId = null;
@@ -290,9 +290,7 @@ function initWorkspaceElements(): void {
     const attachedFileName = missionAttachment?.files?.[0]?.name;
     addUserMessageItem(instruction, attachedFileName);
     missionInput.value = "";
-    // Clear the attachment + chip so the next mission starts clean.
-    if (missionAttachment) missionAttachment.value = "";
-    renderAttachmentChips();
+    missionInput.style.height = "auto";
 
     if (telPlannerLatency) telPlannerLatency.textContent = "—";
     setTaskState("planning");
@@ -336,6 +334,7 @@ function initWorkspaceElements(): void {
       const data = (await res.json()) as { task_id?: string; taskId?: string; chat_id?: string; chatId?: string };
       currentTaskId = data.task_id || data.taskId || null;
       if (missionAttachment) missionAttachment.value = "";
+      renderAttachmentChips();
       activeChatId = activeChatId || data.chat_id || data.chatId || null;
 
       // Refresh chat list to show active title and timestamp
@@ -541,19 +540,19 @@ function setTaskState(state: string): void {
   if (!stateBadge) return;
   stateBadge.textContent = state.toUpperCase();
   if (["running", "planning"].includes(state.toLowerCase())) {
-    stateBadge.style.color = "#a4ad9e";
-    stateBadge.style.background = "rgba(56, 189, 248, 0.2)";
+    stateBadge.style.color = "var(--accent)";
+    stateBadge.style.background = "var(--accent-soft)";
   } else if (state === "completed") {
-    stateBadge.style.color = "#34d399";
-    stateBadge.style.background = "rgba(52, 211, 153, 0.2)";
+    stateBadge.style.color = "var(--privacy)";
+    stateBadge.style.background = "var(--privacy-soft)";
   } else if (state === "awaiting_takeover") {
-    // Task 4: takeover is not an error — amber, distinct from the
-    // confirmation gate's default styling.
-    stateBadge.style.color = "#fbbf24";
-    stateBadge.style.background = "rgba(251, 191, 36, 0.2)";
+    // Task 4: takeover is not an error — terracotta amber, distinct
+    // from the confirmation gate's default styling.
+    stateBadge.style.color = "var(--gate)";
+    stateBadge.style.background = "var(--gate-soft)";
   } else if (["failed", "cancelled"].includes(state)) {
-    stateBadge.style.color = "#f87171";
-    stateBadge.style.background = "rgba(248, 113, 113, 0.2)";
+    stateBadge.style.color = "var(--danger)";
+    stateBadge.style.background = "var(--danger-soft)";
   } else {
     stateBadge.style.color = "";
     stateBadge.style.background = "";
@@ -773,6 +772,27 @@ function addUserMessageItem(message: string, attachmentName?: string): void {
   li.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
+/** Render the composer's file chips from the hidden input's files.
+    Each chip shows "📎 name" with an × that clears the input. The
+    chip's name is escaped via escapeHtml() at the assignment site
+    (inlined, so the innerHTML guard can see it). */
+function renderAttachmentChips(): void {
+  if (!composerChips) return;
+  const files = missionAttachment?.files;
+  if (!files || files.length === 0) {
+    composerChips.innerHTML = "";
+    composerChips.hidden = true;
+    return;
+  }
+  const name = files[0].name;
+  composerChips.innerHTML = `<span class="composer-chip">📎 ${escapeHtml(name)} <button type="button" class="composer-chip__remove" aria-label="Remove attachment">×</button></span>`;
+  composerChips.hidden = false;
+  composerChips.querySelector(".composer-chip__remove")?.addEventListener("click", () => {
+    if (missionAttachment) missionAttachment.value = "";
+    renderAttachmentChips();
+  });
+}
+
 function updateStepsCount(count: number): void {
   const timelineSteps = stepsList ? stepsList.querySelectorAll("li.agent-step-item:not(.agent-step-item--user):not(.agent-step-item--result):not(.agent-step-item--failed)").length : 0;
   stepCounter = Math.max(0, count, timelineSteps);
@@ -829,16 +849,17 @@ function addStepItem(message: string, stepNum?: number): void {
     : "agent-step-item agent-step-item--completed";
   li.dataset.eventKey = eventKey;
   if (isTransient) li.dataset.transient = "true";
-  // The live "Thinking" row gets a shimmer skeleton bar + pulse ring
-  // (not generic bouncing dots) so the user can see at a glance the
-  // agent is still working. The text is still "Thinking..." so the
-  // row's textContent and the dedup above keep working. Inlined (not
-  // a pre-built string) so the innerHTML guard can see the escaping
-  // at the assignment site. Completed steps carry --completed so the
-  // stepper node renders an emerald checkmark.
+  // The live "Thinking" row gets a subtle warm-stone pulse bar +
+  // "Sanitizing DOM locally…" label (no bouncing dots) so the user
+  // can see at a glance the agent is still working. The row's
+  // textContent is still "Thinking..." and the dedup above keeps
+  // working. Completed steps carry --completed so the stepper node
+  // renders a forest-sage checkmark. Inlined (not a pre-built
+  // string) so the innerHTML guard can see the escaping at the
+  // assignment site.
   li.innerHTML = `
     <span class="agent-step-item__icon">${isTransient ? "◌" : "✓"}</span>
-    <span class="agent-step-item__text">${isTransient ? `Thinking<span class="thinking-shimmer" aria-hidden="true"></span>` : linkify(displayMessage)}</span>
+    <span class="agent-step-item__text">${isTransient ? `<span class="thinking-label">Sanitizing DOM locally…</span><span class="thinking-pulse" aria-hidden="true"></span>` : linkify(displayMessage)}</span>
   `;
   stepsList.appendChild(li);
   li.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -860,8 +881,8 @@ function addStepItem(message: string, stepNum?: number): void {
 function showStalledNotice(): void {
   if (missionSubtext && isWorking) {
     missionSubtext.innerHTML = `
-      <span style="color: #fbbf24; font-weight: 500;">
-        ⏳ Progress is taking longer than usual (planner waiting for model response). You may wait or click Cancel.
+      <span style="color: var(--gate); font-weight: 500;">
+        ⏳ Progress is taking longer than usual (planner waiting for model response). You may wait or click Stop.
       </span>
     `;
   }
@@ -878,41 +899,17 @@ function clearStalledNotice(): void {
 // Working state is a flag, not a button label: there is no Start button
 // any more, so there is nothing to re-label. The Cancel button's
 // visibility is managed by the call sites, not here.
-function renderAttachmentChips(): void {
-  if (!composerChips) return;
-  const files = missionAttachment?.files;
-  if (!files || files.length === 0) {
-    composerChips.hidden = true;
-    composerChips.innerHTML = "";
-    return;
-  }
-  const file = files[0];
-  composerChips.hidden = false;
-  // Inlined (not a pre-built string) so the innerHTML guard can see
-  // the escaping at the assignment site.
-  composerChips.innerHTML = `
-    <span class="composer-chip">📎 ${escapeHtml(file.name)}
-      <button type="button" class="composer-chip__remove" aria-label="Remove attachment" title="Remove attachment">×</button>
-    </span>
-  `;
-  composerChips.querySelector(".composer-chip__remove")?.addEventListener("click", () => {
-    if (missionAttachment) missionAttachment.value = "";
-    renderAttachmentChips();
-  });
-}
-
 function setButtonWorking(working: boolean): void {
   isWorking = working;
-  // Morphing action button: while a mission runs the cobalt Send
-  // arrow is replaced (same spot) by the crimson Stop circle; when
-  // idle, Send returns and Stop hides.
-  if (btnSendMission) btnSendMission.hidden = working;
-  if (btnCancelMission) btnCancelMission.hidden = !working;
   if (working) {
     lastProgressTime = Date.now();
   } else {
     clearStalledNotice();
   }
+  // The olive Send pill morphs into the crimson Stop pill while a
+  // mission runs (same spot); Stop returns to Send when it ends.
+  if (btnSendMission) btnSendMission.hidden = working;
+  if (btnCancelMission) btnCancelMission.hidden = !working;
 }
 
 function normalizeForDedup(text: string): string {
@@ -998,11 +995,11 @@ async function syncActiveTask(taskId: string): Promise<boolean> {
 
     if (missionSubtext && !missionSubtext.innerHTML.includes("Progress is taking longer")) {
       if (t.isBrowserTask === false || t.intent === "NON_BROWSER") {
-        missionSubtext.innerHTML = `<span style="color: #d5ff70; font-weight: 500;">💬 Mode: Conversational (Zero Browser Actions)</span>`;
+        missionSubtext.innerHTML = `<span style="color: var(--accent); font-weight: 500;">💬 Mode: Conversational (Zero Browser Actions)</span>`;
       } else if (t.sessionId) {
         const tabInfo = t.primaryTabId ? ` · Tab #${t.primaryTabId}` : "";
         const childInfo = t.childTabIds && t.childTabIds.length > 0 ? ` (+${t.childTabIds.length} child tabs)` : "";
-        missionSubtext.innerHTML = `<span style="color: #a4ad9e; font-weight: 500;">🌐 Session: ${escapeHtml(t.sessionId.slice(0, 8))}${tabInfo}${childInfo}</span>`;
+        missionSubtext.innerHTML = `<span style="color: var(--text-secondary); font-weight: 500;">🌐 Session: ${escapeHtml(t.sessionId.slice(0, 8))}${tabInfo}${childInfo}</span>`;
       }
       // Task 14: routing decision ("via Gmail connector" / "via
       // WebMCP tool X" / "via UCP checkout"). The label is built from
@@ -1010,7 +1007,7 @@ async function syncActiveTask(taskId: string): Promise<boolean> {
       // every poll, so appending here cannot accumulate.
       const routeText = taskRouteLabel((t as any).route);
       if (routeText) {
-        missionSubtext.innerHTML += ` <span style="color: #34d399; font-weight: 500;">${escapeHtml(routeText)}</span>`;
+        missionSubtext.innerHTML += ` <span style="color: var(--privacy); font-weight: 500;">${escapeHtml(routeText)}</span>`;
       }
     }
 
@@ -1669,16 +1666,16 @@ function connectWebSocket(): void {
 
       if (missionSubtext && !missionSubtext.innerHTML.includes("Progress is taking longer")) {
         if (p.isBrowserTask === false || p.intent === "NON_BROWSER") {
-          missionSubtext.innerHTML = `<span style="color: #d5ff70; font-weight: 500;">💬 Mode: Conversational (Zero Browser Actions)</span>`;
+          missionSubtext.innerHTML = `<span style="color: var(--accent); font-weight: 500;">💬 Mode: Conversational (Zero Browser Actions)</span>`;
         } else if (p.sessionId) {
           const tabInfo = p.primaryTabId ? ` · Tab #${p.primaryTabId}` : "";
           const childInfo = p.childTabIds && p.childTabIds.length > 0 ? ` (+${p.childTabIds.length} child tabs)` : "";
-          missionSubtext.innerHTML = `<span style="color: #a4ad9e; font-weight: 500;">🌐 Session: ${escapeHtml(p.sessionId.slice(0, 8))}${tabInfo}${childInfo}</span>`;
+          missionSubtext.innerHTML = `<span style="color: var(--text-secondary); font-weight: 500;">🌐 Session: ${escapeHtml(p.sessionId.slice(0, 8))}${tabInfo}${childInfo}</span>`;
         }
         // Task 14: routing decision — see the polling path above.
         const routeText = taskRouteLabel((p as any).route);
         if (routeText) {
-          missionSubtext.innerHTML += ` <span style="color: #34d399; font-weight: 500;">${escapeHtml(routeText)}</span>`;
+          missionSubtext.innerHTML += ` <span style="color: var(--privacy); font-weight: 500;">${escapeHtml(routeText)}</span>`;
         }
       }
 

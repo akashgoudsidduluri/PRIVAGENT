@@ -25,21 +25,7 @@ function ensureLiveNodes(): WorkspaceNodes | null {
  liveNodes = { workspace, originalTimeline, inspector, feed };
  return liveNodes;
 }
-nav.innerHTML = `<a class="control-monogram" href="#overview" aria-label="PrivAgent overview">P<span>•</span></a><div class="control-nav-label">WORKSPACE</div><span class="control-nav__pill" id="controlNavPill" aria-hidden="true"></span>` + views.map((v,i)=>`<button data-view="${i}" title="${v}"><span>${icons[i]}</span><b>${v}</b>${i===1?'<small>LIVE</small>':''}</button>`).join('') + '<div class="nav-foot"><span class="orbit-dot"></span>LOCAL BY DESIGN</div>';
-const navPill = nav.querySelector<HTMLElement>('#controlNavPill');
-// Animated active-pill indicator: a cobalt-tinted pill that slides
-// behind the selected view button (transform transition). Positioned
-// on every render from the selected button's offset within the nav.
-function moveNavPill(index: number): void {
-  if (!navPill) return;
-  const buttons = nav.querySelectorAll<HTMLButtonElement>('button');
-  const btn = buttons[index];
-  if (!btn) return;
-  const navRect = nav.getBoundingClientRect();
-  const btnRect = btn.getBoundingClientRect();
-  navPill.style.height = `${btnRect.height}px`;
-  navPill.style.transform = `translateY(${btnRect.top - navRect.top + nav.scrollTop}px)`;
-}
+nav.innerHTML = `<div class="control-nav-label">WORKSPACE</div>` + views.map((v,i)=>`<button data-view="${i}" title="${v}"><span>${icons[i]}</span><b>${v}</b>${i===1?'<small>LIVE</small>':''}</button>`).join('') + '<div class="nav-foot"><span class="orbit-dot"></span>LOCAL BY DESIGN</div>';
 let generation = 0;
 let inspectorRefresh: number | undefined;
 async function render(index: number) {
@@ -58,7 +44,6 @@ async function render(index: number) {
  }
  document.body.dataset.controlView = String(index);
  nav.querySelectorAll('button').forEach((b,i)=>{b.classList.toggle('selected', i===index); b.setAttribute('aria-current',i===index?'page':'false');});
- moveNavPill(index);
  page.hidden=index===1;
  if(index===1) return;
  page.innerHTML=`<header class="cc-heading"><div><span class="eyebrow">PRIVAGENT / CONTROL CENTER</span><h1>${views[index]}<span> .</span></h1><p>${['Your autonomy, at a glance.','','A closer look at what your agent can actually see.','Long-running intent. Clear, accountable signals.','Continuous inbox scan, safe cleanup, and neglected email detection.','Your tools, connected on your terms.','Explicit capabilities. Explicit permissions.','Useful context, with a deliberate footprint.','From evidence to something you can use.','Every action leaves a trace.','Privacy is a process. Inspect the policy.','Tune the intelligence behind your missions.'][index]}</p></div><button class="cc-button" id="ccLaunch">↗ New mission</button></header><div id="ccContent" aria-live="polite"></div>`;

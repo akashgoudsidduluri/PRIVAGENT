@@ -120,7 +120,7 @@ export async function mountControlView(index: number, content: HTMLElement, isCu
           '<div class="cc-provider-mark">' + safe(p.provider.slice(0, 1).toUpperCase()) + '</div>' +
           '<p>Native account adapter · in-memory session</p>' +
           (p.account ? '<p style="font-size:12px;color:#8cf2ac;margin:4px 0">✓ Account: <strong>' + safe(p.account) + '</strong></p>' : '') +
-          (p.error && !p.connected ? '<p style="font-size:11px;color:#f87171;margin:4px 0">⚠️ ' + safe(p.error) + '</p>' : '') +
+          (p.error && !p.connected ? '<p style="font-size:11px;color:var(--danger);margin:4px 0">⚠️ ' + safe(p.error) + '</p>' : '') +
           '<div class="cc-provider-actions">' +
           tag(p.connected ? 'Connected' : p.configured ? 'Token Expired / Disconnected' : 'Setup Required') +
           (p.connected
@@ -486,8 +486,8 @@ async function mountEmailIntelligence(content: HTMLElement, isCurrent: () => boo
     '<h3>Status: ' + safe(mission.status.toUpperCase()) + ' ' + modeBadge + '</h3>' +
     '<div style="display:flex;align-items:center;gap:10px;margin:10px 0;padding:8px 14px;background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.25);border-radius:6px;width:fit-content">' +
     '<span style="font-size:16px">⏱</span>' +
-    '<span style="color:#cbd5e1;font-size:13px;font-weight:500">Auto-sync timer:</span>' +
-    '<strong id="emailSyncCountdown" style="font-family:monospace;font-size:16px;color:#6ee7b7;background:rgba(0,0,0,0.35);padding:2px 8px;border-radius:4px;border:1px solid rgba(110,231,183,0.3)">' + formatCountdown(syncPeriodSeconds) + '</strong>' +
+    '<span style="color:var(--text-secondary);font-size:13px;font-weight:500">Auto-sync timer:</span>' +
+    '<strong id="emailSyncCountdown" style="font-family:var(--font-mono);font-size:12px;color:var(--privacy);background:var(--privacy-soft);padding:2px 8px;border-radius:4px;border:1px solid rgba(45,90,60,0.25)">' + formatCountdown(syncPeriodSeconds) + '</strong>' +
     '</div>' +
     '<p>Protected categories (<strong>Banking, Financial, Security, Academic, Recruitment, Personal, Deadlines</strong>) are strictly locked and never automatically deleted.</p>' +
     '</div><div class="cc-row-actions">' +

@@ -143,7 +143,7 @@ test("Missions view still instantiates: template clone produces its nodes", () =
       "cloned Cancel button is not the circular button right of the input",
     );
     assert.equal(
-      host.querySelector("#btnGateApproveStep")?.textContent.includes("Approve this step only"),
+      host.querySelector("#btnGateApproveStep")?.textContent.includes("Approve This Step Only"),
       true,
       "cloned approve-this-step-only control is missing",
     );
@@ -154,7 +154,7 @@ test("Missions view still instantiates: template clone produces its nodes", () =
     for (const id of MISSIONS_IDS) {
       assert.ok(tpl[1].includes(`id="${id}"`), `template payload is missing #${id}`);
     }
-    assert.ok(tpl[1].includes("Approve this step only"), "template lost the approve-step label");
+    assert.ok(tpl[1].includes("Approve This Step Only"), "template lost the approve-step label");
   }
 });
 
@@ -202,48 +202,46 @@ test("agent.html loads no landing stylesheet and agent.css exactly once", () => 
   assert.ok(!distHtml.includes("main.css"), "built agent.html still references main.css");
 });
 
-test("UI redesign: one palette — Tactile Daylight / Studio Slate in agent.css", () => {
-  // 2026-11-18 redesign (user brief): the ink (#101210) + lime
-  // (#d5ff70) palette and the old cyan/purple "AI slop" are gone.
-  // The workspace is now light slate with restrained semantic
-  // accents: cobalt primary, emerald privacy, amber human-gate,
-  // crimson abort. No gradient blobs, no neon.
+test("Editorial redesign: one warm-paper palette, zero shadows, zero gradients", () => {
+  // 2026-11-18 Editorial redesign: the workspace is warm alabaster
+  // paper (#faf8f5) with deep olive-charcoal (#484830) accents, forest
+  // sage privacy, terracotta gate, muted crimson abort. The old
+  // cyan/purple/navy AND the ink+lime palettes are both gone. Zero
+  // drop shadows, zero gradients, zero blue/purple.
   const srcCss = read("src/styles/agent.css");
   for (const bad of [
-    "#d5ff70", "#101210", "#1b1e1b",
     "#46d7ff", "#a06bff", "#c084fc", "#c9a9ff", "#38bdf8", "#a78bfa",
-    "#55eaff", "#7ae3ff", "#0ea5e9", "#f1edff",
+    "#55eaff", "#7ae3ff", "#0ea5e9", "#f1edff", "#2563EB",
     "70, 215, 255", "160, 107, 255", "85, 234, 255",
-    "56, 189, 248", "70, 160, 220", "213, 255, 112",
+    "56, 189, 248", "70, 160, 220",
     "#060b1e", "#04122b", "#0a1230",
+    "#d5ff70", "213, 255, 112", "#101210", "#1b1e1b",
   ]) {
     assert.ok(!srcCss.includes(bad), `agent.css still uses the old palette colour ${bad}`);
   }
-  assert.ok(srcCss.includes("--bg: #F8F9FA"), "agent.css does not define the slate canvas background");
-  assert.ok(srcCss.includes("--accent: #2563EB"), "agent.css does not define the cobalt primary accent");
-  assert.ok(srcCss.includes("--privacy: #059669"), "agent.css does not define the emerald privacy accent");
-  assert.ok(srcCss.includes("--gate: #D97706"), "agent.css does not define the amber human-gate accent");
-  assert.ok(srcCss.includes("--danger: #DC2626"), "agent.css does not define the crimson abort accent");
-  // No decorative gradients anywhere (the new system is flat + shadow).
-  const gradients = [...srcCss.matchAll(/linear-gradient\([^)]*\)/g)].map((m) => m[0]);
-  assert.equal(gradients.length, 0, `agent.css still has a decorative gradient: ${gradients[0] ?? ""}`);
-  // Glassmorphism is intentional ONLY on the sticky command header.
-  assert.ok(srcCss.includes(".command-header"), "agent.css has no command-header rules");
-  assert.ok(srcCss.includes("backdrop-filter: blur(12px)"), "command header is not glassmorphic");
+  assert.ok(srcCss.includes("--bg: #faf8f5"), "agent.css does not define the alabaster background");
+  assert.ok(srcCss.includes("--accent: #484830"), "agent.css does not define the olive-charcoal accent");
+  assert.ok(srcCss.includes("--privacy: #2d5a3c"), "agent.css does not define the forest-sage privacy colour");
+  assert.ok(srcCss.includes("--gate: #9a5b13"), "agent.css does not define the terracotta gate colour");
+  assert.ok(srcCss.includes("--danger: #a62626"), "agent.css does not define the muted-crimson abort colour");
+  // Zero gradients, zero drop shadows (focus rings are 0 0 0 2px).
+  assert.ok(!/linear-gradient\(/.test(srcCss), "agent.css still has a linear gradient");
+  assert.ok(!/radial-gradient\(/.test(srcCss), "agent.css still has a radial gradient");
+  for (const m of srcCss.matchAll(/box-shadow:\s*([^;]+);/g)) {
+    const v = m[1].trim();
+    assert.ok(v === "none" || v.startsWith("0 0 0 2px"), `agent.css still has a drop shadow: ${v}`);
+  }
+  // No glassmorphism on panels.
+  assert.ok(!srcCss.includes("backdrop-filter: blur(12px)"), "agent.css still blurs the header");
+  assert.ok(!srcCss.includes("backdrop-filter: blur(8px)"), "agent.css still blurs a card");
 });
 
-test("UI redesign: no gradient motion background; reduced motion still respected", () => {
-  // The lime aurora motion-bg is gone by design (new system has no
-  // gradient blobs). Reduced-motion must still disable animation.
-  assert.ok(!agentHtml.includes('class="motion-bg"'), "agent.html still has the .motion-bg element");
+test("Editorial redesign: motion background is gone (no aurora blobs)", () => {
+  assert.ok(!agentHtml.includes('class="motion-bg"'), "agent.html still has a .motion-bg element");
   assert.ok(!agentHtml.includes("motion-bg__blob"), "agent.html still has aurora blobs");
   const srcCss = read("src/styles/agent.css");
   assert.ok(!srcCss.includes(".motion-bg"), "agent.css still has motion-bg rules");
-  assert.ok(!srcCss.includes("motion-bg-drift"), "agent.css still has the drift animation");
-  assert.ok(
-    srcCss.includes("@media (prefers-reduced-motion: reduce)"),
-    "agent.css has no prefers-reduced-motion rule",
-  );
+  assert.ok(!srcCss.includes("motion-bg-drift"), "agent.css still has the aurora drift animation");
 });
 
 test("UI redesign: clutter is gone (heading, pills, sentinel copy, badges)", () => {
@@ -337,20 +335,21 @@ test("sidebar close button is a Close (reopenable), not a Delete", () => {
   assert.ok(fn[0].includes("createNewChat()"), "closeChat does not return to the blank New Mission state");
 });
 
-test("Thinking indicator is a shimmer skeleton + pulse ring, not static text", () => {
-  // Redesign 2026-11-18: the bouncing-dots Thinking row is replaced
-  // by a sleek shimmer skeleton bar + a pulsing ring on the status
-  // node, per the Tactile Daylight spec. The live row must still be
-  // visibly animated and must stop for prefers-reduced-motion.
-  assert.ok(agentApp.includes("thinking-shimmer"), "addStepItem does not render the shimmer skeleton bar");
+test("Thinking state is a warm-stone pulse bar + 'Sanitizing DOM locally…', not bouncing dots", () => {
+  // 2026-11-18 Editorial redesign: the bouncing dots are gone. The
+  // live row renders a subtle horizontal warm-stone pulse bar with a
+  // "Sanitizing DOM locally…" label, so the user can see the agent is
+  // still working without a chatty animation.
+  assert.ok(agentApp.includes("thinking-pulse"), "addStepItem does not render the thinking pulse bar");
+  assert.ok(agentApp.includes("Sanitizing DOM locally"), "addStepItem does not label the thinking row");
   assert.ok(agentApp.includes("agent-step-item--thinking"), "thinking row has no distinguishing class");
+  assert.ok(!agentApp.includes("thinking-dots"), "addStepItem still renders the old bouncing dots");
   const srcCss = read("src/styles/agent.css");
-  assert.ok(srcCss.includes(".thinking-shimmer"), "agent.css has no thinking-shimmer rule");
-  assert.ok(srcCss.includes("@keyframes thinking-shimmer"), "agent.css has no thinking-shimmer animation");
-  assert.ok(srcCss.includes("@keyframes thinking-ring"), "agent.css has no thinking-ring pulse animation");
+  assert.ok(srcCss.includes("@keyframes thinking-pulse"), "agent.css has no thinking-pulse animation");
+  assert.ok(srcCss.includes(".thinking-pulse"), "agent.css has no .thinking-pulse rule");
   assert.ok(
-    srcCss.includes("@media (prefers-reduced-motion: reduce)") && srcCss.includes(".thinking-shimmer { animation: none; }"),
-    "thinking shimmer does not stop for prefers-reduced-motion",
+    srcCss.includes("@media (prefers-reduced-motion: reduce)") && srcCss.includes(".thinking-pulse { animation: none; }"),
+    "thinking pulse does not stop for prefers-reduced-motion",
   );
 });
 
@@ -410,25 +409,179 @@ test("empty progress updates do not render a blank step (lone thunder icon)", ()
   assert.ok(fn[0].includes("if (!displayMessage) return;"), "addStepItem does not ignore empty messages");
 });
 
-test("landing page uses the same Tactile Daylight palette as the workspace", () => {
-  // Redesign 2026-11-18: the whole app is one palette now — Tactile
-  // Daylight (slate canvas, cobalt accent). The old cyan/purple/navy
-  // and the interim ink/lime palettes are both gone.
-  for (const cssFile of ["src/styles/main.css", "src/styles/taskconsole.css"]) {
+test("Editorial command header: 60px, serif wordmark, segmented pills, redaction pill", () => {
+  // Spec: 60px sticky alabaster header with a hairline bottom border;
+  // serif PrivAgent wordmark + SIH-26171 pill; segmented Provider /
+  // Vault / Memory pills with live counts; forest-sage redaction pill;
+  // olive New Mission pill; ghost Public Site pill.
+  const srcCss = read("src/styles/agent.css");
+  assert.ok(srcCss.includes("height: 60px"), "agent.css does not set the 60px command header");
+  assert.ok(srcCss.includes(".privacy-telemetry-pill"), "agent.css has no redaction pill");
+  assert.ok(srcCss.includes(".header-pill"), "agent.css has no segmented header pills");
+  assert.ok(srcCss.includes(".brand-pill"), "agent.css has no SIH-26171 pill");
+  assert.ok(agentHtml.includes('class="brand-wordmark"'), "agent.html has no serif wordmark");
+  assert.ok(agentHtml.includes("SIH-26171"), "agent.html has no SIH-26171 pill");
+  assert.ok(agentHtml.includes('id="providerStatus"'), "agent.html has no Provider count");
+  assert.ok(agentHtml.includes('id="vaultCount"'), "agent.html has no Vault count");
+  assert.ok(agentHtml.includes('id="memoryCount"'), "agent.html has no Memory count");
+  assert.ok(agentHtml.includes('id="privacyTelemetryPill"'), "agent.html has no redaction pill");
+  assert.ok(agentHtml.includes("On-Device Redaction"), "redaction pill lost its label");
+  assert.ok(agentHtml.includes("Public Site"), "agent.html lost the Public Site pill");
+});
+
+test("Editorial nav rail: no giant P. lettermark, active view is an olive-bordered pill", () => {
+  // Spec: compact nav rail, no giant P. lettermark at the top; the
+  // active view gets a subtle #eae6dd pill with a #484830 left border.
+  assert.ok(!agentHtml.includes("control-monogram"), "agent.html still renders the giant P. lettermark");
+  const cc = read("src/controlCenter.ts");
+  assert.ok(!cc.includes("control-monogram"), "controlCenter.ts still renders the giant P. lettermark");
+  const srcCss = read("src/styles/control-center.css");
+  assert.ok(srcCss.includes(".control-nav button.selected"), "control-center.css has no selected nav state");
+  assert.ok(srcCss.includes("background:#eae6dd"), "selected nav view is not the #eae6dd pill");
+  assert.ok(srcCss.includes("border-left:3px solid var(--cc-lime)"), "selected nav view has no olive left border");
+});
+
+test("Editorial step stream: connected track, status circles, mono durations, redaction pill", () => {
+  const srcCss = read("src/styles/agent.css");
+  assert.ok(srcCss.includes(".agent-steps::before"), "agent.css has no connected step track");
+  assert.ok(srcCss.includes("agent-step-item--completed"), "agent.css has no completed-step state");
+  assert.ok(srcCss.includes(".agent-step-item__duration"), "agent.css has no step duration");
+  assert.ok(srcCss.includes(".redaction-pill"), "agent.css has no Local Redaction Pill");
+  assert.ok(srcCss.includes("redaction-pill__tokens"), "redaction pill has no token display");
+  assert.ok(agentApp.includes('agent-step-item--completed'), "addStepItem does not mark completed steps");
+});
+
+test("Editorial composer: white input box, Attach pill + chips, Send morphs to Stop", () => {
+  // Spec: clean white input box (no floating shadow box); a custom
+  // styled Attach file ghost pill + file chip list instead of the
+  // native <input type=file>; the olive Send pill swaps to a crimson
+  // Stop pill while a mission runs; micro-status bar underneath.
+  assert.ok(agentHtml.includes('id="btnAttachMission"'), "agent.html has no Attach pill");
+  assert.ok(agentHtml.includes('id="btnSendMission"'), "agent.html has no Send pill");
+  assert.ok(agentHtml.includes('id="composerChips"'), "agent.html has no file chip list");
+  assert.ok(agentHtml.includes('id="composerStatus"'), "agent.html has no composer micro-status bar");
+  assert.ok(agentHtml.includes("Local redaction on"), "micro-status bar lost its redaction text");
+  assert.ok(agentHtml.includes("Human gate on"), "micro-status bar lost its gate text");
+  assert.ok(agentApp.includes("renderAttachmentChips"), "agentApp does not render file chips");
+  assert.ok(agentApp.includes("btnSendMission.hidden = working"), "Send does not morph to Stop while working");
+  const srcCss = read("src/styles/agent.css");
+  assert.ok(srcCss.includes(".composer-attach"), "agent.css has no Attach pill style");
+  assert.ok(srcCss.includes(".composer-send"), "agent.css has no Send pill style");
+  assert.ok(srcCss.includes(".composer-chip"), "agent.css has no file chip style");
+  assert.ok(srcCss.includes(".composer-status"), "agent.css has no micro-status bar style");
+  // The textarea is transparent on the white card (no black panel).
+  assert.ok(!srcCss.includes("rgba(16, 18, 16, 0.9)"), "agent.css still has the black textarea background");
+});
+
+test("Editorial inspector: dark titlebar + mono URL bar over a white viewport", () => {
+  // Spec: a clean #1a1918 browser titlebar (window dots + monospace
+  // URL bar + obstacle pill) over a #ffffff screenshot viewport, plus
+  // bottom telemetry counters (DOM Scanned, 0B Leaked, Scan Latency).
+  assert.ok(agentHtml.includes('class="browser-frame"'), "agent.html has no browser frame");
+  assert.ok(agentHtml.includes("browser-frame__chrome"), "agent.html has no dark titlebar");
+  assert.ok(agentHtml.includes("browser-frame__url"), "agent.html has no mono URL bar");
+  assert.ok(agentHtml.includes('id="browserFrameUrlText"'), "agent.html has no frame URL text node");
+  assert.ok(agentHtml.includes('id="telDomNodes"'), "agent.html has no DOM Scanned counter");
+  assert.ok(agentHtml.includes('id="telPiiMasked"'), "agent.html has no PII Masked counter");
+  assert.ok(agentHtml.includes('id="obstacleBadge"'), "agent.html has no obstacle pill");
+  const srcCss = read("src/styles/agent.css");
+  assert.ok(srcCss.includes(".browser-frame__chrome"), "agent.css has no titlebar style");
+  assert.ok(srcCss.includes("background: var(--dark-band)"), "titlebar is not the dark editorial band");
+  assert.ok(agentApp.includes("browserFrameUrlText"), "agentApp does not sync the frame URL");
+});
+
+test("Editorial human gate: terracotta card, serif title, Takeover toggle, three pills", () => {
+  // Spec: warm terracotta-amber card with a Source Serif 4 title
+  // "Sign-in or Payment Confirmation Required", a Takeover toggle, and
+  // three pill buttons (Continue olive / Approve This Step Only ghost
+  // / Abort Mission crimson).
+  assert.ok(agentHtml.includes("Sign-in or Payment Confirmation Required"), "human gate lost its title");
+  assert.ok(agentHtml.includes('id="takeoverToggle"'), "human gate has no Takeover toggle");
+  assert.ok(agentHtml.includes("I Have Completed This / Continue"), "human gate lost the Continue pill");
+  assert.ok(agentHtml.includes("Approve This Step Only"), "human gate lost the Approve This Step Only pill");
+  assert.ok(agentHtml.includes("Abort Mission"), "human gate lost the Abort pill");
+  const srcCss = read("src/styles/agent.css");
+  assert.ok(srcCss.includes(".human-gate__title"), "agent.css has no human-gate title style");
+  assert.ok(srcCss.includes(".human-gate__takeover"), "agent.css has no Takeover toggle style");
+  assert.ok(srcCss.includes(".human-gate__buttons .btn--danger"), "agent.css has no crimson Abort pill");
+  assert.ok(srcCss.includes("font-family: var(--font-serif)"), "human-gate title is not serif");
+});
+
+test("Editorial hero: 82vh grid, serif H1, split DOM redaction card", () => {
+  // Spec: 82vh tight editorial grid; H1 "A browser agent that never
+  // leaks your screen." (52px desktop / 34px mobile, -1.3px tracking);
+  // right column is a crisp white Split DOM Redaction Card showing raw
+  // inputs -> 8ms redaction layer -> sanitized tokens.
+  const indexHtml = read("index.html");
+  assert.ok(indexHtml.includes("A browser agent that never leaks your screen."), "hero H1 is not the Editorial headline");
+  assert.ok(indexHtml.includes("SIH 26171"), "hero lost the SIH eyebrow");
+  assert.ok(indexHtml.includes("redact-flow"), "hero has no Split DOM Redaction Card");
+  assert.ok(indexHtml.includes("[CARD_REDACTED]"), "redaction card lost the sanitized card token");
+  assert.ok(indexHtml.includes("[PHONE_REDACTED]"), "redaction card lost the sanitized phone token");
+  assert.ok(indexHtml.includes("8ms On-Device Redaction Layer"), "redaction card lost the redaction layer band");
+  assert.ok(indexHtml.includes("0 bytes leaked"), "redaction card lost the 0-bytes-leaked badge");
+  assert.ok(indexHtml.includes("Launch Workspace"), "hero lost the Launch Workspace CTA");
+  assert.ok(indexHtml.includes("Run Live Demo"), "hero lost the Run Live Demo CTA");
+  const main = read("src/styles/main.css");
+  assert.ok(main.includes("min-height: 82vh"), "hero is not 82vh");
+  assert.ok(main.includes("letter-spacing: -1.3px"), "hero H1 tracking is not -1.3px");
+  assert.ok(main.includes(".redact-flow"), "main.css has no redact-flow rules");
+  // The old space hero (stars, space art, preview card) is gone.
+  assert.ok(!indexHtml.includes("hero-space-02.png"), "index.html still references the space hero image");
+  assert.ok(!indexHtml.includes('id="stars"'), "index.html still has the starfield");
+  assert.ok(!indexHtml.includes("hero__preview"), "index.html still has the old preview card");
+});
+
+test("Editorial landing: tech strip, 3-step workflow tabs, console chips, dark CTA band", () => {
+  const indexHtml = read("index.html");
+  assert.ok(indexHtml.includes("tech-strip"), "landing has no quiet tech strip");
+  assert.ok(indexHtml.includes("BUILT WITH") || indexHtml.includes("Built with"), "tech strip lost its eyebrow");
+  assert.ok(indexHtml.includes("Manifest V3"), "tech strip lost Manifest V3");
+  assert.ok(indexHtml.includes("OWASP Agentic-2026"), "tech strip lost OWASP Agentic-2026");
+  assert.ok(indexHtml.includes("flow-scrubber"), "workflow has no 3-step scrubber");
+  assert.ok(indexHtml.includes("Local On-Device Redaction"), "workflow lost the redaction step");
+  assert.ok(indexHtml.includes("Supervised Browser Execution"), "workflow lost the execution step");
+  assert.ok(indexHtml.includes("console__chip"), "console has no preset mission chips");
+  assert.ok(indexHtml.includes("Compare yellow dresses on Amazon and Myntra"), "console lost the yellow-dress preset");
+  assert.ok(indexHtml.includes("cta-band"), "landing has no dark final CTA band");
+  assert.ok(indexHtml.includes("Automate the web without surrendering your data."), "CTA band lost its headline");
+  assert.ok(indexHtml.includes("Local redaction on"), "CTA band lost its reassurance line");
+  const main = read("src/styles/main.css");
+  assert.ok(main.includes(".cta-band"), "main.css has no cta-band rules");
+  assert.ok(main.includes(".flow-tab"), "main.css has no flow-tab rules");
+  assert.ok(main.includes(".tech-strip"), "main.css has no tech-strip rules");
+  assert.ok(main.includes(".console__chip"), "main.css has no console-chip rules");
+  assert.ok(read("src/main.ts").includes("flow-tab"), "main.ts does not wire the workflow tabs");
+  assert.ok(read("src/taskconsole.ts").includes("console__chip"), "taskconsole.ts does not wire the preset chips");
+});
+
+test("Editorial contrast audit: no dark-on-dark panels in any view", () => {
+  // Every card, sidebar, input and view must be light (#faf8f5 /
+  // #f3f0ea / #ffffff) with #181818 ink. No leftover black panels,
+  // near-white text on light, or dark fallbacks.
+  for (const cssFile of [
+    "src/styles/agent.css", "src/styles/main.css",
+    "src/styles/control-center.css", "src/styles/control-center-refresh.css",
+    "src/styles/landing-refresh.css", "src/styles/taskconsole.css",
+  ]) {
     const css = read(cssFile);
     for (const bad of [
-      "#46d7ff", "#a06bff", "#6b8cff", "#030616", "#060b24", "#04122b",
-      "70, 215, 255", "160, 107, 255", "122, 162, 255",
-      "3, 6, 22", "4, 8, 26", "6, 11, 36", "10, 18, 48",
-      "#d5ff70", "#101210", "#1b1e1b", "213, 255, 112",
+      "rgba(27, 30, 27", "rgba(16, 18, 16", "rgba(0, 0, 0, 0.3",
+      "rgba(0, 0, 0, 0.35", "rgba(0, 0, 0, 0.4", "rgba(0, 0, 0, 0.45",
+      "#cbd5e1", "#94a3b8", "#f1f5f9", "#e2e8f0", "#f87171",
+      "#fbbf24", "#fef3c7", "#34d399", "#6ee7b7",
+      "#0b1230", "#061032",
     ]) {
-      assert.ok(!css.includes(bad), `${cssFile} still uses an old palette colour ${bad}`);
+      assert.ok(!css.includes(bad), `${cssFile} still has a dark-on-dark value: ${bad}`);
     }
   }
-  const main = read("src/styles/main.css");
-  assert.ok(main.includes("--bg: #F8F9FA"), "landing page does not use the slate canvas");
-  assert.ok(main.includes("--accent: #2563EB"), "landing page accent is not cobalt");
-  assert.ok(main.includes("--privacy: #059669"), "landing page has no emerald privacy accent");
+  // Inline styles in the workspace JS must not reintroduce them.
+  for (const tsFile of ["src/agentApp.ts", "src/controlViews.ts"]) {
+    const ts = read(tsFile);
+    for (const bad of ["#d5ff70", "#a4ad9e", "#34d399", "#f87171", "#fbbf24", "#cbd5e1", "#6ee7b7"]) {
+      assert.ok(!ts.includes(bad), `${tsFile} still has an off-palette inline colour: ${bad}`);
+    }
+  }
 });
 
 test("Google Fonts load async and never block first paint", () => {
@@ -484,127 +637,4 @@ test("built agent CSS has the moved shell rules and no landing styles", () => {
   for (const s of [".hero__title", ".console__panel", "100deg"]) {
     assert.ok(!css.includes(s), `built agent CSS still carries landing styles: ${s}`);
   }
-});
-
-test("Floating composer dock: morphing Send/Stop, attach trigger, file chips, micro-status bar", () => {
-  // Redesign 2026-11-18: the composer is a floating dock (14px,
-  // focus ring) with a cobalt Send arrow that morphs into a crimson
-  // Stop circle while a mission runs, a paperclip attach trigger,
-  // file-chip previews, and a micro-status bar.
-  assert.ok(agentHtml.includes('id="btnSendMission"'), "composer has no Send button");
-  assert.ok(agentHtml.includes('id="btnAttachMission"'), "composer has no attach trigger");
-  assert.ok(agentHtml.includes('id="composerChips"'), "composer has no file-chip container");
-  assert.ok(agentHtml.includes('id="composerStatus"'), "composer has no micro-status bar");
-  assert.ok(agentHtml.includes("Local redaction ON"), "micro-status bar does not show redaction state");
-  assert.ok(agentHtml.includes("Human gate ON"), "micro-status bar does not show human-gate state");
-  assert.ok(agentApp.includes("btnSendMission"), "agentApp does not wire the Send button");
-  assert.ok(agentApp.includes("renderAttachmentChips"), "agentApp does not render attachment chips");
-  // setButtonWorking morphs Send <-> Stop.
-  assert.ok(agentApp.includes("btnSendMission.hidden = working"), "setButtonWorking does not hide Send while running");
-  assert.ok(agentApp.includes("btnCancelMission.hidden = !working"), "setButtonWorking does not show Stop while running");
-  const srcCss = read("src/styles/agent.css");
-  assert.ok(srcCss.includes(".agent-input-card:focus-within"), "composer dock has no focus-within ring");
-  assert.ok(srcCss.includes(".composer-send"), "agent.css has no Send button rules");
-  assert.ok(srcCss.includes(".composer-chip"), "agent.css has no file-chip rules");
-  assert.ok(srcCss.includes(".composer-status"), "agent.css has no micro-status bar rules");
-  assert.ok(srcCss.includes("border-radius: 14px"), "composer dock is not 14px radius");
-});
-
-test("Command header: 52px glass, SIH-26171 pill, telemetry pill, New Mission ⌘K", () => {
-  // Redesign 2026-11-18: sticky 52px glassmorphic command header.
-  assert.ok(agentHtml.includes("command-header"), "agent.html has no command-header");
-  assert.ok(agentHtml.includes("SIH-26171"), "header has no SIH-26171 pill");
-  assert.ok(agentHtml.includes("privacy-telemetry-pill"), "header has no privacy telemetry pill");
-  assert.ok(agentHtml.includes("On-Device Redaction"), "telemetry pill has no redaction label");
-  assert.ok(agentHtml.includes("⌘K"), "New Mission has no ⌘K shortcut hint");
-  assert.ok(agentHtml.includes('id="providerStatus"'), "Provider pill has no status count");
-  assert.ok(agentHtml.includes('id="vaultCount"'), "Vault pill has no item count");
-  assert.ok(agentHtml.includes('id="memoryCount"'), "Memory pill has no item count");
-  const srcCss = read("src/styles/agent.css");
-  assert.ok(srcCss.includes(".command-header"), "agent.css has no command-header rules");
-  assert.ok(srcCss.includes("height: 52px"), "command header is not 52px");
-  assert.ok(srcCss.includes("backdrop-filter: blur(12px)"), "command header is not glassmorphic");
-  assert.ok(srcCss.includes(".privacy-telemetry-pill__dot"), "telemetry pill has no pulsing dot");
-  assert.ok(srcCss.includes("@keyframes pulse-dot"), "agent.css has no pulse-dot animation");
-});
-
-test("Step stream: connected stepper track, status nodes, redaction pill", () => {
-  // Redesign 2026-11-18: vertical 1.5px slate track, circular status
-  // nodes (emerald check / cobalt ring), redaction pill, mono duration.
-  const srcCss = read("src/styles/agent.css");
-  assert.ok(srcCss.includes(".agent-steps::before"), "step stream has no connected track");
-  assert.ok(srcCss.includes("width: 1.5px"), "step track is not 1.5px");
-  assert.ok(srcCss.includes(".agent-step-item--completed"), "completed steps have no status class");
-  assert.ok(srcCss.includes(".redaction-pill"), "agent.css has no redaction pill");
-  assert.ok(srcCss.includes(".agent-step-item__duration"), "agent.css has no step duration style");
-  assert.ok(agentApp.includes("agent-step-item--completed"), "addStepItem does not mark completed steps");
-  assert.ok(agentApp.includes("agent-step-item--thinking"), "addStepItem does not mark the thinking row");
-});
-
-test("Landing redesign: redaction pipeline hero, 3-step scrubber, bento features, console preset chips", () => {
-  // Redesign 2026-11-18: editorial hero with a split redaction
-  // preview (raw DOM -> local layer -> sanitized tokens), a 3-step
-  // workflow scrubber, a bento features grid, and 3 preset mission
-  // chips in the live console.
-  const landing = read("index.html");
-  assert.ok(landing.includes("redact-flow"), "hero has no redaction pipeline visual");
-  assert.ok(landing.includes("LOCAL REDACTION LAYER"), "hero visual has no redaction layer");
-  assert.ok(landing.includes("[CARD_REDACTED]"), "hero visual shows no redacted tokens");
-  assert.ok(landing.includes("0 bytes leaked"), "hero visual has no 0-bytes-leaked badge");
-  assert.ok(landing.includes("Launch Control Center"), "hero CTA is not 'Launch Control Center'");
-  assert.ok(landing.includes("Try Live Demo"), "hero has no 'Try Live Demo' secondary CTA");
-  assert.ok(landing.includes("flow-scrubber__tab"), "workflow has no scrubber tabs");
-  assert.ok(landing.includes("Natural Language Mission"), "scrubber step 1 missing");
-  assert.ok(landing.includes("Local On-Device Redaction"), "scrubber step 2 missing");
-  assert.ok(landing.includes("Supervised Browser Execution"), "scrubber step 3 missing");
-  assert.ok(landing.includes("bento__card--wide"), "features has no bento wide card");
-  assert.ok(landing.includes("Human-in-the-Loop Gates"), "bento is missing a feature card");
-  assert.ok(landing.includes("console__chip"), "console has no preset mission chips");
-  assert.ok(landing.includes("Compare yellow dresses on Amazon"), "console preset 1 missing");
-  assert.ok(landing.includes("Extract the invoice summary to XLSX"), "console preset 2 missing");
-  assert.ok(landing.includes("MX Master 3S"), "console preset 3 missing");
-  const mainTs = read("src/main.ts");
-  assert.ok(mainTs.includes("flow-scrubber__tab"), "main.ts does not wire the scrubber tabs");
-  const consoleTs = read("src/taskconsole.ts");
-  assert.ok(consoleTs.includes("console__chip"), "taskconsole.ts does not wire the preset chips");
-  const mainCss = read("src/styles/main.css");
-  assert.ok(mainCss.includes(".redact-flow"), "main.css has no redaction-flow rules");
-  assert.ok(mainCss.includes(".flow-scrubber"), "main.css has no scrubber rules");
-  assert.ok(mainCss.includes(".bento"), "main.css has no bento grid rules");
-  assert.ok(mainCss.includes("--font-mono"), "main.css has no mono font token");
-});
-
-test("Control center nav: sliding active pill + light tokens", () => {
-  // Redesign 2026-11-18: the 12-view nav has an animated active
-  // pill that slides behind the selected view, and the control
-  // center tokens are the light Tactile Daylight system.
-  const cc = read("src/controlCenter.ts");
-  assert.ok(cc.includes("controlNavPill"), "controlCenter.ts has no active-pill element");
-  assert.ok(cc.includes("moveNavPill"), "controlCenter.ts does not position the active pill");
-  assert.ok(cc.includes("cubic-bezier(0.16, 1, 0.3, 1)") || read("src/styles/control-center-refresh.css").includes("cubic-bezier(0.16, 1, 0.3, 1)"), "active pill has no spec easing");
-  const refresh = read("src/styles/control-center-refresh.css");
-  assert.ok(refresh.includes(".control-nav__pill"), "refresh CSS has no active-pill rules");
-  assert.ok(!refresh.includes("#d5ff70"), "control-center refresh still uses lime");
-  assert.ok(!refresh.includes("#101210"), "control-center refresh still uses ink");
-  const ccCss = read("src/styles/control-center.css");
-  assert.ok(ccCss.includes("--cc-ink:#F8F9FA"), "control-center tokens are not the light system");
-  assert.ok(ccCss.includes("--cc-lime:#2563EB"), "control-center accent is not cobalt");
-});
-
-test("Inspector: browser viewport frame, URL bar, telemetry counters", () => {
-  // Redesign 2026-11-18: the inspector is a real browser viewport
-  // frame (macOS controls, monospace URL bar with lock), with a
-  // hover inspect overlay and DOM/privacy telemetry counters.
-  assert.ok(agentHtml.includes("browser-frame"), "inspector has no browser viewport frame");
-  assert.ok(agentHtml.includes("browser-frame__dot"), "viewport frame has no window controls");
-  assert.ok(agentHtml.includes("browserFrameUrlText"), "viewport frame has no URL bar");
-  assert.ok(agentHtml.includes("inspector-viewport__overlay"), "viewport has no hover inspect overlay");
-  assert.ok(agentHtml.includes('id="telDomNodes"'), "telemetry has no DOM Nodes Scanned counter");
-  assert.ok(agentHtml.includes('id="telPiiMasked"'), "telemetry has no PII Masked counter");
-  assert.ok(agentHtml.includes("0 bytes leaked"), "telemetry has no 0-bytes-leaked label");
-  assert.ok(agentApp.includes("browserFrameUrlText"), "agentApp does not sync the frame URL bar");
-  const srcCss = read("src/styles/agent.css");
-  assert.ok(srcCss.includes(".browser-frame__chrome"), "agent.css has no browser chrome rules");
-  assert.ok(srcCss.includes(".browser-frame__url"), "agent.css has no URL bar rules");
-  assert.ok(srcCss.includes(".obstacle-badge--clear"), "agent.css has no obstacle badge rules");
 });
