@@ -4,11 +4,11 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>PrivAgent — Browser autonomy with visible control</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='10' fill='%23061032'/%3E%3Ccircle cx='12' cy='12' r='6.5' fill='none' stroke='%2346d7ff' stroke-width='1.8'/%3E%3Ccircle cx='12' cy='12' r='2.4' fill='%23a06bff'/%3E%3C/svg%3E" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='10' fill='%230F172A'/%3E%3Ccircle cx='12' cy='12' r='6.5' fill='none' stroke='%232563EB' stroke-width='1.8'/%3E%3Ccircle cx='12' cy='12' r='2.4' fill='%232563EB'/%3E%3C/svg%3E" />
   <meta name="description" content="PrivAgent brings missions, browser inspection, monitoring, and human approval into one private control center." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=IBM+Plex+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/src/styles/main.css" />
 </head>
 <body>
@@ -41,33 +41,49 @@
   <main id="main">
     <!-- ============ HERO ============ -->
     <header class="hero">
-      <div class="hero__bg" aria-hidden="true">
-        <div class="hero__stars" id="stars"></div>
-      </div>
-      <img class="hero__art" src="/images/hero-space-02.png" alt="" aria-hidden="true" />
-      <div class="hero__preview" aria-label="Illustrative PrivAgent interface preview">
-        <div class="preview__top"><span class="preview__brand">P<span>•</span> <small>CONTROL CENTER</small></span><span class="preview__live"><i></i> MISSION VIEW</span></div>
-        <div class="preview__body"><div class="preview__rail"><b>◈</b><b>↗</b><b>▣</b><b>◎</b><b>⬡</b></div><div class="preview__main"><span class="preview__label">MISSION / 001</span><h3>From intent to evidence.</h3><p>Every step visible. Every sensitive decision yours.</p><div class="preview__trace"><span><i>01</i> Observe page <em>✓</em></span><span><i>02</i> Resolve target <em>✓</em></span><span><i>03</i> Verify outcome <em>↗</em></span></div><div class="preview__foot"><span>6 LAYERS OF VERIFICATION</span><span>HUMAN APPROVAL ON WRITES</span></div></div></div>
-        <span class="preview__caption">Illustrative workspace preview</span>
-      </div>
       <div class="hero__inner container">
-        <p class="hero__kicker reveal"><span class="chip">THE PRIVATE OPERATIONS LAYER</span><span class="chip chip--alt">BUILT FOR SIH 26171</span></p>
-        <h1 class="hero__title reveal">A browser agent<br>That <span class="grad">Respects Your Privacy.</span></h1>
-        <p class="hero__sub reveal">Give it a mission. Watch each observation, action, and verification as it happens. PrivAgent brings browser work, persistent monitors, and approval gates into one local control center.</p>
-        <div class="hero__cta reveal">
-          <a class="btn btn--primary btn--lg" href="/agent.html">Open Control Center
-            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
-          </a>
-          <a class="btn btn--ghost btn--lg" href="#workflow">
-            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6l8-4z"/></svg>
-            Explore the workflow
-          </a>
+        <div class="hero__copy">
+          <p class="hero__kicker reveal"><span class="chip">THE PRIVATE OPERATIONS LAYER</span><span class="chip chip--alt">BUILT FOR SIH 26171</span></p>
+          <h1 class="hero__title reveal">A browser agent<br>That <span class="grad">Respects Your Privacy.</span></h1>
+          <p class="hero__sub reveal">Give it a mission. Watch each observation, action, and verification as it happens. PrivAgent redacts sensitive data on your device — before anything reaches a model — and keeps every consequential step under your approval.</p>
+          <div class="hero__cta reveal">
+            <a class="btn btn--primary btn--lg" href="/agent.html">Launch Control Center →
+            </a>
+            <a class="btn btn--ghost btn--lg" href="#console">
+              Try Live Demo ↓
+            </a>
+          </div>
+          <ul class="hero__stats reveal" role="list">
+            <li><strong>12</strong><span>control center views</span></li>
+            <li><strong>0</strong><span>bytes leaked by default</span></li>
+            <li><strong>100%</strong><span>on-device redaction</span></li>
+          </ul>
         </div>
-        <ul class="hero__stats reveal" role="list">
-          <li><strong>11</strong><span>control center views</span></li>
-          <li><strong>6</strong><span>verification signals</span></li>
-          <li><strong>0</strong><span>screenshots by default</span></li>
-        </ul>
+        <!-- Hero visual: the redaction pipeline. Raw sensitive DOM on
+             the left, the local redaction layer in the middle, and the
+             sanitized tokens that actually reach the model on the right. -->
+        <div class="hero__visual reveal" aria-label="How on-device redaction works">
+          <div class="redact-flow">
+            <div class="redact-flow__panel redact-flow__panel--raw">
+              <span class="redact-flow__label">RAW DOM · YOUR BROWSER</span>
+              <code class="redact-flow__code">&lt;input name="card" value="4111 1111 1111 1111"&gt;
+&lt;input name="phone" value="+91 98765 43210"&gt;
+&lt;input name="token" value="sk-live-9f2…a1"&gt;</code>
+            </div>
+            <div class="redact-flow__arrow" aria-hidden="true">
+              <span class="redact-flow__shield">🛡️</span>
+              <span class="redact-flow__layer">LOCAL REDACTION LAYER</span>
+              <span class="redact-flow__arrow-line">→</span>
+            </div>
+            <div class="redact-flow__panel redact-flow__panel--clean">
+              <span class="redact-flow__label">SANITIZED · SENT TO MODEL</span>
+              <code class="redact-flow__code">&lt;input name="card" value="[CARD_REDACTED]"&gt;
+&lt;input name="phone" value="[PHONE_REDACTED]"&gt;
+&lt;input name="token" value="[TOKEN_REDACTED]"&gt;</code>
+              <span class="redact-flow__badge">✓ 3 fields redacted locally · 0 bytes leaked</span>
+            </div>
+          </div>
+        </div>
       </div>
       <div class="hero__scroll" aria-hidden="true"><span></span></div>
     </header>
@@ -116,13 +132,26 @@
     <section class="section" id="workflow">
       <div class="container">
         <p class="section__kicker reveal">03 · Workflow</p>
-        <h2 class="section__title reveal">From mission to completed task in <em>four steps.</em></h2>
-        <ol class="flow">
-          <li class="flow__step reveal"><span class="flow__num">01</span><h3>Tell the Mission</h3><p>Type or speak the goal. The intent engine parses it into checkable sub-tasks.</p></li>
-          <li class="flow__step reveal"><span class="flow__num">02</span><h3>See the Screen</h3><p>The observer maps interactive elements, accessible names and bounding boxes — with screenshot grounding available as an optional fallback.</p></li>
-          <li class="flow__step reveal"><span class="flow__num">03</span><h3>Act Under Supervision</h3><p>Actions run in your own browser through a Manifest V3 extension, with a live approval gate for sensitive steps.</p></li>
-          <li class="flow__step reveal"><span class="flow__num">04</span><h3>Report, Locally</h3><p>Every run streams into a local timeline with redacted evidence; bounded task records are pruned automatically.</p></li>
-        </ol>
+        <h2 class="section__title reveal">From mission to completed task in <em>three steps.</em></h2>
+        <div class="flow-scrubber reveal" role="tablist" aria-label="How PrivAgent works">
+          <button class="flow-scrubber__tab is-active" role="tab" aria-selected="true" data-flow-step="0"><span class="flow-scrubber__num">01</span> Natural Language Mission</button>
+          <button class="flow-scrubber__tab" role="tab" aria-selected="false" data-flow-step="1"><span class="flow-scrubber__num">02</span> Local On-Device Redaction</button>
+          <button class="flow-scrubber__tab" role="tab" aria-selected="false" data-flow-step="2"><span class="flow-scrubber__num">03</span> Supervised Browser Execution</button>
+        </div>
+        <div class="flow-panels">
+          <article class="flow-panel is-active" data-flow-panel="0">
+            <h3>Tell the Mission</h3>
+            <p>Type or speak the goal in plain language — "compare yellow dresses on Amazon and Myntra" or "extract the invoice summary to XLSX". The intent engine parses it into checkable sub-tasks with a visible plan before anything runs.</p>
+          </article>
+          <article class="flow-panel" data-flow-panel="1" hidden>
+            <h3>Redact Locally, Before the Cloud</h3>
+            <p>A fail-closed redaction layer strips passwords, card numbers, phone numbers, tokens and URL secrets from the DOM on your device. If redaction cannot run, the mission stops — nothing sensitive ever reaches a model.</p>
+          </article>
+          <article class="flow-panel" data-flow-panel="2" hidden>
+            <h3>Act Under Supervision</h3>
+            <p>Actions run in your own browser through a Manifest V3 extension, with a live approval gate for payments, sign-ins and writes. Every step streams to a local timeline with redacted evidence, and bounded task records are pruned automatically.</p>
+          </article>
+        </div>
       </div>
     </section>
 
@@ -131,22 +160,26 @@
       <div class="container">
         <p class="section__kicker reveal">04 · Features</p>
         <h2 class="section__title reveal">Built like a <em>privacy product,</em> not a demo.</h2>
-        <div class="grid grid--2">
-          <article class="card card--wide reveal">
-            <h3><span class="dot"></span>Local-First Vision</h3>
-            <p>Screenshots stay on your device by default. Remote vision is opt-in, capped at 4&nbsp;MB, raster-only, and suppressed whenever a sensitive field is on screen.</p>
+        <div class="bento reveal">
+          <article class="card bento__card bento__card--wide">
+            <h3><span class="dot"></span>Local Luhn / Regex / DOM Redaction</h3>
+            <p>Before any planner call, a local redaction layer masks passwords, card numbers, phone numbers, emails, API keys and URL secrets — and fails closed if it cannot. Your sensitive data never leaves the device.</p>
           </article>
-          <article class="card card--wide reveal">
-            <h3><span class="dot"></span>PII Sentinel</h3>
-            <p>Before any planner call, a local redaction layer masks passwords, card numbers, SSNs, emails, API keys and URL secrets — and fails closed if it cannot.</p>
+          <article class="card bento__card">
+            <h3><span class="dot"></span>Human-in-the-Loop Gates</h3>
+            <p>Payments, sign-ins and writes pause for your approval. Takeover mode lets you act in Chrome, then resume the agent.</p>
           </article>
-          <article class="card card--wide reveal">
+          <article class="card bento__card">
+            <h3><span class="dot"></span>Multi-Store Comparison</h3>
+            <p>Compare listings across stores with a sourced price matrix and a Best Value tag — then export the evidence.</p>
+          </article>
+          <article class="card bento__card">
+            <h3><span class="dot"></span>Document Artifacts</h3>
+            <p>Turn gathered evidence into downloadable DOCX, PDF, PPTX or XLSX with a clear source trail.</p>
+          </article>
+          <article class="card bento__card">
             <h3><span class="dot"></span>Auditable Run Timeline</h3>
             <p>Every step streams to the local console with redacted evidence, while bounded in-memory task records are pruned automatically.</p>
-          </article>
-          <article class="card card--wide reveal">
-            <h3><span class="dot"></span>Adaptive UI Resilience</h3>
-            <p>DOM-first targeting with accessible-name matching and a DPR-normalized coordinate fallback survives layout shifts that break selector-only agents.</p>
           </article>
         </div>
       </div>
@@ -214,6 +247,11 @@
         </div>
         <div class="console__panel">
           <label class="console__label" for="taskInput">Describe a browser task</label>
+          <div class="console__chips" role="group" aria-label="Try a preset mission">
+            <button type="button" class="console__chip" data-preset="Compare yellow dresses on Amazon and Myntra">Compare yellow dresses on Amazon &amp; Myntra</button>
+            <button type="button" class="console__chip" data-preset="Extract the invoice summary to XLSX">Extract invoice summary to XLSX</button>
+            <button type="button" class="console__chip" data-preset="Find the cheapest MX Master 3S on Flipkart and Croma">Find the cheapest MX Master 3S</button>
+          </div>
           <textarea id="taskInput" class="console__input" rows="2" placeholder="e.g. Search Google for the latest James Webb Space Telescope news"></textarea>
           <div class="console__actions">
             <button id="taskStart" class="btn btn--primary" disabled>Start Task</button>

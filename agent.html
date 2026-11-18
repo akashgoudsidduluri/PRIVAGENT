@@ -4,23 +4,22 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>PrivAgent — Control Center</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='10' fill='%23101210'/%3E%3Ccircle cx='12' cy='12' r='6.5' fill='none' stroke='%23d5ff70' stroke-width='1.8'/%3E%3Ccircle cx='12' cy='12' r='2.4' fill='%23d5ff70'/%3E%3C/svg%3E" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='10' fill='%230F172A'/%3E%3Ccircle cx='12' cy='12' r='6.5' fill='none' stroke='%232563EB' stroke-width='1.8'/%3E%3Ccircle cx='12' cy='12' r='2.4' fill='%232563EB'/%3E%3C/svg%3E" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <!-- Fonts load async (preload + onload rel-swap): a plain stylesheet
        <link> to Google Fonts would block first paint on a third-party
-       fetch (GLM review 2026-11-17). display=swap keeps text visible. -->
-  <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=IBM+Plex+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&display=swap" onload="this.onload=null;this.rel='stylesheet'" />
+       fetch (GLM review 2026-11-17). display=swap keeps text visible.
+       Design system: Plus Jakarta Sans (UI/headings) + JetBrains Mono
+       (telemetry, URLs, redacted tokens). -->
+  <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" onload="this.onload=null;this.rel='stylesheet'" />
 </head>
 <body class="agent-body">
-  <!-- Motion background: two slow-drifting lime aurora blobs, fixed
-       behind the workspace (see .motion-bg in agent.css). -->
-  <div class="motion-bg" aria-hidden="true">
-    <div class="motion-bg__blob motion-bg__blob--a"></div>
-    <div class="motion-bg__blob motion-bg__blob--b"></div>
-  </div>
-  <!-- Top App Bar -->
-  <header class="agent-header">
+  <!-- Top Command Header (52px, sticky, glassmorphic). Element IDs are
+       the contract — agentApp.ts wires btnToggleSidebarHeader,
+       btnLlmSettings, btnVaultSettings, btnMemorySettings,
+       btnNewSession, wsIndicator/wsDot/wsText. -->
+  <header class="agent-header command-header">
     <div class="agent-header__left">
       <button id="btnToggleSidebarHeader" class="btn btn--sm btn--ghost btn--icon" title="Toggle Missions Sidebar" aria-label="Toggle Missions Sidebar">
         <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
@@ -29,27 +28,38 @@
         <span class="nav__logo" aria-hidden="true">
           <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3.5 3 14 0 18M12 3c-3 3.5-3 14 0 18"/></svg>
         </span>
-        <span class="nav__wordmark">PRIVAGENT<sup>CONTROL CENTER</sup></span>
+        <span class="nav__wordmark">PRIVAGENT</span>
+        <span class="brand-pill" title="SIH 26171 — On-device Visual Perception for Light-weight Browser Agents">SIH-26171</span>
       </a>
-      <button id="btnLlmSettings" class="btn btn--sm btn--ghost" title="LLM Provider Settings" aria-haspopup="dialog">
-        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      <div class="header-pills" role="group" aria-label="Quick settings">
+      <button id="btnLlmSettings" class="header-pill" title="LLM Provider Settings" aria-haspopup="dialog">
+        <span class="header-pill__dot header-pill__dot--live" aria-hidden="true"></span>
         <span id="llmSettingsLabel">Provider</span>
+        <span class="header-pill__count" id="providerStatus">Antseed</span>
       </button>
-      <button id="btnVaultSettings" class="btn btn--sm btn--ghost" title="Saved Credentials (Vault)" aria-haspopup="dialog">
+      <button id="btnVaultSettings" class="header-pill" title="Saved Credentials (Vault)" aria-haspopup="dialog">
         <span aria-hidden="true">🔐</span>
         <span>Vault</span>
+        <span class="header-pill__count" id="vaultCount">0</span>
       </button>
-      <button id="btnMemorySettings" class="btn btn--sm btn--ghost" title="Long-term Memory (facts, skills, files)" aria-haspopup="dialog">
+      <button id="btnMemorySettings" class="header-pill" title="Long-term Memory (facts, skills, files)" aria-haspopup="dialog">
         <span aria-hidden="true">🧠</span>
         <span>Memory</span>
+        <span class="header-pill__count" id="memoryCount">0</span>
       </button>
+      </div>
     </div>
     <div class="agent-header__right">
+      <div class="privacy-telemetry-pill" id="privacyTelemetryPill" title="Sensitive data is redacted on this device before any model call">
+        <span class="privacy-telemetry-pill__dot" aria-hidden="true"></span>
+        <span class="privacy-telemetry-pill__label">On-Device Redaction</span>
+        <span class="privacy-telemetry-pill__state">ACTIVE</span>
+      </div>
       <div class="agent-ws-indicator" id="wsIndicator">
         <span class="status-dot status-dot--offline" id="wsDot"></span>
         <span class="status-text" id="wsText">Connecting...</span>
       </div>
-      <button id="btnNewSession" class="btn btn--sm btn--ghost">New Mission</button>
+      <button id="btnNewSession" class="btn btn--sm btn--primary">New Mission <kbd class="kbd-hint">⌘K</kbd></button>
       <a href="/" class="btn btn--sm btn--ghost">Public site ↗</a>
     </div>
   </header>
@@ -97,16 +107,24 @@
           <span class="agent-state-badge" id="missionStateBadge">READY</span>
         </label>
         <div class="agent-input-row">
+          <button id="btnAttachMission" class="composer-attach" type="button" aria-label="Attach a file" title="Attach a file">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+          </button>
           <textarea id="missionInput" class="agent-textarea" rows="2" placeholder="e.g. Buy me a yellow dress from amazon (proceed until checkout)"></textarea>
-          <button id="btnCancelMission" class="btn-cancel-circle" hidden aria-label="Cancel mission" title="Cancel mission">
+          <button id="btnSendMission" class="composer-send" type="button" aria-label="Send mission" title="Send mission (Enter)">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+          </button>
+          <button id="btnCancelMission" class="btn-cancel-circle" hidden aria-label="Stop mission" title="Stop mission">
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
           </button>
         </div>
+        <div class="composer-chips" id="composerChips" hidden></div>
         <label class="agent-attachment" for="missionAttachment">Attach a file for this mission (up to 5 MiB)
           <input id="missionAttachment" type="file" accept=".pdf,.png,.jpg,.jpeg,.txt,.csv,.docx,.xlsx" />
         </label>
 
         <span id="missionSubtext" class="agent-subtext"></span>
+        <div class="composer-status" id="composerStatus">🔒 Local redaction ON · 🛡️ Human gate ON · Model: Antseed-V1</div>
       </div>
 
       <!-- Human Credential / Action Banner (shown when sign-in or payment reached) -->
@@ -211,21 +229,32 @@
           <label>LATEST EVIDENCE</label>
           <div id="inspectorEvidence" class="inspector-code">Ready</div>
         </div>
-        <!-- Live Visual Perception Frame -->
+        <!-- Live Visual Perception Frame — styled as a real browser
+             viewport: macOS window controls, a monospace URL bar with
+             a lock/shield, and the live screenshot canvas. -->
         <div class="inspector-viewport-wrap">
           <div class="inspector-viewport-header">
             <label>VISUAL PERCEPTION FRAME</label>
             <span class="obstacle-badge obstacle-badge--clear" id="obstacleBadge">Awaiting evidence</span>
           </div>
-          <div class="inspector-viewport" id="inspectorViewport">
-            <img id="inspectorScreenshot" class="inspector-screenshot" alt="Visual Workflow Frame" hidden />
-            <div id="inspectorScreenshotPlaceholder" class="inspector-screenshot-placeholder">
-              <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.6">
-                <rect x="3" y="3" width="18" height="18" rx="3"/>
-                <circle cx="8.5" cy="8.5" r="1.5"/>
-                <path d="M21 15l-5-5L5 21"/>
-              </svg>
-              <span>Awaiting visual tab capture...</span>
+          <div class="browser-frame" id="browserFrame">
+            <div class="browser-frame__chrome">
+              <span class="browser-frame__dot browser-frame__dot--red" aria-hidden="true"></span>
+              <span class="browser-frame__dot browser-frame__dot--amber" aria-hidden="true"></span>
+              <span class="browser-frame__dot browser-frame__dot--green" aria-hidden="true"></span>
+              <span class="browser-frame__url" id="browserFrameUrl"><span aria-hidden="true">🔒</span> <span id="browserFrameUrlText">No tab yet</span></span>
+            </div>
+            <div class="inspector-viewport" id="inspectorViewport">
+              <img id="inspectorScreenshot" class="inspector-screenshot" alt="Visual Workflow Frame" hidden />
+              <div id="inspectorScreenshotPlaceholder" class="inspector-screenshot-placeholder">
+                <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.6">
+                  <rect x="3" y="3" width="18" height="18" rx="3"/>
+                  <circle cx="8.5" cy="8.5" r="1.5"/>
+                  <path d="M21 15l-5-5L5 21"/>
+                </svg>
+                <span>Awaiting visual tab capture...</span>
+              </div>
+              <div class="inspector-viewport__overlay" aria-hidden="true">Inspect</div>
             </div>
           </div>
         </div>
@@ -244,8 +273,16 @@
       <div class="inspector-card inspector-card--telemetry">
         <div class="telemetry-grid">
           <div class="telemetry-item">
+            <span class="telemetry-val" id="telDomNodes">0</span>
+            <span class="telemetry-lbl">DOM Nodes Scanned</span>
+          </div>
+          <div class="telemetry-item">
+            <span class="telemetry-val" id="telPiiMasked">0 bytes leaked</span>
+            <span class="telemetry-lbl">PII Masked Locally</span>
+          </div>
+          <div class="telemetry-item">
             <span class="telemetry-val" id="telPlannerLatency">—</span>
-            <span class="telemetry-lbl">Planner Latency</span>
+            <span class="telemetry-lbl">Latency</span>
           </div>
           <div class="telemetry-item">
             <span class="telemetry-val" id="telStepsDone">0 / 25</span>

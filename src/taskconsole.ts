@@ -112,6 +112,18 @@ input?.addEventListener("input", () => {
   if (startBtn) startBtn.disabled = !input.value.trim();
 });
 
+// Preset mission chips: fill the console input with a real task and
+// enable Start, so the demo is one tap away.
+document.querySelectorAll<HTMLButtonElement>(".console__chip").forEach(chip => {
+  chip.addEventListener("click", () => {
+    const preset = chip.dataset.preset;
+    if (!input || !preset) return;
+    input.value = preset;
+    input.dispatchEvent(new Event("input"));
+    input.focus();
+  });
+});
+
 input?.addEventListener("keydown", (e: KeyboardEvent) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();

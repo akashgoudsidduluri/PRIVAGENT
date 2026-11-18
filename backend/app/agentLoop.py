@@ -285,6 +285,27 @@ async def _run_loop(
     # nonsense. setdefault: a restored checkpoint's instruction wins
     # when one is already present.
     working_memory.setdefault("instruction", instruction)
+    # Attachment awareness: a file the user attached to this mission is
+    # stored in memory (file_uploads) and is only ever handed to the
+    # extension for an `upload_file` action — but the planner was never
+    # told it exists, so it could never plan to use it. Record the file
+    # NAME + kind (metadata only, never the bytes) in working memory so
+    # build_prompt can tell the planner. The bytes stay out of the
+    # prompt, logs and SQLite by design (file_uploads docstring).
+    if "attachment" not in working_memory:
+        try:
+            _task = real_hub.tasks.get(task_id)
+            _token = getattr(_task, "file_token", None) or ""
+            if _token:
+                from .file_uploads import get as _get_attachment
+
+                _att = _get_attachment(_token)
+                if _att:
+                    _fname = _att[0]
+                    _kind = _fname.rsplit(".", 1)[-1].lower() if "." in _fname else ""
+                    working_memory["attachment"] = {"fileName": _fname, "kind": _kind}
+        except Exception:
+            pass
     # Task 3: the effective allow-list travels in working memory so the
     # planner providers can state it in the prompt (build_prompt) and the
     # loop can enforce it in code. None = not configured (allow all,

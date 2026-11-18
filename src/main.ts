@@ -50,6 +50,25 @@ const sectionObserver = new IntersectionObserver(
 );
 document.querySelectorAll("main section[id]").forEach(s => sectionObserver.observe(s));
 
+// Workflow scrubber: 3-step horizontal tabs.
+const flowTabs = [...document.querySelectorAll<HTMLButtonElement>(".flow-scrubber__tab")];
+const flowPanels = [...document.querySelectorAll<HTMLElement>(".flow-panel")];
+flowTabs.forEach(tab => {
+  tab.addEventListener("click", () => {
+    const step = tab.dataset.flowStep;
+    flowTabs.forEach(t => {
+      const active = t === tab;
+      t.classList.toggle("is-active", active);
+      t.setAttribute("aria-selected", String(active));
+    });
+    flowPanels.forEach(p => {
+      const active = p.dataset.flowPanel === step;
+      p.classList.toggle("is-active", active);
+      p.hidden = !active;
+    });
+  });
+});
+
 const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
 if (reducedMotion) {
   document.querySelectorAll(".reveal").forEach(el => el.classList.add("is-visible"));

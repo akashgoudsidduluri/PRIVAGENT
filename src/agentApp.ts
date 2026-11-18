@@ -18,9 +18,13 @@ let chatHistoryList: HTMLUListElement | null = null;
 let missionInput: HTMLTextAreaElement | null = null;
 let missionAttachment: HTMLInputElement | null = null;
 let btnCancelMission: HTMLButtonElement | null = null;
-// The mission submitter, wired in initWorkspaceElements(). There is no
-// Start button: Enter in the input is the only submit path, and it calls
-// this. Assigned once, when the workspace mounts.
+let btnSendMission: HTMLButtonElement | null = null;
+let btnAttachMission: HTMLButtonElement | null = null;
+let composerChips: HTMLElement | null = null;
+// The mission submitter, wired in initWorkspaceElements(). Enter in the
+// input and the cobalt Send button both call this; while a mission
+// runs the Send arrow morphs into the crimson Stop button (see
+// setButtonWorking). Assigned once, when the workspace mounts.
 let startMission: (() => Promise<void>) | null = null;
 const btnNewSession = document.getElementById("btnNewSession") as HTMLButtonElement | null;
 let missionSubtext: HTMLElement | null = null;
@@ -138,6 +142,9 @@ let btnTakeoverCancel: HTMLButtonElement | null = null;
 let inspectorUrl: HTMLAnchorElement | null = null;
 let inspectorTitle: HTMLElement | null = null;
 let inspectorEvidence: HTMLElement | null = null;
+let browserFrameUrlText: HTMLElement | null = null;
+let telDomNodes: HTMLElement | null = null;
+let telPiiMasked: HTMLElement | null = null;
 let telStepsDone: HTMLElement | null = null;
 let telRemoteVision: HTMLElement | null = null;
 let telPlannerLatency: HTMLElement | null = null;
@@ -181,6 +188,9 @@ function initWorkspaceElements(): void {
   missionInput = document.getElementById("missionInput") as HTMLTextAreaElement | null;
   missionAttachment = document.getElementById("missionAttachment") as HTMLInputElement | null;
   btnCancelMission = document.getElementById("btnCancelMission") as HTMLButtonElement | null;
+  btnSendMission = document.getElementById("btnSendMission") as HTMLButtonElement | null;
+  btnAttachMission = document.getElementById("btnAttachMission") as HTMLButtonElement | null;
+  composerChips = document.getElementById("composerChips") as HTMLElement | null;
   missionSubtext = document.getElementById("missionSubtext") as HTMLElement | null;
   stateBadge = document.getElementById("missionStateBadge") as HTMLElement | null;
   stepsList = document.getElementById("agentStepsList") as HTMLOListElement | null;
@@ -211,6 +221,9 @@ function initWorkspaceElements(): void {
   inspectorUrl = document.getElementById("inspectorUrl") as HTMLAnchorElement | null;
   inspectorTitle = document.getElementById("inspectorTitle") as HTMLElement | null;
   inspectorEvidence = document.getElementById("inspectorEvidence") as HTMLElement | null;
+  browserFrameUrlText = document.getElementById("browserFrameUrlText") as HTMLElement | null;
+  telDomNodes = document.getElementById("telDomNodes") as HTMLElement | null;
+  telPiiMasked = document.getElementById("telPiiMasked") as HTMLElement | null;
   telStepsDone = document.getElementById("telStepsDone") as HTMLElement | null;
   telRemoteVision = document.getElementById("telRemoteVision") as HTMLElement | null;
   telPlannerLatency = document.getElementById("telPlannerLatency") as HTMLElement | null;
@@ -228,13 +241,35 @@ function initWorkspaceElements(): void {
     createNewChat();
   });
 
-  // Enter submits the mission (Shift+Enter inserts a newline). There is
-  // no Start button: the input is the only submit path.
+  // Enter submits the mission (Shift+Enter inserts a newline). The
+  // cobalt Send button is the same submit path.
   missionInput?.addEventListener("keydown", (e: KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       void startMission?.();
     }
+  });
+
+  // Auto-expanding textarea (capped by CSS max-height).
+  missionInput?.addEventListener("input", () => {
+    if (!missionInput) return;
+    missionInput.style.height = "auto";
+    missionInput.style.height = `${Math.min(missionInput.scrollHeight, 160)}px`;
+  });
+
+  btnSendMission?.addEventListener("click", () => {
+    void startMission?.();
+  });
+
+  // Paperclip trigger opens the hidden file input.
+  btnAttachMission?.addEventListener("click", () => {
+    missionAttachment?.click();
+  });
+
+  // File chip preview: shows the attached file name with a remove
+  // button, so the user sees the agent received it before sending.
+  missionAttachment?.addEventListener("change", () => {
+    renderAttachmentChips();
   });
 
   startMission = async (): Promise<void> => {
@@ -250,9 +285,14 @@ function initWorkspaceElements(): void {
     renderedTerminalTaskId = null;
     cancelRequested = false;
 
-    // Append user instruction bubble immediately
-    addUserMessageItem(instruction);
+    // Append user instruction bubble immediately (with the attached
+    // file name, if any, so the user sees the agent received it).
+    const attachedFileName = missionAttachment?.files?.[0]?.name;
+    addUserMessageItem(instruction, attachedFileName);
     missionInput.value = "";
+    // Clear the attachment + chip so the next mission starts clean.
+    if (missionAttachment) missionAttachment.value = "";
+    renderAttachmentChips();
 
     if (telPlannerLatency) telPlannerLatency.textContent = "—";
     setTaskState("planning");
@@ -410,7 +450,10 @@ function initWorkspaceElements(): void {
   });
 
   // Now that the nodes exist, load the data that renders into them.
-  void loadChatList();
+  // No auto-select on mount: opening (or refreshing) the workspace
+  // must land on a blank New Mission, not re-open the latest completed
+  // chat. The sidebar still lists every mission; clicking one opens it.
+  void loadChatList({ autoSelect: false });
   void loadTelemetryConfig();
 }
 
@@ -587,7 +630,7 @@ function actionIcon(msg: string): string {
   return "⚡";
 }
 
-function formatResultHtml(rawMessage: string): string {
+function formatResultHtml(rawMessage: string, includeRawMessage = true): string {
   const urlMatch = rawMessage.match(/https?:\/\/[^\s"'<>)]+/);
   // Show a single price badge only for a shopping directive. Explanatory
   // answers often contain an example price ("price drops below $500"), and
@@ -696,23 +739,35 @@ function formatResultHtml(rawMessage: string): string {
     </div>
   `;
 
+  // The raw message is omitted when the caller already shows it in the
+  // timeline (see renderCompletion): the result card then carries only
+  // the structured extras (comparison showcase, price, links) and the
+  // Suggested Next Moves — the reply itself appears once, in the
+  // timeline, instead of twice.
+  const rawHtml = includeRawMessage
+    ? `<div class="result-raw-text md-body">${renderMarkdown(rawMessage)}</div>`
+    : "";
   return `
     ${showcaseHtml}
-    <div class="result-raw-text md-body">${renderMarkdown(rawMessage)}</div>
+    ${rawHtml}
     ${nextMovesHtml}
   `;
 }
 
-function addUserMessageItem(message: string): void {
+function addUserMessageItem(message: string, attachmentName?: string): void {
   if (!stepsList) return;
   const placeholder = stepsList.querySelector(".agent-step-placeholder");
   if (placeholder) placeholder.remove();
 
   const li = document.createElement("li");
   li.className = "agent-step-item agent-step-item--user";
+  // Show the attached file name so the user can see the agent received
+  // it (the planner is told the same name in the backend prompt).
+  // Inlined (not a pre-built string) so the innerHTML guard can see
+  // the escapeHtml() call at the assignment site.
   li.innerHTML = `
     <span class="agent-step-item__icon">💬</span>
-    <span class="agent-step-item__text">${linkify(message)}</span>
+    <span class="agent-step-item__text">${linkify(message)}${attachmentName ? `<span class="agent-step-item__attachment">📎 ${escapeHtml(attachmentName)}</span>` : ""}</span>
   `;
   stepsList.appendChild(li);
   li.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -737,7 +792,12 @@ function addStepItem(message: string, stepNum?: number): void {
   }
 
   // Normalize display: avoid double prefix like "[1] Step 1:"
-  let displayMessage = message.trim();
+  let displayMessage = (message || "").trim();
+  // An empty progress update must not render a blank row: it shows up
+  // as a lone ⚡ icon with no text (the default actionIcon), which
+  // looks like a broken step. Progress events with no message are
+  // legitimate (state changes), they just carry nothing to show.
+  if (!displayMessage) return;
   const stepPrefixRegex = /^\[\d+\]\s*/;
   if (stepPrefixRegex.test(displayMessage)) {
     displayMessage = displayMessage.replace(stepPrefixRegex, "");
@@ -764,12 +824,21 @@ function addStepItem(message: string, stepNum?: number): void {
   }
 
   const li = document.createElement("li");
-  li.className = "agent-step-item";
+  li.className = isTransient
+    ? "agent-step-item agent-step-item--thinking"
+    : "agent-step-item agent-step-item--completed";
   li.dataset.eventKey = eventKey;
   if (isTransient) li.dataset.transient = "true";
+  // The live "Thinking" row gets a shimmer skeleton bar + pulse ring
+  // (not generic bouncing dots) so the user can see at a glance the
+  // agent is still working. The text is still "Thinking..." so the
+  // row's textContent and the dedup above keep working. Inlined (not
+  // a pre-built string) so the innerHTML guard can see the escaping
+  // at the assignment site. Completed steps carry --completed so the
+  // stepper node renders an emerald checkmark.
   li.innerHTML = `
-    <span class="agent-step-item__icon">${actionIcon(displayMessage)}</span>
-    <span class="agent-step-item__text">${linkify(displayMessage)}</span>
+    <span class="agent-step-item__icon">${isTransient ? "◌" : "✓"}</span>
+    <span class="agent-step-item__text">${isTransient ? `Thinking<span class="thinking-shimmer" aria-hidden="true"></span>` : linkify(displayMessage)}</span>
   `;
   stepsList.appendChild(li);
   li.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -779,6 +848,9 @@ function addStepItem(message: string, stepNum?: number): void {
   if (safeUrl && inspectorUrl) {
     inspectorUrl.href = safeUrl;
     inspectorUrl.textContent = safeUrl;
+  }
+  if (safeUrl && browserFrameUrlText) {
+    browserFrameUrlText.textContent = safeUrl;
   }
   if (inspectorEvidence) {
     inspectorEvidence.textContent = displayMessage;
@@ -806,8 +878,36 @@ function clearStalledNotice(): void {
 // Working state is a flag, not a button label: there is no Start button
 // any more, so there is nothing to re-label. The Cancel button's
 // visibility is managed by the call sites, not here.
+function renderAttachmentChips(): void {
+  if (!composerChips) return;
+  const files = missionAttachment?.files;
+  if (!files || files.length === 0) {
+    composerChips.hidden = true;
+    composerChips.innerHTML = "";
+    return;
+  }
+  const file = files[0];
+  composerChips.hidden = false;
+  // Inlined (not a pre-built string) so the innerHTML guard can see
+  // the escaping at the assignment site.
+  composerChips.innerHTML = `
+    <span class="composer-chip">📎 ${escapeHtml(file.name)}
+      <button type="button" class="composer-chip__remove" aria-label="Remove attachment" title="Remove attachment">×</button>
+    </span>
+  `;
+  composerChips.querySelector(".composer-chip__remove")?.addEventListener("click", () => {
+    if (missionAttachment) missionAttachment.value = "";
+    renderAttachmentChips();
+  });
+}
+
 function setButtonWorking(working: boolean): void {
   isWorking = working;
+  // Morphing action button: while a mission runs the cobalt Send
+  // arrow is replaced (same spot) by the crimson Stop circle; when
+  // idle, Send returns and Stop hides.
+  if (btnSendMission) btnSendMission.hidden = working;
+  if (btnCancelMission) btnCancelMission.hidden = !working;
   if (working) {
     lastProgressTime = Date.now();
   } else {
@@ -815,8 +915,39 @@ function setButtonWorking(working: boolean): void {
   }
 }
 
+function normalizeForDedup(text: string): string {
+  // Compare messages ignoring markdown markers and whitespace: a
+  // progress step renders with linkify (keeps "**bold**" literal) while
+  // the result renders with renderMarkdown (strips it), so the same
+  // message would otherwise never compare equal.
+  return text.replace(/[*_`#]/g, "").replace(/\s+/g, " ").trim();
+}
+
+function isMessageInTimeline(message: string): boolean {
+  // Is this exact message already visible in the timeline? A progress
+  // step carries it in its whole text; a result/failed item carries it
+  // in its .md-body (the "Mission Result:" label is not part of it).
+  const norm = normalizeForDedup(message);
+  if (!norm || !stepsList) return false;
+  const items = stepsList.querySelectorAll("li.agent-step-item");
+  for (const item of Array.from(items)) {
+    if (item.classList.contains("agent-step-item--user")) continue;
+    const body = item.querySelector(".md-body");
+    const text = body
+      ? body.textContent || ""
+      : item.querySelector(".agent-step-item__text")?.textContent || "";
+    if (normalizeForDedup(text) === norm) return true;
+  }
+  return false;
+}
+
 function addCompletionStepItem(taskState: string, message: string): void {
   if (!stepsList) return;
+  // No duplicate: if this exact message is already the last thing the
+  // timeline shows (e.g. a conversational reply that arrived as a
+  // progress step), adding a "Mission Result" item would show it twice.
+  // The reply stays once, in the step that already carries it.
+  if (isMessageInTimeline(message)) return;
   const isOk = taskState === "completed";
 
   // Each turn owns its own result item. Overwriting a previous turn's result
@@ -950,7 +1081,11 @@ function renderCompletion(taskState: string, message: string, appendToTimeline =
   if (currentTaskId && renderedTerminalTaskId === currentTaskId) {
     if (resultContent && !resultCard?.hidden) {
       if (taskState === "completed") {
-        resultContent.innerHTML = formatResultHtml(message || "The autonomous task completed successfully.");
+        // The reply already lives in the timeline (Mission Result item
+        // or the progress step that carried it): do not repeat it in
+        // the result card. The card keeps the showcase + next moves.
+        const showRaw = !isMessageInTimeline(message);
+        resultContent.innerHTML = formatResultHtml(message || "The autonomous task completed successfully.", showRaw);
       } else {
         resultContent.innerHTML = `<div class="result-raw-text md-body">${renderMarkdown(message || "Task stopped before completing all steps.")}</div>`;
       }
@@ -972,7 +1107,12 @@ function renderCompletion(taskState: string, message: string, appendToTimeline =
     if (taskState === "completed") {
       resultCard.classList.remove("is-failed");
       resultBadge.textContent = "✓ Mission Completed";
-      resultContent.innerHTML = formatResultHtml(message || "The autonomous task completed successfully.");
+      // The reply already lives in the timeline (the Mission Result
+      // item addCompletionStepItem just added, or the progress step
+      // that carried it): do not repeat it in the result card. The
+      // card keeps the showcase + next moves; the reply appears once.
+      const showRaw = !isMessageInTimeline(message);
+      resultContent.innerHTML = formatResultHtml(message || "The autonomous task completed successfully.", showRaw);
     } else {
       resultCard.classList.add("is-failed");
       resultBadge.textContent = "✗ Task Blocked / Incomplete";
@@ -1108,12 +1248,19 @@ async function loadChatList(options?: { autoSelect?: boolean }): Promise<void> {
         ? "Recent"
         : dateObj.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 
+      // The × on the OPEN mission is a Close, not a Delete: it returns
+      // the workspace to a blank New Mission and the mission stays in
+      // this list, so it can be clicked open again. (Permanent delete
+      // lives in the control center, behind a confirmation dialog.)
+      // Only the active item shows it — a mission that is not open has
+      // nothing to close. Inlined (not a pre-built string) so the
+      // innerHTML guard can see there is no unescaped value here.
       li.innerHTML = `
         <div class="chat-history-item__main">
           <span class="chat-history-item__title" title="${escapeHtml(chat.title)}">${escapeHtml(chat.title || "Untitled Mission")}</span>
           <span class="chat-history-item__meta">${escapeHtml(dateLabel)}</span>
         </div>
-        <button class="chat-delete-btn" title="Delete mission" aria-label="Delete mission">×</button>
+        ${chat.id === activeChatId ? `<button class="chat-close-btn" title="Close mission" aria-label="Close mission">×</button>` : ""}
       `;
 
       li.addEventListener("click", () => {
@@ -1122,18 +1269,21 @@ async function loadChatList(options?: { autoSelect?: boolean }): Promise<void> {
         }
       });
 
-      const delBtn = li.querySelector(".chat-delete-btn") as HTMLButtonElement | null;
-      delBtn?.addEventListener("click", ev => {
+      const closeBtn = li.querySelector(".chat-close-btn") as HTMLButtonElement | null;
+      closeBtn?.addEventListener("click", ev => {
         ev.stopPropagation();
-        deleteChat(chat.id);
+        closeChat(chat.id);
       });
 
       chatHistoryList?.appendChild(li);
     });
 
-    // Auto-select only when asked: after deleting the active chat the
-    // workspace must stay on the blank New Mission state, not instantly
-    // re-open a different mission. First load still auto-selects.
+    // Auto-select only when asked: opening the workspace (mount) and
+    // closing a mission must stay on the blank New Mission state, not
+    // instantly re-open a mission. Callers that need a selection pass
+    // autoSelect explicitly; the default stays true only for legacy
+    // refresh paths where an active chat is already set (the guard
+    // above makes the block a no-op there anyway).
     if (!activeChatId && (options?.autoSelect ?? true)) {
       const savedChatId = localStorage.getItem("privagent_active_chat_id");
       if (savedChatId && chats.some(c => c.id === savedChatId)) {
@@ -1259,6 +1409,9 @@ async function selectChat(chatId: string): Promise<void> {
             inspectorUrl.href = safeUrl;
             inspectorUrl.textContent = safeUrl;
           }
+          if (safeUrl && browserFrameUrlText) {
+            browserFrameUrlText.textContent = safeUrl;
+          }
           if (inspectorEvidence) inspectorEvidence.textContent = msg.evidence;
         }
       }
@@ -1330,25 +1483,15 @@ async function selectChat(chatId: string): Promise<void> {
   }
 }
 
-async function deleteChat(chatId: string): Promise<void> {
-  try {
-    if (localStorage.getItem("privagent_active_chat_id") === chatId) {
-      localStorage.removeItem("privagent_active_chat_id");
-    }
-  } catch {
-    // Storage restricted
-  }
-  try {
-    await apiFetch(`${API}/api/chat/${chatId}`, { method: "DELETE" });
-  } catch {
-    // Offline
-  }
-
-  if (activeChatId === chatId) {
-    createNewChat();
-  }
-  // No auto-select: deleting the active chat lands on the blank New
+async function closeChat(chatId: string): Promise<void> {
+  // Close is a deselect, never a delete: the mission stays in the
+  // backend and in this sidebar list, so it can be opened again by
+  // clicking it. Only the open mission can be closed.
+  if (activeChatId !== chatId) return;
+  createNewChat();
+  // No auto-select: closing the active chat lands on the blank New
   // Mission state instead of instantly re-opening another mission.
+  // The re-render also drops the × from the just-closed item.
   await loadChatList({ autoSelect: false });
 }
 

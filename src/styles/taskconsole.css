@@ -14,7 +14,7 @@
   border: 1px solid var(--line, rgba(255,255,255,.1));
   color: inherit; font: inherit;
 }
-.console__input:focus-visible { outline: 2px solid var(--accent, #46d7ff); }
+.console__input:focus-visible { outline: 2px solid var(--accent, #2563EB); }
 .console__actions { display: flex; gap: 12px; align-items: center; margin-top: 12px; }
 .console__state { font-family: var(--font-display, monospace); font-size: 13px; opacity: .8; }
 .console__steps { margin: 16px 0 0; padding-left: 18px; font-size: 14px; line-height: 1.7; opacity: .85; }
