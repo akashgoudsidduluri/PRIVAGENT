@@ -469,8 +469,14 @@ def test_daily_time_hour_first_order():
     assert parse_daily_time("notify me the price at 9am every day") == ("30 3 * * *", "9:00 AM IST")
     assert parse_daily_time("tell me the price at 9:30am every morning") == ("0 4 * * *", "9:30 AM IST")
     assert parse_daily_time("notify me at 9 every day") == ("30 3 * * *", "9:00 AM IST")
-    # A price threshold is not a time, even with "every day" after it.
-    assert parse_daily_time("alert me if it drops below ₹5000 every day") is None
+    # A price threshold is not a time — "₹5000" is never read as a
+    # clock hour. But a bare "every day" IS a daily cadence, and the
+    # handler now composes it with the threshold into a below_price
+    # watch on a daily cron (the threshold is preserved, not
+    # swallowed into a daily_price report). So a threshold + "every
+    # day" parses to the 9am default; the old None here predates the
+    # composition and would have dropped the daily cadence entirely.
+    assert parse_daily_time("alert me if it drops below ₹5000 every day") == ("30 3 * * *", "9:00 AM IST")
     assert parse_daily_time("notify me if the price drops") is None
 
 

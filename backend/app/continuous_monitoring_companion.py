@@ -44,14 +44,27 @@ MONITORING_DIRECTIVE_PATTERN = re.compile(
     # prices"): a notify + price(s) ask, or a price(s) ask with a daily
     # cadence. "prizes" is the common misspelling of "prices".
     r"\bnotify\s+me\b[^.\n]{0,60}\b(?:price|prize)s?\b|"
-    r"\b(?:price|prize)s?\b[^.\n]{0,60}\b(?:every\s+day|daily|every\s+morning|each\s+morning)\b|"
-    r"\b(?:every\s+day|daily|every\s+morning|each\s+morning)\b[^.\n]{0,60}\b(?:price|prize)s?\b|"
+    r"\b(?:price|prize)s?\b[^.\n]{0,60}\b(?:every\s+day|everyday|daily|every\s+morning|each\s+morning)\b|"
+    r"\b(?:every\s+day|everyday|daily|every\s+morning|each\s+morning)\b[^.\n]{0,60}\b(?:price|prize)s?\b|"
+    # A notify + daily cadence on its own ("notify me everyday") is a
+    # monitoring cadence even when the word "price" never appears —
+    # the product/threshold comes from the rest of the instruction,
+    # and the handler asks which product when there is none, instead
+    # of inventing one.
+    r"\bnotify\s+me\b[^.\n]{0,40}\b(?:every\s+day|everyday|daily|every\s+morning|each\s+morning)\b|"
     # Absolute threshold ("alert me when the price falls below ₹5000",
     # "notify me if it drops under 3000"): a directive verb + below /
     # under + a number. The verb requirement keeps a plain statement
     # ("the price is below 5000") from becoming a watch.
     r"\b(?:alert|notify|tell|let)\b[^.\n]{0,60}\b(?:below|under)\s*(?:₹|Rs\.?|INR|\$)?\s*[\d,]+(?:\.\d{1,2})?\b|"
     r"\b(?:monitor|track|watch)\b[^.\n]{0,60}\b(?:below|under)\s*(?:₹|Rs\.?|INR|\$)?\s*[\d,]+(?:\.\d{1,2})?\b|"
+    # The threshold forms users actually type, mirroring
+    # parse_below_price: "reaches <5000", "drops to ₹5000", "falls
+    # below 5000", "<₹5000". "check" is a verb here too ("check the
+    # strap and tell me if it reaches <5000") — without it the ask
+    # falls through to a browser task that only looks once.
+    r"\b(?:alert|notify|tell|let|check)\b[^.\n]{0,60}?(?:reaches?|drops?|falls?|goes?|gets?|dips?)\s+(?:below|under|to)\s*(?:₹|Rs\.?|INR|\$)?\s*[\d,]+(?:\.\d{1,2})?\b|"
+    r"\b(?:alert|notify|tell|let|check|watch|monitor|track)\b[^.\n]{0,60}?<\s*(?:₹|Rs\.?|INR|\$)?\s*[\d,]+(?:\.\d{1,2})?\b|"
     + _TRACK_NEW_ALT,
     re.IGNORECASE,
 )
@@ -62,7 +75,7 @@ MONITORING_DIRECTIVE_PATTERN = re.compile(
 # to the UTC cron the scheduler stores ("five UTC fields").
 _IST_OFFSET_MINUTES = 330
 _DAILY_TIME_RE = re.compile(
-    r"\b(?:every\s+day|daily|every\s+morning|each\s+morning)\b[^0-9\n]{0,40}?"
+    r"\b(?:every\s+day|everyday|daily|every\s+morning|each\s+morning)\b[^0-9\n]{0,40}?"
     r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b",
     re.IGNORECASE,
 )
@@ -73,7 +86,15 @@ _DAILY_TIME_RE = re.compile(
 _DAILY_TIME_RE_AFTER = re.compile(
     r"(?:\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b"
     r"|\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b)"
-    r"[^0-9\n]{0,40}?\b(?:every\s+day|daily|every\s+morning|each\s+morning)\b",
+    r"[^0-9\n]{0,40}?\b(?:every\s+day|everyday|daily|every\s+morning|each\s+morning)\b",
+    re.IGNORECASE,
+)
+# Bare daily cadence with no clock time ("notify me every day",
+# "check it daily"): the time-bearing regexes above need an hour,
+# so this one only proves the cadence exists; the default 9:00 AM
+# IST is applied by parse_daily_time.
+_BARE_DAILY_RE = re.compile(
+    r"\b(?:every\s+day|everyday|daily|every\s+morning|each\s+morning)\b",
     re.IGNORECASE,
 )
 
@@ -89,6 +110,13 @@ def parse_daily_time(instruction: str) -> tuple[str, str] | None:
     """
     m = _DAILY_TIME_RE.search(instruction or "") or _DAILY_TIME_RE_AFTER.search(instruction or "")
     if not m:
+        # A bare daily cadence ("notify me every day", "check it daily")
+        # names no clock time. Default to the 9:00 AM IST morning
+        # report — the same default the demo's daily digest uses —
+        # instead of dropping the cadence and falling back to a
+        # 5-minute interval watch the user never asked for.
+        if _BARE_DAILY_RE.search(instruction or ""):
+            return "30 3 * * *", "9:00 AM IST"
         return None
     if m.re is _DAILY_TIME_RE:
         hour_s, minute_s, marker = m.group(1), m.group(2), m.group(3)
@@ -112,7 +140,9 @@ def parse_daily_time(instruction: str) -> tuple[str, str] | None:
 
 
 _BELOW_PRICE_RE = re.compile(
-    r"\b(?:below|under|less\s+than|at\s+most)\s*(?:₹|Rs\.?|INR|\$)?\s*([\d,]+(?:\.\d{1,2})?)",
+    r"(?:\b(?:below|under|less\s+than|at\s+most)\s*(?:₹|Rs\.?|INR|\$)?\s*([\d,]+(?:\.\d{1,2})?)"
+    r"|\b(?:reaches?|drops?|falls?|goes?|gets?|dips?)\s+(?:below|under|to|under)\s*(?:₹|Rs\.?|INR|\$)?\s*([\d,]+(?:\.\d{1,2})?)"
+    r"|<\s*(?:₹|Rs\.?|INR|\$)?\s*([\d,]+(?:\.\d{1,2})?))",
     re.IGNORECASE,
 )
 
@@ -120,14 +150,19 @@ _BELOW_PRICE_RE = re.compile(
 def parse_below_price(instruction: str) -> float | None:
     """Parse 'alert me if the price falls below ₹5000' into 5000.0.
 
-    Returns None when no below/under threshold is named. The caller
-    (a monitoring directive) has already established the intent, so
+    Also accepts the forms users actually type: 'reaches <5000',
+    'drops to ₹5000', 'falls below 5000', '<₹5000'. Returns None
+    when no below/under threshold is named. The caller (a
+    monitoring directive) has already established the intent, so
     this only extracts the number."""
     m = _BELOW_PRICE_RE.search(instruction or "")
     if not m:
         return None
+    raw = next((g for g in m.groups() if g is not None), None)
+    if raw is None:
+        return None
     try:
-        value = float(m.group(1).replace(",", ""))
+        value = float(raw.replace(",", ""))
     except ValueError:
         return None
     return value if value > 0 else None
@@ -139,7 +174,8 @@ def parse_below_price(instruction: str) -> float | None:
 # product is never a hardcoded fallback model.
 _MONITORED_BRANDS = (
     "samsung|amazfit|xiaomi|fitbit|garmin|apple|huawei|noise|boat|fire-boltt|"
-    "realme|oneplus|oppo|vivo|google|sony|lenovo|honor|zebronics|fastrack"
+    "realme|oneplus|oppo|vivo|google|sony|lenovo|honor|zebronics|fastrack|"
+    "logitech|hp|dell|asus|acer|razer|bose|jbl|nothing|iqoo|poco|motorola"
 )
 # Brand + up to three model tokens ("Galaxy Fit3", "Smart Band 10",
 # "Band 7"). Trailing stop-words are stripped after the match so a
@@ -351,14 +387,22 @@ def _extract_monitored_product(instruction: str, history: Optional[list[dict[str
         if raw.lower() not in ("this", "this product", "the product", "this price", "it", ""):
             candidate_title = raw
 
-    # Look back in history for product name and URL
+    # A store URL pasted in the instruction itself wins — the history
+    # loop below only sees earlier messages, so a URL given with the
+    # ask was ignored and the watch fell back to a Flipkart search
+    # page (whose first price is a banner, not the product's).
     best_url = ""
+    url_m = re.search(r"https?://[^\s\"'<>)]+", instruction or "")
+    if url_m and any(d in url_m.group(0).lower() for d in ("amazon.", "flipkart.", "croma.")):
+        best_url = url_m.group(0)
+
+    # Look back in history for product name and URL
     if history:
         for entry in reversed(history):
             content = entry.get("content") or entry.get("message") or ""
-            # Check for URL
+            # Check for URL (only when the instruction gave none)
             url_match = re.search(r"https?://[^\s\"'<>)]+", content)
-            if url_match and ("amazon" in url_match.group(0) or "flipkart" in url_match.group(0) or "croma" in url_match.group(0)):
+            if not best_url and url_match and ("amazon" in url_match.group(0) or "flipkart" in url_match.group(0) or "croma" in url_match.group(0)):
                 best_url = url_match.group(0)
             # Check for a brand + model mention in the suggestion (e.g.
             # the ranked fitness-band list) when the instruction only
@@ -584,13 +628,31 @@ async def handle_continuous_monitoring_instruction(
 
     mission_id = str(uuid.uuid4())
     now = time.time()
-    # A daily time ("every day at 9am", "every morning at 9") becomes
-    # a cron mission that REPORTS the price each morning, instead of a
-    # 5-minute interval mission that only fires on a drop. The cron is
-    # UTC (the scheduler stores five UTC fields); parse_daily_time
-    # converts the user's IST morning into it. (daily / below were
-    # already read at the top of this handler for dispatch order.)
-    if daily:
+    # A daily cadence and a threshold COMPOSE: "below ₹5000, notify
+    # me every day" is a below_price mission on a daily cron — the
+    # check runs once a morning and alerts only when the price is
+    # under the threshold. Before this, daily swallowed the threshold
+    # (a daily_price report with no alert) and a threshold alone fell
+    # back to a 5-minute interval the user never asked for. The
+    # scheduler's claim_due handles a cron trigger for any condition,
+    # so the composed mission is checked the same way.
+    if daily and below is not None:
+        cron, display = daily
+        trigger_type, schedule_cron, interval_sec = "cron", cron, 86400
+        condition_type, condition_params = "below_price", {"target": product_title, "threshold": below}
+        cadence_line = f"• **Check Schedule:** Every day at **{display}**\n"
+        alert_line = (
+            f"• **Alert Condition:** Alert when the price falls below ₹{below:g} "
+            f"(if it is already below, I'll alert you on the first check)\n"
+        )
+    elif daily:
+        # A daily time ("every day at 9am", "every morning at 9")
+        # becomes a cron mission that REPORTS the price each morning,
+        # instead of a 5-minute interval mission that only fires on a
+        # drop. The cron is UTC (the scheduler stores five UTC
+        # fields); parse_daily_time converts the user's IST morning
+        # into it. (daily / below were already read at the top of
+        # this handler for dispatch order.)
         cron, display = daily
         trigger_type, schedule_cron, interval_sec = "cron", cron, 86400
         condition_type, condition_params = "daily_price", {"target": product_title}
