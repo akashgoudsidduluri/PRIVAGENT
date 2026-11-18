@@ -112,6 +112,21 @@ def update_mission(mission_id: str, body: MissionUpdate):
     return {"id": mission_id, "status": status, "next_run_at": next_run}
 
 
+@router.delete("/missions/{mission_id}")
+def delete_mission(mission_id: str):
+    """Cancel a watch. Chat-only monitoring (2026-11-18) needs a way to
+    stop a watch from the conversation: the interactive watch card's
+    Cancel button calls this. Events are removed with the mission."""
+    initialize()
+    with db.get_connection() as conn:
+        row = conn.execute("SELECT id FROM monitoring_missions WHERE id=?", (mission_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, "mission not found")
+        conn.execute("DELETE FROM monitoring_events WHERE mission_id=?", (mission_id,))
+        conn.execute("DELETE FROM monitoring_missions WHERE id=?", (mission_id,))
+    return {"id": mission_id, "deleted": True}
+
+
 @router.get("/missions/{mission_id}/events")
 def mission_events(mission_id: str):
     initialize()

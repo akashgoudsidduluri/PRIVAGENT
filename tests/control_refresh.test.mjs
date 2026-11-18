@@ -15,7 +15,7 @@ const center = readFileSync(join(root, "src/controlCenter.ts"), "utf8");
 // ---------------------------------------------------------------------------
 
 test("Privacy Center preserves the audit filter and limit across re-mounts", () => {
-  const branch = views.match(/if \(index === 10\) \{([\s\S]*?)\n    \}\n/);
+  const branch = views.match(/if \(index === 9\) \{([\s\S]*?)\n    \}\n/);
   assert.ok(branch, "no Privacy Center branch in mountControlView");
   const body = branch[1];
   assert.ok(

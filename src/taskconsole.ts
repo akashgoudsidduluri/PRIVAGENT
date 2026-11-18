@@ -108,6 +108,18 @@ rejectBtn?.addEventListener("click", () => {
   if (id) apiFetch(`${API}/api/task/${id}/confirm`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ decision: "reject" }) });
 });
 
+// Preset mission chips: fill the input, dispatch the input event so
+// the Start button enables, and focus the input.
+document.querySelectorAll<HTMLButtonElement>(".console__chip").forEach(chip => {
+  chip.addEventListener("click", () => {
+    const preset = chip.dataset.preset || "";
+    if (!input || !preset) return;
+    input.value = preset;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.focus();
+  });
+});
+
 input?.addEventListener("input", () => {
   if (startBtn) startBtn.disabled = !input.value.trim();
 });

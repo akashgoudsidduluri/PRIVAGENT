@@ -230,6 +230,26 @@ def classify_instruction_type(instruction: str) -> str:
     if nav_pattern.search(text):
         return "NAVIGATION"
 
+    # Companion-routed instructions (email monitoring, calendar,
+    # tracking, memory, dispatch) are handled by their own companions,
+    # which either do the thing or say honestly they cannot — their
+    # answers are not research products. Without this, the word "find"
+    # in "find the Microsoft interview invitation" labels an email
+    # mission setup as RESEARCH, and Rule 6 prepends "Research
+    # incomplete: No substantive research sources were examined" to a
+    # mission confirmation that never asked for research.
+    from .connectors.calendar_companion import is_calendar_query
+    from .email_intelligence.companion_queries import is_email_companion_query
+    from .email_intelligence.mission_setup import is_email_mission_setup_instruction
+    from .memory_companion import is_remember_directive
+    if (
+        is_email_mission_setup_instruction(instruction)
+        or is_email_companion_query(instruction)
+        or is_calendar_query(instruction)
+        or is_remember_directive(instruction)
+    ):
+        return "CONVERSATIONAL"
+
     # Research patterns
     research_pattern = re.compile(
         r"\b(?:price|search\s+for|find|look\s+up|extract|check\s+price|specs|compare)\b",

@@ -261,10 +261,12 @@ class FakeCalendarConnector:
         self.configured = True
         self.origin = "https://www.googleapis.com"
         self.created = []
+        self.created_reminders = []
         self.listed = 0
 
-    def create_invite(self, calendar_id, title, start, end, attendees):
+    def create_invite(self, calendar_id, title, start, end, attendees, reminders=None):
         self.created.append((title, start, end, attendees))
+        self.created_reminders.append(reminders)
         return {"htmlLink": "https://calendar.google.com/event?id=x"}
 
     def list_events(self, calendar_id, start, end, limit):
@@ -435,3 +437,207 @@ def test_calendar_create_ist_time_books_ist(monkeypatch, audit_events):
     assert "SIH review" in title
     assert "T10:00:00+05:30" in start
     assert "T11:00:00+05:30" in end
+
+
+def test_parse_calendar_create_time_first_form():
+    """The most natural phrasing puts the time before the title:
+    'Create a calendar event tomorrow at 10am for SIH review.' The
+    old title-first regex captured the day word into the title
+    ('SIH review tomorrow') or missed the 'calendar' noun entirely,
+    so the event was created with the wrong name. The parse is now
+    time-aware: the title is the instruction minus the verb phrase
+    and the time span."""
+    import datetime as _dt
+
+    from app.connectors.calendar_companion import parse_calendar_create
+
+    ist = _dt.timezone(_dt.timedelta(hours=5, minutes=30), "IST")
+    tomorrow_ist = (_dt.datetime.now(_dt.timezone.utc).astimezone(ist)
+                    + _dt.timedelta(days=1)).date()
+
+    parsed = parse_calendar_create("Create a calendar event tomorrow at 10am for SIH review.")
+    assert parsed is not None
+    assert parsed["title"] == "SIH review"
+    assert parsed["start"].date() == tomorrow_ist
+    assert (parsed["start"].hour, parsed["start"].minute) == (10, 0)
+    assert parsed["start"].utcoffset() == _dt.timedelta(hours=5, minutes=30)
+
+    # Title-first form keeps working, and the day word stays in the time.
+    parsed2 = parse_calendar_create("Create an event SIH review tomorrow at 10am")
+    assert parsed2 is not None and parsed2["title"] == "SIH review"
+
+    # Attendee emails are attendees, not part of the title.
+    parsed3 = parse_calendar_create(
+        "Create a calendar event tomorrow at 10am for SIH review with priya@example.com"
+    )
+    assert parsed3 is not None and parsed3["title"] == "SIH review"
+    assert "priya@example.com" in parsed3["attendees"]
+
+    # No clock time and no 'on/at/for' separator: not a create.
+    assert parse_calendar_create("schedule a meeting with Priya tomorrow") is None
+    assert parse_calendar_create("Create a calendar event for SIH review") is None
+
+
+def test_parse_calendar_create_next_weekday_and_modifier_noun():
+    """Focused re-check found two gaps in the time-first parse:
+
+    - "next Monday" leaked into the title: "Add a calendar event
+      next Monday at 9:30am called Chat with Priya" titled the event
+      "next   called Chat with Priya" because _time_span only knew
+      the bare weekday, not the "next"/"this" qualifier.
+    - A modifier before the event noun broke the verb phrase entirely:
+      "Book a dentist appointment tomorrow at 4pm" returned None,
+      because the verb regex required the event noun right after the
+      article. The modifier + noun are the title ("dentist
+      appointment"), not filler.
+    """
+    import datetime as _dt
+
+    from app.connectors.calendar_companion import parse_calendar_create
+
+    ist = _dt.timezone(_dt.timedelta(hours=5, minutes=30), "IST")
+    now_ist = _dt.datetime.now(_dt.timezone.utc).astimezone(ist)
+
+    parsed = parse_calendar_create(
+        "Add a calendar event next Monday at 9:30am called Chat with Priya."
+    )
+    assert parsed is not None
+    assert parsed["title"] == "Chat with Priya"
+    assert (parsed["start"].hour, parsed["start"].minute) == (9, 30)
+    assert parsed["start"].weekday() == 0  # Monday
+    assert parsed["start"].date() > now_ist.date()
+
+    parsed2 = parse_calendar_create("Book a dentist appointment tomorrow at 4pm.")
+    assert parsed2 is not None
+    assert parsed2["title"] == "dentist appointment"
+    assert (parsed2["start"].hour, parsed2["start"].minute) == (16, 0)
+
+    parsed3 = parse_calendar_create("Create a team meeting tomorrow at 10am")
+    assert parsed3 is not None and parsed3["title"] == "team meeting"
+
+
+def test_compound_email_calendar_clause_parses_and_surfaces():
+    """The combined email+calendar test failed silently: "Monitor my
+    email using demo sandbox, find the Microsoft interview invitation,
+    and create a Google Calendar event for it tomorrow at 10am with a
+    reminder 3 days before." The email mission handler consumed the
+    whole instruction and the calendar half vanished — no event, no
+    message, nothing. Three more gaps in the same clause: "create a
+    Google Calendar event" never parsed at all ("Google" had no slot
+    in the verb regex), the reminder clause would have polluted the
+    title, and the pronoun "it" would have titled the event "it".
+
+    The clause must extract, "it" must resolve to the Microsoft
+    interview named in the email half, the reminder must parse to
+    4320 minutes (3 days) and stay out of the title, and the compound
+    handler must return the calendar result (honest not-connected in
+    this environment) instead of None.
+    """
+    import asyncio
+
+    from app.connectors.calendar_companion import (
+        extract_calendar_create_clause,
+        handle_compound_calendar,
+        parse_calendar_create,
+        resolve_calendar_event_pronoun,
+    )
+
+    instr = (
+        "Monitor my email using demo sandbox, find the Microsoft interview "
+        "invitation, and create a Google Calendar event for it tomorrow at "
+        "10am with a reminder 3 days before."
+    )
+    clause = extract_calendar_create_clause(instr)
+    assert clause == (
+        "create a Google Calendar event for it tomorrow at 10am "
+        "with a reminder 3 days before"
+    )
+    resolved = resolve_calendar_event_pronoun(clause, instr)
+    assert resolved == (
+        "create a Google Calendar event for Microsoft interview tomorrow "
+        "at 10am with a reminder 3 days before"
+    )
+    parsed = parse_calendar_create(resolved)
+    assert parsed is not None
+    assert parsed["title"] == "Microsoft interview"
+    assert (parsed["start"].hour, parsed["start"].minute) == (10, 0)
+    assert parsed["reminder_minutes"] == 4320
+
+    # The compound handler surfaces the calendar half instead of
+    # dropping it: in this environment the calendar is not connected,
+    # so the honest not-connected message is the correct result.
+    section = asyncio.run(handle_compound_calendar(instr))
+    assert section is not None, "calendar half was silently dropped"
+    assert "Google Calendar Not Connected" in section or "Google Calendar Invite Created" in section
+    # A pure email instruction has no calendar clause: nothing to append.
+    assert asyncio.run(handle_compound_calendar(
+        "Monitor my email using demo sandbox, scan every 60 minutes."
+    )) is None
+    # A bare pronoun with no referent is an honest ask, not a nonsense event.
+    no_ref = asyncio.run(handle_compound_calendar(
+        "Monitor my email and create a calendar event for it tomorrow at 10am."
+    ))
+    assert no_ref is not None and "couldn't tell which event" in no_ref
+
+
+def test_parse_calendar_create_google_calendar_and_reminder():
+    """parse_calendar_create must accept "Google Calendar" in the verb
+    phrase and must understand a reminder clause: the reminder is
+    minutes-before, never part of the title."""
+    from app.connectors.calendar_companion import parse_calendar_create
+
+    p = parse_calendar_create(
+        "Create a Google Calendar event tomorrow at 10am for SIH review "
+        "with a reminder 1 day before."
+    )
+    assert p is not None
+    assert p["title"] == "SIH review"
+    assert p["reminder_minutes"] == 1440
+
+    p2 = parse_calendar_create(
+        "Book a dentist appointment tomorrow at 4pm, remind me 2 hours before."
+    )
+    assert p2 is not None
+    assert p2["title"] == "dentist appointment"
+    assert p2["reminder_minutes"] == 120
+
+    p3 = parse_calendar_create("Create a calendar event tomorrow at 10am for SIH review.")
+    assert p3 is not None
+    assert p3["title"] == "SIH review"
+    assert p3["reminder_minutes"] is None
+
+
+def test_calendar_create_reminder_reaches_connector(monkeypatch, audit_events):
+    """End to end: a reminder in the instruction must reach create_invite
+    as a popup override — not vanish after confirmation. (The fake
+    connector must mirror the real one's reminders parameter, or the
+    create raises TypeError inside the handler and the route reports
+    ok with nothing created.)"""
+    cal = FakeCalendarConnector()
+    oauth = FakeOAuth({"google_calendar": cal})
+    seen = []
+
+    async def _confirm(message, action):
+        seen.append(message)
+        return True
+
+    out = _run_calendar(
+        _route("google_calendar", "create"),
+        "schedule a meeting called Standup on Monday at 10am with a reminder 3 days before",
+        oauth, FakeCalendarOAuth(cal), confirm=_confirm, monkeypatch=monkeypatch,
+    )
+    assert out.ok is True
+    assert len(cal.created) == 1
+    assert cal.created[0][0] == "Standup"
+    assert cal.created_reminders[0] == [{"method": "popup", "minutes": 4320}]
+    # No reminder: nothing is passed.
+    cal2 = FakeCalendarConnector()
+    out2 = _run_calendar(
+        _route("google_calendar", "create"),
+        "schedule a meeting called Standup on Monday at 10am",
+        FakeOAuth({"google_calendar": cal2}), FakeCalendarOAuth(cal2),
+        confirm=_confirm, monkeypatch=monkeypatch,
+    )
+    assert out2.ok is True
+    assert len(cal2.created) == 1
+    assert cal2.created_reminders[0] is None

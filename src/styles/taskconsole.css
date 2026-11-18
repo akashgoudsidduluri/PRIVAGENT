@@ -1,26 +1,28 @@
-/* Task console — reuses existing design tokens from main.css */
-.console { padding: 96px 0; }
+/* Task console — reuses existing design tokens from main.css.
+   The console is a <div> inside a .section (which already carries the
+   96px vertical rhythm), so it has no section padding of its own. */
+.console { margin-top: 0; }
 .console__panel {
   margin-top: 32px;
   padding: 24px;
   border-radius: 16px;
-  background: var(--panel, rgba(255,255,255,.04));
-  border: 1px solid var(--line, rgba(255,255,255,.09));
+  background: var(--elevated, #ffffff);
+  border: 1px solid var(--line, rgba(39,37,30,0.14));
 }
 .console__label { display: block; font-size: 13px; opacity: .7; margin-bottom: 8px; }
 .console__input {
   width: 100%; padding: 12px; border-radius: 10px; resize: vertical;
-  background: var(--bg-soft, rgba(255,255,255,.06));
-  border: 1px solid var(--line, rgba(255,255,255,.1));
+  background: var(--elevated, #ffffff);
+  border: 1px solid var(--line-strong, rgba(39,37,30,0.28));
   color: inherit; font: inherit;
 }
-.console__input:focus-visible { outline: 2px solid var(--accent, #46d7ff); }
+.console__input:focus-visible { outline: 2px solid var(--accent, #484830); }
 .console__actions { display: flex; gap: 12px; align-items: center; margin-top: 12px; }
-.console__state { font-family: var(--font-display, monospace); font-size: 13px; opacity: .8; }
+.console__state { font-family: var(--font-mono); font-size: 13px; opacity: .8; }
 .console__steps { margin: 16px 0 0; padding-left: 18px; font-size: 14px; line-height: 1.7; opacity: .85; }
 .console__summary {
   margin-top: 16px; padding: 12px 14px; border-radius: 10px; font-size: 14px;
-  background: rgba(70,215,255,.08); border: 1px solid rgba(70,215,255,.25);
+  background: var(--privacy-soft, #eaf2ec); border: 1px solid rgba(45,90,60,0.25);
 }
 [hidden],
 .console__confirm[hidden],
@@ -31,17 +33,17 @@
 
 .console__confirm {
   position: fixed; inset: 0; display: grid; place-items: center;
-  background: rgba(0,0,0,.6); z-index: 60;
+  background: rgba(26,25,24,.5); z-index: 60;
 }
 .console__confirm-box {
   max-width: 520px; width: 90%; padding: 24px; border-radius: 16px;
-  background: var(--panel-strong, #0b1230);
-  border: 1px solid var(--line, rgba(255,255,255,.14));
+  background: var(--elevated, #ffffff);
+  border: 1px solid var(--line, rgba(39,37,30,0.14));
 }
 .console__confirm-msg { margin: 8px 0 12px; font-size: 14px; }
 .console__confirm-action {
   font-size: 12px; padding: 12px; border-radius: 8px; overflow: auto; max-height: 200px;
-  background: rgba(255,255,255,.05); border: 1px solid var(--line, rgba(255,255,255,.1));
+  background: var(--bg-2, #f3f0ea); border: 1px solid var(--line, rgba(39,37,30,0.14));
 }
 .console__confirm-actions { display: flex; gap: 12px; margin-top: 16px; justify-content: flex-end; }
 .console__state.pulse::after { content: "…"; animation: console-pulse 1.2s ease infinite; }

@@ -275,17 +275,30 @@ test("selectChat clears the visual frame before loading the new chat", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Chat switching: deleting the active chat must not re-open another one,
-// and a superseded selectChat must not render the wrong thread.
+// Chat switching: closing the active chat must land on the blank New
+// Mission state (not re-open another one), and the closed mission must
+// stay in the list so it can be opened again. The sidebar × is a Close,
+// not a Delete — permanent delete lives in the control center behind a
+// confirmation dialog, so there is no deleteChat in agentApp.ts.
 // ---------------------------------------------------------------------------
 
-test("deleteChat reloads the list without auto-selecting another chat", () => {
+test("closeChat reloads the list without auto-selecting another chat and without deleting it", () => {
   const src = read("src/agentApp.ts");
-  const fn = src.match(/async function deleteChat\(chatId: string\)[\s\S]*?\n\}/);
-  assert.ok(fn, "no deleteChat in agentApp.ts");
+  assert.ok(!src.includes("async function deleteChat"), "agentApp.ts still has a deleteChat — the sidebar × must be a Close, not a Delete");
+  assert.ok(!src.includes("chat-delete-btn"), "agentApp.ts still renders a delete button in the chat list");
+  const fn = src.match(/async function closeChat\(chatId: string\)[\s\S]*?\n\}/);
+  assert.ok(fn, "no closeChat in agentApp.ts");
   assert.ok(
     fn[0].includes("loadChatList({ autoSelect: false })"),
-    "deleteChat reloads with auto-select on — the blank state is instantly replaced by another mission",
+    "closeChat reloads with auto-select on — the blank state is instantly replaced by another mission",
+  );
+  assert.ok(
+    !fn[0].includes("DELETE"),
+    "closeChat still calls the DELETE endpoint — closing must not delete the mission",
+  );
+  assert.ok(
+    fn[0].includes("createNewChat()"),
+    "closeChat does not return to the blank New Mission state",
   );
   assert.ok(
     src.includes("options?.autoSelect ?? true"),

@@ -48,33 +48,15 @@ export async function mountControlView(index: number, content: HTMLElement, isCu
         '<div class="cc-grid cc-metrics">' + card('Browser relay', '<strong class="cc-number">' + (health.extensionConnected ? 'Online' : 'Offline') + '</strong><p>Live backend health</p>') + card('Mission history', '<strong class="cc-number">' + chats.length + '</strong><p>Persisted conversations</p>') + card('Active monitors', '<strong class="cc-number">' + active + '</strong><p>Of ' + missions.length + ' saved missions</p>') + '</div>' +
         card('Recent work', chats.slice(0, 5).map((c: any) => '<article class="cc-row"><div><h3>' + safe(c.title) + '</h3><p>' + safe(c.status) + '</p></div><a class="cc-button cc-button--outline" href="#agent-workspace">Open workspace ↗</a></article>').join('') || empty('Your canvas is clear', 'Start a mission to see its trace here.'), 'MISSION JOURNAL');
     }
+    // Monitoring is chat-only (2026-11-18): there is no monitor form
+    // or scheduled-missions page anymore. A watch is created by telling
+    // the agent in chat ("watch the Helio strap, alert below ₹8000")
+    // and its confirmation + controls live in that conversation. The
+    // old index-3 view was removed; the indices below shifted down by 1.
     if (index === 3) {
-      const missions = await request('/api/control/missions');
-      if (!isCurrent()) return;
-      content.innerHTML = card('Create a monitor', '<form id="missionForm" class="cc-form"><label>Mission title<input name="title" required maxlength="120" placeholder="Track a product price"></label><label>Public URL<input name="target_url" type="url" required placeholder="https://example.org/product"></label><label>Interval in seconds<input name="interval_seconds" type="number" min="60" value="300" required></label><button class="cc-button">Create paused</button></form><p class="cc-note">New monitors start paused. Activate one when its target is ready.</p>', 'PERSISTENT WATCH') +
-        card('Scheduled missions', missions.map((m: any) => '<article class="cc-row cc-mission-row"><div><small>' + safe(m.condition_type) + ' · every ' + safe(m.interval_seconds) + 's</small><h3>' + safe(m.title) + '</h3><p>' + safe(m.target_url) + '</p></div><div class="cc-row-actions">' + tag(m.status) + button(m.status === 'active' ? 'Pause' : 'Activate', 'mission-action', m.id) + button('View diffs', 'mission-events', m.id) + '</div></article>').join('') || empty('No monitors yet', 'Create a persistent watch above.'), 'MONITORING ENGINE') + '<div id="missionDiffs"></div>';
-      content.querySelector<HTMLFormElement>('#missionForm')?.addEventListener('submit', async event => {
-        event.preventDefault(); const form = event.currentTarget as HTMLFormElement;
-        const values = Object.fromEntries(new FormData(form));
-        try { await request('/api/control/missions', jsonOptions('POST', { ...values, interval_seconds: Number(values.interval_seconds) })); rerender(); }
-        catch (error) { showError(form, error); }
-      });
-      content.querySelectorAll<HTMLButtonElement>('[data-mission-action]').forEach(b => b.onclick = async () => {
-        const active = b.textContent === 'Pause'; b.disabled = true;
-        try { await request('/api/control/missions/' + encodeURIComponent(b.dataset.missionAction || ''), jsonOptions('PATCH', { status: active ? 'paused' : 'active' })); rerender(); }
-        catch (error) { showError(b.closest('.cc-row') || content, error); b.disabled = false; }
-      });
-      content.querySelectorAll<HTMLButtonElement>('[data-mission-events]').forEach(b => b.onclick = async () => {
-        const target = content.querySelector<HTMLElement>('#missionDiffs')!;
-        try { const events = await request('/api/control/missions/' + encodeURIComponent(b.dataset.missionEvents || '') + '/events');
-          target.innerHTML = card('Detected changes', events.map((e: any) => '<article class="cc-row"><div><h3>' + safe(e.title || 'Change detected') + '</h3><p>' + safe(e.summary) + '</p></div><time>' + new Date(e.detected_at * 1000).toLocaleString() + '</time></article>').join('') || empty('No changes recorded', 'The next observed difference will appear here.'), 'EVENT HISTORY');
-        } catch (error) { showError(target, error); }
-      });
-    }
-    if (index === 4) {
       await mountEmailIntelligence(content, isCurrent);
     }
-    if (index === 5) {
+    if (index === 4) {
       const providers = await request('/api/connectors');
       if (!isCurrent()) return;
       const names: Record<string, string> = {
@@ -120,7 +102,7 @@ export async function mountControlView(index: number, content: HTMLElement, isCu
           '<div class="cc-provider-mark">' + safe(p.provider.slice(0, 1).toUpperCase()) + '</div>' +
           '<p>Native account adapter · in-memory session</p>' +
           (p.account ? '<p style="font-size:12px;color:#8cf2ac;margin:4px 0">✓ Account: <strong>' + safe(p.account) + '</strong></p>' : '') +
-          (p.error && !p.connected ? '<p style="font-size:11px;color:#f87171;margin:4px 0">⚠️ ' + safe(p.error) + '</p>' : '') +
+          (p.error && !p.connected ? '<p style="font-size:11px;color:var(--danger);margin:4px 0">⚠️ ' + safe(p.error) + '</p>' : '') +
           '<div class="cc-provider-actions">' +
           tag(p.connected ? 'Connected' : p.configured ? 'Token Expired / Disconnected' : 'Setup Required') +
           (p.connected
@@ -222,16 +204,16 @@ export async function mountControlView(index: number, content: HTMLElement, isCu
         catch (error) { showError(b.closest('.cc-card') || content, error); }
       });
     }
-    if (index === 6) await mountMcp(content, isCurrent);
-    if (index === 7) await mountMemory(content, isCurrent);
-    if (index === 8) {
+    if (index === 5) await mountMcp(content, isCurrent);
+    if (index === 6) await mountMemory(content, isCurrent);
+    if (index === 7) {
       const chats = await request('/api/chats');
       const sample = (chats || []).slice(0, 10);
       const groups = await Promise.all(sample.map((c: any) => request('/api/chats/' + encodeURIComponent(c.id) + '/artifacts').catch(() => [])));
       if (!isCurrent()) return;
       content.innerHTML = card('Deliverables', groups.flat().map((a: any) => '<article class="cc-row"><div><small>' + safe(a.file_format?.toUpperCase()) + ' · ' + safe(a.file_size_bytes) + ' bytes</small><h3>' + safe(a.title || a.filename) + '</h3><p>' + safe(a.summary) + '</p></div><a class="cc-button" href="' + artifactUrl(API + '/api/artifacts/' + encodeURIComponent(a.artifact_id) + '/download') + '">Download ↗</a></article>').join('') || empty('Room for your next discovery', 'Completed research exports will appear here.'), 'ARTIFACT MEMORY');
     }
-    if (index === 10) {
+    if (index === 9) {
       // Preserve the operator's audit filter/limit across the 5s live
       // refresh: the full re-mount below rebuilds the selects, and
       // without this both reset to their defaults every interval tick.
@@ -306,7 +288,7 @@ export async function mountControlView(index: number, content: HTMLElement, isCu
       content.querySelector<HTMLButtonElement>('#auditRefresh')?.addEventListener('click', () => void loadAudit());
       void loadAudit();
     }
-    if (index === 11) {
+    if (index === 10) {
       const [health, config, timeouts] = await Promise.all([request('/api/health'), request('/api/llm/config'), request('/api/control/settings')]);
       if (!isCurrent()) return;
       content.innerHTML = card('Planner configuration', '<div class="cc-settings-grid"><div><small>ACTIVE PROVIDER</small><strong>' + safe(config.provider || health.provider) + '</strong></div><div><small>STEP BUDGET</small><strong>' + safe(health.maxSteps) + '</strong></div><div><small>BROWSER RELAY</small><strong>' + (health.extensionConnected ? 'Online' : 'Offline') + '</strong></div></div><p>Provider and model changes apply to the next mission. The runtime keeps API keys write-only.</p><button class="cc-button" id="ccSettings">Configure provider & model ↗</button>', 'RUNTIME SETTINGS') + card('Mission timeouts', '<form class="cc-form cc-form--timeouts" id="timeoutForm"><label>Task timeout (seconds)<input name="taskSeconds" type="number" min="60" max="3600" value="' + safe(timeouts.taskSeconds) + '" required></label><label>Planner timeout (seconds)<input name="plannerSeconds" type="number" min="5" max="180" value="' + safe(timeouts.plannerSeconds) + '" required></label><button class="cc-button">Apply for next mission</button></form><p class="cc-note">Changes are in-memory and reset when the backend restarts.</p>', 'TIME BUDGET');
@@ -372,16 +354,10 @@ async function mountMcp(content: HTMLElement, isCurrent: () => boolean): Promise
 async function mountMemory(content: HTMLElement, isCurrent: () => boolean): Promise<void> {
   const [facts, preferences, chats] = await Promise.all([request('/api/memory/facts'), request('/api/preferences'), request('/api/chats')]);
   if (!isCurrent()) return;
-  content.innerHTML = card('Remember a fact', '<form class="cc-form cc-form--memory" id="factForm"><label>Category<select name="category"><option value="coding">Coding</option><option value="retail">Retail</option><option value="personal">Personal</option></select></label><label>Key<input name="key" required maxlength="80" placeholder="Preferred language"></label><label>Value<input name="value" required maxlength="1000" placeholder="Python"></label><label>Retention (days)<input type="number" name="ttlDays" min="1" max="365" value="90"></label><button class="cc-button">Remember</button></form><p class="cc-note">Credentials and personal identifiers are rejected. Facts expire automatically.</p>', 'EXPLICIT MEMORY') +
-    card('Semantic facts', facts.map((f: any) => '<article class="cc-row"><div><small>' + safe(f.category) + ' · expires ' + new Date(f.expires_at * 1000).toLocaleDateString() + '</small><h3>' + safe(f.fact_key) + '</h3><p>' + safe(f.fact_value) + '</p></div>' + button('Forget', 'forget', f.id) + '</article>').join('') || empty('No saved facts', 'Store a stable preference above when useful.'), 'RETENTION') +
+  content.innerHTML = card('Remember a fact', '<p>Facts are learned from the conversation now — tell the agent in chat, for example “remember my preferred language is Python”, and it stores the fact (same 90-day retention, same credential/PII rejection as the old form). There is no manual entry form anymore.</p><a class="cc-button" href="#agent-workspace">Open workspace ↗</a>', 'CHAT-ONLY MEMORY') +
+    card('Semantic facts', facts.map((f: any) => '<article class="cc-row"><div><small>' + safe(f.category) + ' · expires ' + new Date(f.expires_at * 1000).toLocaleDateString() + '</small><h3>' + safe(f.fact_key) + '</h3><p>' + safe(f.fact_value) + '</p></div>' + button('Forget', 'forget', f.id) + '</article>').join('') || empty('No saved facts', 'Tell the agent in chat — “remember my preferred language is Python”.'), 'RETENTION') +
     card('Preferences', Object.entries(preferences).map(([key, value]) => '<article class="cc-row"><div><h3>' + safe(key) + '</h3><p>' + safe(value) + '</p></div>' + button('Delete', 'preference', key) + '</article>').join('') || empty('No preferences', 'Provider and workspace preferences will appear here.'), 'USER CONTROL') +
     card('Episodic history', chats.slice(0, 15).map((c: any) => '<article class="cc-row"><div><h3>' + safe(c.title) + '</h3><p>' + safe(c.status) + '</p></div><div class="cc-row-actions">' + button('Inspect', 'history', c.id) + button('Delete chat', 'delete-chat', c.id) + '</div></article>').join('') || empty('No episodes', 'Past missions will appear here.'), 'MISSION RECORDS') + '<div id="episodeDetail"></div>';
-  content.querySelector<HTMLFormElement>('#factForm')!.onsubmit = async event => {
-    event.preventDefault(); const form = event.currentTarget as HTMLFormElement;
-    const values = Object.fromEntries(new FormData(form));
-    try { await request('/api/memory/facts', jsonOptions('POST', { ...values, ttlDays: Number(values.ttlDays) })); rerender(); }
-    catch (error) { showError(form, error); }
-  };
   content.querySelectorAll<HTMLButtonElement>('[data-forget]').forEach(b => b.onclick = async () => {
     try { await request('/api/memory/facts/' + encodeURIComponent(b.dataset.forget || ''), { method: 'DELETE' }); rerender(); }
     catch (error) { showError(b.closest('.cc-row') || content, error); }
@@ -486,8 +462,8 @@ async function mountEmailIntelligence(content: HTMLElement, isCurrent: () => boo
     '<h3>Status: ' + safe(mission.status.toUpperCase()) + ' ' + modeBadge + '</h3>' +
     '<div style="display:flex;align-items:center;gap:10px;margin:10px 0;padding:8px 14px;background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.25);border-radius:6px;width:fit-content">' +
     '<span style="font-size:16px">⏱</span>' +
-    '<span style="color:#cbd5e1;font-size:13px;font-weight:500">Auto-sync timer:</span>' +
-    '<strong id="emailSyncCountdown" style="font-family:monospace;font-size:16px;color:#6ee7b7;background:rgba(0,0,0,0.35);padding:2px 8px;border-radius:4px;border:1px solid rgba(110,231,183,0.3)">' + formatCountdown(syncPeriodSeconds) + '</strong>' +
+    '<span style="color:var(--text-secondary);font-size:13px;font-weight:500">Auto-sync timer:</span>' +
+    '<strong id="emailSyncCountdown" style="font-family:var(--font-mono);font-size:12px;color:var(--privacy);background:var(--privacy-soft);padding:2px 8px;border-radius:4px;border:1px solid rgba(45,90,60,0.25)">' + formatCountdown(syncPeriodSeconds) + '</strong>' +
     '</div>' +
     '<p>Protected categories (<strong>Banking, Financial, Security, Academic, Recruitment, Personal, Deadlines</strong>) are strictly locked and never automatically deleted.</p>' +
     '</div><div class="cc-row-actions">' +

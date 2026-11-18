@@ -274,5 +274,16 @@ def test_render_artifact_dispatcher():
         p_xlsx = render_artifact(pkg, "excel", str(Path(tmp_dir) / "out.xlsx"))
         assert Path(p_xlsx).name == "out.xlsx"
 
+        # "xcel" is the user's own spelling (the demo scope says
+        # "ppt/doc/pdf/xcel"). The classifier canonicalises it early,
+        # but a direct render must not silently fall back to docx.
+        p_xcel = render_artifact(pkg, "xcel", str(Path(tmp_dir) / "out-xcel.xlsx"))
+        assert Path(p_xcel).exists()
+        wb = openpyxl.load_workbook(p_xcel)
+        assert "Comparison & Metrics" in wb.sheetnames
+        p_xcel_upper = render_artifact(pkg, "XCEL", str(Path(tmp_dir) / "out-xcel2.xlsx"))
+        wb2 = openpyxl.load_workbook(p_xcel_upper)
+        assert "Comparison & Metrics" in wb2.sheetnames
+
         p_md = render_artifact(pkg, "markdown", str(Path(tmp_dir) / "out.md"))
         assert Path(p_md).name == "out.md"

@@ -25,6 +25,7 @@ RENDERER_REGISTRY: dict[str, type[BaseRenderer]] = {
     "xlsx": XlsxRenderer,
     "xls": XlsxRenderer,
     "excel": XlsxRenderer,
+    "xcel": XlsxRenderer,
     "spreadsheet": XlsxRenderer,
     "csv": CsvRenderer,
     "markdown": MarkdownRenderer,

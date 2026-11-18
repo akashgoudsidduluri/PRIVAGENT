@@ -285,6 +285,27 @@ async def _run_loop(
     # nonsense. setdefault: a restored checkpoint's instruction wins
     # when one is already present.
     working_memory.setdefault("instruction", instruction)
+    # Attachment awareness: a file the user attached to this mission is
+    # stored in memory (file_uploads) and is only ever handed to the
+    # extension for an `upload_file` action — but the planner was never
+    # told it exists, so it could never plan to use it. Record the file
+    # NAME + kind (metadata only, never the bytes) in working memory so
+    # build_prompt can tell the planner. The bytes stay out of the
+    # prompt, logs and SQLite by design (file_uploads docstring).
+    if "attachment" not in working_memory:
+        try:
+            _task = real_hub.tasks.get(task_id)
+            _token = getattr(_task, "file_token", None) or ""
+            if _token:
+                from .file_uploads import get as _get_attachment
+
+                _att = _get_attachment(_token)
+                if _att:
+                    _fname = _att[0]
+                    _kind = _fname.rsplit(".", 1)[-1].lower() if "." in _fname else ""
+                    working_memory["attachment"] = {"fileName": _fname, "kind": _kind}
+        except Exception:
+            pass
     # Task 3: the effective allow-list travels in working memory so the
     # planner providers can state it in the prompt (build_prompt) and the
     # loop can enforce it in code. None = not configured (allow all,
@@ -2987,11 +3008,19 @@ async def run_task(task_id: str) -> None:
                 handle_email_intelligence_instruction,
             )
             from .email_intelligence.companion_queries import is_email_companion_query
-            from .connectors.calendar_companion import is_calendar_query, handle_calendar_instruction
+            from .connectors.calendar_companion import (
+                is_calendar_query,
+                handle_calendar_instruction,
+                handle_compound_calendar,
+            )
 
             from .continuous_monitoring_companion import (
                 is_continuous_monitoring_directive,
                 handle_continuous_monitoring_instruction,
+            )
+            from .memory_companion import (
+                is_remember_directive,
+                handle_remember_instruction,
             )
             from .email_dispatch import (
                 is_email_dispatch_instruction,
@@ -3002,6 +3031,17 @@ async def run_task(task_id: str) -> None:
 
             if is_email_mission_setup_instruction(record.instruction) or is_email_companion_query(record.instruction):
                 answer = await handle_email_intelligence_instruction(record.instruction, chat_id=chat_id)
+                # Compound: the same instruction may also ask for a
+                # calendar event ("...find the Microsoft interview
+                # invitation, and create a calendar event for it...").
+                # The email handler consumes the whole instruction, so
+                # without this the calendar half vanishes silently —
+                # no event, no message, nothing. Only for a mission
+                # setup, not a pure companion query.
+                if is_email_mission_setup_instruction(record.instruction):
+                    cal_section = await handle_compound_calendar(record.instruction, chat_id=chat_id)
+                    if cal_section:
+                        answer = f"{answer}\n\n---\n\n{cal_section}"
             elif is_calendar_query(record.instruction):
                 answer = await handle_calendar_instruction(record.instruction, chat_id=chat_id)
             elif is_continuous_monitoring_directive(
@@ -3013,6 +3053,11 @@ async def run_task(task_id: str) -> None:
                     chat_id=chat_id,
                     history=initial_memory.get("conversation_history", []),
                 )
+            elif is_remember_directive(record.instruction):
+                # Chat-only memory entry (2026-11-18): "remember ..." in
+                # chat stores the fact directly (same store and PII
+                # rejection as the removed form) — no browser task.
+                answer = handle_remember_instruction(record.instruction)
             elif is_dispatch and dispatch_recip:
                 answer = await handle_email_dispatch(
                     record.instruction,
@@ -3025,9 +3070,39 @@ async def run_task(task_id: str) -> None:
             else:
                 provider = _provider_for_config()
                 history = initial_memory.get("conversation_history", [])
+                # Recall: the operator's stored facts must reach the
+                # conversational path too. The browser path gets them via
+                # working_memory, but chat_call only received the
+                # instruction and history — so a recall question ("do you
+                # remember my preferred language?") could never be
+                # answered from memory. Append the recalled facts (and
+                # preferences) to the system prompt; the model is told
+                # to say it does not remember when the fact is absent,
+                # never to invent one.
+                sys_prompt = None
+                mem_lines: list[str] = []
+                prefs = initial_memory.get("user_preferences") or {}
+                if prefs:
+                    mem_lines.append(f"Operator preferences: {json.dumps(prefs)}")
+                facts = initial_memory.get("semantic_facts") or []
+                if facts:
+                    mem_lines.append("Facts the operator asked you to remember:")
+                    for f in facts:
+                        mem_lines.append(
+                            f"- {f.get('category', '')}: {f.get('key', '')} = {f.get('value', '')}"
+                        )
+                if mem_lines:
+                    from .capabilities import SYSTEM_CAPABILITY_PROMPT
+
+                    sys_prompt = (
+                        SYSTEM_CAPABILITY_PROMPT
+                        + "\n\n<remembered-facts (operator-stated, trusted)>\n"
+                        + "\n".join(mem_lines)
+                        + "\nAnswer recall questions from these facts. If the fact is not listed, say you do not remember it — do not invent one.\n</remembered-facts>"
+                    )
                 if hasattr(provider, "chat_call"):
                     try:
-                        answer = provider.chat_call(record.instruction, history=history)
+                        answer = provider.chat_call(record.instruction, history=history, system_prompt=sys_prompt)
                     except Exception:
                         from .providers.mock import MockProvider
                         answer = MockProvider().chat_call(record.instruction, history=history)

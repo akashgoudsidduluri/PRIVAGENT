@@ -21,6 +21,22 @@ from . import db
 from .hub import hub
 
 
+# Track-new-items alternatives, shared by the directive pattern and
+# the handler's own ask detector so the two cannot drift apart.
+# ("track SDE internships and alert me when a new one appears",
+# "watch this page and tell me when a new listing shows up".)
+_TRACK_NEW_ALT = (
+    r"\b(?:monitor|track|watch)\b[^.\n]{0,80}\bnew\b[^.\n]{0,40}\b(?:listing|listings|job|jobs|internship|internships|role|roles|position|positions|product|products|item|items|post|posts|opportunit(?:y|ies)|opening|openings)\b|"
+    r"\b(?:alert|notify|tell|let)\b[^.\n]{0,60}\bnew\b[^.\n]{0,40}\b(?:listing|listings|job|jobs|internship|internships|role|roles|position|positions|product|products|item|items|post|posts|opportunit(?:y|ies)|opening|openings)\b|"
+    r"\bwhen\s+a\s+new\s+one\b[^.\n]{0,40}\bappears?\b|"
+    # Product availability ("alert me when a new iPhone 16 drops on
+    # Amazon"): "new" + a thing + "drops". The plain "price drops"
+    # has no "new", so it cannot match this branch.
+    r"\b(?:alert|notify|tell|let)\b[^.\n]{0,60}\bnew\b[^.\n]{0,40}\bdrops?\b"
+)
+_TRACK_NEW_RE = re.compile(_TRACK_NEW_ALT, re.IGNORECASE)
+
+
 MONITORING_DIRECTIVE_PATTERN = re.compile(
     r"\b(?:continuously\s+monitor|monitor\s+this|monitor\s+(?:the\s+)?(?:product|price|page|site|webpage|item|deal)|track\s+(?:the\s+)?price|alert\s+me\s+if\s+(?:the\s+)?price\s+drops|price\s+drop\s+alert|keep\s+an\s+eye\s+on\s+(?:the\s+)?price)\b|"
     r"\b(?:monitor|track)\s+.*?\b(?:price|drops?|stock|availability|changes?)\b|"
@@ -35,7 +51,8 @@ MONITORING_DIRECTIVE_PATTERN = re.compile(
     # under + a number. The verb requirement keeps a plain statement
     # ("the price is below 5000") from becoming a watch.
     r"\b(?:alert|notify|tell|let)\b[^.\n]{0,60}\b(?:below|under)\s*(?:₹|Rs\.?|INR|\$)?\s*[\d,]+(?:\.\d{1,2})?\b|"
-    r"\b(?:monitor|track|watch)\b[^.\n]{0,60}\b(?:below|under)\s*(?:₹|Rs\.?|INR|\$)?\s*[\d,]+(?:\.\d{1,2})?\b",
+    r"\b(?:monitor|track|watch)\b[^.\n]{0,60}\b(?:below|under)\s*(?:₹|Rs\.?|INR|\$)?\s*[\d,]+(?:\.\d{1,2})?\b|"
+    + _TRACK_NEW_ALT,
     re.IGNORECASE,
 )
 
@@ -144,9 +161,40 @@ def _clean_product_match(text: str) -> str:
     return " ".join(tokens).strip(" -")[:80]
 
 
+_FIND_VERB_RE = re.compile(r"\b(?:find|search|look\s+for|list|show\s+me|get\s+me)\b", re.IGNORECASE)
+_TRACK_VERB_RE = re.compile(r"\b(?:track|watch|monitor|alert|notify)\b", re.IGNORECASE)
+
+
+def _is_compound_find_and_track(text: str) -> bool:
+    """True when the instruction asks to find/search something NOW
+    and also to track it — a compound ask, not a pure tracking ask.
+
+    The find/search verb must come before the tracking verb, and must
+    not sit inside a "when you find ..." / "if you find ..." clause
+    (that phrasing is a future-discovery tracking ask, not a
+    search-now ask). A compound ask goes to the browser task, which
+    searches now and offers the watch; routing it to the handler
+    would create a watch without ever showing results."""
+    if not text:
+        return False
+    fm = _FIND_VERB_RE.search(text)
+    tm = _TRACK_VERB_RE.search(text)
+    if not fm or not tm:
+        return False
+    if fm.start() >= tm.start():
+        return False
+    window = text[max(0, fm.start() - 15):fm.start()].lower()
+    if re.search(r"\b(?:when|if|once|whenever)\b", window):
+        return False
+    return True
+
+
 def is_continuous_monitoring_directive(text: str, history: Optional[list[dict[str, Any]]] = None) -> bool:
     """Check if the user instruction requests continuous background monitoring."""
     if not text:
+        return False
+    # A compound find-now + track ask is not a pure tracking ask.
+    if _is_compound_find_and_track(text):
         return False
     # If it is strictly an email scan mission, let email intelligence handle it
     if re.search(r"\b(?:e-?mails?|inbox|mailbox)\b", text, re.IGNORECASE) and not re.search(r"\b(?:price|product|store|amazon|flipkart|croma)\b", text, re.IGNORECASE):
@@ -199,7 +247,44 @@ def _history_has_monitored_product(history: list[dict[str, Any]]) -> bool:
             return True
         if re.search(r"https?://[^\s\"'<>)]*(?:amazon\.|flipkart\.|croma\.)", content, re.IGNORECASE):
             return True
+        # A listing/search page (internships, jobs) is watchable too:
+        # a bare "yes" to the alert offer after a listing search must
+        # create a new_listings watch, not stay conversational. The
+        # store-URL check above only knows retail hosts.
+        for m in _URL_RE.finditer(content):
+            if any(d in m.group(0).lower() for d in _LISTING_DOMAINS):
+                return True
     return False
+
+
+# Bare pronouns that cannot title a watch ("Track them and alert me"
+# -> "them"). When the extracted title is one of these, derive it
+# from the watch URL instead.
+_PRONOUN_TITLES = {"them", "it", "these", "those", "this", "that", "one", "ones", "me"}
+
+
+def _title_from_listing_url(url: str) -> str:
+    """Human title for a listing URL: the last meaningful path segment,
+    de-slugified (e.g. software-development-internship -> 'software
+    development internship'), else the hostname. ID-like segments
+    (a Flipkart '/p/itm123' product ID) are skipped — they are not a
+    title."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return ""
+    segments = [s for s in (parts.path or "").split("/") if s and s not in ("internships", "jobs", "search")]
+    for slug in reversed(segments):
+        slug = re.sub(r"[?#].*$", "", slug)
+        if re.fullmatch(r"(?:p|itm|pid|dp|product)?\d+", slug):
+            continue
+        if len(slug) < 3:
+            continue
+        title = re.sub(r"[-_]+", " ", slug).strip()
+        if title:
+            return title[:80]
+    host = (parts.hostname or "").removeprefix("www.")
+    return host[:80]
 
 
 # The alert offer appended after a product suggestion / comparison
@@ -307,6 +392,146 @@ def urllib_quote(s: str) -> str:
     return urllib.parse.quote_plus(s)
 
 
+# Sites whose listing / search pages a new-listings watch can target.
+# URLs are extracted whole first, then filtered by domain — anchoring
+# the domain inside the URL regex truncates the match to the domain.
+_URL_RE = re.compile(r"https?://[^\s\"'<>)]+", re.IGNORECASE)
+_LISTING_DOMAINS = ("internshala.com", "linkedin.com", "unstop.com", "amazon.", "flipkart.", "croma.")
+_TRACK_LISTING_TITLE_RE = re.compile(
+    r"\b(?:track|watch|monitor)\b\s+(?:the\s+)?(.+?)(?:\s+and\s+(?:alert|notify|tell)|"
+    r"\s+when\s+a\s+new|\s+on\s+(?:internshala|linkedin|unstop|amazon|flipkart|croma)\b|\s*$)",
+    re.IGNORECASE,
+)
+_NEW_NOUN_RE = re.compile(
+    r"\bnew\s+(?:([A-Za-z][\w\-]*(?:\s+[A-Za-z][\w\-]*){0,3}))\s+(?:appears?|shows?\s+up|comes?\s+up|posted)",
+    re.IGNORECASE,
+)
+
+
+def _is_track_new_ask(instruction: str) -> bool:
+    """True when the instruction asks to watch for NEW items
+    (listings, jobs, internships) rather than a price."""
+    return bool(_TRACK_NEW_RE.search(instruction or ""))
+
+
+def _extract_tracked_listing(instruction: str, history: Optional[list[dict[str, Any]]] = None) -> tuple[str, str]:
+    """Extract the tracked query + a listing/search URL for a
+    track-new-items ask. Returns ("", "") when either is missing —
+    the caller must ask the user instead of inventing a watch.
+    The URL comes from the instruction, else from the most recent
+    listing-site URL in history (the search page the agent already
+    used); a search URL is never constructed from a site name alone,
+    because each site's URL scheme differs and a guessed URL would
+    watch the wrong page."""
+    title = ""
+    m = _TRACK_LISTING_TITLE_RE.search(instruction or "")
+    if m:
+        title = m.group(1).strip(" .").strip()
+    if not title:
+        nm = _NEW_NOUN_RE.search(instruction or "")
+        if nm and nm.group(1).lower() not in ("one", "ones"):
+            title = nm.group(1).strip()
+    if not title and history:
+        for entry in reversed(history):
+            content = str(entry.get("content") or entry.get("message") or "")
+            m2 = _TRACK_LISTING_TITLE_RE.search(content)
+            if m2:
+                title = m2.group(1).strip(" .").strip()
+                break
+    title = re.sub(r"\s+", " ", title)[:80]
+    # A URL pasted in the instruction must not leak into the title
+    # ("Track new SDE internships on https://..." would otherwise
+    # title the watch with the URL itself). Strip URLs, a leading
+    # "new" (the mission title already says "New listings:"), and a
+    # dangling preposition left behind by the URL removal.
+    title = _URL_RE.sub("", title).strip()
+    title = re.sub(r"^new\s+", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\s+(?:on|at|for|in|and|&)\s*$", "", title).strip()
+    title = re.sub(r"\s+", " ", title)[:80]
+
+    url = ""
+    for source in (instruction or "",):
+        for m3 in _URL_RE.finditer(source):
+            if any(d in m3.group(0).lower() for d in _LISTING_DOMAINS):
+                url = m3.group(0)
+                break
+        if url:
+            break
+    if not url and history:
+        for entry in reversed(history):
+            content = str(entry.get("content") or entry.get("message") or "")
+            for m4 in _URL_RE.finditer(content):
+                if any(d in m4.group(0).lower() for d in _LISTING_DOMAINS):
+                    url = m4.group(0)
+                    break
+            if url:
+                break
+    # A bare pronoun title ("Track them and alert me" -> "them") cannot
+    # name a watch. Derive it from the URL the watch will check.
+    if url and (not title or title.lower() in _PRONOUN_TITLES):
+        title = _title_from_listing_url(url)
+    return title, url
+
+
+def _create_new_listings_watch(
+    listing_title: str,
+    listing_url: str,
+    chat_id: Optional[str],
+    db_path: Optional[str],
+) -> str:
+    """Insert a new_listings mission (hourly) and return its confirmation.
+    The watch's checks run through the same egress gate as browsing: if
+    the site is not on the allow-list, the checks would fail forever,
+    so refuse honestly instead of creating a watch that can never fire."""
+    from .allowlist import url_allowed
+    from . import config as _config
+
+    if not url_allowed(listing_url, _config.ALLOWED_DOMAINS):
+        host = urlsplit(listing_url).hostname or listing_url
+        return (
+            f"I can't watch {host} yet — it is not on the allowed-domains list, "
+            f"so the watch's checks would be blocked. Add {host} to "
+            f"PRIVAGENT_ALLOWED_DOMAINS in backend/.env and restart the backend, "
+            f"then ask me again and I'll set up the watch."
+        )
+    mission_id = str(uuid.uuid4())
+    now = time.time()
+    with db.get_connection(db_path) as conn:
+        conn.execute(
+            """INSERT INTO monitoring_missions
+            (id, conversation_id, title, target_url, trigger_type, schedule_cron, interval_seconds,
+             condition_type, condition_params, status, created_at, next_run_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
+            (
+                mission_id,
+                chat_id or "default",
+                f"New listings: {listing_title}",
+                listing_url,
+                "interval",
+                None,
+                3600,
+                "new_listings",
+                json.dumps({"target": listing_title}),
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+    try:
+        hub.spawn(hub.broadcast_control_state())
+    except Exception:
+        pass
+    return (
+        f"### 👀 New-listings watch active\n\n"
+        f"I'll check **{listing_title}** every hour and alert you right here in this conversation when a new one appears.\n\n"
+        f"• **Status:** Active — alerts land in this conversation\n"
+        f"• **Watching:** [{listing_title} ↗]({listing_url})\n"
+        f"• **Check frequency:** Every hour\n"
+        f"• **Alert:** The moment a new listing shows up\n\n"
+        f"<!-- privagent-watch: {mission_id} -->"
+    )
+
+
 async def handle_continuous_monitoring_instruction(
     instruction: str,
     chat_id: Optional[str] = None,
@@ -315,8 +540,38 @@ async def handle_continuous_monitoring_instruction(
 ) -> str:
     """Register a persistent continuous monitoring mission and return natural departure handoff."""
     db.init_db(db_path)
+    # Price signals are read first: a price ask must never become a
+    # listing watch. Dispatch order is daily -> below -> new_listings
+    # -> price_drop, so the handler body matches the documented order.
+    daily = parse_daily_time(instruction)
+    below = parse_below_price(instruction)
+    # Track-new-items ("track SDE internships and alert me when a
+    # new one appears"): a new_listings mission, not a price watch.
+    # Hourly interval — listing pages change slowly; a 5-minute tick
+    # would burn the scheduler and the sites for no gain.
+    if _is_track_new_ask(instruction) and daily is None and below is None:
+        listing_title, listing_url = _extract_tracked_listing(instruction, history=history)
+        if not listing_title or not listing_url:
+            return (
+                "I can watch for new listings, but I need the search page to watch. "
+                "Paste the search results URL (for example, the Internshala search page), "
+                "or ask me to search for the listings first and I'll offer the watch after."
+            )
+        return _create_new_listings_watch(listing_title, listing_url, chat_id, db_path)
     product_title, target_url = _extract_monitored_product(instruction, history=history)
     if not product_title:
+        # Bare "yes" answering the alert offer after a listing search
+        # (e.g. internships): the history carries the search page, so
+        # the watch is a new_listings one, not a price watch. This
+        # branch runs only when there is NO product in the history —
+        # a retail suggestion (Fit3 on Flipkart) has a brand+model, so
+        # it takes the price-watch path below. The detector only routes
+        # here when the offer marker is in the last assistant message
+        # and the history has a tracked listing.
+        if _is_bare_affirmative(instruction) and daily is None and below is None:
+            listing_title, listing_url = _extract_tracked_listing(instruction, history=history)
+            if listing_title and listing_url:
+                return _create_new_listings_watch(listing_title, listing_url, chat_id, db_path)
         # No product and no store URL anywhere: do NOT create a watch
         # for "your last suggestion" on a store homepage. Ask which
         # product to watch instead.
@@ -333,9 +588,8 @@ async def handle_continuous_monitoring_instruction(
     # a cron mission that REPORTS the price each morning, instead of a
     # 5-minute interval mission that only fires on a drop. The cron is
     # UTC (the scheduler stores five UTC fields); parse_daily_time
-    # converts the user's IST morning into it.
-    daily = parse_daily_time(instruction)
-    below = parse_below_price(instruction)
+    # converts the user's IST morning into it. (daily / below were
+    # already read at the top of this handler for dispatch order.)
     if daily:
         cron, display = daily
         trigger_type, schedule_cron, interval_sec = "cron", cron, 86400
@@ -383,21 +637,28 @@ async def handle_continuous_monitoring_instruction(
         conn.commit()
 
     # Inform connected workspace clients (alerts land in the
-    # conversation and in the Control Center monitoring view).
+    # conversation the watch was created in).
     try:
         hub.spawn(hub.broadcast_control_state())
     except Exception:
         pass
 
+    # The watch marker is machine-readable: the workspace strips it
+    # before rendering and turns it into an interactive watch card
+    # (Pause / Resume / Cancel / View changes) in the conversation.
+    # Monitoring is chat-only since 2026-11-18 — there is no monitor
+    # form or scheduled-missions page anymore, so the confirmation
+    # must not point at the Control Center dashboard.
     return (
         f"### 🎯 Continuous Price Monitoring Activated\n\n"
         f"I've configured continuous background price tracking for **{product_title}**.\n\n"
-        f"• **Status:** Active on your Control Center dashboard ([http://localhost:5173](http://localhost:5173))\n"
+        f"• **Status:** Active — I'll post an alert right here in this conversation the moment anything changes\n"
         f"• **Monitored Target:** [{product_title} Listing ↗]({target_url})\n"
         f"{cadence_line}"
         f"{alert_line}"
         f"• **Persistence:** Stored in SQLite — checks continue automatically even if you navigate away\n\n"
         f"---\n\n"
-        f"*I've got the watch running in the background — I'll post an alert right here in this conversation the moment anything changes. Catch you later, buddy!* 👋"
+        f"*I've got the watch running in the background — I'll post an alert right here in this conversation the moment anything changes. Catch you later, buddy!* 👋\n"
+        f"<!-- privagent-watch: {mission_id} -->"
     )
 

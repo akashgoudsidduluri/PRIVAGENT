@@ -136,14 +136,20 @@ async def test_continuous_monitoring_execution(tmp_path):
         db_path=test_db,
     )
     assert "Continuous Price Monitoring Activated" in resp
-    assert "5173" in resp  # the Control Center dashboard link stays
+    # Chat-only monitoring (2026-11-18): the Missions page is gone, so
+    # the confirmation must not link at the Control Center dashboard.
+    # The watch lives in this conversation, and the marker below is
+    # what the workspace turns into the interactive watch card.
+    assert "5173" not in resp
+    assert "Control Center dashboard" not in resp
+    assert "privagent-watch:" in resp
     assert "buddy" in resp.lower()
     assert "see you later" in resp.lower() or "catch you later" in resp.lower()
     # Fix 4 (live failure 2026-11-18 02:07 IST): the agent offered to
     # "keep a watch running on port 5173 and ping you". Port 5173 is
     # only the workspace web UI's address, never the monitoring
     # channel, and there is no phone ping — alerts land in the
-    # workspace conversation and the monitoring view.
+    # workspace conversation the watch was created in.
     assert "port 5173" not in resp.lower()
     assert "ping you" not in resp.lower()
     assert "right here in this conversation" in resp

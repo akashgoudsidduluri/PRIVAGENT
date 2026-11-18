@@ -216,6 +216,12 @@ def _save_checkpoint_defensive(
         # raise here and this helper would swallow it, silently
         # dropping every checkpoint. Init first; it is idempotent.
         db.init_db()
+        # Attachment metadata is ephemeral: it tells the planner a file
+        # was attached, but the file itself expires after 10 minutes
+        # and its name must not persist in SQLite. Strip it from the
+        # saved copy only — the live working_memory keeps it, because
+        # the planner still needs it on later steps.
+        savable_memory = {k: v for k, v in working_memory.items() if k != "attachment"}
         db.save_task_checkpoint(
             task_id=task_id,
             conversation_id=conversation_id or "default",
@@ -223,7 +229,7 @@ def _save_checkpoint_defensive(
             step_index=steps_done,
             last_url=raw_url or "",
             history=history,
-            working_memory=working_memory,
+            working_memory=savable_memory,
         )
     except Exception:
         pass

@@ -91,6 +91,27 @@ def _triggered(condition: str, params: dict, before: dict, after: dict) -> tuple
         if new is None:
             return False, "Price unavailable"
         return new < threshold, f"Price below ₹{threshold:g} (now ₹{new:g})"
+    if condition == "new_listings":
+        # New items on a listing / search page (jobs, internships,
+        # products): fires when accessible names appear that were not
+        # in the previous snapshot. The caller only evaluates this
+        # condition when the state changed, so the first run only
+        # baselines and never alerts. Reordering alone can surface a
+        # name the snapshot window dropped, so the summary names the
+        # new items for the human to judge.
+        before_names = {item.casefold() for item in before.get("elements") or []}
+        if not before_names:
+            # The previous snapshot had no items (login wall, empty
+            # results, failed load): do NOT treat the first non-empty
+            # snapshot as "everything is new" — baseline it instead,
+            # or the watch fires once on every existing listing.
+            return False, "Baseline: no prior listings to compare"
+        new_items = [item for item in (after.get("elements") or []) if item.casefold() not in before_names]
+        if not new_items:
+            return False, "No new listings"
+        shown = ", ".join(new_items[:3])
+        extra = f" and {len(new_items) - 3} more" if len(new_items) > 3 else ""
+        return True, f"New listings: {shown}{extra}"
     if condition == "regex":
         pattern = str(params.get("pattern") or "")
         # A narrow, useful regex subset avoids catastrophic backtracking in

@@ -670,6 +670,20 @@ CALENDAR_DIRECTIVE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Explicit UI navigation — the operator asked to SEE the site, so the
+# browser owns it even when a connector could answer the same question.
+# Mirrors connector_router._EXPLICIT_NAVIGATION_RE. Without this,
+# "Open Google Calendar" is swallowed by CALENDAR_DIRECTIVE_PATTERN
+# (it contains "google calendar") and never reaches the browser,
+# while "Open Gmail" and "Open Google Drive" correctly route there.
+EXPLICIT_NAVIGATION_PATTERN = re.compile(
+    r"\b(?:open|go\s+to|navigate\s+to|visit|browse\s+to|show\s+me)\s+"
+    r"(?:the\s+)?(?:gmail(?:\s+app|\s+website|\s+inbox)?|google\s+(?:calendar|drive)|"
+    r"my\s+inbox|my\s+google\s+drive|drive\s+app)\b"
+    r"|\bopen\s+(?:my\s+)?inbox\b",
+    re.IGNORECASE,
+)
+
 OFFICIAL_DOCS_TRIGGER = re.compile(
     r"\b(?:open|navigate\s+to|go\s+to|browse\s+to)\s+(?:the\s+)?official\s+.+\s+(?:docs|documentation|website|page|site)\b",
     re.IGNORECASE,
@@ -703,7 +717,20 @@ SHOPPING_DISCOVERY_TRIGGER = re.compile(
 
 TRAVEL_SEARCH_TRIGGER = re.compile(
     r"\b(?:find|search(?:\s+for)?|check|book|look\s+up)\s+(?:flights?|hotels?|trains?|cabs?|trips?|tickets?)\s+(?:from|to|in|between|for)\b"
-    r"|\b(?:flight|hotel|train)\s+(?:prices?|fares?|rates?|booking)\b",
+    r"|\b(?:flight|hotel|train)\s+(?:prices?|fares?|rates?|booking)\b"
+    # Trip planning: "Plan Hyderabad to Delhi next month: cheapest
+    # flights, hotels under 3000, and give me the itinerary doc."
+    # The verb is "plan" and the travel nouns come later in the
+    # instruction (after the route), so neither of the two branches
+    # above matches — the instruction fell through to NON_BROWSER and
+    # the conversational fast-path answered with clarifying questions
+    # instead of searching. A "plan" followed by a travel noun in the
+    # same instruction is a browser task.
+    r"|\bplan\b[^.]{0,160}?\b(?:trips?|itinerary|flights?|hotels?|vacation|holiday)\b"
+    # "cheapest flights" / "hotels under 3000" imply a live search —
+    # the cheapest price cannot be known without one.
+    r"|\b(?:cheapest|lowest|best)\s+(?:flights?|hotels?|trains?|tickets?|fares?)\b"
+    r"|\b(?:flights?|hotels?|trains?)\s+(?:under|below|within)\s+(?:rs\.?|₹|\$|inr)?\s*\d",
     re.IGNORECASE,
 )
 
@@ -870,12 +897,39 @@ def classify_intent(
     except Exception:
         pass
 
-    # 4d. Check for Google Calendar directive
+    # 4d. Explicit navigation wins over the calendar directive: "Open
+    # Google Calendar" means show the site, not query the API.
+    if EXPLICIT_NAVIGATION_PATTERN.search(text):
+        return IntentClassification(
+            intent=TaskIntent.NEW_BROWSER_TASK,
+            confidence=0.99,
+            reason="explicit navigation to a Google app — operator asked to see the site",
+        )
+
+    # 4e. Check for Google Calendar directive
     if CALENDAR_DIRECTIVE_PATTERN.search(text):
         return IntentClassification(
             intent=TaskIntent.NON_BROWSER,
             confidence=0.99,
             reason="Google Calendar directive",
+            operation_type=ResearchOperationType.NORMAL_CONVERSATION,
+        )
+
+    # 4f. "How do I / how to" questions are advice requests, not tasks:
+    # "How do I plan a trip to Delhi?" asks for the method, it does not
+    # ask the agent to plan the trip. This sits before the email /
+    # webmail trigger (step 5) and the browser triggers (step 9):
+    # without it, "How do I check my email?" opens Gmail and "How do
+    # I plan a trip?" starts browsing, instead of answering.
+    if re.match(
+        r"^\s*how\s+(?:do\s+i|can\s+i|to|does\s+one|should\s+i|do\s+you)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return IntentClassification(
+            intent=TaskIntent.NON_BROWSER,
+            confidence=0.9,
+            reason="how-to question asks for advice, not a browser task",
             operation_type=ResearchOperationType.NORMAL_CONVERSATION,
         )
 
