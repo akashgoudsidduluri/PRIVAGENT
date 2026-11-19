@@ -159,7 +159,7 @@ def fetch_and_validate_image_url(
             "User-Agent": "PrivAgentResearchBot/1.0 (https://github.com/privagent; contact@privagent.local)",
             "Accept": "image/avif,image/webp,image/apng,image/png,image/jpeg,image/*,*/*;q=0.8",
         }
-        with httpx.Client(timeout=timeout, follow_redirects=False) as client:
+        with httpx.Client(timeout=timeout, follow_redirects=False, trust_env=False) as client:
             for _ in range(max_redirects + 1):
                 resp = client.get(
                     current_url,

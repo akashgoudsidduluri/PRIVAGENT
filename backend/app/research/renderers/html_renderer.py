@@ -294,7 +294,12 @@ class HtmlRenderer(BaseRenderer):
 
         title_esc = html.escape(pkg.topic.title)
         obj_esc = html.escape(pkg.topic.objective)
-        scope_esc = html.escape(pkg.topic.scope or "Comprehensive multi-source research investigation")
+        scope_text = pkg.topic.scope or (
+            "Comprehensive multi-source research investigation"
+            if pkg.sources
+            else "No external sources consulted — findings unverified"
+        )
+        scope_esc = html.escape(scope_text)
 
         doc_parts: list[str] = [
             "<!DOCTYPE html>",

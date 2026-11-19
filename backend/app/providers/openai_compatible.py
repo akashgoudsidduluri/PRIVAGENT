@@ -160,7 +160,7 @@ class OpenAICompatibleProvider:
         self._model = (model or "").strip()
         self._timeout_s = timeout_s
         self.provider_name = provider_name
-        self._client = httpx.Client(timeout=timeout_s, transport=transport)
+        self._client = httpx.Client(timeout=timeout_s, transport=transport, trust_env=False)
         # Telemetry for the UI and audit logs
         self.last_usage: dict[str, Any] = {}
         self.last_latency_ms: Optional[int] = None

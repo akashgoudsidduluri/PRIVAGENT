@@ -1219,6 +1219,13 @@ EMAIL_TRIGGER = re.compile(
 )
 
 EMAIL_SCAN_MISSION_PATTERN = re.compile(
+    # "check/scan/monitor my gmail/email/inbox every N minutes (or every
+    # hour/day)": a monitoring setup, not a one-off read. Must sit before
+    # the EMAIL_TRIGGER step, which would otherwise send any "check my
+    # gmail" to the browser. Cadence may be numbered or bare ("every
+    # hour"); "second" is excluded from the bare form. The mailbox may
+    # carry ".com" ("outlook.com"/"gmail.com").
+    r"\b(?:check|scan|monitor)\s+(?:my\s+)?(?:e-?mails?|mail|inbox|gmail(?:\.com)?|outlook(?:\.com)?)\b[^.]{0,60}?\bevery\s+(?:\d+\s*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?)|(?:hours?|hrs?|minutes?|mins?|days?))\b|"
     r"\b(?:continuously\s+scan|monitor|moinitor|scan\s+and\s+clean|clean\s+up\s+my|cleanup\s+my|scan\s+my)\s+(?:my\s+)?(?:e-?mails?|mailbox|inbox)\b|"
     r"\b(?:identify\s+unnecessary\s+emails?|remove\s+unnecessary|detect\s+important\s+emails?|email\s+monitoring)\b|"
     r"\b(?:what\s+did\s+you\s+delete|why\s+did\s+you\s+delete|show\s+me\s+important\s+emails?|emails?\s+i\s+haven'?t\s+replied|what\s+deadlines|today'?s?\s+email\s+summary|pause\s+email|resume\s+email)\b|"
@@ -1247,6 +1254,8 @@ CALENDAR_DIRECTIVE_PATTERN = re.compile(
     r"\bcalendar\s+(?:status|events?|schedule)\b|"
     r"\b(?:upcoming|next)\s+(?:meetings?|events?|appointments?|calls?)\b|"
     r"\b(?:schedule|create|add|book)\s+(?:an?\s+)?(?:event|meeting|invite|appointment|call)\b|"
+    # "add it / the Microsoft interview to my calendar".
+    r"\b(?:add|put)\s+\S+[^.]{0,50}?\b(?:to|on|onto)\s+(?:my\s+)?calendar\b|"
     r"\bgoogle\s+calendar\b",
     re.IGNORECASE,
 )

@@ -70,7 +70,7 @@ class OllamaProvider:
 
         if not egress_allowed(f"{self._base_url}/api/chat"):
             raise ProviderUnavailable(f"egress blocked: Ollama at {self._base_url} is not allowed")
-        self._client = client if client is not None else httpx.Client(timeout=timeout_s)
+        self._client = client if client is not None else httpx.Client(timeout=timeout_s, trust_env=False)
         # Telemetry for the UI and audit logs (same shape as Groq).
         self.last_usage: dict[str, Any] = {}
         self.last_latency_ms: Optional[int] = None

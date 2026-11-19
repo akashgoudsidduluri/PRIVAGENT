@@ -1172,9 +1172,54 @@ def test_interval_detector_does_not_hijack_non_email_watches():
     assert is_continuous_monitoring_directive("monitor this product every 5 minutes") is True
     assert is_email_interval_change_instruction("refresh this page every 10 minutes") is False
     assert is_email_interval_change_instruction("check my flight status every 5 minutes") is False
+    # Chat-app monitoring is not email monitoring: "monitor my Microsoft
+    # Teams messages every 5 minutes" must not silently retime the email
+    # mission (same for slack / whatsapp / telegram / discord).
+    assert is_email_interval_change_instruction("monitor my Microsoft Teams messages every 5 minutes") is False
+    assert is_email_interval_change_instruction("monitor my whatsapp messages every hour") is False
+    assert is_email_interval_change_instruction("monitor my slack messages every 5 minutes") is False
     # The real email interval change still works.
     assert is_email_interval_change_instruction("check for every 5 minutes") is True
-    assert is_email_interval_change_instruction("check my email every 5 minutes") is True
+    # A full setup sentence that states a frequency is NOT an interval
+    # change — setup handles its own frequency (see the detector's
+    # docstring). "check my email every 5 minutes" now routes to setup;
+    # the re-bind test below proves the frequency still lands.
+    assert is_email_interval_change_instruction("check my email every 5 minutes") is False
+
+
+@pytest.mark.asyncio
+async def test_setup_with_frequency_rebinds_active_mission(email_db, mailbox, monkeypatch):
+    """Setup wins over the interval-change detector for a full setup
+    sentence — so the setup handler must apply the stated frequency on
+    re-bind, or 'check my email every 5 minutes' would silently keep
+    the old interval on an active mission."""
+    from app.email_intelligence import sync_engine
+
+    monkeypatch.setattr(sync_engine, "_demo_mailbox", mailbox)
+
+    await handle_email_intelligence_instruction("Monitor my email every 60 minutes", db_path=email_db)
+    missions = db.list_email_missions(db_path=email_db)
+    assert len(missions) == 1
+    assert missions[0]["frequency_seconds"] == 3600
+
+    await handle_email_intelligence_instruction("check my email every 5 minutes", db_path=email_db)
+    missions = db.list_email_missions(db_path=email_db)
+    assert len(missions) == 1
+    assert missions[0]["frequency_seconds"] == 300
+
+
+def test_parse_frequency_seconds_bare_cadence():
+    """'every hour' / 'every day' mean one unit; 'every second Tuesday'
+    is a weekday, not a 1-second interval."""
+    from app.email_intelligence.mission_setup import parse_frequency_seconds
+
+    assert parse_frequency_seconds("check my email every hour") == 3600
+    assert parse_frequency_seconds("check my email every day") == 86400
+    assert parse_frequency_seconds("check my email every minute") == 60
+    assert parse_frequency_seconds("check my email every 5 minutes") == 300
+    assert parse_frequency_seconds("check my email every 2 days") == 86400  # clamped to 24h
+    assert parse_frequency_seconds("check my email every second Tuesday") is None
+    assert parse_frequency_seconds("check my email") is None
 
 
 def test_question_does_not_authorize_deletion():

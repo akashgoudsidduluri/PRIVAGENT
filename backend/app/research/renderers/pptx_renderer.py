@@ -203,7 +203,12 @@ class PptxRenderer(BaseRenderer):
         else:
             p_sc = first_p
 
-        p_sc.text = f"Research Scope: {pkg.topic.scope or 'Comprehensive multi-source technical investigation'}"
+        scope_text = pkg.topic.scope or (
+            "Comprehensive multi-source technical investigation"
+            if pkg.sources
+            else "No external sources consulted — findings unverified"
+        )
+        p_sc.text = f"Research Scope: {scope_text}"
         p_sc.font.name = "Segoe UI"
         p_sc.font.size = Pt(11.5)
         p_sc.font.bold = True
@@ -646,7 +651,7 @@ class PptxRenderer(BaseRenderer):
         if not ordered_sources:
             tb_ref = s_ref.shapes.add_textbox(Inches(0.8), Inches(1.7), Inches(11.733), Inches(4.8))
             p_r = tb_ref.text_frame.paragraphs[0]
-            p_r.text = "All architectural findings synthesized from local verified domain sources and primary specifications."
+            p_r.text = "No external sources were consulted or cited for this deliverable. Findings are compiled from conversational context without verified external citations."
             p_r.font.name = "Segoe UI"
             p_r.font.size = Pt(11)
             p_r.font.color.rgb = SLATE
