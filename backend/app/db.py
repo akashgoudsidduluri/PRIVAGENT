@@ -113,8 +113,50 @@ def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
     return conn
 
 
+#: sqlite3 errors that mean "another process is initialising the same
+#: database right now", not "the schema is broken". Uvicorn --reload
+#: can start two processes that run init_db at the same time (a reload
+#: storm after a big checkout), and SQLite DDL is check-then-act, so a
+#: concurrent init can surface any of these. Retrying is safe: a
+#: genuinely broken schema still fails the same way on every attempt.
+_TRANSIENT_INIT_ERRORS = (
+    "duplicate column",
+    "no such column",
+    "database schema has changed",
+    "database is locked",
+    "database table is locked",
+)
+
+
 def init_db(db_path: Optional[str] = None) -> None:
-    """Initialize SQLite tables if they do not exist."""
+    """Initialize SQLite tables if they do not exist.
+
+    Retries the whole init a few times on transient concurrency
+    errors (see _TRANSIENT_INIT_ERRORS): two backend processes
+    starting at once must not be able to take startup down. Any
+    other error, or a transient error that persists across all
+    attempts, is raised unchanged.
+    """
+    last_error: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            _init_db_once(db_path)
+            return
+        except sqlite3.OperationalError as exc:
+            last_error = exc
+            if not any(s in str(exc) for s in _TRANSIENT_INIT_ERRORS):
+                raise
+            logger.warning(
+                "db: init_db attempt %d failed (%s); retrying",
+                attempt + 1, exc,
+            )
+            time.sleep(0.2 * (attempt + 1))
+    assert last_error is not None
+    raise last_error
+
+
+def _init_db_once(db_path: Optional[str] = None) -> None:
+    """One init attempt: create tables, add missing columns, migrate OAuth."""
     with get_connection(db_path) as conn:
         conn.executescript(
             """
@@ -470,7 +512,14 @@ def init_db(db_path: Optional[str] = None) -> None:
             existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
             for name, spec in columns.items():
                 if name not in existing:
-                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {spec}")
+                    try:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {spec}")
+                    except sqlite3.OperationalError as exc:
+                        # Two processes can pass the PRAGMA check
+                        # together; the loser sees "duplicate column
+                        # name". The column is there now, so continue.
+                        if "duplicate column" not in str(exc):
+                            raise
 
         # v1 -> v2 OAuth connections: the v1 table was PRIMARY KEY
         # (user_id, provider) — one account per provider per user. v2
