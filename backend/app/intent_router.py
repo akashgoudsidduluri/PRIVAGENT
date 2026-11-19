@@ -168,7 +168,11 @@ FOLLOW_UP_TRIGGERS_RE = re.compile(
 )
 
 EXPORT_DIRECTIVE_PATTERN = re.compile(
-    r"^(?:(?:nice|good|great|awesome|cool|thanks|thank\s+you|well|ok|okay|hey|hi|yo|hello|bro|dude|man|please|pls)\b(?:\s*,\s*|\s+)*(?:but|however|now|then|so)?\s*)*"
+    # Leading conversational opener ("or atleast give a pdf
+    # report..." — "or" / "at least" are not greetings, so the old
+    # pattern anchored at ^ failed on the first word).
+    r"^(?:(?:or|so|and|but)\s+)?(?:at\s+least\s+|atleast\s+)?"
+    r"(?:(?:nice|good|great|awesome|cool|thanks|thank\s+you|well|ok|okay|hey|hi|yo|hello|bro|dude|man|please|pls)\b(?:\s*,\s*|\s+)*(?:but|however|now|then|so)?\s*)*"
     r"(?:(?:can\'t|cant|can|could|would)\s+(?:you|u)\s+)?(?:please\s+|pls\s+)?"
     r"(?:(?:now|then|also|just)\s+)?"
     r"(?:(?:can|could|may)\s+(?:i|we)\s+(?:get|have|receive)|(?:i|we)\s+(?:want|need|would\s+like)|generate|create|export|save|compile|download|produce|make|render|output|convert|turn|give|format|put|send|prepare|provide)\s+"
@@ -178,8 +182,27 @@ EXPORT_DIRECTIVE_PATTERN = re.compile(
     r"(?:(?:a|an|the)\s+)?"
     r"(?:(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|twelve|12)[- ](?:page|slide)s?\s+)?"
     r"(pdf|docx|word(?:\s+doc(?:ument)?)?|pptx|powerpoint|presentation|slides?|slide\s*deck|xlsx|excel(?:\s+sheet)?|spreadsheet|workbook|csv|markdown|html|report|document)\b"
-    r"(?:\s+(?:file|document|deck|sheet|format))?"
-    r"(?:\s+(?:and\s+)?(?:also\s+)?(?:add|include|with)\s+[^\n]+)?"
+    # The format's own noun ("pdf report", "word document", "excel
+    # sheet"): "report" was missing, so "give a pdf report" failed
+    # even though "pdf" itself matched.
+    r"(?:\s+(?:file|document|deck|sheet|format|report))?"
+    # A pronoun topic reference ("about this", "about this topic",
+    # "of the previous report"): only pronouns (optionally followed by
+    # a deliverable noun) / the-above-style references, never a
+    # free-form subject. An explicit new subject ("about Quantum
+    # Mechanics") must NOT match here — it falls through to new
+    # research + deliverable instead of being treated as an export
+    # of existing research. A bare pronoun without its noun left the
+    # noun behind ("give a pdf report about this research" decomposed
+    # to the garbage query "research"), so the noun is part of the
+    # clause.
+    r"(?:\s+(?:about|of|on|for)\s+(?:(?:this|that|it)(?:\s+(?:topic|research|report|analysis|findings|results|document|content|package))?|the\s+(?:above|previous|prior|same)(?:\s+(?:topic|research|report|analysis|findings|results|document|content|package))?))?"
+    # A trailing requirement clause (", that should include images
+    # related to it too", " with images"): the old tail only allowed
+    # an (add|include|with) clause and a few closers, so anything
+    # after the format killed the match.
+    r"(?:\s*,?\s*(?:that\s+)?(?:should\s+)?(?:include|with|having|add|containing)\s+[^\n]+)?"
+    r"(?:\s+(?:(?:and|but)\s+)?(?:also\s+)?(?:add|include|with)\s+[^\n]+)?"
     r"(?:\s+(?:bro|man|dude|pls|please|for\s+me|thanks|thank\s+you|of\s+this|from\s+this|instead|of\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|twelve|12)\s+slides?))?[!.\s]*$",
     re.IGNORECASE,
 )

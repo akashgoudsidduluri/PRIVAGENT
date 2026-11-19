@@ -22,11 +22,13 @@ import pytest
 
 from app.intent_router import (
     IntentClassification,
+    ResearchOperationType,
     TaskIntent,
     classify_intent,
     detect_deliverable_type,
     detect_requested_format,
     extract_research_topic,
+    is_export_deliverable_directive,
     is_research_or_deliverable_request,
 )
 from app.research.models import (
@@ -485,3 +487,122 @@ def test_preserves_continuation_and_user_tab_intent():
     assert res_tab.intent == TaskIntent.USE_EXISTING_USER_TAB
     assert res_tab.is_browser is True
 
+
+
+# ---------------------------------------------------------------------------
+# 8. Export-directive detection for "give a pdf report" follow-ups
+#    (live failure 2026-11-19: "or atleast give a pdf report about
+#    this, that should include images related to it too" was not
+#    recognised as a pure export, so it became a fresh research task
+#    with the garbage query "atleast give about should include images
+#    related to", Google returned askfilo.com, and the task died on
+#    the domain allow-list.)
+# ---------------------------------------------------------------------------
+
+def test_export_directive_pdf_report_followup_phrasings():
+    """The reported follow-up and its variants are pure export directives."""
+    for text in [
+        "or atleast give a pdf report about this, that should include images related to it too",
+        "atleast give a pdf report about this, that should include images related to it too",
+        "give a pdf report about this, that should include images related to it too",
+        "give a pdf report about this",
+        "give a pdf report",
+        "generate a pdf report",
+        "give me a pdf report of the previous research",
+        # Pronoun + deliverable noun ("about this topic"): a bare
+        # pronoun without its noun left the noun behind and decomposed
+        # to the garbage query "research".
+        "give a pdf report about this topic",
+        "give a pdf report about this research",
+        "give a pdf report about that report",
+        "give a pdf report on this topic",
+        "give a pdf report for this",
+        "give a pdf report about this but also add a table",
+    ]:
+        is_exp, fmt, _ = is_export_deliverable_directive(text)
+        assert is_exp is True, text
+        assert fmt == "pdf", text
+
+
+def test_export_directive_pdf_report_routes_to_export_existing_package():
+    """With a prior research topic in context, the follow-up compiles
+    the PDF from existing research — no new browser search, no garbage
+    query, no askfilo.com detour."""
+    ctx = {
+        "research_topic": "Quantum Mechanics similarities with life",
+        "conversation_history": [
+            {"role": "user", "content": 'so i have to submit a research paper on topic: "Quantum Mechanics similarities with life?" so can you research about this topic online'}
+        ],
+    }
+    res = classify_intent(
+        "or atleast give a pdf report about this, that should include images related to it too",
+        context=ctx,
+    )
+    assert res.intent == TaskIntent.NON_BROWSER
+    assert res.operation_type == ResearchOperationType.EXPORT_EXISTING_PACKAGE
+    assert res.requested_format == "pdf"
+    assert res.research_topic == "Quantum Mechanics similarities with life"
+
+
+def test_export_directive_explicit_new_topic_is_not_pure_export():
+    """An explicit NEW subject ("about Quantum Mechanics") must NOT be
+    treated as an export of existing research — it falls through to
+    new research + deliverable instead."""
+    for text in [
+        "give a pdf report about Quantum Mechanics similarities with life",
+        "give a pdf report about Quantum Mechanics similarities with life, include images",
+        # A pronoun reference followed by an explicit new subject is
+        # still a new research task, not an export of existing research.
+        "give a pdf report about this topic on quantum biology",
+        "give a pdf report about this research on transformers",
+        "give a pdf report about that report on batteries",
+        "give a pdf report about this but also research quantum biology",
+    ]:
+        is_exp, _, _ = is_export_deliverable_directive(text)
+        assert is_exp is False, text
+
+
+def test_export_directive_pronoun_noun_followup_never_searches_garbage():
+    """Audit find: "give a pdf report about this research" used to
+    classify as NEW_RESEARCH and decompose to the garbage query
+    "research". It must now route to EXPORT_EXISTING_PACKAGE and
+    decompose to no query at all when there is no prior topic."""
+    from app.website_resolver import WebsiteResolver
+
+    ctx = {
+        "research_topic": "Quantum Mechanics similarities with life",
+        "conversation_history": [
+            {"role": "user", "content": 'so i have to submit a research paper on topic: "Quantum Mechanics similarities with life?"'}
+        ],
+    }
+    for text in [
+        "give a pdf report about this research",
+        "give a pdf report about this topic",
+        "give a pdf report about this but also add a table",
+    ]:
+        res = classify_intent(text, context=ctx)
+        assert res.intent == TaskIntent.NON_BROWSER, text
+        assert res.operation_type == ResearchOperationType.EXPORT_EXISTING_PACKAGE, text
+        assert res.requested_format == "pdf", text
+        assert WebsiteResolver().decompose_search_queries(text, context={}) == [], text
+
+
+def test_decompose_pdf_followup_uses_prior_topic_not_garbage():
+    """A pdf follow-up about 'this' must decompose to the prior topic,
+    never to the scaffolding words. With no prior topic there is no
+    search at all (the export handler then says honestly that no prior
+    research exists) instead of a garbage Google query."""
+    from app.website_resolver import WebsiteResolver
+
+    resolver = WebsiteResolver()
+    text = "or atleast give a pdf report about this, that should include images related to it too"
+
+    with_prior = resolver.decompose_search_queries(
+        text, context={"research_topic": "Quantum Mechanics similarities with life"}
+    )
+    assert with_prior, "expected queries for the prior topic"
+    assert with_prior[0] == "Quantum Mechanics similarities with life", with_prior
+    assert not any("atleast" in q for q in with_prior), with_prior
+
+    without_prior = resolver.decompose_search_queries(text, context={})
+    assert without_prior == [], without_prior
