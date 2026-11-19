@@ -95,7 +95,7 @@ def _oauth_credential(provider: str, kind: str) -> str:
 
 class OAuthManager:
     def __init__(self, client: httpx.Client | None = None, auto_hydrate: bool | None = None):
-        self._client = client or httpx.Client(timeout=12, follow_redirects=False)
+        self._client = client or httpx.Client(timeout=12, follow_redirects=False, trust_env=False)
         self._pending: dict[str, tuple[float, str, str]] = {}
         self._tokens: dict[str, str] = {}
         self._refresh_tokens: dict[str, str] = {}

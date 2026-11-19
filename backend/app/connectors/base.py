@@ -22,7 +22,7 @@ class NativeConnector:
 
     def __init__(self, token: str | None = None, *, client: httpx.Client | None = None, refresh_hook: Any = None):
         self._token = token
-        self._client = client or httpx.Client(timeout=12, follow_redirects=False)
+        self._client = client or httpx.Client(timeout=12, follow_redirects=False, trust_env=False)
         self._refresh_hook = refresh_hook
 
     @property

@@ -553,9 +553,30 @@ def build_structured_document_plan(
         page_number=1,
         page_break_before=False,
     )
+    # An empty package (no claims, no evidence, no sources) means the
+    # research produced nothing verifiable — typically a blocked or
+    # failed run. The fallback prose below must say so plainly instead
+    # of the "authoritative investigation / cross-source corroboration"
+    # boilerplate, which would present an empty report as researched.
+    has_verified_material = bool(pkg.claims or pkg.evidence or pkg.sources)
+
     if pkg.topic.scope:
         s1.add_text(f"<b>Research Scope:</b> {pkg.topic.scope}")
-    if pkg.topic.findings_summary:
+    if not has_verified_material:
+        s1.add_text(
+            f"No verified findings were produced for {clean_doc_title}. "
+            f"No external sources were consulted and no claims could be verified, "
+            f"so this document records the request and its scope only — treat it "
+            f"as a starting point, not a researched result."
+        )
+        if pkg.topic.findings_summary:
+            # A synthesized package carries the prior chat text as its
+            # summary — show it, but labelled unverified, never as an
+            # "Executive Synthesis" of researched material.
+            s1.add_text(
+                f"<b>Unverified summary (from the conversation; no external sources were consulted):</b> {pkg.topic.findings_summary}"
+            )
+    elif pkg.topic.findings_summary:
         s1.add_text(f"<b>Executive Synthesis:</b> {pkg.topic.findings_summary}")
     else:
         s1.add_text(
@@ -586,7 +607,12 @@ def build_structured_document_plan(
         title="2. Detailed Technical Findings & Evidence",
         level=1,
     )
-    if pkg.topic.findings_summary:
+    if not has_verified_material:
+        s2.add_text(
+            f"No literature was visited and no evidence was collected for {clean_doc_title}, "
+            f"so there are no detailed findings to report."
+        )
+    elif pkg.topic.findings_summary:
         s2.add_text(f"<b>Core Findings Synthesis:</b> {pkg.topic.findings_summary}")
     else:
         s2.add_text(
@@ -769,11 +795,16 @@ def build_structured_document_plan(
         title="7. References Cited & Source Provenance",
         level=1,
     )
-    s_ref.add_text(
-        "<b>Verification Methodology & Provenance Integrity:</b> All findings, assertions, and comparative figures in this "
-        "dossier have been cross-verified against primary documentation and authoritative sources. Discrepancies between "
-        "independent measurements are identified in the verification ledger below to ensure complete evidentiary reproducibility."
-    )
+    if has_verified_material:
+        s_ref.add_text(
+            "<b>Verification Methodology & Provenance Integrity:</b> All findings, assertions, and comparative figures in this "
+            "dossier have been cross-verified against primary documentation and authoritative sources. Discrepancies between "
+            "independent measurements are identified in the verification ledger below to ensure complete evidentiary reproducibility."
+        )
+    else:
+        s_ref.add_text(
+            "No external sources were consulted for this document, so nothing in it has been cross-verified."
+        )
     s_ref.blocks.append(ContentBlock(
         block_id="blk_provenance_table",
         block_type=BlockType.PROVENANCE_TABLE,

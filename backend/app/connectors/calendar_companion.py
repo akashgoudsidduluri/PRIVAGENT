@@ -17,6 +17,10 @@ def is_calendar_query(text: str) -> bool:
         r"\bcalendar\s+(?:status|events?|schedule)\b",
         r"\b(?:upcoming|next)\s+(?:meetings?|events?|appointments?|calls?)\b",
         r"\b(?:schedule|create|add|book)\s+(?:an?\s+)?(?:event|meeting|invite|appointment|call)\b",
+        # "add it / the Microsoft interview to my calendar": an object
+        # between the verb and "to my calendar". The \S+ after the verb
+        # keeps a bare "add to my calendar" (a question, no object) out.
+        r"\b(?:add|put)\s+\S+[^.]{0,50}?\b(?:to|on|onto)\s+(?:my\s+)?calendar\b",
         r"\bgoogle\s+calendar\b",
     ]
     return any(re.search(p, t) for p in patterns)
@@ -476,7 +480,10 @@ async def handle_calendar_instruction(instruction: str, chat_id: Optional[str] =
 # another companion task (email monitoring, tracking, ...) ---
 
 _CALENDAR_CREATE_VERB_RE = re.compile(
-    r"\b(?:create|add|schedule|book)\s+(?:an?\s+)?(?:google\s+)?(?:calendar\s+)?(?:\w+\s+)?(?:event|meeting|appointment|call)\b",
+    r"\b(?:create|add|schedule|book)\s+(?:an?\s+)?(?:google\s+)?(?:calendar\s+)?(?:\w+\s+)?(?:event|meeting|appointment|call)\b"
+    # "add it / the Microsoft interview to my calendar": the clause
+    # starts at the verb, with the event object before "to my calendar".
+    r"|\b(?:add|put)\s+\S+[^.]{0,50}?\b(?:to|on|onto)\s+(?:my\s+)?calendar\b",
     re.IGNORECASE,
 )
 # The thing the event is about, named in the other half of the
@@ -489,7 +496,9 @@ _REFERENT_RE = re.compile(
     r"(?i:(interview|invitation|meeting|deadline|assessment|exam|event|internship|offer|call|appointment))\b"
 )
 _PRONOUN_OBJECT_RE = re.compile(
-    r"(\b(?:for|called|titled|about)\s+)(it|that|this|them)\b",
+    r"(\b(?:for|called|titled|about)\s+)(it|that|this|them)\b"
+    # Direct object after add/put/schedule/book: "add it to my calendar".
+    r"|(\b(?:add|put|schedule|book)\s+)(it|that|this|them)\b",
     re.IGNORECASE,
 )
 
@@ -531,7 +540,7 @@ def resolve_calendar_event_pronoun(clause: str, instruction: str) -> str:
     # "Microsoft interview invitation" -> "Microsoft interview".
     referent = re.sub(r"\s+interview\s+invitation$", " interview", referent, flags=re.IGNORECASE)
     return _PRONOUN_OBJECT_RE.sub(
-        lambda mm: mm.group(1) + referent, clause, count=1
+        lambda mm: (mm.group(1) or mm.group(3)) + referent, clause, count=1
     )
 
 

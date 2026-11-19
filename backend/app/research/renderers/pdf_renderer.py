@@ -264,7 +264,7 @@ class PdfRenderer(BaseRenderer):
                         Paragraph(
                             f"<b>Authoritative Sources:</b> {doc_plan.metadata.sources_count} visited websites"
                             if doc_plan.metadata.sources_count > 0
-                            else "<b>Authoritative Sources:</b> Direct technical synthesis",
+                            else "<b>Authoritative Sources:</b> No external sources consulted",
                             body_style,
                         ),
                         Paragraph(f"<b>Verified Empirical Findings:</b> {doc_plan.metadata.claims_count} validated claims", body_style),
