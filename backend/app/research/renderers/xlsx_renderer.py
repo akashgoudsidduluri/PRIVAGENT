@@ -131,7 +131,11 @@ class XlsxRenderer(BaseRenderer):
         ws_sum["A4"] = "Research Objective"
         ws_sum["B4"] = pkg.topic.objective
         ws_sum["A5"] = "Research Scope"
-        ws_sum["B5"] = pkg.topic.scope or "Comprehensive multi-source investigation"
+        ws_sum["B5"] = pkg.topic.scope or (
+            "Comprehensive multi-source investigation"
+            if pkg.sources
+            else "No external sources consulted — findings unverified"
+        )
         ws_sum["A6"] = "Generated Date"
         ws_sum["B6"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         ws_sum["A7"] = "Authoritative Sources Examined"

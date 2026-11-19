@@ -287,3 +287,95 @@ def test_render_artifact_dispatcher():
 
         p_md = render_artifact(pkg, "markdown", str(Path(tmp_dir) / "out.md"))
         assert Path(p_md).name == "out.md"
+
+
+def _build_empty_package() -> ResearchKnowledgePackage:
+    """A package from a research run that produced nothing verifiable
+    (blocked discovery, failed collection): topic only, no sources,
+    evidence, claims, tables or visuals."""
+    return ResearchKnowledgePackage(
+        package_id="pkg_empty",
+        topic=ResearchTopic(title="Black holes", objective="Research black holes"),
+    )
+
+
+def _build_synthesized_empty_package() -> ResearchKnowledgePackage:
+    """The real empty path: package_resolver Case A builds a package
+    from prior chat text — findings_summary set, but no claims, evidence
+    or sources. It must be rendered as unverified chat text, never as
+    an "Executive Synthesis" of researched material."""
+    return ResearchKnowledgePackage(
+        package_id="pkg_synth_empty",
+        topic=ResearchTopic(
+            title="Black holes",
+            objective="Research black holes",
+            findings_summary="Earlier chat said black holes are dense objects.",
+        ),
+    )
+
+
+def test_empty_package_renders_honestly():
+    """An empty package must not be dressed up as researched: the
+    'authoritative investigation / cross-source corroboration' boilerplate
+    and the 'synthesized from local verified domain sources' line are
+    false when zero sources were consulted, so the renderers must say
+    plainly that no verified findings were produced."""
+    from pypdf import PdfReader
+
+    pkg = _build_empty_package()
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        pdf_path = Path(tmp_dir) / "report.pdf"
+        PdfRenderer().render(pkg, str(pdf_path))
+        pdf_text = "".join(
+            (page.extract_text() or "") for page in PdfReader(str(pdf_path)).pages
+        )
+        assert "authoritative investigation" not in pdf_text
+        assert "cross-source corroboration" not in pdf_text
+        assert "Direct technical synthesis" not in pdf_text
+        assert "cross-verified against primary documentation" not in pdf_text
+        assert "No verified findings were produced" in pdf_text
+        assert "No external sources consulted" in pdf_text
+
+        docx_path = Path(tmp_dir) / "report.docx"
+        DocxRenderer().render(pkg, str(docx_path))
+        docx_text = "\n".join(p.text for p in docx.Document(str(docx_path)).paragraphs)
+        assert "authoritative investigation" not in docx_text
+        assert "cross-verified against primary documentation" not in docx_text
+        assert "No verified findings were produced" in docx_text
+
+        pptx_path = Path(tmp_dir) / "report.pptx"
+        PptxRenderer().render(pkg, str(pptx_path))
+        pptx_text = " ".join(
+            shape.text
+            for slide in pptx.Presentation(str(pptx_path)).slides
+            for shape in slide.shapes
+            if hasattr(shape, "text")
+        )
+        assert "synthesized from local verified domain sources" not in pptx_text
+        assert "Comprehensive multi-source" not in pptx_text
+        assert "No external sources were consulted" in pptx_text
+
+    # Synthesized empty package: the chat-text summary must be labelled
+    # unverified, and the references section must not claim
+    # cross-verification.
+    synth = _build_synthesized_empty_package()
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        pdf_path = Path(tmp_dir) / "synth.pdf"
+        PdfRenderer().render(synth, str(pdf_path))
+        pdf_text = "".join(
+            (page.extract_text() or "") for page in PdfReader(str(pdf_path)).pages
+        )
+        assert "Executive Synthesis" not in pdf_text
+        assert "Unverified summary" in pdf_text
+        assert "No verified findings were produced" in pdf_text
+        assert "cross-verified against primary documentation" not in pdf_text
+
+    # The non-empty package keeps the full boilerplate (no regression).
+    full = _build_test_package()
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        pdf_path = Path(tmp_dir) / "full.pdf"
+        PdfRenderer().render(full, str(pdf_path))
+        pdf_text = "".join(
+            (page.extract_text() or "") for page in PdfReader(str(pdf_path)).pages
+        )
+        assert "authoritative investigation" in pdf_text

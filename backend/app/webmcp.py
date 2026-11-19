@@ -255,7 +255,7 @@ def fetch_webmcp_manifest(origin: str, *, client: Any = None) -> tuple[list[WebM
     import httpx
 
     own_client = client is None
-    http = client or httpx.Client(timeout=5, follow_redirects=False)
+    http = client or httpx.Client(timeout=5, follow_redirects=False, trust_env=False)
     try:
         resp = http.get(url, headers={"Accept": "application/json"})
         if resp.status_code in (301, 302, 303, 307, 308):

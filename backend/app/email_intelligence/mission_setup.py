@@ -11,6 +11,13 @@ from .companion_queries import is_email_companion_query, answer_email_companion_
 from .sync_engine import run_email_mission_tick, get_demo_mailbox
 
 SETUP_TRIGGER = re.compile(
+    # "check/scan/monitor my gmail/email/inbox every N minutes (or every
+    # hour/day)": a monitoring setup, not a one-off read. The cadence
+    # may be numbered ("every 5 minutes") or bare ("every hour");
+    # "second" is excluded from the bare form ("every second Tuesday"
+    # is a weekday, not an interval). The mailbox may carry ".com"
+    # ("outlook.com"/"gmail.com") — the filler window cannot cross a ".".
+    r"\b(?:check|scan|monitor)\s+(?:my\s+)?(?:e-?mails?|mail|inbox|gmail(?:\.com)?|outlook(?:\.com)?)\b[^.]{0,60}?\bevery\s+(?:\d+\s*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?)|(?:hours?|hrs?|minutes?|mins?|days?))\b|"
     r"\b(?:continuously\s+scan|monitor|moinitor|scan\s+and\s+clean|clean\s+up|cleanup|scan\s+my)\s+(?:my\s+)?emails?\b|"
     r"\b(?:identify\s+unnecessary\s+emails|remove\s+unnecessary|detect\s+important\s+emails|email\s+monitoring)\b|"
     r"\b(?:remind|notify|alert)\s+(?:me\s+)?(?:if|when|about)\s+.*?\b(?:emails?|mails?|inbox)\b|"
@@ -111,7 +118,13 @@ def extract_custom_topics(text: str) -> list[str]:
 
 
 FREQUENCY_RE = re.compile(
-    r"\bevery\s+(\d+)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?)\b", re.IGNORECASE
+    r"\bevery\s+(\d+)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?|days?)\b", re.IGNORECASE
+)
+# Bare cadence: "every hour" / "every day" (no number) means one unit.
+# "second" is deliberately excluded from the bare form: "every second
+# Tuesday" is a weekday, not a 1-second interval.
+BARE_FREQUENCY_RE = re.compile(
+    r"\bevery\s+(hours?|hrs?|minutes?|mins?|days?)\b", re.IGNORECASE
 )
 # An explicit deletion authorization in the setup instruction itself:
 # "delete them", "trash promotional emails", "move to trash". "Remove"
@@ -131,17 +144,53 @@ DELETE_NEGATION_RE = re.compile(
 )
 
 
+# Mail providers explicitly named in an instruction. "Microsoft interview"
+# is a TOPIC, not a mailbox — bare "microsoft" must not select Outlook.
+# Only a mailbox-anchored "microsoft" ("microsoft account/inbox/mail/365")
+# or "outlook" itself names the provider.
+_OUTLOOK_PROVIDER_RE = re.compile(
+    r"\boutlook\b"
+    r"|\bmicrosoft\s+(?:365|account|inbox|mail|email|outlook)\b"
+    r"|\boffice\s*365\b|\bo365\b",
+    re.IGNORECASE,
+)
+_GMAIL_PROVIDER_RE = re.compile(r"\b(?:gmail|google)\b", re.IGNORECASE)
+
+
+def named_email_providers(text: str) -> set[str]:
+    """The mail providers the instruction names, if any.
+
+    Returns a subset of {"outlook", "gmail"}; empty when no provider is
+    named, so the caller falls back to the connected account order.
+    """
+    t = text or ""
+    out: set[str] = set()
+    if _OUTLOOK_PROVIDER_RE.search(t):
+        out.add("outlook")
+    if _GMAIL_PROVIDER_RE.search(t):
+        out.add("gmail")
+    return out
+
+
 def parse_frequency_seconds(text: str) -> int | None:
     """Parse 'every N minutes/hours/seconds' into seconds, or None.
 
+    A bare cadence ('every hour', 'every day') means one unit.
     Clamped to the mission table's CHECK (min 60s) and to 24h max.
     """
     m = FREQUENCY_RE.search(text or "")
-    if not m:
-        return None
-    n = int(m.group(1))
-    unit = m.group(2).lower()
-    if unit.startswith("hour") or unit.startswith("hr"):
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2).lower()
+    else:
+        b = BARE_FREQUENCY_RE.search(text or "")
+        if not b:
+            return None
+        n = 1
+        unit = b.group(1).lower()
+    if unit.startswith("day"):
+        secs = n * 86400
+    elif unit.startswith("hour") or unit.startswith("hr"):
         secs = n * 3600
     elif unit.startswith("min"):
         secs = n * 60
@@ -157,7 +206,18 @@ def format_frequency_seconds(text: str, seconds: int) -> str:
     if m:
         n = int(m.group(1))
         unit = m.group(2).lower()
-        if unit.startswith("hour") or unit.startswith("hr"):
+    else:
+        b = BARE_FREQUENCY_RE.search(text or "")
+        if b:
+            n = 1
+            unit = b.group(1).lower()
+        else:
+            n = None
+            unit = ""
+    if n is not None:
+        if unit.startswith("day"):
+            word = "day" if n == 1 else "days"
+        elif unit.startswith("hour") or unit.startswith("hr"):
             word = "hour" if n == 1 else "hours"
         elif unit.startswith("min"):
             word = "minute" if n == 1 else "minutes"
@@ -207,9 +267,13 @@ def is_email_mission_setup_instruction(text: str) -> bool:
 # no code behind it. Both are real handlers now.
 
 _INTERVAL_VERB_RE = re.compile(
-    r"\b(?:check|scan|monitor|sync|refresh)\b[^.]{0,40}?\bevery\s+\d+\s*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?)\b"
-    r"|\bchange\b[^.]{0,40}?\bevery\s+\d+\s*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?)\b"
-    r"|^\s*every\s+\d+\s*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?)\b",
+    r"\b(?:check|scan|monitor|sync|refresh)\b[^.]{0,40}?\bevery\s+\d+\s*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?)\b"
+    r"|\bchange\b[^.]{0,40}?\bevery\s+\d+\s*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?)\b"
+    r"|^\s*every\s+\d+\s*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?)\b"
+    # Bare cadence ("check every hour", "every day") means one unit.
+    # "second" is excluded: "every second Tuesday" is a weekday.
+    r"|\b(?:check|scan|monitor|sync|refresh|change)\b[^.]{0,40}?\bevery\s+(?:hours?|hrs?|minutes?|mins?|days?)\b"
+    r"|^\s*every\s+(?:hours?|hrs?|minutes?|mins?|days?)\b",
     re.IGNORECASE,
 )
 # A non-email object means the interval change is not about email:
@@ -218,7 +282,7 @@ _INTERVAL_VERB_RE = re.compile(
 # "refresh this page every 10 minutes" is a browser refresh — none
 # of them should silently change the email interval.
 _NON_EMAIL_OBJECT_RE = re.compile(
-    r"\b(?:product|flight|page|website|webpage|stock|stocks?|crypto|weather|train|bus|order|package|delivery|news|ticket|hotel|share|shares?|bitcoin|ethereum|url|link)\b",
+    r"\b(?:product|flight|page|website|webpage|stock|stocks?|crypto|weather|train|bus|order|package|delivery|news|ticket|hotel|share|shares?|bitcoin|ethereum|url|link|teams|slack|telegram|discord|whatsapp)\b",
     re.IGNORECASE,
 )
 
@@ -646,8 +710,9 @@ async def handle_email_intelligence_instruction(
         # silently set up Gmail when the user said Outlook. If the
         # named provider is not connected, say so honestly instead of
         # silently falling back to the other account.
-        wants_outlook = bool(re.search(r"\b(?:outlook|microsoft|office\s*365|o365)\b", instruction, re.IGNORECASE))
-        wants_gmail = bool(re.search(r"\b(?:gmail|google)\b", instruction, re.IGNORECASE))
+        _named = named_email_providers(instruction)
+        wants_outlook = "outlook" in _named
+        wants_gmail = "gmail" in _named
         if wants_outlook and not wants_gmail:
             if ms_status.get("connected") and ms_status.get("account"):
                 account_email = ms_status["account"]

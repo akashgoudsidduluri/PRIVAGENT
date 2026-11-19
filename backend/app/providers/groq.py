@@ -62,7 +62,7 @@ class GroqProvider:
 
         if not egress_allowed("https://api.groq.com/openai/v1/chat/completions"):
             raise ProviderUnavailable("egress blocked: api.groq.com is not on the egress allow-list")
-        self._client = httpx.Client(timeout=timeout_s)
+        self._client = httpx.Client(timeout=timeout_s, trust_env=False)
         # Telemetry for the UI and audit logs
         self.last_usage: dict[str, Any] = {}
         self.last_latency_ms: Optional[int] = None

@@ -995,7 +995,7 @@ def harvest_page_evidence(
                         "User-Agent": "PrivAgentResearchBot/1.0 (https://github.com/privagent; contact@privagent.local)",
                         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
                     }
-                    with httpx.Client(timeout=4.0, follow_redirects=True) as client:
+                    with httpx.Client(timeout=4.0, follow_redirects=True, trust_env=False) as client:
                         resp = client.get(canon_url, headers=fetch_headers)
                         if resp.status_code == 200 and resp.text:
                             html_content = resp.text
