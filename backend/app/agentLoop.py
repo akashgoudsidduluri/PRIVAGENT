@@ -61,6 +61,7 @@ from .loop_helpers import (
     _actions_match,
     _failure_action_matches,
     _auto_complete_after_send,
+    _send_visible_in_page,
     _call_planner,
     _enforce_date_integrity,
     _execute_with_retries,
@@ -74,6 +75,7 @@ from .loop_helpers import (
     _is_messaging_host,
     _is_redundant_completed_action,
     _is_whatsapp_qr,
+    _fail_host,
     _normalize_loop_error,
     _plan_tree_and_refs,
     _same_failure,
@@ -360,6 +362,13 @@ async def _run_loop(
     cached_obs: Any = None
     last_digest: Optional[str] = None
     zero_change_repeats = 0
+    # Consecutive iterations that ended by re-planning after a redundant
+    # completed action (no step executed, so the step budget never
+    # trips). A planner stuck repeating a completed action would
+    # otherwise loop forever — the `continue` below skips the
+    # zero-change detector entirely. Same threshold (5) as the
+    # consecutive-failure counter.
+    redundant_repeats = 0
     # Task 11: latency instrumentation, observation cache, batching.
     # ``timings`` is created by run_with_injection (and attached to the
     # result); a direct _run_loop caller gets a fresh one.
@@ -1303,6 +1312,40 @@ async def _run_loop(
                                 or pkg_data.get("evidence")
                                 or pkg_data.get("tables")
                             ):
+                                # One bounded retry before the honest
+                                # failure: the planner gave up by repeating
+                                # its first navigation without ever loading
+                                # a source page (live 2026-11-19: "black
+                                # holes facts" search, then nothing). If a
+                                # next source is already queued, give the
+                                # planner one more turn pointed at it; if
+                                # the retry is used up or no source is
+                                # queued, fail honestly as before.
+                                _retry_url = None
+                                if not working_memory.get("research_incomplete_retry_used"):
+                                    _pending_links = list(working_memory.get("pending_research_links") or [])
+                                    if _pending_links:
+                                        # PEEK, don't pop (review #4, S4):
+                                        # the link leaves the queue only
+                                        # once the planner actually
+                                        # navigates to it (see the
+                                        # consume step after history.append).
+                                        _retry_url = _pending_links[0]
+                                        working_memory["research_retry_url"] = _retry_url
+                                    else:
+                                        for _cand in (working_memory.get("autonomous_discovery") or {}).get("candidate_sources", []) or []:
+                                            _cand_url = _cand.get("url") if isinstance(_cand, dict) else None
+                                            if _cand_url and _cand_url != raw_url:
+                                                _retry_url = _cand_url
+                                                break
+                                if _retry_url:
+                                    working_memory["research_incomplete_retry_used"] = True
+                                    penalties.append(
+                                        "Research retry (1 of 1): the source page did not load and no "
+                                        f"evidence was collected. Navigate to the next source now: {_retry_url}. "
+                                        "Collect evidence from that page instead of repeating the search."
+                                    )
+                                    continue
                                 # The task repeated its first navigation without
                                 # ever loading a source page. Report this honestly
                                 # instead of claiming a completed research run.
@@ -1321,6 +1364,17 @@ async def _run_loop(
                             )
                             return {"final": "completed", "steps": steps_done, "summary": summary_notes,
                                     "history": history, "url": raw_url, "last_obs": raw_obs}
+                    redundant_repeats += 1
+                    if redundant_repeats >= 5:
+                        return {
+                            "final": "budget_exceeded",
+                            "steps": steps_done,
+                            "summary": (
+                                "Loop detected: the planner repeated a completed action "
+                                f"{redundant_repeats} times in a row with no progress."
+                            ),
+                            "history": history,
+                        }
                     penalties.append(
                         "You emitted an action that was already executed and completed in a previous step. Do not repeat completed browser actions."
                     )
@@ -1330,17 +1384,44 @@ async def _run_loop(
         # positives on ordinary search forms that happen to have a send button).
         if history and history[-1].get("result_ok"):
             if _auto_complete_after_send(history, action, raw_url):
-                notes_summary = working_memory.get("notes") or "Message successfully sent to recipient."
-                notes_summary = _finalize_research_summary(
-                    task_id, conversation_id, working_memory, notes_summary
+                # Post-send verification: a successful composer submit
+                # is not proof the message sent. The sent bubble must
+                # be visible in the fresh observation. If it is not,
+                # give the page up to two more turns to show it (render
+                # lag) — then complete honestly with the qualifier
+                # instead of looping or re-sending. Never silently
+                # claim a verified send.
+                if _send_visible_in_page(history, raw_text):
+                    notes_summary = working_memory.get("notes") or "Message successfully sent to recipient."
+                    notes_summary = _finalize_research_summary(
+                        task_id, conversation_id, working_memory, notes_summary
+                    )
+                    return {
+                        "final": "completed",
+                        "steps": steps_done,
+                        "summary": notes_summary if working_memory.get("is_research")
+                        else f"Completed: {notes_summary[:160]}",
+                        "history": history,
+                    }
+                _unverified = int(working_memory.get("send_unverified_turns") or 0) + 1
+                working_memory["send_unverified_turns"] = _unverified
+                if _unverified >= 2:
+                    notes_summary = (
+                        "Message sent, but the sent message could not be confirmed in the chat "
+                        "— please check WhatsApp to confirm it arrived."
+                    )
+                    return {
+                        "final": "completed",
+                        "steps": steps_done,
+                        "summary": notes_summary,
+                        "history": history,
+                    }
+                penalties.append(
+                    "The message was typed and submitted, but the sent message is not visible "
+                    "in the chat yet. Check whether it actually sent before doing anything else — "
+                    "do not type or send it again."
                 )
-                return {
-                    "final": "completed",
-                    "steps": steps_done,
-                    "summary": notes_summary if working_memory.get("is_research")
-                    else f"Completed: {notes_summary[:160]}",
-                    "history": history,
-                }
+                continue
 
             # State-aware loop detection: detect repeated actions with zero page state change
             if last_digest is not None and current_digest == last_digest:
@@ -1440,6 +1521,81 @@ async def _run_loop(
                     "Do not repeat it without a new target or strategy; conclude if "
                     "the goal cannot be reached."
                 )
+
+        # Consecutive-failure loop detection: the check above only fires
+        # for the SAME action with the SAME normalized error. A planner
+        # that cycles targets (or hits varied errors) resets that counter
+        # every time — live 2026-11-19: ten consecutive failed clicks on
+        # Google result links, each a different target / different error,
+        # and the task ran 25 steps / 213s and delivered nothing. Count
+        # trailing failed steps regardless of target or error; five in a
+        # row with zero progress stops the task. A warning at two gives
+        # the planner one chance to change strategy first.
+        # Tradeoff (review #4, S5): the run is per-HOST, not global —
+        # a research task probing five dead candidate sources on five
+        # different hosts is legitimate exploration, not a loop, so a
+        # host change restarts the count. Five failures on ONE host
+        # (the live case: one flaky page) still stop the task.
+        # Global cap (review #5, S9): the per-host reset is evadable by
+        # alternating hosts — twelve consecutive failures on alternating
+        # hosts, distinct URLs and alternating errors defeated every
+        # detector at once. Ten consecutive failures with zero progress
+        # stop the task regardless of host, while the five-source
+        # exploration allowance (fewer than ten) is preserved. The
+        # global count is its own pass: the per-host loop below breaks
+        # on the first host change, so it cannot count across hosts.
+        _consec_failed_global = 0
+        for _h in reversed(history):
+            if _h.get("result_ok") is False:
+                _consec_failed_global += 1
+            else:
+                break
+        _consec_failed = 0
+        _consec_host: Optional[str] = None
+        for _h in reversed(history):
+            if _h.get("result_ok") is False:
+                _h_host = _fail_host(_h, raw_url)
+                if _consec_host is None:
+                    _consec_host = _h_host
+                elif _h_host != _consec_host:
+                    break
+                _consec_failed += 1
+            else:
+                break
+        if _consec_failed_global >= 10:
+            _last_err_text = ""
+            if history and history[-1].get("error"):
+                _last_err_text = f" (last error: {history[-1].get('error')})"
+            return {
+                "final": "budget_exceeded",
+                "steps": steps_done,
+                "summary": (
+                    f"Loop detected: {_consec_failed_global} consecutive failed steps "
+                    f"with no progress across hosts{_last_err_text}; stopping instead of "
+                    "repeating it."
+                ),
+                "history": history,
+            }
+        if _consec_failed >= 5:
+            _last_err_text = ""
+            if history and history[-1].get("error"):
+                _last_err_text = f" (last error: {history[-1].get('error')})"
+            return {
+                "final": "budget_exceeded",
+                "steps": steps_done,
+                "summary": (
+                    f"Loop detected: {_consec_failed} consecutive failed steps "
+                    f"with no progress{_last_err_text}; stopping instead of "
+                    "repeating it."
+                ),
+                "history": history,
+            }
+        if _consec_failed >= 2:
+            penalties.append(
+                f"Consecutive failure warning: {_consec_failed} steps in a row "
+                "have failed with no progress. Change target or strategy, or "
+                "conclude if the goal cannot be reached."
+            )
 
         # Task 7: resolve element refs against this *redacted*
         # observation before anything executes. A ref the planner quoted
@@ -2444,6 +2600,22 @@ async def _run_loop(
             if penalty:
                 penalties.append(penalty)
         history.append(entry)
+        redundant_repeats = 0
+        # Research-retry bookkeeping (review #4, S4): the retry only
+        # peeked at the queued link — remove it from the queue now that
+        # the planner actually navigated to it. A retry the planner
+        # ignored leaves the link queued for the normal machinery.
+        _retry_url = working_memory.get("research_retry_url")
+        if (
+            _retry_url
+            and action.get("type") == "navigate"
+            and action_ok
+            and (action.get("params") or {}).get("url") == _retry_url
+        ):
+            working_memory["pending_research_links"] = [
+                u for u in (working_memory.get("pending_research_links") or []) if u != _retry_url
+            ]
+            working_memory.pop("research_retry_url", None)
         if _recovery is not None:
             working_memory.setdefault("automation_recoveries", []).append(
                 {"step": steps_done, **_recovery}
@@ -2648,16 +2820,104 @@ async def run_task(task_id: str) -> None:
 
             latest_cp = db.get_latest_checkpoint_for_chat(chat_id)
 
-            db.add_message(chat_id, "user", record.instruction, task_id=task_id)
+            if not getattr(record, "compound_part", False):
+                db.add_message(chat_id, "user", record.instruction, task_id=task_id)
 
-            chat_info = db.get_chat(chat_id)
-            if chat_info and chat_info.get("title") in ("New Mission", "New Chat", ""):
-                trunc_title = record.instruction[:36].strip()
-                if len(record.instruction) > 36:
-                    trunc_title += "..."
-                db.update_chat_title(chat_id, trunc_title)
+                chat_info = db.get_chat(chat_id)
+                if chat_info and chat_info.get("title") in ("New Mission", "New Chat", ""):
+                    trunc_title = record.instruction[:36].strip()
+                    if len(record.instruction) > 36:
+                        trunc_title += "..."
+                    db.update_chat_title(chat_id, trunc_title)
         except Exception:
             pass
+
+    # Compound instructions: run each clause as its own mission, in
+    # order, threading earlier parts' results into later ones ("it" =
+    # the research summary, "him" = the last named recipient, "the
+    # link" = a URL an earlier part produced). A part that fails does
+    # NOT cancel the rest; a part whose dependency failed is skipped
+    # with an honest reason instead of sending garbage. The final
+    # message names every part's outcome, and the mission is
+    # "completed" only when every part completed — a partial run is
+    # "failed" with the completed parts listed, never silently
+    # "completed". Single instructions never reach this branch.
+    # Live 2026-11-19: "research about black holes and send it to
+    # prateek in whatsapp, also ask a random question to him, and
+    # then open amazon and send redmi phone link to prateek" ran 25
+    # steps, delivered nothing, and reported the research as
+    # incomplete while the WhatsApp/Amazon halves vanished.
+    if not getattr(record, "compound_part", False):
+        from .intent_router import (
+            has_unresolved_reference,
+            split_compound_instruction,
+            thread_compound_context,
+            update_compound_context,
+        )
+
+        _parts = split_compound_instruction(record.instruction)
+        if len(_parts) > 1:
+            record.intent = "COMPOUND"
+            _ctx: dict[str, Any] = {}
+            _outcomes: list[tuple[str, str, str]] = []
+            _any_failed = False
+            for _i, _part in enumerate(_parts):
+                if record.cancelled:
+                    # Fold the skipped part's text into the context
+                    # anyway: the recipient/channel come from the
+                    # instruction, not from an outcome, so a later
+                    # part can still inherit them (review #4, S6 —
+                    # without this, a skipped WhatsApp send left the
+                    # following question part unthreaded and it
+                    # "completed" as a chat greeting, sending nothing).
+                    _ctx = update_compound_context(_ctx, _part, ("", "skipped", "not run: the mission was cancelled"))
+                    _outcomes.append((_part, "skipped", "not run: the mission was cancelled"))
+                    _any_failed = True
+                    continue
+                if _any_failed and has_unresolved_reference(_part, _ctx):
+                    _ctx = update_compound_context(_ctx, _part, ("", "skipped", "not run: it depends on an earlier part that failed"))
+                    _outcomes.append((_part, "skipped", "not run: it depends on an earlier part that failed"))
+                    _any_failed = True
+                    continue
+                _threaded = thread_compound_context(_part, _ctx)
+                _sub_id = f"{task_id}__part{_i + 1}"
+                _sub = TaskRecord(
+                    task_id=_sub_id,
+                    instruction=_threaded,
+                    chat_id=chat_id,
+                    compound_part=True,
+                    parent_task_id=task_id,
+                    allowed_domains=record.allowed_domains,
+                    background=record.background,
+                )
+                real_hub.tasks[_sub_id] = _sub
+                try:
+                    await run_task(_sub_id)
+                except Exception as _exc:  # a part must never kill the rest
+                    _sub.state = "failed"
+                    _sub.message = f"Part failed with an internal error: {_exc}"
+                _outcomes.append((_part, _sub.state, _sub.message or ""))
+                record.steps_done += _sub.steps_done
+                if _sub.state != "completed":
+                    _any_failed = True
+                _ctx = update_compound_context(_ctx, _part, (_sub.intent, _sub.state, _sub.message or ""))
+            _lines = []
+            for _n, (_part, _state, _msg) in enumerate(_outcomes, start=1):
+                _first = (_msg.strip().splitlines() or [""])[0][:200]
+                _lines.append(f"Part {_n} ({_part}): {_state}" + (f" — {_first}" if _first else ""))
+            record.state = "completed" if not _any_failed else "failed"
+            record.message = (
+                f"Done in {len(_outcomes)} parts"
+                + (" — all parts completed." if not _any_failed else " — some parts did not complete:")
+                + "\n" + "\n".join(_lines)
+            )
+            await real_hub.broadcast_progress(record)
+            if chat_id:
+                try:
+                    _persist_agent_message(chat_id, record.message, evidence="compound", task_id=task_id)
+                except Exception:
+                    pass
+            return
 
     # 1. Intent Classification Stage (P5.2 & Operation Disambiguation)
     from .intent_router import classify_intent, TaskIntent, ResearchOperationType
@@ -3180,6 +3440,23 @@ async def run_task(task_id: str) -> None:
                         answer = MockProvider().chat_call(record.instruction, history=history)
                 else:
                     answer = "I have processed your request."
+                # A hallucinated tool call must never reach the user as if
+                # it ran. The direct-answer path offers the model NO tools,
+                # but it can still emit a `<tool_call>` block as text (live
+                # 2026-11-19: `createpresentation` with a 10-slide outline
+                # for the PPT request, mission "completed", no file). Strip
+                # the block and say honestly that nothing was created.
+                from .loop_helpers import strip_tool_call_blocks
+
+                _stripped_tools = []
+                if isinstance(answer, str):
+                    answer, _stripped_tools = strip_tool_call_blocks(answer)
+                    if _stripped_tools:
+                        answer = (
+                            f"{answer}\n\nNote: the plan mentioned a tool "
+                            f"({', '.join(_stripped_tools)}) that isn't available, "
+                            "so no file was created from it."
+                        )
                 # Fix 5: a conversational product suggestion states
                 # prices no browsing ever verified (live case: the
                 # fitness-band suggestion answered from LLM knowledge

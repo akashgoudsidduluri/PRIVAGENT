@@ -83,11 +83,293 @@ class IntentClassification:
 
 FORMAT_PDF_RE = re.compile(r"(?:\bpdf\b|\.pdf\b)", re.IGNORECASE)
 FORMAT_DOCX_RE = re.compile(r"(?:\bdocx\b|\bword(?:\s+doc(?:ument)?)?\b|\.docx\b)", re.IGNORECASE)
-FORMAT_PPTX_RE = re.compile(r"(?:\bpptx\b|\bpowerpoint\b|\bpresentation\b|\bslide\s*deck\b|\bslides?\b|\.pptx\b)", re.IGNORECASE)
+# Bare "ppt" is how users actually say it ("ppt report on topic X",
+# "make a ppt", "a nice looking ppt") — it must read as pptx. The
+# omission (live 2026-11-19) meant detect_requested_format returned
+# None for the PPT instruction, so the request never reached the
+# research pipeline and the agent hallucinated a `createpresentation`
+# tool call instead. Compare FORMAT_XLSX_RE's "xcel" alias precedent.
+FORMAT_PPTX_RE = re.compile(r"(?:\bpptx\b|\bppt\b|\bpowerpoint\b|\bpresentation\b|\bslide\s*deck\b|\bslides?\b|\.pptx\b|\.ppt\b)", re.IGNORECASE)
 FORMAT_XLSX_RE = re.compile(r"(?:\bxlsx\b|\bexcel\b|\bxcel\b|\bspreadsheet\b|\bworkbook\b|\.xlsx\b)", re.IGNORECASE)
 FORMAT_CSV_RE = re.compile(r"(?:\bcsv\b|\.csv\b)", re.IGNORECASE)
 FORMAT_MD_RE = re.compile(r"(?:\bmarkdown\b|\.md\b)", re.IGNORECASE)
 FORMAT_HTML_RE = re.compile(r"(?:\bhtml\b|\bwebpage\b|\.html?\b)", re.IGNORECASE)
+
+# A bare leading deliverable preamble — a deliverable noun (or two)
+# with a topic introducer and NO leading verb: "ppt report on topic X",
+# "presentation about X", "report on X", "ppt topic X". The introducer
+# (on/about/of/topic) is required, so a topic that legitimately starts
+# with a deliverable noun ("report writing techniques") is untouched.
+BARE_DELIVERABLE_PREAMBLE_RE = re.compile(
+    r"^(?:(?:please|hey|hi|hello|ok|okay)[\s,]+)?"
+    r"(?:(?:ppt|pptx|powerpoint|presentation|slides?|slide\s*deck|report|document|whitepaper|dossier|pdf|docx|xlsx|spreadsheet|workbook)\s+){1,2}"
+    r"(?:(?:on|about|of)\s+(?:the\s+)?(?:topic\s*:?\s*)?|topic\s*:?\s+)",
+    re.IGNORECASE,
+)
+
+# Words that can never be a messaging channel (review #5, M6/M7):
+# month and weekday names, time words, and email words. "send the
+# invoice to Priya in June" is timing, not a channel — the browser loop
+# would otherwise try to send it immediately. "send the report to
+# Prateek on email" belongs to the email-dispatch handler, not the
+# browser. The negative lookahead is word-boundary-terminated, so a
+# channel that merely STARTS with a stoplist word ("mayfair") still
+# matches. No channel names are hardcoded here, so test_generalisation
+# stays green.
+_CHANNEL_STOPLIST = (
+    r"january|february|march|april|may|june|july|august|september|october|november|december"
+    r"|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec"
+    r"|monday|tuesday|wednesday|thursday|friday|saturday|sunday"
+    r"|mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun"
+    r"|today|tomorrow|morning|afternoon|evening|tonight|week|month|year|the"
+    r"|email|mail|gmail"
+)
+
+
+# A delivery / messaging / shopping clause inside a compound
+# instruction: everything from the first such clause onward is NOT
+# part of the research topic ("research about black holes and send it
+# to prateek in a chat app" -> research half is "black holes"). The cut
+# is used by extract_research_topic and decompose_search_queries; the
+# remainder is kept by the compound splitter, never silently dropped.
+# "send me the ppt about X" does NOT cut: the send has no destination
+# clause (to/on/via/...) and no link noun, so it is a deliverable
+# request about X, not a delivery of something else.
+DELIVERY_CLAUSE_CUT_RE = re.compile(
+    r"\s*(?:,\s*)?(?:and\s+)?(?:then\s+|also\s+)?"
+    r"(?:send\s+(?:it|this|that|them|him|her|the\s+(?:summary|report|research|link|url|ppt|document|file|findings|results?|deck|presentation))\s+(?:to|on|via|through|in|over|by|for)\b"
+    r"|send\s+(?:\S+\s+){0,3}?(?:link|url)\b"
+    r"|ask\s+(?:a\s+)?(?:random\s+)?question\b"
+    r"|ask\s+(?:him|her|them)\b"
+    r"|share\s+(?:it|this|that|the|this\s+link|the\s+link)\b"
+    r"|message\s+(?:it|this|that|him|her|them)\b)",
+    re.IGNORECASE,
+)
+
+
+def cut_delivery_clauses(text: str) -> str:
+    """Return the text before the first delivery/messaging/shopping clause.
+
+    Used to keep the research topic clean in compound instructions.
+    Returns the input unchanged when no delivery clause is present.
+    """
+    if not text:
+        return text
+    m = DELIVERY_CLAUSE_CUT_RE.search(text)
+    if not m:
+        return text
+    return text[: m.start()].strip()
+
+
+# Verbs that start a NEW sub-task inside a compound instruction.
+# Deliberately narrow: mutation verbs owned by the mission-control
+# dispatcher and the email+calendar compound handler (delete, add,
+# create, update, remove, cancel, pause, resume, monitor) are NOT
+# split verbs, so "check my email and delete promo emails" stays one
+# mission and keeps its existing handling. A split needs a real clause
+# boundary (comma / "and" / "then" / "also") AND one of these verbs,
+# so "research Tom and Jerry" never splits on the "and".
+_COMPOUND_SPLIT_VERBS = (
+    r"send|ask|message|share|email|mail|open|research|search|"
+    r"explain|describe|summarise|summarize"
+)
+_COMPOUND_SPLIT_RE = re.compile(
+    r"(?:,\s*(?:and\s+)?(?:then\s+|also\s+)?|\s+and\s+(?:then\s+|also\s+)?)"
+    r"(?=(?:" + _COMPOUND_SPLIT_VERBS + r")\b)",
+    re.IGNORECASE,
+)
+_BARE_OPEN_SITE_RE = re.compile(
+    # A bare "open <one word>" clause ("open a search engine", "open a store") is a
+    # navigation preamble, not a task of its own: it folds into the
+    # following part. Deliberately generic — no site names (see
+    # test_generalisation: routing code must not hardcode sites; the
+    # allow-list is data, not code).
+    r"^\s*open\s+\w+\s*,?\s*$",
+    re.IGNORECASE,
+)
+_URL_RE = re.compile(r"https?://\S+")
+_RECIPIENT_RE = re.compile(
+    # "send it to <name> in/on <any channel word>": the channel is any
+    # single word — only the recipient (group 1) is used. No hardcoded
+    # channel names (see test_generalisation).
+    r"\bto\s+([A-Za-z][A-Za-z\-']{1,30})\s+(?:in|on|via|through|over)\s+\w+\b",
+    re.IGNORECASE,
+)
+_RECIPIENT_FALLBACK_RE = re.compile(r"\bto\s+([A-Z][a-z]{1,30})\b")
+
+
+# An "open" clause that refers back to the previous part's findings
+# ("open the cheapest one", "open the first result", "open it") is not
+# a new sub-task: it has no site or object of its own, and the runner
+# threads only research summaries, recipients and links — not general
+# findings — so the part would run blind (review #5, S8). A
+# self-contained "open" clause ("open a store", "open the docs") still
+# splits. The guard runs at split time (not as a merge afterwards) so
+# splitting stays idempotent.
+_ANAPHORIC_OPEN_RE = re.compile(
+    r"^\s*open\s+(?:(?:the|that|this|those)\s+"
+    r"(?:cheapest|first|best|top|newest|one|link|result|page|option|item)\b"
+    r"|it\b|them\b)",
+    re.IGNORECASE,
+)
+
+
+def split_compound_instruction(instruction: str) -> list[str]:
+    """Split a compound instruction into sequential sub-tasks.
+
+    "open a search engine, research about black holes and send it to prateek
+    in a chat app, also ask a random question to him, and then open
+    a store and send a phone link to prateek" becomes four parts:
+    the research, the chat send, the question, and the store
+    link send. A bare "open <site>" clause folds into the following
+    part (it is that part's navigation preamble). Single instructions
+    return unchanged, and splitting is idempotent: splitting any part
+    returns just that part.
+    """
+    if not instruction:
+        return [instruction]
+    # Boundaries are found with the split regex, but a boundary whose
+    # following clause is an anaphoric "open" (S8) is skipped — the
+    # clause stays attached to the part whose findings it refers to.
+    parts: list[str] = []
+    _start = 0
+    for _m in _COMPOUND_SPLIT_RE.finditer(instruction):
+        if _ANAPHORIC_OPEN_RE.match(instruction[_m.end():]):
+            continue
+        parts.append(instruction[_start:_m.start()].strip())
+        _start = _m.end()
+    parts.append(instruction[_start:].strip())
+    parts = [p for p in parts if p]
+    if len(parts) < 2:
+        return [instruction.strip()]
+    merged: list[str] = []
+    for part in parts:
+        if merged and _BARE_OPEN_SITE_RE.match(merged[-1]):
+            merged[-1] = f"{merged[-1]}, {part}"
+        else:
+            merged.append(part)
+    # A trailing bare "open <site>" with nothing after it is a real
+    # task on its own; only fold when a following part exists.
+    if len(merged) < 2:
+        return [instruction.strip()]
+    return merged
+
+
+# The channel word of a messaging part ("in/on/via <word>") — generic,
+# no hardcoded channel names. Only read from messaging-verb parts, so
+# "go to paris in june" never sets a channel (review #4, N1). The
+# channel slot excludes the stoplist (review #5, M6/M7): month/time
+# words ("in June", "in the morning") and email words ("on email")
+# are never channels.
+_CHANNEL_RE = re.compile(
+    r"\b(?:in|on|via|through|over)\s+(?!" + _CHANNEL_STOPLIST + r"\b)(\w+)\b",
+    re.IGNORECASE,
+)
+_MESSAGING_PART_RE = re.compile(
+    r"^\s*(?:(?:please|hey|hi|hello|can\s+you)\s*,?\s*)?(?:send|message|share|ask)\b",
+    re.IGNORECASE,
+)
+# A messaging clause anywhere in a part ("open a store, send ... to
+# prateek") — the part need not START with the verb, since a navigation
+# preamble can precede it. The recipient is any name/pronoun except
+# articles and group words ("the", "a", "everyone"), so "to the store"
+# never counts as a recipient.
+_MESSAGING_CLAUSE_RE = re.compile(
+    r"\b(?:send|message|share|ask)\b.*?\b(?:to|with)\s+"
+    r"(?!(?:the|a|an|everyone|everybody|all)\b)"
+    r"(?:[A-Za-z][A-Za-z\-']{1,30}|him|her|them|me)\b",
+    re.IGNORECASE,
+)
+_HAS_RECIPIENT_RE = re.compile(
+    r"\b(?:to|with)\s+"
+    r"(?!(?:the|a|an|everyone|everybody|all)\b)"
+    r"(?:[A-Za-z][A-Za-z\-']{1,30}|him|her|them|me)\b",
+    re.IGNORECASE,
+)
+
+
+def thread_compound_context(part: str, context: dict) -> str:
+    """Resolve pronouns in a later part against earlier parts' results.
+
+    "it" -> the summary (appended as a block), "him/her/them" -> the
+    last named recipient, "the/that link" -> the first URL an earlier
+    part produced, and a messaging part with a recipient but no channel
+    inherits the last channel ("ask ... to Prateek" -> "... on <channel>").
+    The wording is trigger-free by design: "the summary below" and the
+    "Summary:" header contain no "research", so the threaded part can
+    never be misread as a research directive (review #4, M1). All
+    replacements run on the part text BEFORE the summary block is
+    appended, so the summary itself is never rewritten (review #4, M2).
+    Unresolvable references are left as-is; the runner skips a part
+    whose dependency failed instead.
+    """
+    if not context or not part:
+        return part
+    out = part
+    recipient = context.get("last_recipient")
+    if recipient:
+        out = re.sub(r"\b(him|her|them)\b", recipient, out, count=1, flags=re.IGNORECASE)
+    links = context.get("found_links") or []
+    if links and re.search(r"\b(?:the|that|this)\s+link\b", out, re.IGNORECASE):
+        out = re.sub(r"\b(?:the|that|this)\s+link\b", links[0], out, count=1, flags=re.IGNORECASE)
+    channel = context.get("last_channel")
+    if (
+        channel
+        and _MESSAGING_CLAUSE_RE.search(out)
+        and _HAS_RECIPIENT_RE.search(out)
+        and not _CHANNEL_RE.search(out)
+    ):
+        out = f"{out} on {channel}"
+    summary = context.get("research_summary")
+    if summary and re.search(r"\bit\b", out, re.IGNORECASE):
+        out = re.sub(r"\bit\b", "the summary below", out, count=1, flags=re.IGNORECASE)
+        out = f"{out}\n\nSummary:\n{summary}"
+    return out
+
+
+def has_unresolved_reference(part: str, context: dict) -> bool:
+    """True when a part refers to an earlier result that does not exist.
+
+    "it" needs a research summary, "the/that link" needs a URL an
+    earlier part produced. A recipient pronoun is never unresolved:
+    the recipient comes from the part text itself, not an outcome.
+    """
+    if not context:
+        context = {}
+    if re.search(r"\bit\b", part, re.IGNORECASE) and not context.get("research_summary"):
+        return True
+    if re.search(r"\b(?:the|that|this)\s+link\b", part, re.IGNORECASE) and not context.get("found_links"):
+        return True
+    return False
+
+
+def update_compound_context(context: dict, part: str, outcome: tuple) -> dict:
+    """Fold one part's outcome into the threading context.
+
+    outcome is (intent, state, message). The research summary is kept
+    only from a completed research part; the recipient is read from
+    the part text (it is known even when the part failed); URLs are
+    collected from any completed part's message.
+    """
+    ctx = dict(context or {})
+    intent, state, message = outcome
+    if state == "completed" and intent == "RESEARCH_TASK" and message:
+        ctx["research_summary"] = message[:3000]
+    m = _RECIPIENT_RE.search(part) or _RECIPIENT_FALLBACK_RE.search(part)
+    if m:
+        ctx["last_recipient"] = m.group(1).strip().title()
+    if _MESSAGING_PART_RE.match(part):
+        ch = _CHANNEL_RE.search(part)
+        if ch:
+            ctx["last_channel"] = ch.group(1).strip().lower()
+    if state == "completed" and message:
+        found = [u.rstrip(".,)") for u in _URL_RE.findall(message)]
+        if found:
+            seen = set(ctx.get("found_links") or [])
+            ctx["found_links"] = (ctx.get("found_links") or []) + [u for u in found if u not in seen][:5]
+    return ctx
+
+
 
 
 def detect_requested_format(text: str) -> Optional[str]:
@@ -112,7 +394,7 @@ def detect_requested_format(text: str) -> Optional[str]:
 
 
 DELIVERABLE_PRESENTATION_RE = re.compile(
-    r"\b(?:presentation|slide\s*deck|slides?|powerpoint|pptx)\b",
+    r"\b(?:presentation|slide\s*deck|slides?|powerpoint|pptx|ppt)\b",
     re.IGNORECASE,
 )
 DELIVERABLE_SPREADSHEET_RE = re.compile(
@@ -143,7 +425,7 @@ RESEARCH_DIRECTIVE_RE = re.compile(
     re.IGNORECASE,
 )
 PREPARE_ARTIFACT_RE = re.compile(
-    r"\b(?:prepare|create|generate|write|make|build|produce|export|need|want|give\s+me|can\s+(?:i|we)\s+get)\s+(?:a|an)\s+(?:(?:new|detailed|comprehensive|fresh|research)\s+)*(?:(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|twelve|12)[- ](?:page|slide)s?\s+)?(?:report|presentation|slides?|slide\s*deck|excel(?:\s+comparison)?|spreadsheet|workbook|document|whitepaper|dossier|pdf|docx|pptx|xlsx|csv|html|markdown|comparison)\b",
+    r"\b(?:prepare|create|generate|write|make|build|produce|export|need|want|give\s+me|can\s+(?:i|we)\s+get)\s+(?:a|an)\s+(?:(?:new|detailed|comprehensive|fresh|research)\s+)*(?:(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|twelve|12)[- ](?:page|slide)s?\s+)?(?:report|presentation|slides?|slide\s*deck|excel(?:\s+comparison)?|spreadsheet|workbook|document|whitepaper|dossier|pdf|docx|pptx|ppt|powerpoint|xlsx|csv|html|markdown|comparison)\b",
     re.IGNORECASE,
 )
 EXPLANATION_WITH_DELIVERABLE_RE = re.compile(
@@ -484,6 +766,23 @@ def extract_research_topic(text: str, context: Optional[dict[str, Any]] = None) 
         flags=re.IGNORECASE,
     ).strip()
 
+    # 1b. Strip a leading delivery-request prefix ("send me the ppt
+    # about X", "give me the ppt for review"): the send verb and the
+    # pronoun/article are not the topic. Only when a deliverable noun
+    # follows — "send it to prateek in a chat app" has none, so a
+    # messaging instruction is untouched (review #5, S7).
+    if re.search(
+        r"\b(?:ppt|pptx|powerpoint|presentation|slides?|slide\s*deck|report|document|whitepaper|dossier|pdf|docx|xlsx|spreadsheet|workbook)\b",
+        cleaned,
+        re.IGNORECASE,
+    ):
+        cleaned = re.sub(
+            r"^(?:send|give|share|show|forward)\s+(?:me\s+|us\s+)?(?:the\s+|this\s+|that\s+|my\s+|it\s+)?",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip()
+
     # 2. Strip conversational command openers and directives
     cleaned = re.sub(
         r"^(?:could|can|would)\s+(?:you|u)\s+(?:please\s+|pls\s+)?(?:give|make|create|prepare|generate|provide|write|add|show|include|expand|elaborate|do|research|investigate)?\s*(?:me\s+)?",
@@ -510,6 +809,19 @@ def extract_research_topic(text: str, context: Optional[dict[str, Any]] = None) 
         flags=re.IGNORECASE,
     ).strip()
     cleaned = re.sub(r"^(?:now|then|next|also)\s+", "", cleaned, flags=re.IGNORECASE).strip()
+
+    # 2b. Strip a bare leading deliverable preamble ("ppt report on topic
+    # X", "presentation about X", "report on X"). Without this the
+    # preamble becomes the topic (live 2026-11-19: "ppt on topic
+    # university should teach..." survived as the topic).
+    cleaned = BARE_DELIVERABLE_PREAMBLE_RE.sub("", cleaned, count=1).strip()
+
+    # 2c. Cut delivery / messaging / shopping clauses out of a compound
+    # instruction ("research about black holes and send it to prateek
+    # in a chat app" -> research half only). The remainder is kept by the
+    # compound splitter, never silently dropped — this only keeps the
+    # RESEARCH topic clean.
+    cleaned = cut_delivery_clauses(cleaned)
     cleaned = re.sub(
         r"^(?:(?:hey|hi|yo|hello|ok|okay|bro|dude|man|please|pls|buddy|pal|friend|so|well|yeah|yep|yes)[\s,]+)+",
         "",
@@ -518,6 +830,16 @@ def extract_research_topic(text: str, context: Optional[dict[str, Any]] = None) 
     ).strip()
 
     # 3. Clean leading command verbs
+    # A navigation preamble ("open google, research about X") names the
+    # search engine, not the topic. Only a named engine counts — "open
+    # source licensing" must keep "open". Runs before the verb strip so
+    # the "research" after it is stripped by the verb pattern below.
+    cleaned = re.sub(
+        r"^open\s+(?:google|bing|duckduckgo|yahoo)\s*,?\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
     cleaned = re.sub(
         r"^(?:research(?:ing)?|conduct\s+research\s+on|investigate|study|deep\s+dive\s+into|survey|explain|describe|analyze|summarize|compare(?:\s+the)?|prepare|create|generate|write|make|build)\s+",
         "",
@@ -527,6 +849,16 @@ def extract_research_topic(text: str, context: Optional[dict[str, Any]] = None) 
 
     # 4. Clean trailing deliverable / format / illustration clauses BEFORE stripping
     #    the deliverable nouns they contain.
+    # A trailing purpose clause ("... for review", "... for checking")
+    # is why the deliverable is wanted, not the topic: "send me the
+    # ppt for review" must not become a research mission on "review"
+    # (review #5, S7).
+    cleaned = re.sub(
+        r"\s+for\s+(?:review|checking)\b.*$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
     cleaned = re.sub(
         r"\s+(?:and\s+)?(?:bro\s+|please\s+)?(?:prepare|create|generate|write|make|build|export|output)\s+(?:a|an)?\s*(?:more\s+)?(?:detailed\s+)?(?:research\s+)?(?:report|presentation|slides?|slide\s*deck|excel(?:\s+comparison)?|spreadsheet|workbook|document|whitepaper|dossier|pdf|docx|pptx|xlsx|csv|html)\b.*$",
         "",
@@ -548,7 +880,7 @@ def extract_research_topic(text: str, context: Optional[dict[str, Any]] = None) 
 
     # 5. Strip deliverable artifacts & slide/page counts (numbers or words)
     cleaned = re.sub(
-        r"\b(?:a\s+|an\s+)?(?:more\s+)?(?:detailed\s+)?(?:(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|twelve|12)[- ](?:page|slide)s?\s+)?(?:research\s+)?(?:report|presentation|slides?|slide\s*deck|excel(?:\s+comparison)?|spreadsheet|workbook|document|whitepaper|dossier|pdf|docx|pptx|xlsx|csv|html|comparison)(?:\s+(?:of|with)\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|twelve|12)\s+(?:slides?|pages?))?\b",
+        r"\b(?:a\s+|an\s+)?(?:more\s+)?(?:detailed\s+)?(?:(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|twelve|12)[- ](?:page|slide)s?\s+)?(?:research\s+)?(?:report|presentation|slides?|slide\s*deck|excel(?:\s+comparison)?|spreadsheet|workbook|document|whitepaper|dossier|pdf|docx|pptx|ppt|powerpoint|xlsx|csv|html|comparison)(?:\s+(?:of|with)\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|twelve|12)\s+(?:slides?|pages?))?\b",
         "",
         cleaned,
         flags=re.IGNORECASE,
@@ -559,6 +891,21 @@ def extract_research_topic(text: str, context: Optional[dict[str, Any]] = None) 
     cleaned = re.sub(
         r"\b(?:it\s+should\s+include|including|with)\b(?:(?!\b(?:and\s+also|and\s+research|also\s+research|research)\b).)*\b(?:formulas|equations|diagrams|figures|charts|tables|citations|references)(?:\s+(?:too|also|as\s+well))?",
         "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
+    # Trailing style clauses ("... use images and make it nice looking
+    # ppt") are presentation wishes, not topic. The (.+?) guard keeps a
+    # topic that legitimately STARTS with "use images" intact.
+    cleaned = re.sub(
+        r"^(.+?)\s+use\s+(?:relevant\s+)?(?:images?|diagrams?|figures?|charts?)\b.*$",
+        r"\1",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
+    cleaned = re.sub(
+        r"^(.+?)\s+make\s+it\s+(?:nice(?:[-\s]looking)?|better|good|great|beautiful|presentable)\b.*$",
+        r"\1",
         cleaned,
         flags=re.IGNORECASE,
     ).strip()
@@ -584,6 +931,10 @@ def extract_research_topic(text: str, context: Optional[dict[str, Any]] = None) 
     ).strip()
     cleaned = re.sub(r"\s+(?:in|on|at|for|with|about|from|of)$", "", cleaned, flags=re.IGNORECASE).strip()
     cleaned = re.sub(r"\s+(?:bro|man|dude|buddy|pal|friend|pls|please|thanks|thank\s+you|for\s+me|as\s+well|too)$", "", cleaned, flags=re.IGNORECASE).strip()
+
+    # Noun-stripping above can leave double spaces ("send me the  for
+    # review"); collapse them so the topic is well-formed.
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
 
     prior_topic = resolve_topic_from_context(context)
 
@@ -672,6 +1023,20 @@ def is_research_or_deliverable_request(
     has_expl_deliverable = bool(EXPLANATION_WITH_DELIVERABLE_RE.search(text))
     has_comp_deliverable = bool(COMPARISON_WITH_DELIVERABLE_RE.search(text))
     req_format = detect_requested_format(text)
+    # A bare deliverable noun phrase with a topic ("ppt report on topic
+    # X", "presentation about X", "report on X") is a research +
+    # deliverable request even though it has no leading verb —
+    # PREPARE_ARTIFACT_RE requires one, so without this the instruction
+    # falls through to NON_BROWSER and the LLM answers directly (live
+    # 2026-11-19: hallucinated `createpresentation` tool call, no file).
+    # The preamble regex requires a topic introducer, so "report writing
+    # techniques" does not count. A detected format or deliverable type
+    # must be present, so a bare "report on the meeting" still counts
+    # (report -> docx default) but plain conversation does not.
+    has_bare_deliverable = bool(
+        BARE_DELIVERABLE_PREAMBLE_RE.search(text)
+        and (req_format or detect_deliverable_type(text))
+    )
     has_format_directive = bool(
         req_format
         and re.search(
@@ -696,7 +1061,7 @@ def is_research_or_deliverable_request(
         or (prior_is_research and any(k in text.lower() for k in ["page", "pages", "slide", "slides", "report", "image", "images", "diagram", "diagrams", "table", "tables", "formula", "formulas", "compare", "comparison"]))
     )
 
-    if not (has_research or has_artifact or has_expl_deliverable or has_comp_deliverable or has_format_directive or (prior_is_research and is_follow_up)):
+    if not (has_research or has_artifact or has_expl_deliverable or has_comp_deliverable or has_format_directive or has_bare_deliverable or (prior_is_research and is_follow_up)):
         return False, None, None, None
 
     deliv_type = detect_deliverable_type(text)
@@ -716,6 +1081,19 @@ def is_research_or_deliverable_request(
             req_format = "docx"
 
     topic_hint = extract_research_topic(text, context=context) or prior_topic
+    # A bare format directive with no subject and no prior topic is not
+    # research: "send me the ppt for review" / "create a ppt" name no
+    # topic, so there is nothing to research — routing them as
+    # RESEARCH_TASK with topic None runs a garbage mission (review #5,
+    # S7). With a real subject, another trigger, or prior context the
+    # route stands.
+    if (
+        not topic_hint
+        and not prior_topic
+        and has_format_directive
+        and not (has_research or has_artifact or has_expl_deliverable or has_comp_deliverable or has_bare_deliverable or (prior_is_research and is_follow_up))
+    ):
+        return False, None, None, None
     return True, deliv_type, req_format, topic_hint
 
 
@@ -942,6 +1320,32 @@ GENERIC_SITE_OPEN_TRIGGER = re.compile(
     re.IGNORECASE,
 )
 
+# Messaging send: "send/message/share/ask <thing> to|with <name> in|on|via
+# <channel>" is a browser task on the messaging app — never a chat answer.
+# Without this, "send it to prateek in a chat app" falls to the NON_BROWSER
+# fast-path and "completes" by chatting, sending nothing (live 2026-11-19,
+# review #4 M1). The channel is any single word (no hardcoded names)
+# EXCEPT the stoplist (review #5, M6/M7): month/time words ("in June",
+# "in the morning") and email words ("on email", "via email") are not
+# channels, so those instructions stay out of the browser loop. The
+# prepositions exclude "by"/"for" so "send it to me by email" stays
+# with the email-dispatch handler (step 4c3, which runs first). A direct
+# "message <Name> on <channel>" is covered by the second arm.
+MESSAGING_SEND_RE = re.compile(
+    r"^\s*(?:(?:please|hey|hi|hello|can\s+you)\s*,?\s*)?"
+    r"(?:send|message|share|ask)\s+"
+    r"(?:\S+\s+){0,4}?"
+    r"(?:to|with)\s+[A-Za-z][A-Za-z\-']{1,30}\s+"
+    r"(?:in|on|via|through|over)\s+(?!" + _CHANNEL_STOPLIST + r"\b)\w+\b",
+    re.IGNORECASE,
+)
+MESSAGING_DIRECT_RE = re.compile(
+    r"^\s*(?:(?:please|hey|hi|hello|can\s+you)\s*,?\s*)?"
+    r"message\s+[A-Z][A-Za-z\-']{1,30}\s+"
+    r"(?:in|on|via|through|over)\s+(?!" + _CHANNEL_STOPLIST + r"\b)\w+\b",
+    re.IGNORECASE,
+)
+
 BROWSER_TRIGGERS = [
     re.compile(r"https?://[^\s]+", re.IGNORECASE),
     EMAIL_TRIGGER,
@@ -1144,6 +1548,17 @@ def classify_intent(
             reason="instruction requests email / webmail navigation",
             target_tab_hint="mail.google.com",
             operation_type=None,
+        )
+
+    # 5a. Messaging send (review #4, M1): "send/message/share/ask <thing>
+    # to|with <name> in|on <channel>" is a browser task on the messaging
+    # app. The NON_BROWSER fast-path has no messaging handler, so without
+    # this rule a send "completes" by chatting and nothing is ever sent.
+    if MESSAGING_SEND_RE.search(text) or MESSAGING_DIRECT_RE.search(text):
+        return IntentClassification(
+            intent=TaskIntent.NEW_BROWSER_TASK,
+            confidence=0.97,
+            reason="messaging send to a named recipient on a named channel",
         )
 
     # 5b. Check for pure deliverable export / compilation directive (e.g. "bro generate a pdf man", "export the previous analysis as a pdf")

@@ -43,6 +43,8 @@ __all__ = [
     "_actions_match",
     "_failure_action_matches",
     "_auto_complete_after_send",
+    "_send_visible_in_page",
+    "strip_tool_call_blocks",
     "_call_planner",
     "_enforce_date_integrity",
     "_execute_with_retries",
@@ -55,6 +57,7 @@ __all__ = [
     "_is_messaging_host",
     "_is_redundant_completed_action",
     "_is_whatsapp_qr",
+    "_fail_host",
     "_normalize_loop_error",
     "_normalize_loop_name",
     "_plan_tree_and_refs",
@@ -213,6 +216,86 @@ def _is_composer_target(target: Any) -> bool:
     )
 
 
+def strip_tool_call_blocks(text: str) -> tuple[str, list[str]]:
+    """Remove hallucinated `<tool_call>...</tool_call>` blocks from a direct answer.
+
+    The NON_BROWSER direct-answer path calls the LLM with NO tools, but the
+    model can still emit a tool-call block as text (live 2026-11-19: the PPT
+    request was answered directly and the model emitted a
+    `createpresentation` tool call with a 10-slide outline; the mission then
+    "completed" with an outline and no file). A tool call the backend never
+    registered must never reach the user as if it ran. Returns the cleaned
+    text and the tool names that were stripped, so the caller can say
+    honestly that no file was created.
+    """
+    if not text:
+        return text, []
+    names: list[str] = []
+    pattern = re.compile(r"<tool_call\b[^>]*>(.*?)</tool_call\s*>", re.IGNORECASE | re.DOTALL)
+    def _collect(m: re.Match[str]) -> str:
+        body = m.group(1) or ""
+        name_m = re.search(r'"name"\s*:\s*"([^"]+)"', body)
+        if name_m:
+            names.append(name_m.group(1))
+        else:
+            names.append("unknown")
+        return ""
+    cleaned = pattern.sub(_collect, text)
+    # A truncated (unclosed) block — exactly how the live outline was cut
+    # off mid-slide — has no closing tag for the regex above. Cut from
+    # its first occurrence to the end of the text and record the name
+    # when it is parseable.
+    _trunc = re.search(r"<tool_call\b[^>]*>(.*)$", cleaned, re.IGNORECASE | re.DOTALL)
+    if _trunc:
+        body = _trunc.group(1) or ""
+        name_m = re.search(r'"name"\s*:\s*"([^"]+)"', body)
+        names.append(name_m.group(1) if name_m else "unknown")
+        cleaned = cleaned[: _trunc.start()]
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned, names
+
+
+def _send_visible_in_page(history: list[dict[str, Any]], page_text: str) -> bool:
+    """Did the just-sent message actually appear in the chat?
+
+    The auto-complete gate fires on a successful composer `type` with
+    submit — but "typed and submitted" is not "sent": the submit can
+    silently fail to register (chat not focused, send button missed).
+    A distinctive snippet of the sent text must appear in the fresh
+    observation's page text. Whitespace-normalised, case-insensitive;
+    long messages match on their first 80 characters, since the page
+    text may truncate the tail. Empty page text never verifies.
+    """
+    if not history or not page_text:
+        return False
+    last = history[-1]
+    if not last.get("result_ok"):
+        return False
+    sent = str(((last.get("action") or {}).get("params") or {}).get("text") or "").strip()
+    if not sent:
+        return False
+    norm = lambda s: re.sub(r"\s+", " ", s).strip().lower()
+    norm_sent = norm(sent)
+    if len(norm_sent) > 80:
+        cut = norm_sent[:80]
+        # A cut at exactly 80 characters lands mid-word most of the
+        # time, and the trailing (?!\w) then can never match — even
+        # with the bubble plainly visible, every long send "fails"
+        # verification (review #5, M8). Back off to the last word
+        # boundary inside the cut instead.
+        if cut and cut[-1].isalnum() and norm_sent[80].isalnum():
+            cut = cut.rsplit(" ", 1)[0] if " " in cut else cut
+        needle = norm(cut)
+    else:
+        needle = norm_sent
+    if not needle:
+        return False
+    # Word boundaries: a bare substring match is vacuous for short
+    # messages ("hi" matches inside "this", "ok" inside "okay"), so the
+    # verification this guards would pass with no bubble present.
+    return re.search(r"(?<!\w)" + re.escape(needle) + r"(?!\w)", norm(page_text)) is not None
+
+
 def _auto_complete_after_send(history: list[dict[str, Any]], action: dict[str, Any], url: str) -> bool:
     """Detect a redundant follow-up after a composer send on a chat app.
 
@@ -323,6 +406,30 @@ def _normalize_loop_error(error: Any) -> str:
     text = re.sub(r"[0-9]+", " ", text)
     text = re.sub(r"[^a-z0-9]+", " ", text.lower())
     return " ".join(text.split())
+
+
+def _fail_host(entry: dict[str, Any], current_url: str) -> str:
+    """Host a failed step ran against, for the consecutive-failure counter.
+
+    Navigates carry their target host; every other action ran on the
+    page the loop is currently on. The counter is per-host (review #4,
+    S5): failures across different hosts restart the count, so probing
+    five dead candidate sources is exploration, not a loop.
+    """
+    if not isinstance(entry, dict):
+        return ""
+    act = entry.get("action") or {}
+    if not isinstance(act, dict):
+        act = {}
+    if act.get("type") == "navigate":
+        try:
+            return (urlsplit((act.get("params") or {}).get("url") or "").hostname or "").lower()
+        except Exception:
+            return ""
+    try:
+        return (urlsplit(current_url).hostname or "").lower()
+    except Exception:
+        return ""
 
 
 # Transient planner failures: the model gateway could not be reached

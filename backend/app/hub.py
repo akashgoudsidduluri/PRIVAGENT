@@ -84,6 +84,12 @@ class TaskRecord:
     # "merchant": ...} once the loop uses a standard tool. Names and
     # reasons only, never content — safe for the UI and the API.
     route: Optional[dict[str, Any]] = None
+    # Compound sub-task: one clause of a multi-clause instruction run
+    # as its own mission under a parent task. The parent owns the chat
+    # message and the final summary; a part never adds its own user
+    # message or retitles the chat.
+    compound_part: bool = False
+    parent_task_id: Optional[str] = None
 
 
 class ActionResultSlot:

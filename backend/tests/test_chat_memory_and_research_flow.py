@@ -117,6 +117,34 @@ def test_search_query_decomposition_strips_conversational_fluff():
         assert "platform" in q.lower()
 
 
+def test_decompose_compound_instruction_strips_delivery_clauses():
+    """A compound instruction's research queries cover the research half only.
+
+    Live 2026-11-19: decompose on "open google, research about black
+    holes and send it to prateek in whatsapp, also ask a random question
+    to him, and then open amazon and send redmi phone link to prateek"
+    produced ["google about black holes and send to prateek", "... official
+    overview", "... guide specifications"] — the WhatsApp/Amazon clauses
+    became search terms, and the whole task died in garbage queries.
+    """
+    instruction = (
+        "open google, research about black holes and send it to prateek in "
+        "whatsapp, also ask a random question to him, and then open amazon "
+        "and send redmi phone link to prateek"
+    )
+    queries = website_resolver.decompose_search_queries(instruction, category="research")
+    assert len(queries) >= 1
+    for q in queries:
+        assert "black hole" in q.lower()
+        assert "prateek" not in q.lower()
+        assert "whatsapp" not in q.lower()
+        assert "amazon" not in q.lower()
+        assert "redmi" not in q.lower()
+        assert "send" not in q.lower()
+        assert "google" not in q.lower()
+        assert len(q.split()) <= 14
+
+
 def test_chat_memory_extraction_and_persistence(tmp_path):
     """Verify extract_mission_facts and db chat_memory persist research metadata."""
     from app import db
