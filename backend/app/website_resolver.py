@@ -924,12 +924,45 @@ class WebsiteResolver:
                     prior_topic = top.get("title") if isinstance(top, dict) else getattr(top, "title", None)
 
         # If pure export/deliverable directive, fall back to prior topic or empty
-        from .intent_router import is_export_deliverable_directive
+        from .intent_router import is_export_deliverable_directive, is_prior_research_reference
         is_exp, _, _ = is_export_deliverable_directive(clean, context=context)
         if is_exp:
             clean = prior_topic or ""
             if not clean:
                 return []
+
+        # A bare "based on till now / so far" names no new subject — it
+        # is a reference to the prior research. Search the prior topic,
+        # never the literal reference phrase (which produced the garbage
+        # query "based on till now overview technical principles").
+        if is_prior_research_reference(clean):
+            clean = prior_topic or ""
+            if not clean:
+                return []
+
+        # An anaphoric follow-up ("yeah research about the topic
+        # first", "research about the topic first") names no new
+        # subject either — the topic extractor resolves it to the
+        # prior topic. Without this the raw instruction became the
+        # topic and decomposed into garbage queries ("yeah first
+        # overview technical principles"). Only the anaphoric case
+        # rewrites the query text: an explicit new subject keeps its
+        # own wording (the extractor returns it, not the prior topic).
+        if prior_topic:
+            from .intent_router import extract_research_topic
+
+            resolved = extract_research_topic(clean, context)
+            if resolved == prior_topic:
+                clean = prior_topic
+            elif resolved and resolved.startswith(prior_topic + " - "):
+                # Mixed reference + modifier ("based on till now, and
+                # also compare with biology") resolves in extract to
+                # "<prior> - <modifier>": use that as the query text.
+                # Without this the literal reference phrase became
+                # the query and the modifier ("biology") was dropped.
+                # The " - " separator is flattened to a space so the
+                # query reads as a topic, not a code artifact.
+                clean = resolved.replace(" - ", " ", 1)
 
         # Multi-sentence / structured decomposition:
         # Separate main topic from subtopic and deliverable clauses

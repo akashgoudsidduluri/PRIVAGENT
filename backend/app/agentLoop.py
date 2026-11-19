@@ -394,6 +394,14 @@ async def _run_loop(
     # stale ref in a row fails honestly instead of looping forever.
     grounding_stale_retries = 0
     url_history: list[str] = []
+    # Persistent A-B-A-B navigation cycles: the soft oscillation
+    # warning alone does not stop a planner that keeps bouncing, so the
+    # cycle count is tracked and the loop is stopped after 3 detections
+    # of the SAME pair. The pair is tracked: three separate single
+    # round-trips between different page pairs are legitimate
+    # cross-checks, not a loop, and must not accumulate to a stop.
+    oscillation_cycles = 0
+    oscillation_pair: Optional[frozenset] = None
     last_site_name: Optional[str] = None
 
     def progress(msg: str, screenshot: Optional[str] = None, observation: Any = None) -> None:
@@ -470,9 +478,16 @@ async def _run_loop(
             pass
         progress(f"Takeover: {trigger.reason}")
         takeover_started = time.perf_counter()
-        outcome = await _await_takeover(takeover_gate, task_id, trigger, takeover_timeout_s)
-        metrics("takeover_wait", takeover_started)
-        await _notify_extension_takeover(ext_hub, task_id, False)
+        try:
+            outcome = await _await_takeover(takeover_gate, task_id, trigger, takeover_timeout_s)
+        finally:
+            # The extension's takeover flag is GLOBAL: if the wait
+            # raises instead of returning (cancelled loop, teardown),
+            # the TAKEOVER_END below would never run and every later
+            # task would fail its first observation with TAKEOVER_ACTIVE
+            # forever. Always clear the flag, whatever the wait did.
+            metrics("takeover_wait", takeover_started)
+            await _notify_extension_takeover(ext_hub, task_id, False)
         # Task 10: audit — takeover end with the outcome.
         try:
             from .audit import append_event as _audit_event2
@@ -1600,6 +1615,41 @@ async def _run_loop(
                 if (url_history[-1] == url_history[-3] and
                     url_history[-2] == url_history[-4] and
                     url_history[-1] != url_history[-2]):
+                    # The pair is ORDER-INSENSITIVE (frozenset): the
+                    # detection window slides by one URL each iteration,
+                    # so the same A<->B oscillation reports (B, A) on
+                    # one firing and (A, B) on the next. A tuple key
+                    # would reset the count on every firing and the
+                    # loop would never stop.
+                    pair = frozenset((url_history[-1], url_history[-2]))
+                    # Count cycles per pair: a new pair resets the
+                    # count, so separate single round-trips between
+                    # different pages never accumulate into a stop.
+                    if pair != oscillation_pair:
+                        oscillation_pair = pair
+                        oscillation_cycles = 0
+                    oscillation_cycles += 1
+                    # A soft warning alone does not stop a planner that
+                    # keeps bouncing: the live research run ping-ponged
+                    # Wikipedia <-> BBC for 10 steps (34 in an earlier
+                    # run) despite this warning, burning ~118s of
+                    # overhead on pure navigations. After two ignored
+                    # warnings (three detections) the cycle is a loop,
+                    # not a strategy — stop honestly instead of running
+                    # to the step cap or the planner timeout.
+                    if oscillation_cycles >= 3:
+                        _save_checkpoint_defensive(task_id, conversation_id, session_id, steps_done, raw_url, history, working_memory)
+                        return {
+                            "final": "budget_exceeded",
+                            "steps": steps_done,
+                            "summary": (
+                                f"Loop detected: repeatedly bouncing between "
+                                f"{url_history[-1]} and {url_history[-2]} "
+                                f"({oscillation_cycles} oscillation cycles) without "
+                                f"progress; stopping instead of repeating the cycle."
+                            ),
+                            "history": history,
+                        }
                     penalties.append(
                         "Oscillation warning: You are repeatedly bouncing between two pages. Do not navigate back and forth; execute your search or extraction on the destination page."
                     )
@@ -3511,7 +3561,8 @@ class _LiveObservation:
     async def __call__(self) -> dict[str, Any]:
         if not real_hub.extension_sockets:
             raise RuntimeError("EXTENSION_DISCONNECTED: no extension socket")
-        for attempt in range(2):
+        stale_cleared = False
+        for attempt in range(3):
             if is_cancelled(self._task_id):
                 raise RuntimeError("task cancelled")
             act: dict[str, Any] = {
@@ -3526,9 +3577,53 @@ class _LiveObservation:
                 return res["observation"]
             if is_cancelled(self._task_id):
                 raise RuntimeError("task cancelled")
-            if attempt == 0:
+            err = res.get("error") or {}
+            if isinstance(err, dict) and err.get("code") == "TAKEOVER_ACTIVE" and not stale_cleared:
+                # The extension's takeover flag is global, and a
+                # takeover that ended without its TAKEOVER_END (loop
+                # teardown, lost message) leaves it set forever — every
+                # later task then fails its first observation the same
+                # way. If no OTHER task is currently waiting in
+                # takeover, the flag is stale: nobody is doing a manual
+                # step, so clear it and retry instead of failing.
+                stale_cleared = True
+                if await _clear_stale_takeover(self._task_id):
+                    await asyncio.sleep(0.5)
+                    continue
+                raise RuntimeError(
+                    "observation blocked: a takeover is still active in the browser "
+                    "(the operator is completing a login / payment step in another task). "
+                    "Resume or cancel that takeover from its banner, then retry this task."
+                )
+            if attempt < 2:
                 await asyncio.sleep(0.5)
         raise RuntimeError(f"observation failed: {res.get('error')}")
+
+
+async def _clear_stale_takeover(task_id: str) -> bool:
+    """Clear a TAKEOVER_ACTIVE flag no task owns any more.
+
+    Returns True when the flag was cleared (the caller retries the
+    observation) and False when another task is genuinely waiting in
+    takeover — clearing the flag then would let the agent observe
+    while the operator is typing a password or a payment.
+    """
+    try:
+        for t in real_hub.tasks.values():
+            if getattr(t, "task_id", None) != task_id and getattr(t, "state", None) == "awaiting_takeover":
+                return False
+    except Exception:
+        return False
+    try:
+        notify = getattr(real_hub, "notify_extension", None)
+        if notify is None:
+            return False
+        result = notify({"type": "TAKEOVER_END", "taskId": task_id})
+        if asyncio.iscoroutine(result):
+            await result
+    except Exception:
+        return False
+    return True
 
 
 def _live_observation_factory(record: TaskRecord) -> _LiveObservation:

@@ -147,6 +147,51 @@ def test_get_chat_rehydrates_checkpoints_and_steps(temp_db):
 
 
 
+def test_get_chat_steps_attach_only_by_task_id(temp_db):
+    """Steps attach ONLY by task_id, never by position. Live failure
+    (2026-11-19): a timeline from the previous chat showed in a new
+    chat. The backend half: get_chat paired agent messages to
+    checkpoints by INDEX when a message had no matching task_id, so a
+    conversational greeting (no checkpoint of its own) inherited the
+    next browser task's steps and rendered them under the wrong turn.
+    A greeting must carry no steps; the browse turn keeps its own."""
+    chat = db.create_chat(title="Timeline Leak Chat", db_path=temp_db)
+    cid = chat["id"]
+    tid_browse = "task-browse-1"
+
+    # Turn 1: a plain greeting — no task, no checkpoint.
+    db.add_message(cid, "user", "hi", db_path=temp_db)
+    db.add_message(cid, "agent", "Hey there! Great to see you.", db_path=temp_db)
+    # Turn 2: a real browser task with a checkpoint.
+    db.add_message(cid, "user", "check the price", task_id=tid_browse, db_path=temp_db)
+    db.save_task_checkpoint(
+        task_id=tid_browse,
+        conversation_id=cid,
+        session_id="sess-browse",
+        step_index=1,
+        last_url="https://site3.test",
+        history=[
+            {"action": {"type": "navigate"}, "evidence": "https://site3.test", "result_ok": True},
+        ],
+        working_memory={},
+        db_path=temp_db,
+    )
+    db.add_message(cid, "agent", "price is ₹999", task_id=tid_browse, db_path=temp_db)
+
+    detail = db.get_chat(cid, db_path=temp_db)
+    assert detail is not None
+    messages = detail["messages"]
+    assert len(messages) == 4
+    greeting = messages[1]
+    assert greeting["role"] == "agent"
+    assert "steps" not in greeting, greeting
+    browse = messages[3]
+    assert browse["role"] == "agent"
+    assert "steps" in browse
+    assert len(browse["steps"]) == 1
+    assert browse["steps"][0]["message"] == "Step 1: navigate -> https://site3.test"
+
+
 def test_user_preferences_vault(temp_db):
     db.set_user_preference("pincode", "500081", db_path=temp_db)
     db.set_user_preference("currency", "INR", db_path=temp_db)

@@ -606,3 +606,230 @@ def test_decompose_pdf_followup_uses_prior_topic_not_garbage():
 
     without_prior = resolver.decompose_search_queries(text, context={})
     assert without_prior == [], without_prior
+
+
+def test_export_directive_based_on_till_now_phrasings():
+    """\"based on till now / so far\" is a reference to the research done
+    so far, not a new subject. A deliverable request built on it
+    (\"generate pdf based on research till now\") is a pure export of the
+    existing research — it must not become a new research task on the
+    literal topic \"based on till now\"."""
+    for text in [
+        "generate pdf based on research till now",
+        "generate pdf based on till now",
+        "give me a pdf based on research till now",
+        "based on the research till now, generate a pdf",
+        "generate a pdf based on the work so far",
+        "generate a docx based on till now",
+    ]:
+        is_exp, fmt, _ = is_export_deliverable_directive(text)
+        assert is_exp is True, text
+        assert fmt in {"pdf", "docx"}, text
+
+
+def test_based_on_till_now_resolves_to_prior_topic():
+    """A bare \"based on till now / so far\" names no new subject — it
+    resolves to the prior research topic from context, in extract,
+    classify and decompose. An explicit new subject after \"based on\"
+    (\"based on quantum mechanics\") is still a NEW research task, not
+    an export of existing research."""
+    from app.website_resolver import WebsiteResolver
+
+    ctx = {
+        "research_topic": "Quantum Mechanics similarities with life",
+        "conversation_history": [
+            {"role": "user", "content": 'so i have to submit a research paper on topic: "Quantum Mechanics similarities with life?"'}
+        ],
+    }
+    resolver = WebsiteResolver()
+    for text in [
+        "generate pdf based on research till now",
+        "generate pdf based on till now",
+        "based on till now",
+        "based on the research till now, generate a pdf",
+        "based on so far",
+        "till now",
+    ]:
+        assert extract_research_topic(text, context=ctx) == "Quantum Mechanics similarities with life", text
+        queries = resolver.decompose_search_queries(text, context=ctx)
+        assert queries and queries[0] == "Quantum Mechanics similarities with life", (text, queries)
+        assert not any("till now" in q.lower() or "so far" in q.lower() for q in queries), (text, queries)
+    # Export phrasings route to EXPORT_EXISTING_PACKAGE with the prior topic.
+    for text in [
+        "generate pdf based on research till now",
+        "based on the research till now, generate a pdf",
+    ]:
+        res = classify_intent(text, context=ctx)
+        assert res.intent == TaskIntent.NON_BROWSER, text
+        assert res.operation_type == ResearchOperationType.EXPORT_EXISTING_PACKAGE, text
+        assert res.requested_format == "pdf", text
+        assert res.research_topic == "Quantum Mechanics similarities with life", text
+    # A bare reference with no prior topic yields no topic and no search.
+    assert extract_research_topic("based on till now", context={}) is None
+    assert resolver.decompose_search_queries("based on till now", context={}) == []
+    # An explicit NEW subject after "based on" is not a reference.
+    res = classify_intent("generate pdf based on quantum mechanics", context=ctx)
+    assert res.intent == TaskIntent.RESEARCH_TASK, res
+    assert res.operation_type == ResearchOperationType.NEW_RESEARCH, res
+    assert extract_research_topic("generate pdf based on quantum mechanics", context=ctx) == "based on quantum mechanics"
+
+
+def test_export_directive_ref_first_with_new_subject_is_new_research():
+    """A reference FIRST, then an explicit new subject (\"based on the
+    research till now, generate a pdf about quantum mechanics\") is NEW
+    research on that subject — not an export of the prior research.
+    Before the fix the reference-first export check used re.match
+    with no tail constraint, so it returned export=True and the new
+    subject was silently dropped (the pdf would have been built on the
+    old topic). The topic extractor had the same hole: step 4's
+    trailing-clause strip ate \"generate a pdf about quantum
+    mechanics\" wholesale, leaving the bare reference, which resolved
+    to the prior topic."""
+    from app.website_resolver import WebsiteResolver
+
+    ctx = {
+        "research_topic": "Quantum Mechanics similarities with life",
+        "conversation_history": [
+            {"role": "user", "content": 'so i have to submit a research paper on topic: "Quantum Mechanics similarities with life?"'}
+        ],
+    }
+    text = "based on the research till now, generate a pdf about quantum mechanics"
+    is_exp, _, _ = is_export_deliverable_directive(text, context=ctx)
+    assert is_exp is False, text
+    assert extract_research_topic(text, context=ctx) == "quantum mechanics", text
+    res = classify_intent(text, context=ctx)
+    assert res.intent == TaskIntent.RESEARCH_TASK, res
+    assert res.operation_type == ResearchOperationType.NEW_RESEARCH, res
+    assert res.research_topic == "quantum mechanics", res
+    # The verb may be "give" too ("based on till now, give a pdf
+    # about quantum mechanics") — the new-subject check mirrors the
+    # export pattern's verb list, not a subset of it.
+    assert extract_research_topic(
+        "based on till now, give a pdf about quantum mechanics", context=ctx
+    ) == "quantum mechanics"
+    # And the give variant must CLASSIFY as research too: the format
+    # directive's verb list missed "give", so it classified
+    # NON_BROWSER while the generate variant yielded NEW_RESEARCH.
+    res_give = classify_intent(
+        "based on till now, give a pdf about quantum mechanics", context=ctx
+    )
+    assert res_give.intent == TaskIntent.RESEARCH_TASK, res_give
+    assert res_give.operation_type == ResearchOperationType.NEW_RESEARCH, res_give
+    assert res_give.research_topic == "quantum mechanics", res_give
+    # A requirement tail on the new subject is stripped, not kept
+    # ("quantum mechanics with images" -> "quantum mechanics").
+    assert extract_research_topic(
+        "based on till now, generate a pdf about quantum mechanics with images", context=ctx
+    ) == "quantum mechanics"
+    # Pure references still export (controls — the fix must not
+    # break the ref-first export path).
+    for pure in [
+        "based on the research till now, generate a pdf",
+        "based on till now, generate a pdf",
+        "generate pdf based on research till now",
+    ]:
+        is_exp, fmt, _ = is_export_deliverable_directive(pure, context=ctx)
+        assert is_exp is True, pure
+        assert fmt == "pdf", pure
+        assert extract_research_topic(pure, context=ctx) == "Quantum Mechanics similarities with life", pure
+
+
+def test_bare_so_far_resolves_to_prior_topic():
+    """Bare \"so far\" is a reference to the research done so far.
+    Before the fix, extract_research_topic stripped the leading
+    \"so\" as a conversational opener, so \"so far\" became \"far\"
+    before the reference check ran — the topic was the literal word
+    \"far\"."""
+    ctx = {
+        "research_topic": "Quantum Mechanics similarities with life",
+        "conversation_history": [
+            {"role": "user", "content": 'research paper on topic: "Quantum Mechanics similarities with life?"'}
+        ],
+    }
+    assert extract_research_topic("so far", context=ctx) == "Quantum Mechanics similarities with life"
+    assert extract_research_topic("based on so far", context=ctx) == "Quantum Mechanics similarities with life"
+    # An opener in front of a bare reference ("yeah, so far", "ok, so
+    # far") is still just the reference: step 1 strips the opener AND
+    # "so" (also an opener), leaving the nonsense topic "far".
+    for text in ["yeah, so far", "ok, so far", "so, far", "yeah, till now", "well, so far"]:
+        assert extract_research_topic(text, context=ctx) == "Quantum Mechanics similarities with life", text
+    from app.website_resolver import WebsiteResolver
+
+    queries = WebsiteResolver().decompose_search_queries("so far", context=ctx)
+    assert queries and queries[0] == "Quantum Mechanics similarities with life", queries
+
+
+def test_mixed_reference_plus_modifier_strips_reference():
+    """\"based on till now, and also compare with biology\" is the prior
+    topic plus a modifier — the literal reference phrase must not
+    survive into the topic (\"... - based on till now, and also
+    compare with biology\" was the pre-fix topic)."""
+    ctx = {
+        "research_topic": "Quantum Mechanics similarities with life",
+        "conversation_history": [
+            {"role": "user", "content": 'research paper on topic: "Quantum Mechanics similarities with life?"'}
+        ],
+    }
+    assert extract_research_topic(
+        "based on till now, and also compare with biology", context=ctx
+    ) == "Quantum Mechanics similarities with life - compare with biology"
+    # And the query decomposition must use the same resolved topic —
+    # the literal reference phrase must not become the query with the
+    # modifier ("biology") dropped.
+    from app.website_resolver import WebsiteResolver
+
+    queries = WebsiteResolver().decompose_search_queries(
+        "based on till now, and also compare with biology", context=ctx
+    )
+    assert queries, queries
+    assert any("biology" in q.lower() for q in queries), queries
+    assert not any("till now" in q.lower() for q in queries), queries
+
+
+def test_no_trailing_comma_in_topic():
+    """\"based on quantum mechanics, generate a pdf\" must not leave a
+    trailing comma on the topic (pre-fix topic ended with \",\")."""
+    ctx = {
+        "research_topic": "Quantum Mechanics similarities with life",
+        "conversation_history": [
+            {"role": "user", "content": 'research paper on topic: "Quantum Mechanics similarities with life?"'}
+        ],
+    }
+    topic = extract_research_topic("based on quantum mechanics, generate a pdf", context=ctx)
+    assert topic == "based on quantum mechanics", topic
+
+
+def test_yeah_research_about_the_topic_first_resolves_prior_topic():
+    """\"yeah research about the topic first\" is an anaphoric follow-up
+    on the prior topic (the PPT chat: prior turn asked for a ppt on
+    \"university should teach beyond classical syllabus in this AI
+    Era\"). Before the fix, \"yeah\" was not in the opener-strip list
+    and \"the topic\" was never resolved, so the literal topic became
+    \"yeah first\" / \"the topic first\" and decomposed into garbage
+    queries (\"yeah first overview technical principles\",
+    \"yeah about the topic first technical mechanics implementation
+    methods\")."""
+    from app.website_resolver import WebsiteResolver
+
+    prior = "university should teach beyond classical syllabus in this AI Era"
+    ctx = {
+        "research_topic": prior,
+        "conversation_history": [
+            {"role": "user", "content": "ppt report on topic university should teach beyond classical syllabus in this AI Era. use images and make it nice looking ppt"}
+        ],
+    }
+    text = "yeah research about the topic first"
+    assert extract_research_topic(text, context=ctx) == prior, text
+    queries = WebsiteResolver().decompose_search_queries(text, context=ctx)
+    assert queries, queries
+    assert all("yeah" not in q.lower() and "first" not in q.lower() for q in queries), queries
+    assert any(prior.split(" in ")[0].lower() in q.lower() for q in queries), queries
+    # The comma variant ("yeah, research about the topic first") must
+    # resolve the same way — the opener strip used to require
+    # whitespace after the opener word, so "yeah," survived and became
+    # the literal topic "yeah, about the topic first".
+    assert extract_research_topic("yeah, research about the topic first", context=ctx) == prior
+    queries = WebsiteResolver().decompose_search_queries(
+        "yeah, research about the topic first", context=ctx
+    )
+    assert queries and all("yeah" not in q.lower() for q in queries), queries

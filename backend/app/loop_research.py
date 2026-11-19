@@ -246,23 +246,43 @@ def _finalize_research_artifacts(
                 except Exception:
                     pass
 
-        # 3. Render architecture block diagram if relevant topic and no diagram exists
+        # 3. Render architecture block diagram ONLY when the topic
+        # actually warrants one (system / neural / architecture
+        # keywords). The old code rendered it unconditionally whenever
+        # no diagram existed, so every research PDF — including a
+        # quantum-biology paper — got a generic software-architecture
+        # block diagram ("Client Interface & Ingestion Pipeline",
+        # "Algorithmic Processing", "Data Storage") that has nothing to
+        # do with the topic. derive_visual_plan is the existing
+        # relevance check; a biology / history / non-technical topic
+        # gets no diagram at all.
         has_diagram = any(v.asset_id == "vis_diagram_arch" for v in pkg.visuals)
         if not has_diagram:
-            diag_path = artifacts_dir / "architecture_diagram.png"
             try:
-                render_diagram_to_png(pkg.topic.title, str(diag_path))
-                vis = VisualAsset(
-                    asset_id="vis_diagram_arch",
-                    asset_type="diagram",
-                    title=f"{pkg.topic.title} Architecture",
-                    caption="Architectural flow and component breakdown",
-                    url_or_path=str(diag_path),
-                    is_generated=True,
+                from .research.adaptive_planner import derive_visual_plan
+
+                _vplan = derive_visual_plan(
+                    working_memory.get("instruction") or "",
+                    topic=pkg.topic.title,
                 )
-                pkg.add_visual(vis)
+                _need_arch = bool(_vplan.need_architecture_diagram)
             except Exception:
-                pass
+                _need_arch = False
+            if _need_arch:
+                diag_path = artifacts_dir / "architecture_diagram.png"
+                try:
+                    render_diagram_to_png(pkg.topic.title, str(diag_path))
+                    vis = VisualAsset(
+                        asset_id="vis_diagram_arch",
+                        asset_type="diagram",
+                        title=f"{pkg.topic.title} Architecture",
+                        caption="Architectural flow and component breakdown",
+                        url_or_path=str(diag_path),
+                        is_generated=True,
+                    )
+                    pkg.add_visual(vis)
+                except Exception:
+                    pass
 
         # 4. Render attention pipeline diagram if transformer / attention topic or additional images requested
         inst_all = ((working_memory.get("instruction") or "") + " " + (pkg.topic.objective or "")).lower()

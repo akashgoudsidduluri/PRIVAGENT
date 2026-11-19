@@ -167,6 +167,31 @@ FOLLOW_UP_TRIGGERS_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A reference to the research / work done so far — "based on till now",
+# "based on research till now", "based on the work so far", "till now",
+# "so far", "up to now". These are anaphoric: they name NO new subject
+# and must resolve to the prior research topic from context, never be
+# treated as a literal topic or search query. The noun after "based on"
+# is limited to research-ish words, so an explicit new subject
+# ("based on quantum mechanics") does NOT match — it stays a new
+# research task.
+PRIOR_RESEARCH_REF_RE = re.compile(
+    r"^(?:based\s+on\s+)?"
+    r"(?:(?:the\s+)?(?:research|work|findings|results|analysis|stuff|material|content|what\s+we\s+(?:have|found|did|covered|discussed|got|learned))\s+)?"
+    r"(?:the\s+)?"
+    r"(?:till\s+now|so\s*,?\s*far|up\s+to\s+now|till\s+date|up\s+to\s+date)"
+    r"[!., \s]*$",
+    re.IGNORECASE,
+)
+
+
+def is_prior_research_reference(text: str) -> bool:
+    """True when the text is ONLY a reference to prior research (no new subject)."""
+    if not text:
+        return False
+    return bool(PRIOR_RESEARCH_REF_RE.match(text.strip()))
+
+
 EXPORT_DIRECTIVE_PATTERN = re.compile(
     # Leading conversational opener ("or atleast give a pdf
     # report..." — "or" / "at least" are not greetings, so the old
@@ -197,6 +222,13 @@ EXPORT_DIRECTIVE_PATTERN = re.compile(
     # to the garbage query "research"), so the noun is part of the
     # clause.
     r"(?:\s+(?:about|of|on|for)\s+(?:(?:this|that|it)(?:\s+(?:topic|research|report|analysis|findings|results|document|content|package))?|the\s+(?:above|previous|prior|same)(?:\s+(?:topic|research|report|analysis|findings|results|document|content|package))?))?"
+    # A "based on ... till now / so far" reference to the research done
+    # so far ("generate pdf based on research till now", "based on till
+    # now"): a pure reference to prior research, never a new subject.
+    # The noun after "based on" is limited to research-ish words, so an
+    # explicit new subject ("based on quantum mechanics") does NOT
+    # match — it stays a new research task.
+    r"(?:\s+based\s+on\s+(?:(?:the\s+)?(?:research|work|findings|results|analysis|stuff|material|content|what\s+we\s+(?:have|found|did|covered|discussed|got|learned))\s+)?(?:till\s+now|so\s*,?\s*far|up\s+to\s+now|till\s+date|up\s+to\s+date))?"
     # A trailing requirement clause (", that should include images
     # related to it too", " with images"): the old tail only allowed
     # an (add|include|with) clause and a few closers, so anything
@@ -249,6 +281,43 @@ def is_export_deliverable_directive(
     m = EXPORT_DIRECTIVE_PATTERN.match(clean)
     if m:
         raw_fmt = m.group(1).lower()
+        fmt = detect_requested_format(raw_fmt) or detect_requested_format(clean)
+        deliv = detect_deliverable_type(clean) or ("presentation" if fmt == "pptx" else "report")
+        if not fmt and deliv == "presentation":
+            fmt = "pptx"
+        elif not fmt and context:
+            fmt = context.get("requested_format")
+        if not fmt:
+            fmt = "pdf"
+        return True, fmt, deliv
+
+    # "based on the research till now, generate a pdf" — the reference
+    # comes first and the deliverable request second. The main pattern
+    # anchors on the verb, so this order needs its own check. The tail
+    # mirrors the main pattern's tail (pronoun topic clause /
+    # requirement clause / closers, then $): without it the check
+    # matched a prefix, so "generate a pdf about quantum mechanics"
+    # was silently treated as a pure export of prior research and the
+    # explicit new subject was dropped.
+    m_ref_first = re.match(
+        r"^(?:based\s+on\s+)?"
+        r"(?:(?:the\s+)?(?:research|work|findings|results|analysis|stuff|material|content|what\s+we\s+(?:have|found|did|covered|discussed|got|learned))\s+)?"
+        r"(?:the\s+)?"
+        r"(?:till\s+now|so\s*,?\s*far|up\s+to\s+now|till\s+date|up\s+to\s+date)"
+        r"\s*,?\s*"
+        r"(?:generate|create|export|save|compile|download|produce|make|render|output|convert|turn|give|format|put|send|prepare|provide)\s+"
+        r"(?:(?:a|an|the)\s+)?"
+        r"(pdf|docx|word(?:\s+doc(?:ument)?)?|pptx|powerpoint|presentation|slides?|slide\s*deck|xlsx|excel(?:\s+sheet)?|spreadsheet|workbook|csv|markdown|html|report|document)\b"
+        r"(?:\s+(?:file|document|deck|sheet|format|report))?"
+        r"(?:\s+(?:about|of|on|for)\s+(?:(?:this|that|it)(?:\s+(?:topic|research|report|analysis|findings|results|document|content|package))?|the\s+(?:above|previous|prior|same)(?:\s+(?:topic|research|report|analysis|findings|results|document|content|package))?))?"
+        r"(?:\s*,?\s*(?:that\s+)?(?:should\s+)?(?:include|with|having|add|containing)\s+[^\n]+)?"
+        r"(?:\s+(?:(?:and|but)\s+)?(?:also\s+)?(?:add|include|with)\s+[^\n]+)?"
+        r"(?:\s+(?:bro|man|dude|pls|please|for\s+me|thanks|thank\s+you|of\s+this|from\s+this|instead))?[!.\s]*$",
+        clean,
+        re.IGNORECASE,
+    )
+    if m_ref_first:
+        raw_fmt = m_ref_first.group(1).lower()
         fmt = detect_requested_format(raw_fmt) or detect_requested_format(clean)
         deliv = detect_deliverable_type(clean) or ("presentation" if fmt == "pptx" else "report")
         if not fmt and deliv == "presentation":
@@ -334,9 +403,82 @@ def extract_research_topic(text: str, context: Optional[dict[str, Any]] = None) 
     if is_exp:
         return resolve_topic_from_context(context)
 
-    # 1. Strip conversational slang openers
+    # A bare prior-research reference ("so far", "till now") must be
+    # checked on the RAW text: step 1 below strips leading "so" as a
+    # conversational opener, so "so far" would become "far" before the
+    # reference check ever ran.
+    if is_prior_research_reference(cleaned):
+        return resolve_topic_from_context(context)
+
+    # An opener in front of a bare reference ("yeah, so far", "ok, so
+    # far") is still just the reference — but step 1 strips the opener
+    # AND "so" (also an opener), leaving the nonsense topic "far".
+    # Check the reference on opener-stripped text too, before any
+    # stripping runs. The prestrip deliberately EXCLUDES "so" from its
+    # opener list: including it would strip "so" out of "so far" and
+    # leave "far" again. The guard skips the re-check when nothing
+    # was stripped (the raw check above already covered that case).
+    _prestripped = re.sub(
+        r"^(?:(?:hey|hi|yo|hello|ok|okay|bro|dude|man|please|pls|buddy|pal|friend|well|yeah|yep|yes)[\s,]+)+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
+    if _prestripped != cleaned and is_prior_research_reference(_prestripped):
+        return resolve_topic_from_context(context)
+
+    # A reference followed by an EXPLICIT new subject ("based on the
+    # research till now, generate a pdf about quantum mechanics") is
+    # new research on that subject — the subject after "about/on" is
+    # the topic, not the prior one. Without this, step 4 below
+    # (trailing deliverable clause, whose `.*$` eats everything after
+    # the format noun) strips "generate a pdf about quantum
+    # mechanics" entirely, leaving the bare reference, which the
+    # check above then resolves to the prior topic — the explicit new
+    # subject silently disappears. The verb list mirrors the export
+    # pattern's verbs ("give a pdf about ..." was missed at first:
+    # "give" is a deliverable verb too).
+    m_new_subject = re.search(
+        r"(?:till\s+now|so\s*,?\s*far|up\s+to\s+now|till\s+date|up\s+to\s+date)\b"
+        r"[^.\n]*?\b(?:generate|create|make|prepare|produce|write|build|export|give|save|compile|download|render|output|convert|turn|format|put|send|provide)\b"
+        r"[^.\n]*?\b(?:pdf|docx|word|pptx|presentation|slides?|slide\s*deck|xlsx|excel|spreadsheet|report|document)\b"
+        r"\s+(?:about|on|of)\s+(.+)$",
+        cleaned,
+        re.IGNORECASE,
+    )
+    if m_new_subject:
+        subject = re.sub(r"[.!?,]+$", "", m_new_subject.group(1).strip()).strip()
+        # Strip a requirement tail off the subject ("quantum mechanics
+        # with images" -> "quantum mechanics"): only the known
+        # requirement nouns, so a subject that legitimately contains
+        # "with" ("living with diabetes") is left alone.
+        subject = re.sub(
+            r"\s+with\s+(?:relevant\s+)?(?:images|diagrams|figures|charts|tables|references|citations|examples|equations|formulas)\b.*$",
+            "",
+            subject,
+            flags=re.IGNORECASE,
+        ).strip()
+        subject = re.sub(
+            r"\s+(?:that|which)\s+(?:should\s+)?(?:include|contain|cover)\b.*$",
+            "",
+            subject,
+            flags=re.IGNORECASE,
+        ).strip()
+        subject = re.sub(r"\s+including\b.*$", "", subject, flags=re.IGNORECASE).strip()
+        subject = re.sub(r"[.!?,]+$", "", subject).strip()
+        # A pronoun subject ("about this research") is not a new
+        # subject at all — the export check above already returned
+        # for those; anything reaching here with only a pronoun has
+        # no usable subject, so fall through to the normal path.
+        if subject and not re.fullmatch(r"(?:this|that|it)(?:\s+(?:topic|research|report|analysis|findings|results|document|content|package))?", subject, re.IGNORECASE):
+            return subject
+
+    # 1. Strip conversational slang openers (including bare
+    # affirmations like "yeah" / "yep" — "yeah research about the
+    # topic first" is a follow-up on the prior topic, not a topic
+    # containing the word "yeah").
     cleaned = re.sub(
-        r"^(?:(?:hey|hi|yo|hello|ok|okay|bro|dude|man|please|pls|buddy|pal|friend|so|well)\s+)+",
+        r"^(?:(?:hey|hi|yo|hello|ok|okay|bro|dude|man|please|pls|buddy|pal|friend|so|well|yeah|yep|yes)[\s,]+)+",
         "",
         cleaned,
         flags=re.IGNORECASE,
@@ -369,7 +511,7 @@ def extract_research_topic(text: str, context: Optional[dict[str, Any]] = None) 
     ).strip()
     cleaned = re.sub(r"^(?:now|then|next|also)\s+", "", cleaned, flags=re.IGNORECASE).strip()
     cleaned = re.sub(
-        r"^(?:(?:hey|hi|yo|hello|ok|okay|bro|dude|man|please|pls|buddy|pal|friend|so|well)\s+)+",
+        r"^(?:(?:hey|hi|yo|hello|ok|okay|bro|dude|man|please|pls|buddy|pal|friend|so|well|yeah|yep|yes)[\s,]+)+",
         "",
         cleaned,
         flags=re.IGNORECASE,
@@ -433,7 +575,7 @@ def extract_research_topic(text: str, context: Optional[dict[str, Any]] = None) 
     cleaned = re.sub(r"\s+(?:bro|man|dude|buddy|pal|friend|pls|please|thanks|thank\s+you|for\s+me|as\s+well|too)$", "", cleaned, flags=re.IGNORECASE).strip()
     cleaned = re.sub(r"^(?:and|also|too|with|in|for|about|on)\s+", "", cleaned, flags=re.IGNORECASE).strip()
     cleaned = re.sub(r"\s+(?:too|also|as\s+well|for\s+it|about\s+it|instead)$", "", cleaned, flags=re.IGNORECASE).strip()
-    cleaned = re.sub(r"[.!?]+$", "", cleaned).strip()
+    cleaned = re.sub(r"[.!?,]+$", "", cleaned).strip()
     cleaned = re.sub(
         r"\s+(?:and\s+)?(?:prepare|create|generate|write|make|build|export|output)$",
         "",
@@ -444,6 +586,27 @@ def extract_research_topic(text: str, context: Optional[dict[str, Any]] = None) 
     cleaned = re.sub(r"\s+(?:bro|man|dude|buddy|pal|friend|pls|please|thanks|thank\s+you|for\s+me|as\s+well|too)$", "", cleaned, flags=re.IGNORECASE).strip()
 
     prior_topic = resolve_topic_from_context(context)
+
+    # A bare "based on till now / so far" names no new subject — it is
+    # a reference to the research done so far. Resolve to the prior
+    # topic; with no prior topic there is nothing to research, so
+    # return None instead of letting the literal phrase become a
+    # garbage topic ("based on till now") and a garbage search query.
+    if is_prior_research_reference(cleaned):
+        return prior_topic or None
+
+    # An anaphoric "the topic" (optionally with a sequencing word —
+    # "research about the topic first", "yeah research about the topic
+    # first") names no new subject either: it is the prior topic.
+    # Without this, "the topic first" became the literal topic and
+    # decomposed into garbage queries ("yeah first overview technical
+    # principles").
+    if prior_topic and re.fullmatch(
+        r"(?:(?:about|on|of)\s+)?(?:the|this|that)\s+topic(?:\s+first)?",
+        cleaned,
+        re.IGNORECASE,
+    ):
+        return prior_topic
 
     generic_words = {
         "platforms", "different platforms", "frameworks", "implementations",
@@ -475,7 +638,18 @@ def extract_research_topic(text: str, context: Optional[dict[str, Any]] = None) 
         and len(cleaned.split()) <= 10
         and any(w in cleaned.lower() for w in ("platform", "framework", "tool", "code", "implementation", "detail", "equation", "diagram", "comparison", "compare", "jax", "pytorch", "latest", "development", "2024", "2025", "2026", "versus", "vs"))
     ):
-        return f"{prior_topic} - {cleaned}"
+        # Strip a leading prior-reference phrase before appending the
+        # modifier: "based on till now, and also compare with biology"
+        # must become "<prior> - compare with biology", not "<prior> -
+        # based on till now, and also compare with biology".
+        modifier = re.sub(
+            r"^(?:based\s+on\s+(?:(?:the\s+)?(?:research|work|findings|results|analysis|stuff|material|content|what\s+we\s+(?:have|found|did|covered|discussed|got|learned))\s+)?(?:till\s+now|so\s*,?\s*far|up\s+to\s+now|till\s+date|up\s+to\s+date)"
+            r"|(?:till\s+now|so\s*,?\s*far|up\s+to\s+now|till\s+date|up\s+to\s+date))\s*,?\s*(?:and\s+also\s+|and\s+)?",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip()
+        return f"{prior_topic} - {modifier or cleaned}"
 
     return cleaned or prior_topic or None
 
@@ -501,7 +675,13 @@ def is_research_or_deliverable_request(
     has_format_directive = bool(
         req_format
         and re.search(
-            r"\b(?:generate|create|prepare|make|build|produce|export|output|in|as|into)\b",
+            # The verb list mirrors the export pattern's verbs: "give
+            # a pdf about <new subject>" routes to research, but
+            # "give" (like send/provide/turn/render/compile/download/
+            # format/put/save/write) was missing here, so the give
+            # variant classified NON_BROWSER while the generate variant
+            # correctly yielded RESEARCH_TASK / NEW_RESEARCH.
+            r"\b(?:generate|create|prepare|make|build|produce|export|output|give|send|provide|turn|render|compile|download|format|put|save|write|in|as|into)\b",
             text,
             re.IGNORECASE,
         )

@@ -65,6 +65,15 @@ MONITORING_DIRECTIVE_PATTERN = re.compile(
     # falls through to a browser task that only looks once.
     r"\b(?:alert|notify|tell|let|check)\b[^.\n]{0,60}?(?:reaches?|drops?|falls?|goes?|gets?|dips?)\s+(?:below|under|to)\s*(?:₹|Rs\.?|INR|\$)?\s*[\d,]+(?:\.\d{1,2})?\b|"
     r"\b(?:alert|notify|tell|let|check|watch|monitor|track)\b[^.\n]{0,60}?<\s*(?:₹|Rs\.?|INR|\$)?\s*[\d,]+(?:\.\d{1,2})?\b|"
+    # An interval cadence on its own ("alert me every 5 minutes",
+    # "check its price and just alert me every 5 minutes"): the
+    # directive verb + a per-N-minutes/hours cadence. Without this a
+    # follow-up that only changes the cadence fell through to a
+    # research task and died in the completion guard ("Research
+    # incomplete") — the product/threshold come from the history.
+    # The number may be a word ("every five minutes"), not only a
+    # digit — the handler parses both (see _parse_interval_seconds).
+    r"\b(?:alert|notify|tell|let|check|monitor|track|watch)\b[^.\n]{0,60}?\bevery\s+(?:(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty)\s*)?(?:minutes?|mins?|hours?)\b|"
     + _TRACK_NEW_ALT,
     re.IGNORECASE,
 )
@@ -97,6 +106,47 @@ _BARE_DAILY_RE = re.compile(
     r"\b(?:every\s+day|everyday|daily|every\s+morning|each\s+morning)\b",
     re.IGNORECASE,
 )
+
+
+_WORD_NUMBERS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "fifteen": 15, "twenty": 20, "thirty": 30,
+}
+
+_INTERVAL_RE = re.compile(
+    r"\bevery\s+(?:(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty)\s*)?(minutes?|mins?|hours?)\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_interval_seconds(instruction: str) -> int:
+    """Parse \"every 5 minutes\" / \"every two hours\" into seconds.
+
+    The handler used to hardcode 300s for every interval watch, so
+    \"check every 2 hours\" silently became a 5-minute watch. No
+    cadence in the instruction -> the 300s default. Clamped to a
+    60-second floor: a sub-minute tick would burn the scheduler.
+    """
+    m = _INTERVAL_RE.search(instruction or "")
+    if not m:
+        return 300
+    num_s, unit = m.group(1), m.group(2).lower()
+    num = 1 if num_s is None else (int(num_s) if num_s.isdigit() else _WORD_NUMBERS.get(num_s.lower(), 5))
+    seconds = num * 3600 if unit.startswith("hour") else num * 60
+    return max(60, seconds)
+
+
+def _describe_interval(interval_seconds: int) -> str:
+    """Human cadence for an interval watch: \"every 5 minutes\",
+    \"every 2 hours\". Used in replies so the message quotes the
+    watch's real cadence, never a hardcoded one."""
+    seconds = interval_seconds or 300
+    if seconds % 3600 == 0:
+        hours = seconds // 3600
+        return f"every {hours} hour" + ("s" if hours != 1 else "")
+    minutes = max(1, seconds // 60)
+    return f"every {minutes} minute" + ("s" if minutes != 1 else "")
 
 
 def parse_daily_time(instruction: str) -> tuple[str, str] | None:
@@ -194,7 +244,120 @@ _PRODUCT_STOPWORDS = {
 def _clean_product_match(text: str) -> str:
     """Trim a brand+model match to the model name (drop stop-words)."""
     tokens = [t for t in text.split() if t.lower() not in _PRODUCT_STOPWORDS]
-    return " ".join(tokens).strip(" -")[:80]
+    return _truncate_title(" ".join(tokens).strip(" -"))
+
+
+# App / service names that look like brand+model to _PRODUCT_RE
+# ("Google Calendar", "Google Drive") but are never a product to
+# watch. The agent's own greeting lists connected apps, so the
+# history scan used to pick "Google Calendar" out of it and watch a
+# calendar listing for a bike stand the user actually asked about.
+_SERVICE_NAMES = {
+    "google calendar", "google drive", "google docs", "google sheets",
+    "google slides", "google meet", "google maps", "google photos",
+    "google keep", "gmail", "outlook", "microsoft teams", "slack",
+    "github", "google chrome", "google pay",
+}
+
+
+def _is_service_name(title: str) -> bool:
+    """True when a cleaned brand+model match is really an app/service.
+    Exact match plus a service name followed by a generic suffix
+    (\"Google Calendar app\") — the exact-only check missed those."""
+    t = (title or "").strip().lower()
+    candidates = {t, t[:-1]} if t.endswith("s") else {t}
+    return any(
+        c in _SERVICE_NAMES or any(c.startswith(name + " ") for name in _SERVICE_NAMES)
+        for c in candidates
+    )
+
+
+def _truncate_title(text: str, limit: int = 80) -> str:
+    """Shorten a product title to at most `limit` chars without cutting
+    a word in half: cut at the last space inside the limit. A title cut
+    mid-word ("... Stand (Floo") reads broken in the watch card and in
+    every reply that names the product, and it leaks into the search
+    URL built from the title too."""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    cut = text.rfind(" ", 0, limit)
+    if cut <= 0:
+        return text[:limit]
+    return text[:cut]
+
+
+def _product_phrase_from_text(text: str) -> str:
+    """Product phrase named after a monitor/track/watch/check verb.
+
+    "monitor this, Grandbiker Rear Wheel Paddock Stand ..." names a
+    product with no brand in _MONITORED_BRANDS, so brand+model matching
+    misses it entirely. Take the phrase after the verb, cut the
+    threshold / cadence / alert tail off, and require at least two
+    real words. A pronoun-led phrase ("check its price ...") is NOT a
+    product — it resolves from history instead.
+    """
+    if not text:
+        return ""
+    m = re.search(
+        # The pronoun after the verb must be a whole word (\b):
+        # without it "check its price" matched "it" inside "its" and
+        # the phrase became the nonsense "s price and just alert me".
+        r"\b(?:monitor|track|watch|check)\s+(?:(?:this|that|it|the\s+product|this\s+product)\b)?\s*,?\s*(.+)$",
+        text.strip(),
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not m:
+        return ""
+    phrase = m.group(1).strip()
+    # A bare cadence is not a product ("check every 2 hours", "check
+    # every day"): the phrase after the verb is only the interval, so
+    # strip a LEADING cadence and let the rest resolve from history —
+    # otherwise the follow-up becomes a phantom watch titled
+    # "Every 2 Hours" / "Every Day" and the real watch never changes.
+    phrase = re.sub(
+        r"^every\s+(?:(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty)\s*)?(?:minutes?|mins?|hours?|days?|mornings?|evenings?|nights?)\b\s*,?\s*",
+        "",
+        phrase,
+        flags=re.IGNORECASE,
+    ).strip()
+    phrase = re.split(
+        # The alert tail may follow a comma ("..., alert me") as well
+        # as "and" — without the comma split the title became
+        # "Grandbiker Rear Wheel Paddock Stand, Alert Me". The number
+        # after "every" may be a word ("every five minutes"). A daily
+        # / morning cadence cuts the title too ("watch the stand every
+        # day" must not become a product called "Stand Every Day").
+        r",\s*(?:alert|notify|tell)\b"
+        r"|\s+if\s+the\s+price\b|\s+if\s+it\b|\s+when\b|\s+and\s+(?:alert|notify|tell)\b"
+        r"|\s+every\s+(?:(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty)\s*)?(?:minutes?|mins?|hours?|days?|mornings?|evenings?|nights?)\b",
+        phrase,
+        flags=re.IGNORECASE,
+    )[0]
+    phrase = phrase.strip().strip("\"'").rstrip(".,;:!?").strip()
+    phrase = re.sub(r"^(?:the|a|an)\s+", "", phrase, flags=re.IGNORECASE).strip()
+    phrase = re.sub(r"^price\s+of\s+", "", phrase, flags=re.IGNORECASE).strip()
+    # "the price of the X" leaves a second "the" behind after the
+    # "price of" strip — strip the article once more.
+    phrase = re.sub(r"^(?:the|a|an)\s+", "", phrase, flags=re.IGNORECASE).strip()
+    words = phrase.split()
+    if len(words) < 2:
+        return ""
+    # A product phrase never starts with a preposition ("keep a watch
+    # on product prices" is the greeting's capability list, not a
+    # product — without this the greeting alone counts as a product).
+    # "out" covers the phrasal verbs ("check out the new deals",
+    # "watch out for ..."), which name no product.
+    if words[0].lower() in {"on", "for", "over", "about", "of", "at", "to", "in", "with", "from", "by", "out"}:
+        return ""
+    # Possessive pronouns name someone's account, not a product
+    # ("watch my email", "check your inbox" must not become watches
+    # for "my email" / "your inbox").
+    if words[0].lower() in {"its", "it", "this", "that", "them", "their", "they", "he", "she", "my", "your", "his", "her", "our"}:
+        return ""
+    if _is_service_name(phrase):
+        return ""
+    return _truncate_title(phrase)
 
 
 _FIND_VERB_RE = re.compile(r"\b(?:find|search|look\s+for|list|show\s+me|get\s+me)\b", re.IGNORECASE)
@@ -279,7 +442,10 @@ def _history_has_monitored_product(history: list[dict[str, Any]]) -> bool:
         if not isinstance(entry, dict):
             continue
         content = str(entry.get("content") or entry.get("message") or "")
-        if _PRODUCT_RE.search(content):
+        prod_m = _PRODUCT_RE.search(content)
+        if prod_m and not _is_service_name(_clean_product_match(prod_m.group(0))):
+            return True
+        if _product_phrase_from_text(content):
             return True
         if re.search(r"https?://[^\s\"'<>)]*(?:amazon\.|flipkart\.|croma\.)", content, re.IGNORECASE):
             return True
@@ -379,7 +545,14 @@ def _extract_monitored_product(instruction: str, history: Optional[list[dict[str
     # Samsung Galaxy Fit3", "monitor the Xiaomi Smart Band 10").
     prod_m = _PRODUCT_RE.search(instruction or "")
     if prod_m:
-        candidate_title = _clean_product_match(prod_m.group(0))
+        cleaned_match = _clean_product_match(prod_m.group(0))
+        if not _is_service_name(cleaned_match):
+            candidate_title = cleaned_match
+    # The product named after the verb ("monitor this, Grandbiker Rear
+    # Wheel Paddock Stand ...") — no brand in _MONITORED_BRANDS, so
+    # brand+model matching misses it entirely.
+    if not candidate_title:
+        candidate_title = _product_phrase_from_text(instruction or "")
     # Weaker signal: "monitor price of X" / "track X on Amazon".
     if not candidate_title:
         m = re.search(r"\b(?:for|of|on)\s+([^,.\n]+?)(?:\s+(?:on|at|and|if|when)|$)", instruction, re.IGNORECASE)
@@ -396,21 +569,41 @@ def _extract_monitored_product(instruction: str, history: Optional[list[dict[str
     if url_m and any(d in url_m.group(0).lower() for d in ("amazon.", "flipkart.", "croma.")):
         best_url = url_m.group(0)
 
-    # Look back in history for product name and URL
+    # Look back in history for product name and URL. The history scan
+    # used to take the first brand+model match from ANY message —
+    # including the agent's own greeting ("Connected apps — Gmail,
+    # Google Calendar ..."), which produced a watch for "Google
+    # Calendar" when the user asked about a bike stand. Now: user
+    # messages may name the product (verb phrase or brand+model);
+    # assistant messages only count when they carry a real suggestion
+    # (a store URL or a price), never a greeting or capability list.
+    # Service names ("Google Calendar") are rejected everywhere.
     if history:
         for entry in reversed(history):
             content = entry.get("content") or entry.get("message") or ""
+            role = (entry.get("role") or "").lower()
             # Check for URL (only when the instruction gave none)
             url_match = re.search(r"https?://[^\s\"'<>)]+", content)
             if not best_url and url_match and ("amazon" in url_match.group(0) or "flipkart" in url_match.group(0) or "croma" in url_match.group(0)):
                 best_url = url_match.group(0)
-            # Check for a brand + model mention in the suggestion (e.g.
-            # the ranked fitness-band list) when the instruction only
-            # says "I want like this".
-            if not candidate_title:
+            if candidate_title:
+                continue
+            if role == "user":
+                phrase = _product_phrase_from_text(content)
+                if phrase:
+                    candidate_title = phrase
+                    continue
                 prod_m = _PRODUCT_RE.search(content)
                 if prod_m:
-                    candidate_title = _clean_product_match(prod_m.group(0))
+                    cleaned_match = _clean_product_match(prod_m.group(0))
+                    if not _is_service_name(cleaned_match):
+                        candidate_title = cleaned_match
+            elif _STORE_LINK_RE.search(content) or _PRICE_RE.search(content):
+                prod_m = _PRODUCT_RE.search(content)
+                if prod_m:
+                    cleaned_match = _clean_product_match(prod_m.group(0))
+                    if not _is_service_name(cleaned_match):
+                        candidate_title = cleaned_match
 
     if not candidate_title and not best_url:
         # No product was named anywhere: say so instead of inventing
@@ -428,7 +621,7 @@ def _extract_monitored_product(instruction: str, history: Optional[list[dict[str
         # product's).
         best_url = f"https://www.flipkart.com/search?q={urllib_quote(candidate_title)}"
 
-    return candidate_title.title(), best_url
+    return _truncate_title(candidate_title.title()), best_url
 
 
 def urllib_quote(s: str) -> str:
@@ -576,6 +769,25 @@ def _create_new_listings_watch(
     )
 
 
+def _threshold_from_history(history: Optional[list[dict[str, Any]]]) -> float | None:
+    """Most recent below-price threshold in the last few history turns.
+
+    A follow-up that only changes the cadence ("check its price and
+    just alert me every 5 minutes") names no threshold — the one from
+    the ask it follows ("if the price is below 1000") still applies.
+    Only the last few turns are scanned, so an old threshold for a
+    different product in the same chat cannot leak in.
+    """
+    for entry in reversed((history or [])[-4:]):
+        if not isinstance(entry, dict):
+            continue
+        content = str(entry.get("content") or entry.get("message") or "")
+        value = parse_below_price(content)
+        if value is not None:
+            return value
+    return None
+
+
 async def handle_continuous_monitoring_instruction(
     instruction: str,
     chat_id: Optional[str] = None,
@@ -589,6 +801,18 @@ async def handle_continuous_monitoring_instruction(
     # -> price_drop, so the handler body matches the documented order.
     daily = parse_daily_time(instruction)
     below = parse_below_price(instruction)
+    # A follow-up that only changes the cadence ("check its price and
+    # just alert me every 5 minutes") names no threshold — the one from
+    # the ask it follows ("if the price is below 1000") still applies.
+    # Only when the instruction names NO product of its own (a pronoun
+    # follow-up): an explicit new product must never inherit an old
+    # threshold for a different product.
+    if (
+        below is None
+        and not _PRODUCT_RE.search(instruction or "")
+        and not _product_phrase_from_text(instruction or "")
+    ):
+        below = _threshold_from_history(history)
     # Track-new-items ("track SDE internships and alert me when a
     # new one appears"): a new_listings mission, not a price watch.
     # Hourly interval — listing pages change slowly; a 5-minute tick
@@ -662,19 +886,110 @@ async def handle_continuous_monitoring_instruction(
         # Absolute threshold ("alert me when the price falls below
         # ₹5000"): a below_price mission, not a %-drop one. The
         # detector fires on the first run too when the price is
-        # already under the threshold.
-        trigger_type, schedule_cron, interval_sec = "interval", None, 300
+        # already under the threshold. The cadence is the one the
+        # user asked for ("every 2 hours" is 2 hours, not 5
+        # minutes); no cadence in the instruction -> 300s default.
+        interval_sec = _parse_interval_seconds(instruction)
+        trigger_type, schedule_cron = "interval", None
         condition_type, condition_params = "below_price", {"target": product_title, "threshold": below}
-        cadence_line = "• **Check Frequency:** Every 5 minutes (interval scheduler tick)\n"
+        cadence_line = f"• **Check Frequency:** {_describe_interval(interval_sec).capitalize()} (interval scheduler tick)\n"
         alert_line = (
             f"• **Alert Condition:** Alert the moment the price falls below ₹{below:g} "
             f"(if it is already below, I'll alert you on the first check)\n"
         )
     else:
-        trigger_type, schedule_cron, interval_sec = "interval", None, 300
+        interval_sec = _parse_interval_seconds(instruction)
+        trigger_type, schedule_cron = "interval", None
         condition_type, condition_params = "price_drop", {"target": product_title, "min_percent": 0}
-        cadence_line = "• **Check Frequency:** Every 5 minutes (interval scheduler tick)\n"
+        cadence_line = f"• **Check Frequency:** {_describe_interval(interval_sec).capitalize()} (interval scheduler tick)\n"
         alert_line = "• **Alert Condition:** Instant notification whenever the price drops or special discount offers are detected\n"
+
+    # A follow-up that only changes the cadence ("check its price and
+    # just alert me every 5 minutes") must not create a SECOND watch
+    # for the same product — the first watch already checks every 5
+    # minutes, so a duplicate would double-alert on the same drop.
+    # But the guard must compare the REQUESTED settings with the
+    # STORED row: a daily cron watch exists and the user asks for
+    # every 5 minutes is a settings CHANGE, not a duplicate — the old
+    # code answered "is being checked every 5 minutes" and created
+    # nothing, so the reply was false and the request was silently
+    # dropped. Same settings -> say so; different settings -> update
+    # the existing mission in place and say what changed.
+    with db.get_connection(db_path) as conn:
+        existing = conn.execute(
+            """SELECT id, trigger_type, condition_type, condition_params, interval_seconds, schedule_cron
+               FROM monitoring_missions
+               WHERE conversation_id = ? AND title = ? AND status = 'active'
+               ORDER BY created_at DESC LIMIT 1""",
+            (chat_id or "default", f"Price Watch: {product_title}"),
+        ).fetchone()
+    if existing:
+        try:
+            stored_params = json.loads(existing["condition_params"] or "{}")
+        except Exception:
+            stored_params = {}
+        stored_threshold = stored_params.get("threshold")
+        same_settings = (
+            existing["trigger_type"] == trigger_type
+            and existing["interval_seconds"] == interval_sec
+            and (existing["schedule_cron"] or None) == (schedule_cron or None)
+            and existing["condition_type"] == condition_type
+            and (stored_threshold if condition_type == "below_price" else None)
+            == (below if condition_type == "below_price" else None)
+        )
+        if same_settings:
+            cadence = _describe_interval(interval_sec) if trigger_type == "interval" else "daily"
+            threshold_line = (
+                f", alerting when the price falls below ₹{below:g}"
+                if below is not None
+                else ""
+            )
+            return (
+                f"That watch is already running — **{product_title}** is being checked "
+                f"{cadence}{threshold_line}."
+            ) + f"\n\n<!-- privagent-watch: {existing['id']} -->"
+        old_cadence = (
+            "daily"
+            if existing["trigger_type"] == "cron"
+            else _describe_interval(existing["interval_seconds"] or 300)
+        )
+        new_cadence = _describe_interval(interval_sec) if trigger_type == "interval" else "daily"
+        old_threshold = (
+            f", alerting below ₹{stored_threshold:g}"
+            if stored_threshold is not None
+            else ""
+        )
+        new_threshold = (
+            f", alerting when the price falls below ₹{below:g}"
+            if below is not None
+            else ""
+        )
+        with db.get_connection(db_path) as conn:
+            conn.execute(
+                """UPDATE monitoring_missions
+                   SET target_url = ?, trigger_type = ?, schedule_cron = ?, interval_seconds = ?,
+                       condition_type = ?, condition_params = ?, next_run_at = ?
+                   WHERE id = ?""",
+                (
+                    target_url,
+                    trigger_type,
+                    schedule_cron,
+                    interval_sec,
+                    condition_type,
+                    json.dumps(condition_params),
+                    now,
+                    existing["id"],
+                ),
+            )
+            conn.commit()
+        try:
+            hub.spawn(hub.broadcast_control_state())
+        except Exception:
+            pass
+        return (
+            f"Updated the watch for **{product_title}** — it was checking {old_cadence}{old_threshold}, "
+            f"now checking {new_cadence}{new_threshold}."
+        ) + f"\n\n<!-- privagent-watch: {existing['id']} -->"
 
     with db.get_connection(db_path) as conn:
         conn.execute(
