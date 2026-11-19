@@ -964,6 +964,19 @@ class WebsiteResolver:
                 # query reads as a topic, not a code artifact.
                 clean = resolved.replace(" - ", " ", 1)
 
+        # A compound instruction's delivery / messaging / shopping
+        # clauses are not search terms (live 2026-11-19: "research
+        # about black holes and send it to prateek in whatsapp"
+        # became the query "google about black holes and send to
+        # prateek"). Cut them before any cleaning runs; the remainder
+        # is kept by the compound splitter, never silently dropped.
+        from .intent_router import BARE_DELIVERABLE_PREAMBLE_RE, cut_delivery_clauses
+
+        clean = cut_delivery_clauses(clean)
+        # A bare leading deliverable preamble ("ppt report on topic X")
+        # is not the topic — same strip as extract_research_topic.
+        clean = BARE_DELIVERABLE_PREAMBLE_RE.sub("", clean, count=1).strip()
+
         # Multi-sentence / structured decomposition:
         # Separate main topic from subtopic and deliverable clauses
         sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", clean) if s.strip()]
@@ -1045,7 +1058,7 @@ class WebsiteResolver:
 
         # 2. Clean leading command verbs and articles
         clean = re.sub(
-            r"^(?:find|search(?:\s+for)?|look\s+up|research|compare(?:\s+the)?|get|show|check|discover|explain|describe|analyze|summarize|open(?:\s+the)?(?:\s+wikipedia\s+page\s+about)?)\s+",
+            r"^(?:find|search(?:\s+for)?|look\s+up|research|compare(?:\s+the)?|get|show|check|discover|explain|describe|analyze|summarize|open(?:\s+the)?(?:\s+(?:google|bing|duckduckgo|wikipedia\s+page\s+about))?)\s*,?\s*",
             "",
             clean,
             flags=re.IGNORECASE,
@@ -1054,7 +1067,7 @@ class WebsiteResolver:
 
         # 3. Strip deliverable artifacts & slide/page counts (numbers or words)
         clean = re.sub(
-            r"\b(?:a\s+|an\s+)?(?:more\s+)?(?:detailed\s+)?(?:(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|twelve|12)[- ](?:page|slide)s?\s+)?(?:research\s+)?(?:report|presentation|slides?|slide\s*deck|excel(?:\s+comparison)?|spreadsheet|workbook|document|whitepaper|dossier|pdf|docx|pptx|xlsx|csv|html|comparison)(?:\s+(?:of|with)\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|twelve|12)\s+(?:slides?|pages?))?\b",
+            r"\b(?:a\s+|an\s+)?(?:more\s+)?(?:detailed\s+)?(?:(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|twelve|12)[- ](?:page|slide)s?\s+)?(?:research\s+)?(?:report|presentation|slides?|slide\s*deck|excel(?:\s+comparison)?|spreadsheet|workbook|document|whitepaper|dossier|pdf|docx|pptx|ppt|powerpoint|xlsx|csv|html|comparison)(?:\s+(?:of|with)\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|twelve|12)\s+(?:slides?|pages?))?\b",
             "",
             clean,
             flags=re.IGNORECASE,
@@ -1071,6 +1084,22 @@ class WebsiteResolver:
         clean = re.sub(
             r"\b(?:it\s+should\s+include|including|with)\b(?:(?!\b(?:and\s+also|and\s+research|also\s+research|research)\b).)*\b(?:formulas|equations|diagrams|figures|charts|tables|citations|references)(?:\s+(?:too|also|as\s+well))?",
             "",
+            clean,
+            flags=re.IGNORECASE,
+        ).strip()
+        # Trailing style clauses ("... use images and make it nice
+        # looking ppt") are presentation wishes, not the topic. The
+        # (.+?) guard keeps a topic that legitimately STARTS with
+        # "use images" intact.
+        clean = re.sub(
+            r"^(.+?)\s+use\s+(?:relevant\s+)?(?:images?|diagrams?|figures?|charts?)\b.*$",
+            r"\1",
+            clean,
+            flags=re.IGNORECASE,
+        ).strip()
+        clean = re.sub(
+            r"^(.+?)\s+make\s+it\s+(?:nice(?:[-\s]looking)?|better|good|great|beautiful|presentable)\b.*$",
+            r"\1",
             clean,
             flags=re.IGNORECASE,
         ).strip()

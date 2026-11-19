@@ -74,6 +74,78 @@ def test_cancellation_between_actions():
     assert state["final"] == "cancelled"
 
 
+def test_request_cancel_propagates_to_compound_children():
+    """Review #4, S3: cancelling a compound parent cancels its parts.
+
+    A part's loop checks is_cancelled() on its own sub id every
+    iteration; cancelling only the parent id left a long browser part
+    running until it finished on its own.
+    """
+    from app.hub import TaskRecord, hub as singleton_hub
+    from app.loop_state import _cancelled, is_cancelled, request_cancel
+
+    parent = TaskRecord(task_id="task_parent_cancel", instruction="x", chat_id="c")
+    child = TaskRecord(task_id="task_parent_cancel__part2", instruction="y", chat_id="c",
+                       compound_part=True, parent_task_id="task_parent_cancel")
+    singleton_hub.tasks["task_parent_cancel"] = parent
+    singleton_hub.tasks["task_parent_cancel__part2"] = child
+    try:
+        request_cancel("task_parent_cancel")
+        assert is_cancelled("task_parent_cancel") is True
+        assert is_cancelled("task_parent_cancel__part2") is True
+        assert child.cancelled is True
+    finally:
+        singleton_hub.tasks.pop("task_parent_cancel", None)
+        singleton_hub.tasks.pop("task_parent_cancel__part2", None)
+        _cancelled.discard("task_parent_cancel")
+        _cancelled.discard("task_parent_cancel__part2")
+
+
+def test_cancel_parent_stops_running_compound_part_promptly():
+    """Review #4, S3: a cancel issued mid-part stops the part's loop.
+
+    The child loop runs under its own sub id; the parent cancel must
+    reach it through request_cancel's propagation, not only between
+    parts. The loop must stop after a couple of clicks, not burn the
+    whole budget.
+    """
+    from app.hub import TaskRecord, hub as singleton_hub
+    from app.loop_state import _cancelled
+
+    child = TaskRecord(task_id="child-task", instruction="do a long browser task", chat_id="c",
+                       compound_part=True, parent_task_id="parent-task")
+    singleton_hub.tasks["child-task"] = child
+    singleton_hub.tasks["parent-task"] = TaskRecord(task_id="parent-task", instruction="x", chat_id="c")
+    hub = FakeHub({"click": [{"ok": True} for _ in range(50)]})
+
+    class Planner:
+        def __call__(self, i, p, h):
+            return {"goal": "g", "steps": [{"why": "w", "action": {"type": "click", "risk": "write", "verify": "v", "timeoutMs": 100, "target": {"targetId": "b1"}}}]}
+
+    async def scenario():
+        async def cancel_parent_soon():
+            await asyncio.sleep(0.05)
+            agentLoop.request_cancel("parent-task")
+        state = await asyncio.gather(
+            agentLoop.run_with_injection(
+                hub, planner=Planner(), task_id="child-task",
+                obs_factory=lambda: {"tabId": 1, "url": "u", "title": "t", "interactive": [], "scroll": {}, "dpr": 1},
+            ),
+            cancel_parent_soon(),
+        )
+        return state[0]
+
+    try:
+        state = asyncio.run(scenario())
+    finally:
+        singleton_hub.tasks.pop("child-task", None)
+        singleton_hub.tasks.pop("parent-task", None)
+        _cancelled.discard("parent-task")
+        _cancelled.discard("child-task")
+    assert state["final"] == "cancelled"
+    assert hub.executed.count("click") <= 5
+
+
 def test_repeated_identical_error_triggers_replan_penalized():
     hub = FakeHub({"click": [{"ok": False, "error": {"code": "STALE_TARGET", "message": "gone", "recoverable": True}, "fail_n": 9},
                              {"ok": True}]})
@@ -531,6 +603,635 @@ def test_repeated_failure_loop_detection_stops_icon_only_stale_clicks():
     assert "Loop detected" in state["summary"]
     assert "failed" in state["summary"]
     assert state["steps"] <= 5
+
+
+def test_consecutive_failures_any_target_or_error_stop_the_loop():
+    """Ten failed clicks on DIFFERENT targets with DIFFERENT errors must
+    still stop the task — the per-(action, error) detector is not enough.
+
+    Live run 2026-11-19 (black-holes compound task): steps #11-20 were
+    ten consecutive failed clicks on Google result links, then the task
+    kept going for 25 steps / 213s and still delivered nothing. The
+    repeated-failure detector (~1410) only counts trailing failures of
+    the SAME action with the SAME normalized error, so a planner that
+    cycles targets (or hits varied errors) resets the counter every
+    time and burns the whole budget. A consecutive-failed-steps counter
+    that ignores target and error must stop it.
+    """
+    # Rotating causes AND rotating targets: the normalized error key and
+    # the action-match both differ every step, so the existing
+    # same-(action, error) detector can never reach its threshold.
+    error_cycle = [
+        ("STALE_TARGET", 'no matching element for {"elementRef":"e%d","targetId":"r%d","name":"Result %d"}'),
+        ("ELEMENT_NOT_FOUND", "element not found on page"),
+        ("NOT_INTERACTABLE", "element not interactable at point"),
+        ("TIMEOUT", "timeout waiting for element to be clickable"),
+        ("NOT_VISIBLE", "element is not visible"),
+    ]
+    failures = []
+    for i in range(60):
+        code, tmpl = error_cycle[i % len(error_cycle)]
+        msg = tmpl % (12 + i, i + 1, (i % 5) + 1) if "%" in tmpl else tmpl
+        failures.append({"ok": False, "error": {"code": code, "message": msg, "recoverable": True}})
+    hub = FakeHub({"click": failures})
+    calls = {"n": 0}
+
+    class Planner:
+        def __call__(self, i, p, h):
+            calls["n"] += 1
+            n = calls["n"]
+            return {
+                "goal": "open a search result",
+                "steps": [{
+                    "why": "open result",
+                    "action": {
+                        "type": "click",
+                        "risk": "write",
+                        "verify": "v",
+                        "timeoutMs": 100,
+                        "target": {"targetId": f"result-{n}", "name": f"Result {(n % 5) + 1}"},
+                    },
+                }],
+            }
+
+    state = asyncio.run(agentLoop.run_with_injection(
+        hub, planner=Planner(),
+        obs_factory=lambda: {
+            "tabId": 1, "url": "https://www.google.com/search?q=black+holes", "title": "Search",
+            "interactive": [],
+            "scroll": {}, "dpr": 1,
+        },
+    ))
+    assert state["final"] == "budget_exceeded"
+    assert "Loop detected" in state["summary"]
+    assert "failed" in state["summary"]
+    # Five consecutive failures stop it — not the 50-step cap, and not
+    # ten wasted clicks like the live run.
+    assert state["steps"] <= 6
+
+
+def test_consecutive_failures_across_distinct_hosts_do_not_stop():
+    """Review #4, S5: the consecutive-failure counter is per-host.
+
+    A research task probing five dead candidate sources on five
+    different hosts is legitimate exploration, not a loop — the count
+    restarts when the host changes. Five failures on ONE host still
+    stop the task (the test above). The 6th navigate succeeds, so the
+    run must reach it instead of stopping at 5.
+    """
+    hosts = ["a.example.com", "b.example.com", "c.example.com", "d.example.com", "e.example.com", "f.example.com"]
+    codes = ["NET_ERROR", "TIMEOUT", "HTTP_500", "DNS_FAILURE", "HTTP_502"]
+    failures = [
+        {"ok": False, "error": {"code": codes[i], "message": f"host {hosts[i]} failed", "recoverable": True}}
+        for i in range(5)
+    ]
+    hub = FakeHub({"navigate": failures + [{"ok": True}]})
+    state = {"url": "https://www.google.com/", "calls": 0, "urls": []}
+    orig_send = hub.send_action
+
+    async def send_action(task_id, action, timeout_s=45.0):
+        if action.get("type") == "navigate":
+            state["url"] = action["params"]["url"]
+            state["urls"].append(action["params"]["url"])
+        return await orig_send(task_id, action, timeout_s)
+
+    hub.send_action = send_action
+
+    def obs_factory():
+        return {"tabId": 1, "url": state["url"], "title": "t", "interactive": [], "scroll": {}, "dpr": 1}
+
+    def planner(i, p, h):
+        state["calls"] += 1
+        if state["calls"] <= 6:
+            return {"goal": "probe", "steps": [{"why": "probe", "action": {
+                "type": "navigate", "risk": "write", "verify": "v", "timeoutMs": 100,
+                "params": {"url": f"https://{hosts[state['calls'] - 1]}/page"}}}]}
+
+        return {"goal": "probe", "steps": []}
+
+    result = asyncio.run(agentLoop.run_with_injection(
+        hub, planner=planner, obs_factory=obs_factory,
+        instruction="visit each candidate source",
+    ))
+    # The run reaches the 6th host and completes — it was never stopped
+    # as a "consecutive failures" loop. (The executed count exceeds the
+    # planner's 6 navigates: the loop's failure recovery legitimately
+    # retries a failed navigate, so assert on hosts reached, not on
+    # the raw count.)
+    assert result["final"] == "completed"
+    assert "consecutive failed steps" not in (result["summary"] or "")
+    assert state["calls"] == 7
+    assert state["url"] == "https://f.example.com/page"
+    assert all(any(h in u for u in state["urls"]) for h in hosts)
+
+
+def test_send_visible_in_page_needs_word_boundaries():
+    """Review #4, M4: a bare substring match is vacuous for short sends.
+
+    "hi" matches inside "this" and "ok" inside "okay", so the
+    post-send verification would pass with no bubble present — exactly
+    the short messages WhatsApp users send most.
+    """
+    from app.loop_helpers import _send_visible_in_page
+
+    def hist(text):
+        return [{"action": {"type": "type", "params": {"text": text, "submit": True}}, "result_ok": True}]
+
+    assert _send_visible_in_page(hist("hi"), "this is a test") is False
+    assert _send_visible_in_page(hist("ok"), "okay then") is False
+    assert _send_visible_in_page(hist("hi"), "say hi there") is True
+    assert _send_visible_in_page(hist("ok"), "ok, done") is True
+    assert _send_visible_in_page(hist("babua"), "Mummy\nbabua\n10:05") is True
+    assert _send_visible_in_page(hist("babua"), "Mummy\nChats") is False
+    assert _send_visible_in_page(hist("hi"), "") is False
+    # Review #5, M8: long messages must verify too. The first-80-chars
+    # needle used to be cut mid-word ("...third quarter o"), and the
+    # trailing word-boundary lookahead then failed even with the full
+    # bubble visible — every long send completed "could not be
+    # confirmed". The needle now backs off to the last word boundary.
+    long1 = "please review the quarterly financial performance report for the third quarter of 2026 and share your thoughts"
+    long2 = "please review the quarterly financial report for the third quarter of 2026 and then send me a copy"
+    assert len(long1) > 80 and len(long2) > 80
+    assert _send_visible_in_page(hist(long1), long1) is True
+    assert _send_visible_in_page(hist(long2), long2) is True
+    assert _send_visible_in_page(hist(long1), "something else entirely") is False
+    # A long message whose visible bubble is only a different long
+    # message still does not verify.
+    assert _send_visible_in_page(hist(long1), long2) is False
+
+
+def test_consecutive_failures_across_hosts_stop_at_global_cap():
+    """Review #5, S9: the per-host counter is evadable by alternating hosts.
+
+    Twelve consecutive failed navigates on alternating hosts, distinct
+    URLs and alternating errors defeated every detector at once (the
+    same-(action,error) detector resets on alternating errors, the
+    oscillation detector on distinct URLs, the per-host counter on the
+    host change) — the run "completed" only because the scripted
+    planner stopped. Ten consecutive failures with zero progress stop
+    the task regardless of host, while the five-source exploration
+    allowance (the test above: 6 hosts, no stop) is preserved.
+    """
+    hosts = ["a.example.com", "b.example.com"]
+    codes = ["NET_ERROR", "TIMEOUT"]
+    failures = [
+        {"ok": False, "error": {"code": codes[i % 2], "message": f"{hosts[i % 2]} failed", "recoverable": True}}
+        for i in range(12)
+    ]
+    hub = FakeHub({"navigate": failures})
+    state = {"url": "https://www.google.com/", "calls": 0, "urls": []}
+    orig_send = hub.send_action
+
+    async def send_action(task_id, action, timeout_s=45.0):
+        if action.get("type") == "navigate":
+            state["url"] = action["params"]["url"]
+            state["urls"].append(action["params"]["url"])
+        return await orig_send(task_id, action, timeout_s)
+
+    hub.send_action = send_action
+
+    def obs_factory():
+        return {"tabId": 1, "url": state["url"], "title": "t", "interactive": [], "scroll": {}, "dpr": 1}
+
+    def planner(i, p, h):
+        state["calls"] += 1
+        if state["calls"] <= 12:
+            host = hosts[(state["calls"] - 1) % 2]
+            return {"goal": "probe", "steps": [{"why": "probe", "action": {
+                "type": "navigate", "risk": "write", "verify": "v", "timeoutMs": 100,
+                "params": {"url": f"https://{host}/page{state['calls']}"}}}]}
+
+        return {"goal": "probe", "steps": []}
+
+    result = asyncio.run(agentLoop.run_with_injection(
+        hub, planner=planner, obs_factory=obs_factory,
+        instruction="visit each candidate source",
+    ))
+    assert result["final"] == "budget_exceeded"
+    assert "Loop detected" in (result["summary"] or "")
+    assert "consecutive failed steps" in (result["summary"] or "")
+    # Stopped by the cap, not by the 50-step budget or the planner
+    # giving up: fewer planner calls than the 12 planned.
+    assert state["calls"] < 12
+    assert len(set(state["urls"])) > 1
+
+
+def test_whatsapp_send_completes_only_when_bubble_visible():
+    """A WhatsApp send completes when the sent bubble is in the page.
+
+    The auto-complete gate used to fire on a successful composer submit
+    alone — "typed and submitted" is not "sent". With the bubble
+    visible in the fresh observation, the mission completes as before,
+    and the redundant follow-up type is never executed.
+    """
+    state = {"calls": 0, "typed": False}
+    hub = FakeHub({"type": [{"ok": True}]})
+    orig_send = hub.send_action
+
+    async def send_action(task_id, action, timeout_s=45.0):
+        if action.get("type") == "type":
+            state["typed"] = True
+        return await orig_send(task_id, action, timeout_s)
+
+    hub.send_action = send_action
+
+    def obs_factory():
+        text = "Mummy\nbabua\n10:05" if state["typed"] else "Mummy\nChats"
+        return {"tabId": 1, "url": "https://web.whatsapp.com/", "title": "WhatsApp",
+                "interactive": [{"targetId": "composer", "role": "textbox", "name": "Type a message",
+                                 "tag": "div", "visible": True, "enabled": True}],
+                "scroll": {}, "dpr": 1, "page_text": text}
+
+    def planner(i, p, h):
+        state["calls"] += 1
+        # The follow-up must differ from the sent text: repeating the
+        # exact same type is caught by the redundant-action gate before
+        # the auto-complete check ever runs.
+        text = "babua" if state["calls"] == 1 else "thanks"
+        return {"goal": "send", "steps": [{"why": "send", "action": {
+            "type": "type", "risk": "write", "verify": "v", "timeoutMs": 100,
+            "target": {"targetId": "composer", "name": "Type a message"},
+            "params": {"text": text, "submit": True}}}]}
+
+    result = asyncio.run(agentLoop.run_with_injection(
+        hub, planner=planner, obs_factory=obs_factory,
+        instruction="send 'babua' to Mummy on WhatsApp",
+    ))
+    assert result["final"] == "completed"
+    assert "Message successfully sent" in (result["summary"] or "")
+    assert hub.executed.count("type") == 1
+
+
+def test_whatsapp_send_unverified_completes_honestly_after_two_turns():
+    """A send whose bubble never appears completes with a qualifier.
+
+    The submit succeeded at the extension level, but the sent message
+    is not visible in the chat after two more turns (render lag or a
+    silent submit failure). The mission must NOT loop forever or
+    re-send: it completes once, honestly, telling the user to confirm
+    in WhatsApp. The follow-up types are never executed.
+    """
+    state = {"calls": 0, "typed": False}
+    hub = FakeHub({"type": [{"ok": True}]})
+    orig_send = hub.send_action
+
+    async def send_action(task_id, action, timeout_s=45.0):
+        if action.get("type") == "type":
+            state["typed"] = True
+        return await orig_send(task_id, action, timeout_s)
+
+    hub.send_action = send_action
+
+    def obs_factory():
+        # The page changes (a timestamp appears) so the step verifies,
+        # but the sent bubble never shows up.
+        text = "Mummy\nChats\n10:05" if state["typed"] else "Mummy\nChats"
+        return {"tabId": 1, "url": "https://web.whatsapp.com/", "title": "WhatsApp",
+                "interactive": [{"targetId": "composer", "role": "textbox", "name": "Type a message",
+                                 "tag": "div", "visible": True, "enabled": True}],
+                "scroll": {}, "dpr": 1, "page_text": text}
+
+    def planner(i, p, h):
+        state["calls"] += 1
+        # Each follow-up differs from the last: repeating the exact
+        # same type is caught by the redundant-action gate before the
+        # auto-complete check ever runs.
+        text = ["babua", "thanks", "ok"][min(state["calls"], 3) - 1]
+        return {"goal": "send", "steps": [{"why": "send", "action": {
+            "type": "type", "risk": "write", "verify": "v", "timeoutMs": 100,
+            "target": {"targetId": "composer", "name": "Type a message"},
+            "params": {"text": text, "submit": True}}}]}
+
+    result = asyncio.run(agentLoop.run_with_injection(
+        hub, planner=planner, obs_factory=obs_factory,
+        instruction="send 'babua' to Mummy on WhatsApp",
+    ))
+    assert result["final"] == "completed"
+    assert "could not be confirmed" in (result["summary"] or "")
+    assert "please check WhatsApp" in (result["summary"] or "")
+    assert hub.executed.count("type") == 1
+    assert state["calls"] == 3  # send + two unverified follow-up turns
+
+
+def test_repeated_redundant_action_stops_instead_of_looping_forever():
+    """A planner stuck repeating a completed action must terminate.
+
+    The redundant-action path `continue`s without executing a step, so
+    the step budget never trips — and the `continue` skips the
+    zero-change detector below it. Before this fix a planner repeating
+    the same successful type looped forever (found while testing the
+    WhatsApp send verification: the test hung past 180s). Five
+    redundant repeats now stop the loop as budget_exceeded.
+    """
+    state = {"calls": 0}
+    hub = FakeHub({"type": [{"ok": True}]})
+
+    def obs_factory():
+        return {"tabId": 1, "url": "https://web.whatsapp.com/", "title": "WhatsApp",
+                "interactive": [{"targetId": "composer", "role": "textbox", "name": "Type a message",
+                                 "tag": "div", "visible": True, "enabled": True}],
+                "scroll": {}, "dpr": 1, "page_text": "Mummy\nChats"}
+
+    def planner(i, p, h):
+        state["calls"] += 1
+        return {"goal": "send", "steps": [{"why": "send", "action": {
+            "type": "type", "risk": "write", "verify": "v", "timeoutMs": 100,
+            "target": {"targetId": "composer", "name": "Type a message"},
+            "params": {"text": "babua", "submit": True}}}]}
+
+    result = asyncio.run(agentLoop.run_with_injection(
+        hub, planner=planner, obs_factory=obs_factory,
+        instruction="send 'babua' to Mummy on WhatsApp",
+    ))
+    assert result["final"] == "budget_exceeded"
+    assert "repeated a completed action" in (result["summary"] or "")
+    assert hub.executed.count("type") == 1
+    assert state["calls"] <= 7
+
+
+def test_strip_tool_call_blocks_removes_hallucinated_tool_calls():
+    """A `<tool_call>` block in a direct answer must be stripped, not shown as run.
+
+    Live 2026-11-19: the PPT request was answered directly (NON_BROWSER)
+    and the model emitted a `createpresentation` tool call with a 10-slide
+    outline; the mission "completed" with an outline and no file. The
+    strip helper removes the block and reports the tool name so the caller
+    can say honestly that nothing was created.
+    """
+    from app.loop_helpers import strip_tool_call_blocks
+
+    text = (
+        "I'll build you a polished deck.\n\n"
+        '<tool_call>{"name": "createpresentation", "arguments": {"title": "X", "slidecount": 10}}</tool_call>\n\n'
+        "Let me lay out the deck first."
+    )
+    cleaned, names = strip_tool_call_blocks(text)
+    assert "createpresentation" not in cleaned
+    assert "tool_call" not in cleaned
+    assert names == ["createpresentation"]
+    assert "polished deck" in cleaned
+
+    plain, names2 = strip_tool_call_blocks("Just a normal answer.")
+    assert plain == "Just a normal answer."
+    assert names2 == []
+
+    # Review #4, S1: a truncated (unclosed) block — exactly how the live
+    # outline was cut off mid-slide-8 — must be cut too, not returned
+    # as if it were a real answer.
+    truncated = (
+        "I will build it.\n\n"
+        '<tool_call>{"name": "createpresentation", "arguments": {"title": "X", "slides": [1, 2, 3'
+    )
+    cleaned3, names3 = strip_tool_call_blocks(truncated)
+    assert "createpresentation" not in cleaned3
+    assert "tool_call" not in cleaned3
+    assert names3 == ["createpresentation"]
+    assert "I will build it." in cleaned3
+
+    # An unclosed block with no parseable name still gets cut.
+    cleaned4, names4 = strip_tool_call_blocks("Before.\n<tool_call>{garbage")
+    assert "tool_call" not in cleaned4
+    assert names4 == ["unknown"]
+    assert "Before." in cleaned4
+
+
+def test_research_incomplete_retries_once_with_next_source():
+    """A stalled research run gets ONE retry at the next queued source.
+
+    Live 2026-11-19: the planner searched "black holes facts", then
+    repeated its first navigation and gave up — "Research incomplete:
+    the source page did not load". With a pending source link queued,
+    the loop must give the planner one more turn pointed at that link
+    instead of failing outright.
+    """
+    SEARCH = "https://www.google.com/search?q=black+holes+facts"
+    WIKI = "https://en.wikipedia.org/wiki/Black_hole"
+    state = {"url": "https://www.google.com/", "calls": 0}
+    hub = FakeHub({"navigate": [{"ok": True}]})
+    orig_send = hub.send_action
+
+    async def send_action(task_id, action, timeout_s=45.0):
+        if action.get("type") == "navigate":
+            state["url"] = action["params"]["url"]
+        return await orig_send(task_id, action, timeout_s)
+
+    hub.send_action = send_action
+
+    def obs_factory():
+        return {"tabId": 1, "url": state["url"], "title": "t",
+                "interactive": [], "scroll": {}, "dpr": 1}
+
+    def planner(i, p, h):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            return {"goal": "research", "steps": [{"why": "search", "action": {
+                "type": "navigate", "risk": "write", "verify": "v", "timeoutMs": 100,
+                "params": {"url": SEARCH}}}]}
+        if state["calls"] == 2:
+            # Repeats the first navigation: redundant, so the loop's
+            # research-incomplete branch fires.
+            return {"goal": "research", "steps": [{"why": "search again", "action": {
+                "type": "navigate", "risk": "write", "verify": "v", "timeoutMs": 100,
+                "params": {"url": SEARCH}}}]}
+        if state["calls"] == 3:
+            return {"goal": "research", "steps": [{"why": "open source", "action": {
+                "type": "navigate", "risk": "write", "verify": "v", "timeoutMs": 100,
+                "params": {"url": WIKI}}}]}
+        return {"goal": "research", "steps": []}
+
+    result = asyncio.run(agentLoop.run_with_injection(
+        hub, planner=planner, obs_factory=obs_factory,
+        instruction="research black holes",
+        initial_memory={"is_research": True, "notes": "Black holes are dense.",
+                        "pending_research_links": [WIKI],
+                        "research_knowledge_package": {}},
+    ))
+    # The retry navigated to the pending source instead of failing at
+    # the repeated search. (The run then ends on the adaptive block's
+    # honest "no independent sources" failure — the test observation
+    # carries no extractable source — which is a different, honest
+    # failure, not the stalled "page did not load" one.)
+    assert state["url"] == WIKI
+    assert hub.executed.count("navigate") == 2
+    assert "the source page did not load" not in (result["summary"] or "")
+
+
+def test_research_incomplete_still_fails_honestly_without_queued_source():
+    """No queued source, no retry: the honest failure is unchanged."""
+    SEARCH = "https://www.google.com/search?q=black+holes+facts"
+    state = {"url": "https://www.google.com/", "calls": 0}
+    hub = FakeHub({"navigate": [{"ok": True}]})
+    orig_send = hub.send_action
+
+    async def send_action(task_id, action, timeout_s=45.0):
+        if action.get("type") == "navigate":
+            state["url"] = action["params"]["url"]
+        return await orig_send(task_id, action, timeout_s)
+
+    hub.send_action = send_action
+
+    def obs_factory():
+        return {"tabId": 1, "url": state["url"], "title": "t",
+                "interactive": [], "scroll": {}, "dpr": 1}
+
+    def planner(i, p, h):
+        state["calls"] += 1
+        if state["calls"] <= 2:
+            return {"goal": "research", "steps": [{"why": "search", "action": {
+                "type": "navigate", "risk": "write", "verify": "v", "timeoutMs": 100,
+                "params": {"url": SEARCH}}}]}
+        return {"goal": "research", "steps": []}
+
+    result = asyncio.run(agentLoop.run_with_injection(
+        hub, planner=planner, obs_factory=obs_factory,
+        instruction="research black holes",
+        initial_memory={"is_research": True, "notes": "Black holes are dense.",
+                        "pending_research_links": [],
+                        "research_knowledge_package": {}},
+    ))
+    assert result["final"] == "failed"
+    assert "the source page did not load" in (result["summary"] or "")
+    assert hub.executed.count("navigate") == 1
+
+
+def test_research_incomplete_retry_is_used_only_once():
+    """The retry is bounded: a planner that ignores it fails honestly."""
+    SEARCH = "https://www.google.com/search?q=black+holes+facts"
+    WIKI = "https://en.wikipedia.org/wiki/Black_hole"
+    state = {"url": "https://www.google.com/", "calls": 0}
+    hub = FakeHub({"navigate": [{"ok": True}]})
+    orig_send = hub.send_action
+
+    async def send_action(task_id, action, timeout_s=45.0):
+        if action.get("type") == "navigate":
+            state["url"] = action["params"]["url"]
+        return await orig_send(task_id, action, timeout_s)
+
+    hub.send_action = send_action
+
+    def obs_factory():
+        return {"tabId": 1, "url": state["url"], "title": "t",
+                "interactive": [], "scroll": {}, "dpr": 1}
+
+    def planner(i, p, h):
+        state["calls"] += 1
+        return {"goal": "research", "steps": [{"why": "search", "action": {
+            "type": "navigate", "risk": "write", "verify": "v", "timeoutMs": 100,
+            "params": {"url": SEARCH}}}]}
+
+    result = asyncio.run(agentLoop.run_with_injection(
+        hub, planner=planner, obs_factory=obs_factory,
+        instruction="research black holes",
+        initial_memory={"is_research": True, "notes": "Black holes are dense.",
+                        "pending_research_links": [WIKI],
+                        "research_knowledge_package": {}},
+    ))
+    assert result["final"] == "failed"
+    assert "the source page did not load" in (result["summary"] or "")
+    # Only the first search ever executed: the retry was offered once
+    # (as a penalty), the planner ignored it, and the loop stopped.
+    assert hub.executed.count("navigate") == 1
+
+
+def test_research_incomplete_retry_peeks_not_pops():
+    """Review #4, S4: a retry the planner ignores must not drop the link.
+
+    The retry only peeks at the queued source. If the planner does
+    something else (here: it keeps repeating the search and fails
+    honestly), the link stays in pending_research_links for the normal
+    machinery instead of being silently discarded.
+    """
+    SEARCH = "https://www.google.com/search?q=black+holes+facts"
+    WIKI = "https://en.wikipedia.org/wiki/Black_hole"
+    state = {"url": "https://www.google.com/", "calls": 0}
+    hub = FakeHub({"navigate": [{"ok": True}]})
+    orig_send = hub.send_action
+
+    async def send_action(task_id, action, timeout_s=45.0):
+        if action.get("type") == "navigate":
+            state["url"] = action["params"]["url"]
+        return await orig_send(task_id, action, timeout_s)
+
+    hub.send_action = send_action
+
+    def obs_factory():
+        return {"tabId": 1, "url": state["url"], "title": "t",
+                "interactive": [], "scroll": {}, "dpr": 1}
+
+    def planner(i, p, h):
+        state["calls"] += 1
+        return {"goal": "research", "steps": [{"why": "search", "action": {
+            "type": "navigate", "risk": "write", "verify": "v", "timeoutMs": 100,
+            "params": {"url": SEARCH}}}]}
+
+    result = asyncio.run(agentLoop.run_with_injection(
+        hub, planner=planner, obs_factory=obs_factory,
+        instruction="research black holes",
+        initial_memory={"is_research": True, "notes": "Black holes are dense.",
+                        "pending_research_links": [WIKI],
+                        "research_knowledge_package": {}},
+    ))
+    assert result["final"] == "failed"
+    assert "the source page did not load" in (result["summary"] or "")
+    assert result["working_memory"]["pending_research_links"] == [WIKI]
+
+
+def test_research_incomplete_retry_link_consumed_when_used():
+    """Review #4, S4: a retry the planner DOES use leaves the queue.
+
+    When the planner navigates to the peeked link, it is removed from
+    pending_research_links — the existing retry test's count assertion
+    (exactly 2 navigates) pins this: without the consume step the
+    adaptive block would navigate to the same link a second time.
+    """
+    SEARCH = "https://www.google.com/search?q=black+holes+facts"
+    WIKI = "https://en.wikipedia.org/wiki/Black_hole"
+    state = {"url": "https://www.google.com/", "calls": 0}
+    hub = FakeHub({"navigate": [{"ok": True}]})
+    orig_send = hub.send_action
+
+    async def send_action(task_id, action, timeout_s=45.0):
+        if action.get("type") == "navigate":
+            state["url"] = action["params"]["url"]
+        return await orig_send(task_id, action, timeout_s)
+
+    hub.send_action = send_action
+
+    def obs_factory():
+        return {"tabId": 1, "url": state["url"], "title": "t",
+                "interactive": [], "scroll": {}, "dpr": 1}
+
+    def planner(i, p, h):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            return {"goal": "research", "steps": [{"why": "search", "action": {
+                "type": "navigate", "risk": "write", "verify": "v", "timeoutMs": 100,
+                "params": {"url": SEARCH}}}]}
+        if state["calls"] == 2:
+            return {"goal": "research", "steps": [{"why": "search again", "action": {
+                "type": "navigate", "risk": "write", "verify": "v", "timeoutMs": 100,
+                "params": {"url": SEARCH}}}]}
+        if state["calls"] == 3:
+            return {"goal": "research", "steps": [{"why": "open source", "action": {
+                "type": "navigate", "risk": "write", "verify": "v", "timeoutMs": 100,
+                "params": {"url": WIKI}}}]}
+        return {"goal": "research", "steps": []}
+
+    result = asyncio.run(agentLoop.run_with_injection(
+        hub, planner=planner, obs_factory=obs_factory,
+        instruction="research black holes",
+        initial_memory={"is_research": True, "notes": "Black holes are dense.",
+                        "pending_research_links": [WIKI],
+                        "research_knowledge_package": {}},
+    ))
+    assert state["url"] == WIKI
+    assert hub.executed.count("navigate") == 2
+    assert result["working_memory"]["pending_research_links"] == []
+    # Four planner calls, not three: the 4th is the empty-steps turn
+    # where the adaptive block fails honestly — the test observation
+    # carries no extractable source, so "no independent sources" is
+    # the honest end, not the stalled "page did not load" one.
+    assert state["calls"] == 4
 
 
 def test_tab_opened_by_click_registers_and_can_be_selected():

@@ -25,11 +25,16 @@ from app.intent_router import (
     ResearchOperationType,
     TaskIntent,
     classify_intent,
+    cut_delivery_clauses,
     detect_deliverable_type,
     detect_requested_format,
     extract_research_topic,
+    has_unresolved_reference,
     is_export_deliverable_directive,
     is_research_or_deliverable_request,
+    split_compound_instruction,
+    thread_compound_context,
+    update_compound_context,
 )
 from app.research.models import (
     DataTable,
@@ -326,6 +331,32 @@ def test_detect_requested_format():
     assert detect_requested_format("What is the speed of light?") is None
 
 
+def test_detect_requested_format_bare_ppt():
+    """Bare "ppt" is how users actually say it — it must read as pptx.
+
+    Live 2026-11-19: "ppt report on topic university should teach beyond
+    classical syllabus in this AI Era. use images and make it nice looking
+    ppt" returned None, so the request never reached the research pipeline
+    and the agent hallucinated a `createpresentation` tool call instead.
+    FORMAT_PPTX_RE matched pptx/powerpoint/presentation/slides but not the
+    bare word "ppt" (compare FORMAT_XLSX_RE, which already has the "xcel"
+    alias for exactly this reason).
+    """
+    assert detect_requested_format("ppt report on topic black holes") == "pptx"
+    assert detect_requested_format("make a ppt about black holes") == "pptx"
+    assert detect_requested_format("a nice looking ppt on black holes") == "pptx"
+    assert detect_requested_format(
+        "ppt report on topic university should teach beyond classical syllabus "
+        "in this AI Era. use images and make it nice looking ppt"
+    ) == "pptx"
+
+
+def test_detect_deliverable_type_bare_ppt():
+    """A bare "ppt" deliverable noun is a presentation, not a report."""
+    assert detect_deliverable_type("ppt report on topic black holes") == "presentation"
+    assert detect_deliverable_type("make a ppt about black holes") == "presentation"
+
+
 def test_detect_deliverable_type():
     """Verify classification of deliverable archetypes."""
     assert detect_deliverable_type("Prepare a presentation on battery tech") == "presentation"
@@ -345,6 +376,302 @@ def test_extract_research_topic():
     assert extract_research_topic("Prepare a presentation about renewable energy.") == "renewable energy"
     assert extract_research_topic("Research renewable energy technologies and prepare a presentation.") == "renewable energy technologies"
     assert extract_research_topic("Prepare a detailed research report on microservices architecture with relevant diagrams and references.") == "microservices architecture"
+
+
+def test_extract_research_topic_strips_bare_ppt_preamble():
+    """A bare leading deliverable preamble is not the topic.
+
+    Live 2026-11-19: extract_research_topic("ppt report on topic
+    university should teach...") returned the whole instruction with
+    "ppt on topic" still leading, so the research pipeline (had it been
+    reached) would have searched for the preamble instead of the subject.
+    """
+    assert extract_research_topic(
+        "ppt report on topic university should teach beyond classical syllabus "
+        "in this AI Era. use images and make it nice looking ppt"
+    ) == "university should teach beyond classical syllabus in this AI Era"
+    assert extract_research_topic("ppt on black holes") == "black holes"
+    assert extract_research_topic("presentation on black holes") == "black holes"
+    # A navigation preamble must only strip a NAMED engine: "open source
+    # licensing" is a topic, not "open google".
+    assert extract_research_topic("research open source licensing") == "open source licensing"
+
+
+def test_ppt_report_bare_noun_phrase_routes_to_research_task():
+    """"ppt report on topic X" is a research + pptx request, not chat.
+
+    Live 2026-11-19: this exact instruction classified NON_BROWSER
+    (0.8, "general knowledge/conversational request"), so it never
+    entered the research pipeline; the LLM answered directly and
+    hallucinated a `createpresentation` tool call, and no file was ever
+    produced. A bare deliverable noun phrase with a topic must route to
+    RESEARCH_TASK with format pptx.
+    """
+    instruction = (
+        "ppt report on topic university should teach beyond classical syllabus "
+        "in this AI Era. use images and make it nice looking ppt"
+    )
+    cl = classify_intent(instruction)
+    assert cl.intent == TaskIntent.RESEARCH_TASK, f"Expected RESEARCH_TASK, got {cl.intent}"
+    assert cl.is_research is True
+    assert cl.requested_format == "pptx"
+    assert cl.deliverable_type == "presentation"
+    assert cl.research_topic == "university should teach beyond classical syllabus in this AI Era"
+
+
+def test_ppt_report_with_leading_filler_routes_to_research_task():
+    """Review #4, M3: "please ppt report on topic X" must route too.
+
+    The bare-preamble regex is ^-anchored; with no leading-filler
+    allowance the most natural phrasing ("please ...") reproduced the
+    live failure — NON_BROWSER, no pipeline, no file.
+    """
+    for prefix in ("please ", "hey, ", "hi ", "ok, "):
+        instruction = prefix + "ppt report on topic quantum computing"
+        cl = classify_intent(instruction)
+        assert cl.intent == TaskIntent.RESEARCH_TASK, f"{instruction!r} -> {cl.intent}"
+        assert cl.requested_format == "pptx"
+        assert cl.research_topic == "quantum computing"
+
+
+def test_messaging_send_routes_to_browser_task_not_chat():
+    """Review #4, M1: a send to a named recipient on a channel is a
+    browser task. The NON_BROWSER fast-path has no messaging handler,
+    so without this rule a send "completes" by chatting and nothing is
+    ever sent (live 2026-11-19).
+    """
+    for instruction in (
+        "send it to prateek in whatsapp",
+        "send 'babua' to Mummy on WhatsApp",
+        "send the summary below to prateek in whatsapp",
+        "ask a random question to Prateek on whatsapp",
+        "message Prateek on whatsapp",
+        "share the link with prateek on whatsapp",
+    ):
+        cl = classify_intent(instruction)
+        assert cl.intent == TaskIntent.NEW_BROWSER_TASK, f"{instruction!r} -> {cl.intent}"
+        assert cl.is_browser is True
+    # "send it to me by email" stays with the email-dispatch handler,
+    # not the messaging rule (the rule's prepositions exclude by/for).
+    cl = classify_intent("send it to me by email")
+    assert cl.intent != TaskIntent.NEW_BROWSER_TASK or "email" in (cl.reason or "").lower()
+    # Review #5, M6/M7: month/time words and email words are NOT
+    # channels — "in June" is timing, "on email" is the email handler.
+    # All four M6 inputs and both M7 inputs were NEW_BROWSER_TASK
+    # before the stoplist (a regression vs base, proven by stash A/B).
+    for instruction in (
+        "send the invoice to Priya in June",
+        "send the report to Ana in May",
+        "send it to Rahul in the morning",
+        "message Rahul in June about the meeting",
+        "send the report to Prateek on email",
+        "share the report with Prateek via email",
+    ):
+        assert classify_intent(instruction).intent == TaskIntent.NON_BROWSER, instruction
+    # A bare "ask" with no recipient/channel is still just chat.
+    assert classify_intent("ask a random question").intent == TaskIntent.NON_BROWSER
+
+
+def test_compound_channel_not_set_by_month_words():
+    """Review #5, M6: the threading channel extractor shares the
+    classifier's stoplist — "send it to prateek in june" must not
+    record "june" as the channel a later part inherits.
+    """
+    assert update_compound_context(
+        {}, "send it to prateek in june", ("NEW_BROWSER_TASK", "completed", "sent")
+    ).get("last_channel") is None
+    assert update_compound_context(
+        {}, "send it to prateek in whatsapp", ("NEW_BROWSER_TASK", "completed", "sent")
+    ).get("last_channel") == "whatsapp"
+
+
+def test_send_me_ppt_for_review_is_not_research():
+    """Review #5, S7: "send me the ppt for review" asks for an existing
+    file, not new research — at base it was NON_BROWSER; the batch
+    routed it RESEARCH_TASK with the mangled topic "send me the for
+    review". With a real subject the deliverable route stands.
+    """
+    assert classify_intent("send me the ppt for review").intent == TaskIntent.NON_BROWSER
+    assert classify_intent("send me the ppt").intent == TaskIntent.NON_BROWSER
+    assert extract_research_topic("send me the ppt for review") is None
+    cl = classify_intent("send me the ppt about quantum computing")
+    assert cl.intent == TaskIntent.RESEARCH_TASK
+    assert cl.research_topic == "quantum computing"
+    cl = classify_intent("give me the ppt about quantum computing")
+    assert cl.intent == TaskIntent.RESEARCH_TASK
+    assert cl.research_topic == "quantum computing"
+
+
+def test_delivery_clause_cut_keeps_topical_send_phrases():
+    """Review #4, M5: the cut must not eat a research topic that happens
+    to contain "send ... to ...".
+
+    "research how to send money to friends" is research about
+    money-transfer methods, not a delivery clause; "send me the ppt for
+    review" has no destination clause, so it must not cut to empty.
+    """
+    assert cut_delivery_clauses("research how to send money to friends") == (
+        "research how to send money to friends"
+    )
+    assert extract_research_topic("research how to send money to friends") == (
+        "how to send money to friends"
+    )
+    assert cut_delivery_clauses("send me the ppt for review") == "send me the ppt for review"
+    # Review #5, S7: the M5-era assertion here ("send me the for
+    # review") was a garbage topic — the delivery prefix and the
+    # purpose clause are now stripped, so the fragment has no subject
+    # and extracts to None instead of a nonsense topic.
+    assert extract_research_topic("send me the ppt for review") is None
+    assert extract_research_topic("send me the ppt about quantum computing") == (
+        "quantum computing"
+    )
+    assert extract_research_topic("give me the ppt about quantum computing") == (
+        "quantum computing"
+    )
+    # The live delivery clauses still cut.
+    assert cut_delivery_clauses(
+        "research about black holes and send it to prateek in whatsapp"
+    ) == "research about black holes"
+    assert cut_delivery_clauses("research X and send the summary to prateek") == "research X"
+
+
+def test_compound_instruction_research_topic_is_research_half_only():
+    """Delivery/messaging/shopping clauses are not part of the research topic.
+
+    Live 2026-11-19: classify_intent on the compound black-holes /
+    WhatsApp / Amazon instruction returned RESEARCH_TASK with
+    research_topic = the ENTIRE instruction, and decompose turned it
+    into garbage queries ("google about black holes and send to
+    prateek"). The research topic must be the research clause only.
+    """
+    instruction = (
+        "open google, research about black holes and send it to prateek in "
+        "whatsapp, also ask a random question to him, and then open amazon "
+        "and send redmi phone link to prateek"
+    )
+    assert extract_research_topic(instruction) == "black holes"
+
+
+def test_compound_splitter_four_parts_and_idempotent():
+    """The live compound instruction splits into four runnable parts.
+
+    Live 2026-11-19: the whole instruction ran as ONE research mission
+    with a poisoned topic; the WhatsApp send, the question, and the
+    Amazon link send never executed. The splitter must produce the
+    four parts (bare "open <site>" folds into the following part), and
+    splitting any part must return just that part (the runner recurses
+    into run_task, which re-splits — a non-idempotent splitter would
+    loop or re-split forever).
+    """
+    instruction = (
+        "open google, research about black holes and send it to prateek in "
+        "whatsapp, also ask a random question to him, and then open amazon "
+        "and send redmi phone link to prateek"
+    )
+    parts = split_compound_instruction(instruction)
+    assert parts == [
+        "open google, research about black holes",
+        "send it to prateek in whatsapp",
+        "ask a random question to him",
+        "open amazon, send redmi phone link to prateek",
+    ]
+    for part in parts:
+        assert split_compound_instruction(part) == [part], f"not idempotent: {part!r}"
+
+
+def test_compound_splitter_does_not_split_singles_or_owned_compounds():
+    """No false splits: topics with "and", owned compounds, PPT phrase."""
+    assert split_compound_instruction("research whatsapp privacy policy") == [
+        "research whatsapp privacy policy"
+    ]
+    # Email+calendar / email-mutation compounds stay one mission: the
+    # mission-control dispatcher and the email+calendar handler own them.
+    assert split_compound_instruction("check my email and delete promo emails") == [
+        "check my email and delete promo emails"
+    ]
+    assert split_compound_instruction("research Tom and Jerry") == ["research Tom and Jerry"]
+    assert split_compound_instruction("explain black holes") == ["explain black holes"]
+    # Review #4, S2: ordinary multi-clause instructions must NOT split —
+    # the second clause runs on the first clause's findings in one
+    # mission; splitting it runs blind.
+    for single in (
+        "search for flights and check prices",
+        "check my email and check my calendar",
+        "research quantum computing and tell me more",
+        "check the weather and go for a walk",
+    ):
+        assert split_compound_instruction(single) == [single], single
+    # Review #5, S8: an "open" clause that refers back to the previous
+    # part's findings ("the cheapest one", "the first result") is not
+    # a new sub-task — it has no site or object of its own.
+    for single in (
+        "search for flights and open the cheapest one",
+        "search for flights and open the first result",
+        "search for flights and open it",
+    ):
+        assert split_compound_instruction(single) == [single], single
+    # But a self-contained "open" clause still splits.
+    assert split_compound_instruction("research black holes and open amazon") == [
+        "research black holes",
+        "open amazon",
+    ]
+    assert split_compound_instruction(
+        "ppt report on topic university should teach beyond classical syllabus "
+        "in this AI Era. use images and make it nice looking ppt"
+    ) == [
+        "ppt report on topic university should teach beyond classical syllabus "
+        "in this AI Era. use images and make it nice looking ppt"
+    ]
+
+
+def test_compound_threading_resolves_pronouns_from_earlier_parts():
+    """'it' becomes the summary, 'him' the named recipient, and a
+    messaging part without a channel inherits the last one.
+
+    Review #4, M1/M2: the threading wording is trigger-free ("the
+    summary below" / "Summary:" — the word "research" must not appear,
+    or the threaded part misroutes to a garbage research run), and the
+    replacements run on the part text BEFORE the summary block is
+    appended, so a summary containing "them" is never rewritten.
+    """
+    ctx = {
+        "research_summary": "Black holes are regions where gravity is so strong that nothing can escape them.",
+        "last_recipient": "Prateek",
+        "last_channel": "whatsapp",
+    }
+    threaded = thread_compound_context("send it to prateek in whatsapp", ctx)
+    assert "Black holes are regions where gravity is so strong that nothing can escape them." in threaded
+    assert " the summary below " in threaded
+    assert "Research summary:" not in threaded
+    assert "research" not in threaded.lower()
+    # The threaded send must classify as a browser messaging task, not
+    # RESEARCH_TASK with topic None and not a NON_BROWSER fake-complete.
+    cl = classify_intent(threaded)
+    assert cl.intent == TaskIntent.NEW_BROWSER_TASK, f"threaded send -> {cl.intent}"
+    # Part 3 inherits the channel: "ask ... to Prateek" is asked on the
+    # same channel as the earlier send.
+    threaded3 = thread_compound_context("ask a random question to him", ctx)
+    assert threaded3 == "ask a random question to Prateek on whatsapp"
+    assert classify_intent(threaded3).intent == TaskIntent.NEW_BROWSER_TASK
+    # Part 4 (navigation preamble + send) inherits the channel too.
+    threaded4 = thread_compound_context("open amazon, send redmi phone link to prateek", ctx)
+    assert threaded4 == "open amazon, send redmi phone link to prateek on whatsapp"
+    # Without a summary, "it" is unresolved — the runner skips such a
+    # part when an earlier part failed, instead of sending garbage.
+    assert has_unresolved_reference("send it to prateek in whatsapp", {}) is True
+    assert has_unresolved_reference("ask a random question to him", {}) is False
+    # Context update: a completed research part supplies the summary,
+    # and the recipient + channel are read from the part text.
+    ctx2 = update_compound_context({}, "send it to prateek in whatsapp",
+                                   ("NEW_BROWSER_TASK", "completed", "sent"))
+    assert ctx2["last_recipient"] == "Prateek"
+    assert ctx2["last_channel"] == "whatsapp"
+    ctx3 = update_compound_context({}, "research about black holes",
+                                   ("RESEARCH_TASK", "completed", "Black holes: ..."))
+    assert ctx3["research_summary"] == "Black holes: ..."
+    # A non-messaging part never sets a channel ("go to paris in june").
+    assert update_compound_context({}, "go to paris in june",
+                                   ("NEW_BROWSER_TASK", "completed", "done")).get("last_channel") is None
 
 
 # ---------------------------------------------------------------------------

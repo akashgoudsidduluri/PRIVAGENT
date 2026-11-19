@@ -42,6 +42,28 @@ _takeover_wait_events: dict[str, asyncio.Event] = {}
 
 def request_cancel(task_id: str) -> None:
     _cancelled.add(task_id)
+    # Cancelling a compound parent cancels its running parts too
+    # (review #4, S3): a part's loop checks is_cancelled() on its own
+    # sub id every iteration, so without this a cancel issued mid-part
+    # would do nothing until that part finished on its own.
+    try:
+        from .hub import hub as _hub
+
+        for _t in list(_hub.tasks.values()):
+            if getattr(_t, "parent_task_id", None) == task_id:
+                _cancelled.add(_t.task_id)
+                try:
+                    _t.cancelled = True
+                except Exception:
+                    pass
+                _sub_event = _pause_events.get(_t.task_id)
+                if _sub_event:
+                    _sub_event.set()
+                _sub_takeover = _takeover_wait_events.get(_t.task_id)
+                if _sub_takeover:
+                    _sub_takeover.set()
+    except Exception:
+        pass
     event = _pause_events.get(task_id)
     if event:
         event.set()
