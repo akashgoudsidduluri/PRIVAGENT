@@ -725,6 +725,25 @@ async def cancel_task(task_id: str) -> dict[str, str]:
     task.takeover = None
     task.takeover_decision = False
     task.takeover_event.set()
+    # The extension's takeover flag is global: if the loop already
+    # exited (or never entered its wait), no TAKEOVER_END would ever
+    # arrive and every later task would fail its first observation
+    # with TAKEOVER_ACTIVE. A cancel means the operator takes the
+    # browser back, so clearing the flag here is correct — but only
+    # when no OTHER task is waiting in takeover: clearing unconditionally
+    # would let this task's cancel kill another task's genuine manual
+    # step (password / payment in progress). Best effort — no socket,
+    # no flag to clear.
+    other_awaiting = any(
+        getattr(t, "task_id", None) != task_id
+        and getattr(t, "state", None) == "awaiting_takeover"
+        for t in hub.tasks.values()
+    )
+    if not other_awaiting:
+        try:
+            await hub.notify_extension({"type": "TAKEOVER_END", "taskId": task_id})
+        except Exception:
+            pass
     hub.abort_task_actions(task_id)
     if getattr(task, "session_id", None):
         from .session_manager import session_manager

@@ -452,11 +452,15 @@ def get_chat(chat_id: str, db_path: Optional[str] = None) -> Optional[dict[str, 
 
         cp_by_task = {cp["task_id"]: cp for cp in checkpoints if cp.get("task_id")}
         agent_msgs = [m for m in messages if m.get("role") == "agent"]
-        for idx, m in enumerate(agent_msgs):
+        for m in agent_msgs:
             tid = m.get("task_id")
             cp = cp_by_task.get(tid) if tid else None
-            if not cp and idx < len(checkpoints):
-                cp = checkpoints[idx]
+            # Attach steps ONLY by task_id. The old index fallback
+            # (cp = checkpoints[idx]) paired a conversational agent
+            # message that has no checkpoint — e.g. the "hi" greeting —
+            # with whatever checkpoint sat at the same position, so the
+            # greeting rendered with a later browser task's steps and a
+            # timeline from one turn showed up under another.
             if cp:
                 hist = cp.get("history") or []
                 m["steps"] = format_history_steps(hist)

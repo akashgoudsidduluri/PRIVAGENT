@@ -841,3 +841,177 @@ async def test_screenshot_less_step_clears_task_screenshot(monkeypatch, tmp_path
         db.init_db = old_init_db
         real_hub.tasks.pop(task_id, None)
         real_hub.extension_sockets.clear()
+
+
+def test_persistent_navigation_oscillation_stops_after_warnings():
+    """A planner that keeps bouncing between two pages (Wikipedia <->
+    BBC) must be stopped, not left to run to the step cap or the
+    planner timeout. The old code only appended a soft penalty, so a
+    live research run ping-ponged for 10 steps (34 in an earlier run)
+    burning ~118s of overhead on pure navigations. After two ignored
+    warnings (three detections) the loop stops honestly."""
+    hub = FakeHub({"navigate": [{"ok": True}]})
+    url_a = "https://en.wikipedia.org/wiki/Quantum_mind"
+    url_b = "https://www.bbc.co.uk/search?q=quantum+biology"
+    calls = {"n": 0}
+
+    def obs_factory():
+        # The observed URL alternates A, B, A, B ... (the agent keeps
+        # navigating back and forth between the two pages).
+        calls["n"] += 1
+        url = url_a if calls["n"] % 2 == 1 else url_b
+        return {
+            "tabId": 1, "url": url, "title": "t",
+            "interactive": [], "scroll": {}, "dpr": 1,
+        }
+
+    class Planner:
+        def __call__(self, i, p, h):
+            # Alternate the navigation target A, B, A, B ...
+            target = url_a if calls["n"] % 2 == 0 else url_b
+            return {
+                "goal": "research",
+                "steps": [{
+                    "why": "check page",
+                    "action": {
+                        "type": "navigate",
+                        "risk": "read",
+                        "verify": "v",
+                        "timeoutMs": 1000,
+                        "url": target,
+                    },
+                }],
+            }
+
+    state = asyncio.run(agentLoop.run_with_injection(
+        hub, planner=Planner(), obs_factory=obs_factory,
+    ))
+    assert state["final"] == "budget_exceeded", state
+    assert "Loop detected" in state["summary"], state
+    assert "bouncing" in state["summary"], state
+    # Stopped early (well under the 50-step cap / the 10-step live run).
+    assert state["steps"] <= 8, state
+
+
+def test_oscillation_counter_resets_for_new_page_pair():
+    """Three separate single round-trips between DIFFERENT page pairs
+    are legitimate cross-checks, not a loop. Before the fix the
+    oscillation counter was global and never reset, so three
+    one-off A-B, C-D, E-F round-trips accumulated to a stop — the
+    loop was killed for comparing sources. Only repeated cycles of
+    the SAME pair count."""
+    hub = FakeHub({"navigate": [{"ok": True}]})
+    # FOUR single round-trips between different pairs: with a global
+    # counter the 3rd pair's round-trip is the 3rd detection and the
+    # loop stops at iteration 12, before the 4th pair. With per-pair
+    # counting each pair resets the count and the loop completes.
+    seq = [
+        "https://en.wikipedia.org/wiki/Quantum_mind",
+        "https://www.bbc.co.uk/search?q=quantum+biology",
+        "https://en.wikipedia.org/wiki/Quantum_mind",
+        "https://www.bbc.co.uk/search?q=quantum+biology",
+        "https://en.wikipedia.org/wiki/Quantum_biology",
+        "https://www.nature.com/search?q=quantum+biology",
+        "https://en.wikipedia.org/wiki/Quantum_biology",
+        "https://www.nature.com/search?q=quantum+biology",
+        "https://arxiv.org/abs/quantum",
+        "https://en.wikipedia.org/wiki/Quantum_computing",
+        "https://arxiv.org/abs/quantum",
+        "https://en.wikipedia.org/wiki/Quantum_computing",
+        "https://www.bbc.co.uk/news/quantum",
+        "https://en.wikipedia.org/wiki/Quantum_field_theory",
+        "https://www.bbc.co.uk/news/quantum",
+        "https://en.wikipedia.org/wiki/Quantum_field_theory",
+    ]
+    calls = {"n": 0}
+
+    def obs_factory():
+        calls["n"] += 1
+        return {
+            "tabId": 1, "url": seq[calls["n"] - 1], "title": "t",
+            "interactive": [], "scroll": {}, "dpr": 1,
+        }
+
+    class Planner:
+        def __call__(self, i, p, h):
+            if calls["n"] >= len(seq):
+                return {"goal": "research", "steps": []}
+            target = seq[calls["n"]]
+            return {
+                "goal": "research",
+                "steps": [{
+                    "why": "check page",
+                    "action": {
+                        "type": "navigate",
+                        "risk": "read",
+                        "verify": "v",
+                        "timeoutMs": 1000,
+                        "url": target,
+                    },
+                }],
+            }
+
+    state = asyncio.run(agentLoop.run_with_injection(
+        hub, planner=Planner(), obs_factory=obs_factory,
+    ))
+    assert state["final"] == "completed", state
+    assert "Loop detected" not in (state["summary"] or ""), state
+
+
+def test_live_observation_recovers_from_stale_takeover_flag(monkeypatch):
+    """A TAKEOVER_ACTIVE flag no task owns must not wedge every later
+    task. Live failure (2026-11-19): a research task failed with
+    \"loop error: observation failed: TAKEOVER_ACTIVE\" and the
+    immediate retry (\"check again\") failed the same way — the
+    extension's global flag was stuck set after a takeover ended
+    without its TAKEOVER_END. When no other task is waiting in
+    takeover, the observation clears the stale flag and retries."""
+    calls = {"n": 0}
+    notified: list[dict] = []
+
+    class Hub:
+        extension_sockets = [object()]
+        tasks: dict = {}
+
+        async def send_action(self, task_id, action, timeout_s=45.0):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"ok": False, "error": {"code": "TAKEOVER_ACTIVE",
+                                               "message": "takeover in progress",
+                                               "recoverable": True}}
+            return {"ok": True, "observation": {"tabId": 1, "url": "https://example.com", "title": "t"}}
+
+        async def notify_extension(self, message):
+            notified.append(message)
+
+    monkeypatch.setattr(agentLoop, "real_hub", Hub())
+    result = asyncio.run(agentLoop._LiveObservation("t1")())
+    assert result["url"] == "https://example.com"
+    assert notified == [{"type": "TAKEOVER_END", "taskId": "t1"}]
+
+
+def test_live_observation_does_not_clear_genuine_takeover(monkeypatch):
+    """The stale-flag recovery must NOT clear a takeover another task
+    is genuinely waiting in — that would let the agent observe while
+    the operator is typing a password or a payment. It fails
+    honestly instead, naming the blocker instead of the raw error
+    dict."""
+    from types import SimpleNamespace
+
+    class Hub:
+        extension_sockets = [object()]
+        tasks = {"other": SimpleNamespace(task_id="other", state="awaiting_takeover")}
+
+        async def send_action(self, task_id, action, timeout_s=45.0):
+            return {"ok": False, "error": {"code": "TAKEOVER_ACTIVE",
+                                           "message": "takeover in progress",
+                                           "recoverable": True}}
+
+        async def notify_extension(self, message):
+            raise AssertionError("must not clear a genuine takeover")
+
+    monkeypatch.setattr(agentLoop, "real_hub", Hub())
+    with pytest.raises(RuntimeError) as exc:
+        asyncio.run(agentLoop._LiveObservation("t1")())
+    assert "takeover is still active" in str(exc.value), exc.value
+    assert "TAKEOVER_ACTIVE" not in str(exc.value), exc.value

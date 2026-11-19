@@ -309,3 +309,254 @@ def test_extract_monitored_product_other_brands():
     # Other brands work the same way.
     title, _ = _extract_monitored_product("Watch the HP Victus 15 and alert me if it drops below ₹60000")
     assert title == "Hp Victus 15"
+
+
+def test_extract_monitored_product_monitor_this_phrase():
+    """A product named after \"monitor this\" — with no brand in the
+    brand list — must still be extracted. Live failure (2026-11-19):
+    the user asked to monitor a \"Grandbiker Rear Wheel Paddock
+    Stand...\" and the agent created a watch for \"Google Calendar\"
+    instead, because the history scan matched the brand \"google\" in
+    the agent's own greeting (\"Connected apps — Gmail, Google
+    Calendar, Drive...\") while the instruction-side extraction had no
+    verb-phrase path for \"monitor this, <product>\"."""
+    from app.continuous_monitoring_companion import _extract_monitored_product
+
+    title, url = _extract_monitored_product(
+        "monitor this, Grandbiker Rear Wheel Paddock Stand with Swing Arm Rest "
+        "Bike Storage Stand (Floor Mount). if the price is below 1000 then alert me."
+    )
+    assert title == "Grandbiker Rear Wheel Paddock Stand With Swing Arm Rest Bike Storage Stand", title  # titles are capped at 80 chars at a word boundary (see _truncate_title)
+    assert url.startswith("https://www.flipkart.com/search?q=Grandbiker"), url
+
+
+def test_extract_monitored_product_ignores_greeting_service_names():
+    """The greeting alone must yield NO product: \"Google Calendar\"
+    in \"Connected apps — Gmail, Google Calendar, Drive, Slack,
+    GitHub...\" is a connected service, not a product to watch. The
+    same denylist also stops \"check its price\" from becoming the
+    nonsense product \"s price\" (the verb-phrase regex used to match
+    \"it\" inside \"its\")."""
+    from app.continuous_monitoring_companion import _extract_monitored_product, _product_phrase_from_text
+
+    greeting = (
+        "Hey there! Great to see you. I'm PrivAgent — your privacy-preserving browser co-pilot. "
+        "Connected apps — Gmail, Google Calendar, Drive, Slack, GitHub, and your local files."
+    )
+    assert _extract_monitored_product(
+        "hi", history=[{"role": "assistant", "content": greeting}]
+    ) == ("", "")
+    assert _product_phrase_from_text(
+        "or do one thing, check its price and just alert me every 5 minutes"
+    ) == ""
+
+
+def test_follow_up_cadence_change_resolves_product_from_history():
+    """\"or do one thing, check its price and just alert me every 5
+    minutes\" is a monitoring directive (the interval branch was
+    missing, so it fell through to a research task and failed with
+    \"Research incomplete\"), and it resolves the product from the
+    earlier turn — the Grandbiker stand — with the earlier threshold
+    (below ₹1000)."""
+    from app.continuous_monitoring_companion import (
+        _extract_monitored_product,
+        _threshold_from_history,
+        is_continuous_monitoring_directive,
+    )
+
+    monitor_ask = (
+        "monitor this, Grandbiker Rear Wheel Paddock Stand with Swing Arm Rest "
+        "Bike Storage Stand (Floor Mount). if the price is below 1000 then alert me."
+    )
+    greeting = (
+        "Hey there! Great to see you. I'm PrivAgent. "
+        "Connected apps — Gmail, Google Calendar, Drive, Slack, GitHub, and your local files."
+    )
+    history = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": greeting},
+        {"role": "user", "content": "so can you really perform the monitoring"},
+        {"role": "user", "content": monitor_ask},
+    ]
+    follow_up = "or do one thing, check its price and just alert me every 5 minutes"
+    assert is_continuous_monitoring_directive(follow_up) is True
+    title, _ = _extract_monitored_product(follow_up, history=history)
+    assert title == "Grandbiker Rear Wheel Paddock Stand With Swing Arm Rest Bike Storage Stand", title  # titles are capped at 80 chars at a word boundary (see _truncate_title)
+    assert _threshold_from_history(history) == 1000.0
+
+
+def test_handler_does_not_duplicate_existing_price_watch(database):
+    """A cadence-only follow-up must not create a SECOND watch for the
+    same product: the first watch already checks every 5 minutes, so
+    a duplicate would double-alert on the same drop. The handler
+    answers \"already running\" and leaves exactly one active
+    mission."""
+    from app.continuous_monitoring_companion import handle_continuous_monitoring_instruction
+
+    monitor_ask = (
+        "monitor this, Grandbiker Rear Wheel Paddock Stand with Swing Arm Rest "
+        "Bike Storage Stand (Floor Mount). if the price is below 1000 then alert me."
+    )
+    reply1 = asyncio.run(handle_continuous_monitoring_instruction(monitor_ask, chat_id="dup1", db_path=database))
+    assert "1000" in reply1
+    follow_up = "or do one thing, check its price and just alert me every 5 minutes"
+    history = [{"role": "user", "content": monitor_ask}]
+    reply2 = asyncio.run(handle_continuous_monitoring_instruction(
+        follow_up, chat_id="dup1", history=history, db_path=database,
+    ))
+    assert "already running" in reply2.lower(), reply2
+    with db.get_connection(database) as conn:
+        rows = conn.execute(
+            "SELECT * FROM monitoring_missions WHERE conversation_id='dup1' AND status='active'"
+        ).fetchall()
+    assert len(rows) == 1, rows
+    assert rows[0]["title"] == "Price Watch: Grandbiker Rear Wheel Paddock Stand With Swing Arm Rest Bike Storage Stand"
+    assert rows[0]["interval_seconds"] == 300
+
+
+def test_handler_bare_cadence_follow_up_updates_existing_watch(database):
+    """A bare cadence follow-up ("check every 2 hours") must update
+    the existing watch, not create a phantom one. Live shape of the
+    bug, found by tracing the exact follow-up through the handler:
+    the phrase after "check" was "every 2 hours", which the phrase
+    extractor kept as a product name — so the handler created a
+    SECOND watch titled "Every 2 Hours" (price_drop, no threshold)
+    while the real Grandbiker watch stayed on 5 minutes and the
+    user's requested change silently never happened."""
+    from app.continuous_monitoring_companion import handle_continuous_monitoring_instruction
+
+    monitor_ask = (
+        "monitor this, Grandbiker Rear Wheel Paddock Stand with Swing Arm Rest "
+        "Bike Storage Stand (Floor Mount). if the price is below 1000 then alert me."
+    )
+    reply1 = asyncio.run(handle_continuous_monitoring_instruction(monitor_ask, chat_id="bare1", db_path=database))
+    assert "1000" in reply1
+    history = [{"role": "user", "content": monitor_ask}, {"role": "assistant", "content": reply1}]
+    reply2 = asyncio.run(handle_continuous_monitoring_instruction(
+        "check every 2 hours", chat_id="bare1", history=history, db_path=database,
+    ))
+    assert "updated" in reply2.lower(), reply2
+    assert "Grandbiker" in reply2, reply2
+    assert "every 2 hours" in reply2.lower(), reply2
+    assert "Every 2 Hours" not in reply2, reply2  # no phantom product title
+    with db.get_connection(database) as conn:
+        rows = conn.execute(
+            "SELECT * FROM monitoring_missions WHERE conversation_id='bare1' AND status='active'"
+        ).fetchall()
+    assert len(rows) == 1, rows
+    assert "Every 2 Hours" not in rows[0]["title"], rows[0]["title"]
+    assert rows[0]["interval_seconds"] == 7200
+    assert rows[0]["condition_type"] == "below_price"
+    assert json.loads(rows[0]["condition_params"])["threshold"] == 1000.0
+
+
+def test_handler_cadence_change_updates_existing_watch(database):
+    """A follow-up that CHANGES the cadence must update the existing
+    watch, not claim it already runs that way and do nothing. Live
+    shape of the bug: a daily cron watch exists; \"check its price
+    every 5 minutes\" answered \"is being checked every 5 minutes\"
+    and created nothing — the reply was false and the requested change
+    was silently dropped. The update happens in place (one active
+    mission) and the reply says what changed."""
+    from app.continuous_monitoring_companion import handle_continuous_monitoring_instruction
+
+    product = (
+        "Grandbiker Rear Wheel Paddock Stand with Swing Arm Rest "
+        "Bike Storage Stand (Floor Mount)"
+    )
+    reply1 = asyncio.run(handle_continuous_monitoring_instruction(
+        f"Watch the {product} and tell me the price every day at 9am",
+        chat_id="m1upd", db_path=database,
+    ))
+    assert "9:00 AM" in reply1
+    with db.get_connection(database) as conn:
+        before = conn.execute(
+            "SELECT interval_seconds, condition_type FROM monitoring_missions "
+            "WHERE conversation_id='m1upd' AND status='active'"
+        ).fetchall()
+    assert len(before) == 1 and before[0]["interval_seconds"] == 86400, before
+    history = [{"role": "user", "content": f"monitor this, {product}. if the price is below 1000 then alert me."}]
+    reply2 = asyncio.run(handle_continuous_monitoring_instruction(
+        "or do one thing, check its price and just alert me every 5 minutes",
+        chat_id="m1upd", history=history, db_path=database,
+    ))
+    assert "updated" in reply2.lower(), reply2
+    assert "daily" in reply2.lower() and "every 5 minutes" in reply2.lower(), reply2
+    with db.get_connection(database) as conn:
+        rows = conn.execute(
+            "SELECT * FROM monitoring_missions WHERE conversation_id='m1upd' AND status='active'"
+        ).fetchall()
+    assert len(rows) == 1, rows
+    assert rows[0]["interval_seconds"] == 300
+    assert rows[0]["condition_type"] == "below_price"
+    assert json.loads(rows[0]["condition_params"])["threshold"] == 1000.0
+
+
+def test_parse_interval_seconds_words_and_hours():
+    """\"every two hours\" is 7200 seconds, \"every five minutes\" is
+    300 — the handler used to hardcode 300s for every interval watch,
+    so an hourly cadence silently became a 5-minute one."""
+    from app.continuous_monitoring_companion import _parse_interval_seconds, _describe_interval
+
+    assert _parse_interval_seconds("check every 5 minutes") == 300
+    assert _parse_interval_seconds("alert me every five minutes") == 300
+    assert _parse_interval_seconds("check every two hours") == 7200
+    assert _parse_interval_seconds("check every 1 hour") == 3600
+    assert _parse_interval_seconds("no cadence here") == 300
+    # A bare "every hour" / "every minute" (no number) means one of
+    # the unit — and it routes as a monitoring directive.
+    assert _parse_interval_seconds("check its price every hour") == 3600
+    assert _parse_interval_seconds("alert me every minute") == 60
+    from app.continuous_monitoring_companion import is_continuous_monitoring_directive
+
+    assert is_continuous_monitoring_directive("check its price every hour") is True
+    assert _describe_interval(7200) == "every 2 hours"
+    assert _describe_interval(300) == "every 5 minutes"
+
+
+def test_product_phrase_tails_and_pronouns():
+    """Phrase tails and pronoun-led phrases must not become products:
+    a comma before \"alert me\" (\"..., alert me\") used to mangle the
+    title to \"..., Alert Me\"; \"the price of the X\" left a leading
+    \"the\"; \"check out ...\" and \"watch my email\" became bogus
+    products (\"out the new deals\", \"my email\")."""
+    from app.continuous_monitoring_companion import _product_phrase_from_text
+
+    assert _product_phrase_from_text("watch the Grandbiker Rear Stand, alert me") == "Grandbiker Rear Stand"
+    assert _product_phrase_from_text("check the price of the Grandbiker Rear Stand") == "Grandbiker Rear Stand"
+    assert _product_phrase_from_text("check out the new deals on laptops") == ""
+    assert _product_phrase_from_text("watch my email for offers") == ""
+    assert _product_phrase_from_text("check your inbox for price drops") == ""
+    # A plural service name is still a service ("Google Calendars").
+    from app.continuous_monitoring_companion import _is_service_name
+
+    assert _is_service_name("Google Calendars") is True
+    assert _is_service_name("Google Calendar app") is True
+    assert _is_service_name("Samsung Galaxy Fit3") is False
+    # A bare cadence is not a product: "check every 2 hours" / "check
+    # every day" used to become a phantom watch titled "Every 2 Hours"
+    # / "Every Day", and the real watch never changed cadence.
+    assert _product_phrase_from_text("check every 2 hours") == ""
+    assert _product_phrase_from_text("check every five minutes") == ""
+    assert _product_phrase_from_text("check every day") == ""
+    assert _product_phrase_from_text("check every morning") == ""
+    assert _product_phrase_from_text("watch the bike stand every day") == "bike stand"
+    assert _product_phrase_from_text("monitor the bike stand every 2 hours") == "bike stand"
+
+
+def test_truncate_title_cuts_at_word_boundary():
+    """A long title is capped at 80 chars at a word boundary, never
+    mid-word: the Grandbiker title used to end "... Stand (Floo" in
+    the watch card and in every reply naming the product."""
+    from app.continuous_monitoring_companion import _truncate_title
+
+    long_title = (
+        "Grandbiker Rear Wheel Paddock Stand with Swing Arm Rest Bike "
+        "Storage Stand (Floor Mount)"
+    )
+    assert _truncate_title(long_title) == (
+        "Grandbiker Rear Wheel Paddock Stand with Swing Arm Rest Bike Storage Stand"
+    )
+    assert len(_truncate_title(long_title)) <= 80
+    assert _truncate_title("Short title") == "Short title"
+    assert _truncate_title("x" * 100) == "x" * 80  # no space: hard cut

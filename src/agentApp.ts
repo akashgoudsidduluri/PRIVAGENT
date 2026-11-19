@@ -336,6 +336,17 @@ function initWorkspaceElements(): void {
       if (missionAttachment) missionAttachment.value = "";
       renderAttachmentChips();
       activeChatId = activeChatId || data.chat_id || data.chatId || null;
+      // Persist the adopted chat id: the send flow used to leave
+      // localStorage empty after the first message of a new chat, so
+      // a refresh lost the new chat and the list could re-open the
+      // previous one instead ("new chats not registering").
+      if (activeChatId) {
+        try {
+          localStorage.setItem("privagent_active_chat_id", activeChatId);
+        } catch {
+          // Storage might be restricted
+        }
+      }
 
       // Refresh chat list to show active title and timestamp
       loadChatList();
@@ -1383,12 +1394,17 @@ async function loadChatList(options?: { autoSelect?: boolean }): Promise<void> {
     // autoSelect explicitly; the default stays true only for legacy
     // refresh paths where an active chat is already set (the guard
     // above makes the block a no-op there anyway).
+    //
+    // Restore ONLY the chat id saved in localStorage. There used to
+    // be a fallback to chats[0] here (most recently updated chat):
+    // any bare loadChatList() while no chat was active — e.g. right
+    // after New Mission — silently re-opened the previous chat, so
+    // its timeline showed in the "new" chat and the next message
+    // landed in the old chat instead of registering a new one.
     if (!activeChatId && (options?.autoSelect ?? true)) {
       const savedChatId = localStorage.getItem("privagent_active_chat_id");
       if (savedChatId && chats.some(c => c.id === savedChatId)) {
         void selectChat(savedChatId);
-      } else if (chats.length > 0) {
-        void selectChat(chats[0].id);
       }
     }
   } catch {
@@ -1406,6 +1422,11 @@ async function selectChat(chatId: string): Promise<void> {
   }
   currentTaskId = null;
   stepCounter = 0;
+  // Switching chats must stop the previous chat's poller: without
+  // this a poll tick already in flight could render the old task's
+  // steps into the new chat's timeline (its guard only trips on the
+  // NEXT tick).
+  stopFallbackPolling();
   hideHumanGate();
   if (btnCancelMission) btnCancelMission.hidden = true;
   setButtonWorking(false);

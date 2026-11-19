@@ -550,6 +550,43 @@ _EXTRACTION_INTENT_RE = re.compile(
 )
 
 
+def _evidence_destination_url(evidence: str) -> Optional[str]:
+    """Extract the destination URL from a navigation evidence string.
+
+    Click evidence is "navigated {before} -> {after} (observed
+    destination content)" (or "opened new tab {tab}: navigated
+    {before} -> {after} ..."). The destination is the URL after the
+    arrow. Returns None when the evidence has no arrow (e.g. a bare
+    navigate result, which is just the URL itself).
+    """
+    if not evidence:
+        return None
+    m = re.search(r"→\s*(\S+)", evidence)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"->\s*(\S+)", evidence)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def _evidence_landed_on_search_page(evidence: str) -> bool:
+    """True when a navigation evidence landed on a search/results page.
+
+    The check is against the DESTINATION URL only. The old code checked
+    the whole evidence string, but click evidence carries the BEFORE
+    URL too ("navigated {google-search-url} -> {article-url}"), so a
+    click from a search page to a real article was rejected as "still
+    on a search page" — the live failure: clicking the Internshala
+    result on Google, and clicking a Flipkart product from Flipkart
+    search, both reported "the requested page or article was not
+    opened" although the destination was a real page.
+    """
+    dest = _evidence_destination_url(evidence)
+    target = dest if dest is not None else evidence
+    return any(s in target for s in ("/search", "index.php?search"))
+
+
 def _uncompleted_extraction(
     payload: Any, history: list[dict[str, Any]], instruction: str, answer: Optional[str]
 ) -> bool:
@@ -574,7 +611,7 @@ def _uncompleted_extraction(
         has_nav = any(
             h.get("result_ok")
             and "navigated" in str(h.get("evidence") or "")
-            and not any(s in str(h.get("evidence") or "") for s in ("/search", "index.php?search"))
+            and not _evidence_landed_on_search_page(str(h.get("evidence") or ""))
             for h in history
         )
         if not has_nav:

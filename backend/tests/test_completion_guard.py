@@ -287,3 +287,80 @@ def test_extraction_claim_accepted_on_article_page():
     )
     assert plan.blocked is False
     assert "Extracted" in plan.answer
+
+
+# --- Click from a search page to a real page must count as navigation --------
+# Live failure 2026-11-19: clicking the Internshala result on Google, and
+# clicking a Flipkart product from Flipkart search, both ended with
+# "the requested page or article was not opened". The click evidence is
+# "navigated {before} -> {after} (observed destination content)" and the
+# BEFORE url is the search page, so the old has_nav exclusion ("/search"
+# anywhere in the evidence) rejected a navigation that landed on a real
+# article/product page. The exclusion must look at the destination only.
+
+def test_extraction_claim_accepted_after_click_from_search_to_article():
+    """Click Google search -> Internshala article counts as opening the page,
+    even though the payload is still the Google tab and the evidence carries
+    the Google search URL."""
+    plan = _validate_plan(
+        _completion("Found SDE internships in Hyderabad with stipend above 15000."),
+        payload=_payload("https://www.google.com/search?q=sde+internships+hyderabad"),
+        history=[{
+            "action": {"type": "click"},
+            "result_ok": True,
+            "evidence": "navigated https://www.google.com/search?q=sde+internships+hyderabad \u2192 https://internshala.com/internships/software-development-engineering-internship-in-hyderabad (observed destination content)",
+        }],
+        instruction="find SDE internships in Hyderabad and Bangalore with stipend above 15000 and give me the details",
+    )
+    assert plan.blocked is False
+    assert "Found SDE internships" in plan.answer
+
+
+def test_extraction_claim_accepted_after_click_from_search_to_product():
+    """Click Flipkart search -> product page counts as opening the page."""
+    plan = _validate_plan(
+        _completion("Apple iPhone 18 Pro Burgundy 256GB is priced at 99999 on Flipkart."),
+        payload=_payload("https://www.flipkart.com/search?q=apple+iphone+18+pro+burgundy+256gb"),
+        history=[{
+            "action": {"type": "click"},
+            "result_ok": True,
+            "evidence": "navigated https://www.flipkart.com/search?q=apple+iphone+18+pro+burgundy+256gb \u2192 https://www.flipkart.com/apple-iphone-18-pro-burgundy-256-gb/p/itmx123 (observed destination content)",
+        }],
+        instruction="find the price of Apple iPhone 18 Pro Burgundy 256GB on Flipkart",
+    )
+    assert plan.blocked is False
+    assert "99999" in plan.answer
+
+
+def test_extraction_claim_rejected_after_click_to_another_search_page():
+    """Click Google -> Flipkart search still does NOT count: the destination
+    is another search page, not an article/product."""
+    plan = _validate_plan(
+        _completion("Apple iPhone 18 Pro is priced at 99999."),
+        payload=_payload("https://www.flipkart.com/search?q=apple+iphone+18+pro"),
+        history=[{
+            "action": {"type": "click"},
+            "result_ok": True,
+            "evidence": "navigated https://www.google.com/search?q=iphone \u2192 https://www.flipkart.com/search?q=iphone (observed destination content)",
+        }],
+        instruction="find the price of Apple iPhone 18 Pro on Flipkart",
+    )
+    assert plan.blocked is True
+    assert "cannot claim extraction from search results" in plan.answer
+
+
+def test_extraction_claim_rejected_when_click_did_not_navigate():
+    """A click that was accepted but detected no navigation still does not
+    count as opening the page."""
+    plan = _validate_plan(
+        _completion("Found SDE internships in Hyderabad."),
+        payload=_payload("https://www.google.com/search?q=sde+internships+hyderabad"),
+        history=[{
+            "action": {"type": "click"},
+            "result_ok": True,
+            "evidence": "clicked coords (120, 300) (click accepted; no navigation detected; url: https://www.google.com/search?q=sde+internships+hyderabad)",
+        }],
+        instruction="find SDE internships in Hyderabad and give me the details",
+    )
+    assert plan.blocked is True
+    assert "cannot claim extraction from search results" in plan.answer

@@ -191,3 +191,106 @@ def test_comparison_package_renders_xlsx_from_tracker():
     finally:
         shutil.rmtree(task_dir, ignore_errors=True)
         db.delete_artifact(f"art_{task_id}_xlsx")
+
+
+def _build_minimal_pkg(task_id: str, topic_title: str, instruction: str):
+    """Minimal research package with one source + one verified claim."""
+    from app.research.models import (
+        EvidenceClassification,
+        EvidenceItem,
+        ResearchClaim,
+        ResearchKnowledgePackage,
+        ResearchTopic,
+        SourceReference,
+    )
+
+    pkg = ResearchKnowledgePackage(
+        package_id=f"pkg_{task_id}",
+        topic=ResearchTopic(
+            title=topic_title,
+            objective=instruction,
+            target_format="pdf",
+        ),
+    )
+    pkg.add_source(SourceReference(
+        source_id="src_1",
+        url="https://en.wikipedia.org/wiki/Quantum_biology",
+        domain="wikipedia.org",
+        title="Quantum biology",
+        reliability_score=0.9,
+        reliability_tier="credible_reference",
+        is_primary=False,
+    ))
+    pkg.add_evidence(EvidenceItem(
+        evidence_id="ev_1",
+        source_id="src_1",
+        quote="Quantum biology studies quantum-mechanical effects in biology.",
+        confidence=0.9,
+    ))
+    pkg.add_claim(ResearchClaim(
+        claim_id="clm_1",
+        statement="Quantum biology studies quantum-mechanical effects in biology.",
+        classification=EvidenceClassification.SINGLE_SOURCE,
+        primary_source_id="src_1",
+        supporting_source_ids=["src_1"],
+    ))
+    return pkg
+
+
+def test_architecture_diagram_only_for_relevant_topics():
+    """The architecture block diagram must NOT be generated for a
+    non-technical topic. The old code rendered it unconditionally, so a
+    quantum-biology research PDF shipped a generic software-architecture
+    diagram (\"Client Interface & Ingestion Pipeline\" etc.) that has
+    nothing to do with the topic. An architecture topic still gets it."""
+    import shutil
+
+    from app.loop_research import _finalize_research_artifacts
+
+    # Non-technical topic: no architecture diagram.
+    task_id = "task_diag_bio"
+    pkg = _build_minimal_pkg(
+        task_id,
+        "Quantum Mechanics similarities with life",
+        "research quantum mechanics similarities with life and generate a pdf",
+    )
+    wm = {
+        "is_research": True,
+        "requested_format": "pdf",
+        "deliverable_type": "report",
+        "instruction": "research quantum mechanics similarities with life and generate a pdf",
+        "research_knowledge_package": pkg.to_dict(),
+    }
+    task_dir = ARTIFACTS_DIR / task_id
+    try:
+        art = _finalize_research_artifacts(task_id, "chat_diag_bio", wm)
+        assert art is not None
+        visuals = wm["research_knowledge_package"].get("visuals", [])
+        assert not any(v.get("asset_id") == "vis_diagram_arch" for v in visuals), visuals
+    finally:
+        shutil.rmtree(task_dir, ignore_errors=True)
+        db.delete_artifact(f"art_{task_id}_pdf")
+
+    # Architecture topic: the diagram IS generated.
+    task_id2 = "task_diag_arch"
+    pkg2 = _build_minimal_pkg(
+        task_id2,
+        "Transformer neural network architecture",
+        "research transformer neural network architecture and generate a pdf",
+    )
+    wm2 = {
+        "is_research": True,
+        "requested_format": "pdf",
+        "deliverable_type": "report",
+        "instruction": "research transformer neural network architecture and generate a pdf",
+        "research_knowledge_package": pkg2.to_dict(),
+    }
+    task_dir2 = ARTIFACTS_DIR / task_id2
+    try:
+        art2 = _finalize_research_artifacts(task_id2, "chat_diag_arch", wm2)
+        assert art2 is not None
+        visuals2 = wm2["research_knowledge_package"].get("visuals", [])
+        assert any(v.get("asset_id") == "vis_diagram_arch" for v in visuals2), visuals2
+    finally:
+        shutil.rmtree(task_dir2, ignore_errors=True)
+        db.delete_artifact(f"art_{task_id2}_pdf")
