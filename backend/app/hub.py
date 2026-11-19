@@ -62,6 +62,12 @@ class TaskRecord:
     child_tab_ids: list[int] = field(default_factory=list)
     terminal_emitted: bool = False
     last_observation: Any = None
+    # Identity propagation: the authenticated user who created this task
+    # (request.state.user_id at creation), or None for operator
+    # (local-token) work. The task loop and the connector runner read
+    # this to resolve the task owner's own OAuth connections — a
+    # session user's task must never fall back to the legacy globals.
+    user_id: Optional[str] = None
     # Task 3: domain allow-list for this task (None = not configured,
     # navigation allowed everywhere with a warning at task creation).
     allowed_domains: Optional[list[str]] = None
@@ -143,9 +149,9 @@ class Hub:
         task.add_done_callback(self._bg_tasks.discard)
         return task
 
-    def new_task(self, instruction: str, chat_id: Optional[str] = None, allowed_domains: Optional[list[str]] = None, long_horizon: bool = False, background: bool = False) -> TaskRecord:
+    def new_task(self, instruction: str, chat_id: Optional[str] = None, allowed_domains: Optional[list[str]] = None, long_horizon: bool = False, background: bool = False, user_id: Optional[str] = None) -> TaskRecord:
         self._prune_tasks()
-        task = TaskRecord(task_id=uuid.uuid4().hex, instruction=instruction, chat_id=chat_id, allowed_domains=allowed_domains, long_horizon=long_horizon, background=background)
+        task = TaskRecord(task_id=uuid.uuid4().hex, instruction=instruction, chat_id=chat_id, allowed_domains=allowed_domains, long_horizon=long_horizon, background=background, user_id=user_id)
         self.tasks[task.task_id] = task
         return task
 

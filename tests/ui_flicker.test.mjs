@@ -643,7 +643,9 @@ test("Chat-only monitoring: the Missions page (monitor form + scheduled list) is
   // 2026-11-18: monitoring is chat-only. The Missions view (Create a
   // monitor form + Scheduled missions list) was removed — a monitor can
   // be anything (price, page, inbox), not just a product URL, so the
-  // product-only form was the wrong shape. The nav has 11 views now.
+  // product-only form was the wrong shape. The nav had 11 views then;
+  // the Profile view (index 11, user auth) was added 2026-11-19, so
+  // the nav has 12 views now.
   assert.ok(!read("src/controlCenter.ts").includes("'Missions'"), "controlCenter still lists a Missions view");
   assert.ok(!read("src/controlCenter.ts").includes("◎"), "controlCenter still has the Missions nav icon");
   assert.ok(!read("src/controlViews.ts").includes("Create a monitor"), "controlViews still renders the monitor form");
@@ -656,10 +658,11 @@ test("Chat-only monitoring: the Missions page (monitor form + scheduled list) is
   // Activity is index 8; the mount list must match controlViews.
   const cc = read("src/controlCenter.ts");
   assert.ok(cc.includes("if(index===8){content.append(nodes!.feed)"), "Activity is not index 8 after the removal");
-  assert.ok(cc.includes("if([0,3,4,5,6,7,9,10].includes(index))"), "mount list does not match the shifted indices");
+  assert.ok(cc.includes("if([0,3,4,5,6,7,9,10,11].includes(index))"), "mount list does not match the shifted indices");
   const cv = read("src/controlViews.ts");
   assert.ok(cv.includes("if (index === 3) {\n      await mountEmailIntelligence"), "Email Intelligence is not index 3 after the removal");
   assert.ok(cv.includes("if (index === 10) {"), "Settings is not index 10 after the removal");
+  assert.ok(cv.includes("if (index === 11) await mountProfile"), "Profile is not index 11");
   // The old #missions hash falls back to Overview (route() renders
   // index 0 when no view name matches), so a bookmarked link does not
   // break the control center.
@@ -739,4 +742,55 @@ test("Chat-only memory: the 'Remember a fact' form is gone, the transparency lis
   assert.ok(companion.includes("semantic.remember"), "remember handler does not use the semantic store");
   const loop = read("backend/app/agentLoop.py");
   assert.ok(loop.includes("is_remember_directive(record.instruction)"), "agent loop does not route remember directives");
+});
+
+test("User auth: landing page has signup/login forms; session restores only on a live session", () => {
+  // 2026-11-19: email + password accounts. The landing page carries the
+  // signup/login forms (#account); the workspace Profile view shows the
+  // profile. A stored session must survive a backend hiccup: only a 401
+  // (dead session) clears it — a 500 or a network error keeps the token
+  // and shows the sign-in form instead of logging the user out.
+  const landing = read("dist/index.html");
+  for (const id of ["account", "authForm", "authEmail", "authPassword", "authDisplayName", "authTabSignup", "authTabLogin", "authSignedIn"]) {
+    assert.ok(landing.includes(`id="${id}"`), `built landing page is missing #${id}`);
+  }
+  const landingAuth = read("src/landingAuth.ts");
+  assert.ok(
+    /if \(res\.status === 401\) \{\s*clearSessionToken\(\);/.test(landingAuth),
+    "landingAuth clears the session outside a 401 branch (a backend hiccup would log the user out)",
+  );
+});
+
+test("OAuth Connectors: real Connect button, no token paste, callback errors shown", () => {
+  // 2026-11-19: per-user OAuth. The Connectors view must render a real
+  // Connect button (data-connect → POST /start) when a provider is
+  // configured but not connected; the raw access/refresh-token paste
+  // boxes are gone (manual config stays only for client credentials);
+  // and a denied/failed callback lands back here with ?oauth_error=...,
+  // which the view shows once and then clears from the URL.
+  const views = read("src/controlViews.ts");
+  assert.ok(views.includes('data-connect="'), "Connectors view renders no Connect button (data-connect)");
+  assert.ok(!views.includes("data-token-input"), "Connectors view still has the raw access-token paste box");
+  assert.ok(!views.includes("data-refresh-token-input"), "Connectors view still has the raw refresh-token paste box");
+  assert.ok(!views.includes("accessToken:"), "Connectors view still posts a pasted access token to /configure");
+  assert.ok(views.includes("oauth_error"), "Connectors view does not surface the callback ?oauth_error=... parameter");
+  assert.ok(views.includes("delete('oauth_error')"), "Connectors view does not clear oauth_error from the URL after showing it");
+});
+
+test("OAuth Connectors v2: multi-account list, six states, claim-legacy form", () => {
+  // 2026-11-19: v2. Each provider lists its connections (account,
+  // primary marker, per-connection Disconnect, Make primary); states
+  // are Not Configured / Not Connected / Connecting / Connected /
+  // Expired / Connection Error; a legacy operator connection can be
+  // claimed by confirming its account email (never silently).
+  const views = read("src/controlViews.ts");
+  assert.ok(views.includes("p.connections"), "Connectors view does not render the per-provider connections list");
+  assert.ok(views.includes("data-disconnect-conn"), "Connectors view has no per-connection Disconnect");
+  assert.ok(views.includes("data-make-primary"), "Connectors view has no Make primary action");
+  for (const state of ["Not Configured", "Not Connected", "Connecting", "Connected", "Expired", "Connection Error"]) {
+    assert.ok(views.includes("'" + state + "'"), "Connectors view is missing the '" + state + "' state");
+  }
+  assert.ok(views.includes("data-claim-confirm"), "Connectors view has no claim-legacy confirmation");
+  assert.ok(views.includes("/migrate"), "Connectors view does not call the confirmed-migration endpoint");
+  assert.ok(views.includes("exchange_failed"), "Connectors view does not distinguish an exchange failure from a bad state");
 });

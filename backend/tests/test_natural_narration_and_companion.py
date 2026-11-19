@@ -170,7 +170,7 @@ def test_email_dispatch_detection():
 async def test_email_dispatch_execution_when_connected(monkeypatch):
     # Mock oauth_manager to simulate connected account
     from app.connectors.oauth import oauth_manager
-    monkeypatch.setattr(oauth_manager, "verify_connection", lambda p: {"connected": True, "account": "operator@example.com", "access_token": "mock_token"})
+    monkeypatch.setattr(oauth_manager, "verify_connection", lambda p, user_id=None, connection_id=None: {"connected": True, "account": "operator@example.com", "access_token": "mock_token"})
 
     resp = await handle_email_dispatch(
         instruction="Email this comparison summary to operator@example.com",
@@ -195,7 +195,7 @@ def test_restore_companion_query_execution_and_capability(monkeypatch):
 
     # 2. Execution check when mock connected
     from app.connectors.oauth import oauth_manager
-    monkeypatch.setattr(oauth_manager, "verify_connection", lambda p: {"connected": True, "account": "user@test.org"})
+    monkeypatch.setattr(oauth_manager, "verify_connection", lambda p, user_id=None, connection_id=None: {"connected": True, "account": "user@test.org"})
 
     class MockGmailConn:
         def list_messages(self, query="", limit=10):
@@ -208,7 +208,7 @@ def test_restore_companion_query_execution_and_capability(monkeypatch):
         def untrash_message(self, mid):
             return {"id": mid, "labelIds": ["INBOX"]}
 
-    monkeypatch.setattr(oauth_manager, "connector", lambda p: MockGmailConn())
+    monkeypatch.setattr(oauth_manager, "connector", lambda p, user_id=None, connection_id=None: MockGmailConn())
 
     exec_query = "then restore lastly deleted mail"
     assert is_email_companion_query(exec_query) is True
@@ -224,7 +224,7 @@ def test_i_connected_everything_companion_query(monkeypatch):
     from app.email_intelligence.companion_queries import is_email_companion_query, answer_email_companion_query
     from app.connectors.oauth import oauth_manager
 
-    monkeypatch.setattr(oauth_manager, "verify_connection", lambda p: {"connected": True, "account": "user@test.org"})
+    monkeypatch.setattr(oauth_manager, "verify_connection", lambda p, user_id=None, connection_id=None: {"connected": True, "account": "user@test.org"})
     q = "i connected evrything"
     assert is_email_companion_query(q) is True
     ans = answer_email_companion_query(q)
@@ -236,7 +236,7 @@ def test_promotional_and_safety_queries(monkeypatch):
     from app.email_intelligence.companion_queries import is_email_companion_query, answer_email_companion_query
     from app.connectors.oauth import oauth_manager
 
-    monkeypatch.setattr(oauth_manager, "verify_connection", lambda p: {"connected": True, "account": "user@test.org"})
+    monkeypatch.setattr(oauth_manager, "verify_connection", lambda p, user_id=None, connection_id=None: {"connected": True, "account": "user@test.org"})
 
     # 1. "can you automatically delete promotional emails"
     q_promo = "can you automatically delete promotional emails"

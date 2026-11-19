@@ -153,12 +153,18 @@ def _maybe_compact_history(working_memory: dict[str, Any], history: list[dict[st
     working_memory["long_horizon_summary_at_step"] = steps_done
 
 
-def save_cancel_checkpoint(task_id: str, instruction: str, steps_done: int, last_url: str = "") -> bool:
+def save_cancel_checkpoint(task_id: str, instruction: str, steps_done: int, last_url: str = "",
+                           user_id: Optional[str] = None, conversation_id: Optional[str] = None) -> bool:
     """Checkpoint a task at cancel time, so a cancelled task can still
     be resumed. Only writes when no checkpoint exists yet — the loop
     already checkpoints after every step, so in practice this fires
     only for tasks cancelled before their first step. Returns True
-    when a checkpoint was written."""
+    when a checkpoint was written.
+
+    ``user_id`` / ``conversation_id`` are stamped into the checkpoint
+    so a restored task keeps its owner: without them the ownership
+    check would 404 the task's own owner after a restart.
+    """
     # Task 10: zero retention — a cancelled task leaves no checkpoint
     # behind either; there is nothing to resume from, by design.
     try:
@@ -177,12 +183,13 @@ def save_cancel_checkpoint(task_id: str, instruction: str, steps_done: int, last
             return False
         db.save_task_checkpoint(
             task_id=task_id,
-            conversation_id="default",
+            conversation_id=conversation_id or "default",
             session_id=None,
             step_index=steps_done,
             last_url=last_url or "",
             history=[],
-            working_memory={"instruction": instruction, "cancelled": True, "steps_done": steps_done},
+            working_memory={"instruction": instruction, "cancelled": True, "steps_done": steps_done,
+                            "user_id": user_id},
         )
         return True
     except Exception:

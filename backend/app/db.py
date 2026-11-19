@@ -121,6 +121,7 @@ def init_db(db_path: Optional[str] = None) -> None:
             CREATE TABLE IF NOT EXISTS chats (
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
+                user_id TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 status TEXT DEFAULT 'active'
@@ -182,6 +183,7 @@ def init_db(db_path: Optional[str] = None) -> None:
             -- runner is best-effort — a restart re-claims anything due.
             CREATE TABLE IF NOT EXISTS scheduled_jobs (
                 id TEXT PRIMARY KEY, instruction TEXT NOT NULL,
+                user_id TEXT,
                 schedule TEXT NOT NULL, schedule_kind TEXT NOT NULL,
                 cron TEXT, interval_seconds INTEGER,
                 status TEXT NOT NULL DEFAULT 'active',
@@ -241,7 +243,7 @@ def init_db(db_path: Optional[str] = None) -> None:
             );
 
             CREATE TABLE IF NOT EXISTS monitoring_missions (
-                id TEXT PRIMARY KEY, conversation_id TEXT, title TEXT NOT NULL,
+                id TEXT PRIMARY KEY, conversation_id TEXT, user_id TEXT, title TEXT NOT NULL,
                 target_url TEXT NOT NULL, trigger_type TEXT NOT NULL DEFAULT 'interval',
                 schedule_cron TEXT, interval_seconds INTEGER NOT NULL CHECK(interval_seconds >= 60),
                 condition_type TEXT NOT NULL DEFAULT 'text_change', condition_params TEXT NOT NULL DEFAULT '{}',
@@ -258,7 +260,7 @@ def init_db(db_path: Optional[str] = None) -> None:
                 state_hash TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS mcp_audit (
-                id TEXT PRIMARY KEY, tool_name TEXT NOT NULL, input_hash TEXT NOT NULL,
+                id TEXT PRIMARY KEY, user_id TEXT, tool_name TEXT NOT NULL, input_hash TEXT NOT NULL,
                 latency_ms INTEGER NOT NULL, status TEXT NOT NULL, output_hash TEXT NOT NULL,
                 created_at REAL NOT NULL
             );
@@ -282,6 +284,8 @@ def init_db(db_path: Optional[str] = None) -> None:
             CREATE TABLE IF NOT EXISTS email_monitoring_missions (
                 id TEXT PRIMARY KEY,
                 conversation_id TEXT,
+                user_id TEXT,
+                connection_id TEXT,
                 account_email TEXT NOT NULL,
                 provider TEXT NOT NULL DEFAULT 'gmail',
                 frequency_seconds INTEGER NOT NULL DEFAULT 300 CHECK(frequency_seconds >= 60),
@@ -364,6 +368,66 @@ def init_db(db_path: Optional[str] = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_email_class_category ON email_classifications(mission_id, category);
             CREATE INDEX IF NOT EXISTS idx_email_audit_mission ON email_audit_log(mission_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_email_notif_status ON email_notifications(mission_id, status);
+
+            -- User accounts for the website (email + password auth).
+            -- Passwords are scrypt hashes (see app/auth_users.py); session
+            -- tokens are stored as SHA-256 hashes only, never in plain text.
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                email TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                salt TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                last_login_at INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS sessions (
+                token_hash TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                expires_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+            -- Per-user OAuth connections for Connected Services.
+            -- Tokens are Fernet-encrypted (secrets.encrypt_text) — never
+            -- plaintext. One row per (user, provider, account): a user
+            -- can hold several accounts from the same provider (two
+            -- Gmail accounts, a work and a personal GitHub). The
+            -- connection id is the stable handle; is_primary picks the
+            -- account the agent uses when none is named.
+            -- migrated_from_legacy marks a row that was claimed from
+            -- the old operator-global tokens via the confirmed
+            -- migration flow (never a silent transfer).
+            CREATE TABLE IF NOT EXISTS oauth_connections (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                provider TEXT NOT NULL,
+                account_email TEXT,
+                access_token_enc TEXT NOT NULL,
+                refresh_token_enc TEXT,
+                scopes TEXT,
+                is_primary INTEGER NOT NULL DEFAULT 0,
+                migrated_from_legacy INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(user_id, provider, account_email)
+            );
+            CREATE INDEX IF NOT EXISTS idx_oauth_connections_user ON oauth_connections(user_id, provider);
+
+            -- Single-use OAuth authorization states (CSRF protection).
+            -- DB-backed, not in-memory: a backend restart between
+            -- authorize and callback must not kill the flow. The state
+            -- binds the callback to the user who started it.
+            CREATE TABLE IF NOT EXISTS oauth_states (
+                state TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                provider TEXT NOT NULL,
+                verifier TEXT NOT NULL,
+                expires_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_oauth_states_expiry ON oauth_states(expires_at);
             """
         )
         # Earlier control-center previews created narrower tables. Add only
@@ -375,6 +439,7 @@ def init_db(db_path: Optional[str] = None) -> None:
                 "condition_params": "TEXT NOT NULL DEFAULT '{}'", "last_state_json": "TEXT",
                 "last_alert_hash": "TEXT", "last_alert_at": "REAL",
                 "consecutive_failures": "INTEGER NOT NULL DEFAULT 0",
+                "user_id": "TEXT",
             },
             "monitoring_events": {
                 "task_id": "TEXT", "title": "TEXT NOT NULL DEFAULT ''",
@@ -384,6 +449,22 @@ def init_db(db_path: Optional[str] = None) -> None:
             "messages": {
                 "task_id": "TEXT",
             },
+            # Identity propagation: owner columns. NULL = legacy /
+            # operator-owned row (created before auth, or by the local
+            # operator token); only the operator sees NULL rows.
+            "chats": {
+                "user_id": "TEXT",
+            },
+            "email_monitoring_missions": {
+                "user_id": "TEXT",
+                "connection_id": "TEXT",
+            },
+            "scheduled_jobs": {
+                "user_id": "TEXT",
+            },
+            "mcp_audit": {
+                "user_id": "TEXT",
+            },
         }
         for table, columns in migrations.items():
             existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -391,28 +472,110 @@ def init_db(db_path: Optional[str] = None) -> None:
                 if name not in existing:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {spec}")
 
+        # v1 -> v2 OAuth connections: the v1 table was PRIMARY KEY
+        # (user_id, provider) — one account per provider per user. v2
+        # keys rows by a connection id so a user can hold several
+        # accounts from the same provider. Rebuild once, preserving
+        # rows (v1 never shipped, so this only ever touches scratch
+        # databases, but the data is copied, not dropped).
+        _migrate_oauth_connections_v2(conn)
 
-def create_chat(title: Optional[str] = None, db_path: Optional[str] = None) -> dict[str, Any]:
+
+def _migrate_oauth_connections_v2(conn) -> None:
+    """Rebuild a v1 oauth_connections table into the v2 shape."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(oauth_connections)")}
+    if not cols or "id" in cols:
+        return
+    import uuid as _uuid
+
+    conn.execute(
+        """
+        CREATE TABLE oauth_connections_v2 (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            provider TEXT NOT NULL,
+            account_email TEXT,
+            access_token_enc TEXT NOT NULL,
+            refresh_token_enc TEXT,
+            scopes TEXT,
+            is_primary INTEGER NOT NULL DEFAULT 0,
+            migrated_from_legacy INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            UNIQUE(user_id, provider, account_email)
+        )
+        """
+    )
+    rows = conn.execute(
+        "SELECT user_id, provider, account_email, access_token_enc,"
+        " refresh_token_enc, scopes, created_at, updated_at"
+        " FROM oauth_connections ORDER BY created_at"
+    ).fetchall()
+    seen: set[tuple[str, str]] = set()
+    for row in rows:
+        # One orphan row (its user was deleted) must not brick startup:
+        # skip it and keep migrating the rest.
+        owner = conn.execute(
+            "SELECT 1 FROM users WHERE id = ?", (row["user_id"],)
+        ).fetchone()
+        if owner is None:
+            continue
+        key = (row["user_id"], row["provider"])
+        conn.execute(
+            "INSERT INTO oauth_connections_v2"
+            " (id, user_id, provider, account_email, access_token_enc,"
+            "  refresh_token_enc, scopes, is_primary,"
+            "  migrated_from_legacy, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+            (_uuid.uuid4().hex, row["user_id"], row["provider"],
+             row["account_email"], row["access_token_enc"],
+             row["refresh_token_enc"], row["scopes"],
+             0 if key in seen else 1, row["created_at"], row["updated_at"]),
+        )
+        seen.add(key)
+    conn.execute("DROP TABLE oauth_connections")
+    conn.execute("ALTER TABLE oauth_connections_v2 RENAME TO oauth_connections")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_oauth_connections_user"
+        " ON oauth_connections(user_id, provider)"
+    )
+
+
+def create_chat(title: Optional[str] = None, db_path: Optional[str] = None, user_id: Optional[str] = None) -> dict[str, Any]:
     from .privacy import scrub_persistent
     chat_id = uuid.uuid4().hex
     display_title = scrub_persistent((title or "New Mission").strip())
     with get_connection(db_path) as conn:
         conn.execute(
-            "INSERT INTO chats (id, title, status) VALUES (?, ?, 'active')",
-            (chat_id, display_title),
+            "INSERT INTO chats (id, title, user_id, status) VALUES (?, ?, ?, 'active')",
+            (chat_id, display_title, user_id),
         )
-    return get_chat(chat_id, db_path=db_path) or {"id": chat_id, "title": display_title}
+    return get_chat(chat_id, db_path=db_path) or {"id": chat_id, "title": display_title, "user_id": user_id}
 
 
-def list_chats(db_path: Optional[str] = None) -> list[dict[str, Any]]:
+def list_chats(db_path: Optional[str] = None, user_id: Optional[str] = None) -> list[dict[str, Any]]:
+    """List chats. A session user sees only their own rows (NULL
+    user_id = legacy/operator-owned, visible to the operator only);
+    the operator (user_id=None) sees all."""
     with get_connection(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT id, title, created_at, updated_at, status
-            FROM chats
-            ORDER BY updated_at DESC
-            """
-        ).fetchall()
+        if user_id is None:
+            rows = conn.execute(
+                """
+                SELECT id, title, user_id, created_at, updated_at, status
+                FROM chats
+                ORDER BY updated_at DESC
+                """
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT id, title, user_id, created_at, updated_at, status
+                FROM chats
+                WHERE user_id = ?
+                ORDER BY updated_at DESC
+                """,
+                (user_id,),
+            ).fetchall()
         return [dict(r) for r in rows]
 
 
@@ -441,7 +604,7 @@ def format_history_steps(hist: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def get_chat(chat_id: str, db_path: Optional[str] = None) -> Optional[dict[str, Any]]:
     with get_connection(db_path) as conn:
         row = conn.execute(
-            "SELECT id, title, created_at, updated_at, status FROM chats WHERE id = ?",
+            "SELECT id, title, user_id, created_at, updated_at, status FROM chats WHERE id = ?",
             (chat_id,),
         ).fetchone()
         if not row:
@@ -1099,6 +1262,8 @@ def create_email_mission(
     policy_authorized: bool = False,
     dry_run: bool = True,
     db_path: Optional[str] = None,
+    user_id: Optional[str] = None,
+    connection_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Create or register an email monitoring mission in SQLite."""
     ident = mission_id or f"email_{uuid.uuid4().hex[:12]}"
@@ -1121,13 +1286,13 @@ def create_email_mission(
         conn.execute(
             """
             INSERT INTO email_monitoring_missions (
-                id, conversation_id, account_email, provider, frequency_seconds,
+                id, conversation_id, user_id, connection_id, account_email, provider, frequency_seconds,
                 status, policy_authorized, dry_run, cleanup_policy_json,
                 notification_policy_json, next_run_at, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)
             """,
-            (ident, conversation_id, account_email, provider.lower(), frequency_seconds,
+            (ident, conversation_id, user_id, connection_id, account_email, provider.lower(), frequency_seconds,
              1 if policy_authorized else 0, 1 if dry_run else 0,
              clean_pol, notif_pol, now, now, now),
         )
@@ -1135,13 +1300,13 @@ def create_email_mission(
         conn.execute(
             """
             INSERT OR REPLACE INTO monitoring_missions (
-                id, conversation_id, title, target_url, trigger_type,
+                id, conversation_id, user_id, title, target_url, trigger_type,
                 interval_seconds, condition_type, condition_params,
                 status, next_run_at, created_at
             )
-            VALUES (?, ?, ?, ?, 'interval', ?, 'email_intelligence', '{}', 'active', ?, ?)
+            VALUES (?, ?, ?, ?, ?, 'interval', ?, 'email_intelligence', '{}', 'active', ?, ?)
             """,
-            (ident, conversation_id, f"Email Intelligence ({account_email})",
+            (ident, conversation_id, user_id, f"Email Intelligence ({account_email})",
              f"email://{provider.lower()}/{account_email}", frequency_seconds, now, now),
         )
         conn.commit()
@@ -1173,10 +1338,17 @@ def get_email_mission(mission_id: str, db_path: Optional[str] = None) -> Optiona
         return res
 
 
-def list_email_missions(db_path: Optional[str] = None) -> list[dict[str, Any]]:
-    """List all email monitoring missions."""
+def list_email_missions(db_path: Optional[str] = None, user_id: Optional[str] = None) -> list[dict[str, Any]]:
+    """List email monitoring missions. A session user sees only their
+    own rows; the operator (user_id=None) sees all."""
     with get_connection(db_path) as conn:
-        rows = conn.execute("SELECT * FROM email_monitoring_missions ORDER BY created_at DESC").fetchall()
+        if user_id is None:
+            rows = conn.execute("SELECT * FROM email_monitoring_missions ORDER BY created_at DESC").fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM email_monitoring_missions WHERE user_id = ? ORDER BY created_at DESC",
+                (user_id,),
+            ).fetchall()
         results = []
         for r in rows:
             d = dict(r)
@@ -1200,6 +1372,10 @@ def update_email_mission(mission_id: str, updates: dict[str, Any], db_path: Opti
         "next_run_at", "total_processed", "unnecessary_detected",
         "moved_to_trash", "important_detected", "neglected_detected",
         "frequency_seconds", "account_email", "provider",
+        # Identity propagation: the owner and the exact connection a
+        # mission resolves. (Stamped at creation; updated when a
+        # mission is claimed or re-attached.)
+        "user_id", "connection_id",
     }
     set_clauses = []
     params = []
@@ -1497,6 +1673,14 @@ def get_email_notifications(
                 continue
             results.append(d)
         return results
+
+
+def get_email_notification(notif_id: str, db_path: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """One notification row (carries mission_id, so the dismiss route
+    can check the owning mission)."""
+    with get_connection(db_path) as conn:
+        row = conn.execute("SELECT * FROM email_notifications WHERE id = ?", (notif_id,)).fetchone()
+        return dict(row) if row else None
 
 
 def update_email_notification_status(

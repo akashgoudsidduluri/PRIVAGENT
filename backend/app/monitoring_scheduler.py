@@ -160,6 +160,10 @@ def claim_due(now: float | None = None, limit: int = 5, db_path: str | None = No
                         "condition_type": "email_intelligence",
                         "conversation_id": ed.get("conversation_id"),
                         "frequency_seconds": freq,
+                        # The tick resolves the mission owner's
+                        # connection from these — never the globals.
+                        "user_id": ed.get("user_id"),
+                        "connection_id": ed.get("connection_id"),
                     })
             except Exception as exc:
                 logger.error("Failed to claim email monitoring missions: %s", exc)
@@ -215,7 +219,7 @@ async def execute_monitor(mission: dict) -> None:
         return
 
     record = hub.new_task(f"Open {target_url} and observe its public visible page text and price. Report only observed facts.",
-                          chat_id=mission["conversation_id"])
+                          chat_id=mission["conversation_id"], user_id=mission.get("user_id"))
     record.state = "planning"
     await hub.broadcast_progress(record)
     try:

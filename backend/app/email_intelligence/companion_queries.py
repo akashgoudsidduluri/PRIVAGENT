@@ -55,14 +55,19 @@ def answer_email_companion_query(
     query: str,
     mission_id: Optional[str] = None,
     db_path: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Produce an accurate conversational reply based exclusively on real DB records."""
+    """Produce an accurate conversational reply based exclusively on real DB records.
+
+    ``user_id`` is the task owner's id: only that user's missions are
+    visible, and every connection check uses their own account.
+    """
     db.init_db(db_path)
-    missions = db.list_email_missions(db_path=db_path)
+    missions = db.list_email_missions(db_path=db_path, user_id=user_id)
     if not missions:
         from app.connectors.oauth import oauth_manager
-        google_status = oauth_manager.verify_connection("google")
-        ms_status = oauth_manager.verify_connection("microsoft")
+        google_status = oauth_manager.verify_connection("google", user_id=user_id)
+        ms_status = oauth_manager.verify_connection("microsoft", user_id=user_id)
         if google_status.get("connected") or ms_status.get("connected"):
             acc = google_status.get("account") or ms_status.get("account")
             prov = "Google (Gmail)" if google_status.get("connected") else "Microsoft (Outlook)"
@@ -84,7 +89,12 @@ def answer_email_companion_query(
 
     active_mission = None
     if mission_id:
-        active_mission = db.get_email_mission(mission_id, db_path=db_path)
+        cand = db.get_email_mission(mission_id, db_path=db_path)
+        # A named mission belongs to its owner only; a session user
+        # naming another user's mission — or a legacy (NULL-owner)
+        # mission — gets "not found", not the row.
+        if cand is not None and (user_id is None or cand.get("user_id") == user_id):
+            active_mission = cand
     if not active_mission:
         active_mission = missions[0]
     mid = active_mission["id"]
@@ -103,8 +113,8 @@ def answer_email_companion_query(
         t,
     ):
         from app.connectors.oauth import oauth_manager
-        google_status = oauth_manager.verify_connection("google")
-        ms_status = oauth_manager.verify_connection("microsoft")
+        google_status = oauth_manager.verify_connection("google", user_id=user_id)
+        ms_status = oauth_manager.verify_connection("microsoft", user_id=user_id)
 
         connected_acc = None
         prov_label = ""
@@ -158,7 +168,7 @@ def answer_email_companion_query(
         prov = active_mission.get("provider", "gmail")
         is_live = False
         try:
-            conn = oauth_manager.connector("gmail" if prov == "gmail" else "outlook")
+            conn = oauth_manager.connector("gmail" if prov == "gmail" else "outlook", user_id=user_id)
             is_live = getattr(conn, "configured", False)
         except Exception:
             pass
@@ -230,7 +240,7 @@ def answer_email_companion_query(
         from app.connectors.oauth import oauth_manager
         prov = active_mission.get("provider", "gmail")
         conn_key = "gmail" if prov == "gmail" else "outlook"
-        status = oauth_manager.verify_connection("google" if prov == "gmail" else "microsoft")
+        status = oauth_manager.verify_connection("google" if prov == "gmail" else "microsoft", user_id=user_id)
 
         if not status.get("connected"):
             return {
@@ -244,7 +254,7 @@ def answer_email_companion_query(
             }
 
         try:
-            conn = oauth_manager.connector(conn_key)
+            conn = oauth_manager.connector(conn_key, user_id=user_id)
             resp = conn.list_messages(query="in:trash", limit=1)
             trash_msgs = resp.get("messages", [])
             if not trash_msgs:

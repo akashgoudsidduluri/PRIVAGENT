@@ -19,6 +19,9 @@
 
 export const TOKEN_STORAGE_KEY = "privagentLocalToken";
 
+/** User-session token (email + password account, app/auth_users.py). */
+export const SESSION_STORAGE_KEY = "privagentSessionToken";
+
 export function getToken(): string | null {
   try {
     return window.localStorage.getItem(TOKEN_STORAGE_KEY);
@@ -35,7 +38,40 @@ export function setToken(token: string): void {
   }
 }
 
+export function getSessionToken(): string | null {
+  try {
+    return window.localStorage.getItem(SESSION_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function setSessionToken(token: string): void {
+  try {
+    window.localStorage.setItem(SESSION_STORAGE_KEY, token.trim());
+  } catch {
+    // Private mode etc: the caller still gets one in-memory attempt.
+  }
+}
+
+export function clearSessionToken(): void {
+  try {
+    window.localStorage.removeItem(SESSION_STORAGE_KEY);
+  } catch {
+    // Already gone.
+  }
+}
+
+export function isSignedIn(): boolean {
+  return !!getSessionToken();
+}
+
 export function authHeaders(): Record<string, string> {
+  // A user session wins over the local operator token: /api/profile and
+  // /api/auth/me accept a session only, and every other /api/* route
+  // accepts either. The local token stays the fallback for operator mode.
+  const session = getSessionToken();
+  if (session) return { Authorization: `Bearer ${session}` };
   const token = getToken();
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
@@ -84,8 +120,17 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
     ...extra,
     headers: { ...(init?.headers as Record<string, string> | undefined), ...authHeaders(), ...((extra?.headers as Record<string, string> | undefined) ?? {}) },
   });
+  const sessionSent = !!getSessionToken();
   let res = await fetch(input, withAuth());
   if (res.status === 401) {
+    if (sessionSent) {
+      // The session is dead (expired or revoked). Drop it and hand the
+      // 401 back so the caller can route to sign-in. Never prompt an
+      // email/password user for the local operator token — wrong
+      // credential, and it leaks the operator-token mechanism.
+      clearSessionToken();
+      return res;
+    }
     const token = promptForToken();
     if (token) {
       res = await fetch(input, {

@@ -31,15 +31,20 @@ async def handle_email_dispatch(
     chat_id: Optional[str] = None,
     history: Optional[list[dict[str, Any]]] = None,
     db_path: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> str:
-    """Handle emailing comparison summary or deliverable to a recipient."""
+    """Handle emailing comparison summary or deliverable to a recipient.
+
+    ``user_id`` is the task owner's id: the connected account checked
+    and used is that user's own, never the legacy globals.
+    """
     from .connectors.oauth import oauth_manager
-    status = oauth_manager.verify_connection("google")
+    status = oauth_manager.verify_connection("google", user_id=user_id)
     connected = status.get("connected")
     account = status.get("account") or "your connected mail account"
 
     if not connected:
-        ms_status = oauth_manager.verify_connection("microsoft")
+        ms_status = oauth_manager.verify_connection("microsoft", user_id=user_id)
         if ms_status.get("connected"):
             connected = True
             account = ms_status.get("account") or "your Outlook account"
@@ -66,8 +71,7 @@ async def handle_email_dispatch(
     # If connected and we have actual summary content, attempt send or draft
     if summary_text and "no results" not in summary_text.lower():
         try:
-            from .connectors.gmail import GmailConnector
-            connector = GmailConnector(token=status.get("access_token"))
+            connector = oauth_manager.connector("gmail", user_id=user_id)
             # Draft or send
             connector.draft_email(
                 to=recipient,

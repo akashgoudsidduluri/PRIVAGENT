@@ -54,7 +54,16 @@ def _get_connector_for_mission(mission: dict[str, Any]):
         from app.connectors import OutlookConnector
         return OutlookConnector("sandbox-demo-token", client=client), "sandbox"
 
-    conn = oauth_manager.connector(connector_key)
+    # A mission owned by a user resolves that user's own connection
+    # (and the exact connection stamped on the mission). A legacy
+    # mission with no owner keeps the global path by design; a user
+    # mission with no connection raises honestly instead of falling
+    # back to the globals.
+    conn = oauth_manager.connector(
+        connector_key,
+        user_id=mission.get("user_id"),
+        connection_id=mission.get("connection_id"),
+    )
     if getattr(conn, "configured", False):
         return conn, "live"
     raise RuntimeError(
@@ -92,6 +101,7 @@ async def run_email_mission_tick(mission_id: str, db_path: Optional[str] = None)
     task_record = hub.new_task(
         f"Autonomous email scan for {account_email}",
         chat_id=mission.get("conversation_id"),
+        user_id=mission.get("user_id"),
     )
     task_record.state = "running"
     task_record.message = f"Connecting to email ({account_email})..."

@@ -1,6 +1,8 @@
 import "./styles/main.css";
 import "./styles/landing-refresh.css";
+import "./styles/auth.css";
 import "./taskconsole";
+import { initLandingAuth } from "./landingAuth";
 
 // Workflow 3-step scrubber: click a tab to show its panel.
 const flowTabs = [...document.querySelectorAll<HTMLButtonElement>(".flow-tab")];
@@ -69,3 +71,6 @@ if (reducedMotion) {
   );
   document.querySelectorAll(".reveal:not(.hero .reveal)").forEach(el => revealObserver.observe(el));
 }
+
+// Account forms (#account section).
+initLandingAuth();

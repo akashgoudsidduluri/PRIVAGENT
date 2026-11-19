@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from pathlib import Path
 import re
 import sys
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 if sys.platform == "win32":
     try:
@@ -15,7 +17,7 @@ if sys.platform == "win32":
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.responses import RedirectResponse
@@ -130,7 +132,7 @@ def _origin_allowed(origin: Optional[str]) -> bool:
 # probe. The OAuth callback is a top-level browser redirect from the
 # provider: it cannot carry an Authorization header, and its `state`
 # parameter is validated server-side by oauth_manager.complete().
-_AUTH_EXEMPT_PATHS = {"/api/health", "/health"}
+_AUTH_EXEMPT_PATHS = {"/api/health", "/health", "/api/auth/signup", "/api/auth/login"}
 _OAUTH_CALLBACK_RE = re.compile(r"^/api/connectors/[^/]+/callback$")
 _STATE_CHANGING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
@@ -192,20 +194,34 @@ async def security_guard(request, call_next):
     path = request.url.path
     if path.startswith("/api/") and not _auth_exempt(path):
         token: Optional[str] = None
+        token_from_header = False
         auth_header = request.headers.get("authorization", "")
         if auth_header.lower().startswith("bearer "):
             token = auth_header[7:].strip()
+            token_from_header = True
         elif request.method == "GET":
             # Anchor-navigation fallback (artifact preview/download).
             token = request.query_params.get("token")
-        if not verify_token(token):
+        # A user session token is accepted as well as the local token —
+        # but only from the Authorization header. Session tokens must
+        # never travel in URLs: query strings land in access logs.
+        authed = verify_token(token)
+        user_id: Optional[str] = None
+        if not authed and token_from_header and token:
+            from .auth_users import verify_session
+
+            user_id = verify_session(token)
+            authed = user_id is not None
+        request.state.user_id = user_id
+        request.state.auth_kind = "session" if user_id is not None else "local"
+        if not authed:
             # Task 10: audit — failed local-auth attempts (no token
             # value is ever recorded, only the path and method).
             try:
                 from .audit import append_event as _audit_event3
 
                 _audit_event3("auth_failure",
-                              f"invalid local auth token for {request.method} {path}",
+                              f"invalid auth token for {request.method} {path}",
                               actor="system")
             except Exception:
                 pass
@@ -233,90 +249,338 @@ class AttachmentInput(BaseModel):
 
 
 @app.get("/api/connectors")
-def connector_status() -> list[dict]:
+def connector_status(request: Request = None) -> list[dict]:
     from .connectors.oauth import oauth_manager
-    return oauth_manager.status()
+    # A signed-in user sees their own connections; the local-token
+    # operator sees the legacy global connections (unchanged).
+    return oauth_manager.status(getattr(request.state, "user_id", None))
+
+
+# ---------------------------------------------------------------- user auth
+# Email + password accounts for the website (app/auth_users.py). Signup and
+# login are exempt from the guard above — nobody has a credential yet.
+# /api/auth/me and /api/profile need a user session: the local token alone
+# gets a 401 there. No email verification / password reset yet: the backend
+# has no mailer, so that is a later step, not a silent gap.
+
+
+class AuthSignupInput(BaseModel):
+    email: str
+    password: str
+    display_name: Optional[str] = Field(default=None, alias="displayName")
+    model_config = {"populate_by_name": True}
+
+
+class AuthLoginInput(BaseModel):
+    email: str
+    password: str
+
+
+class ProfileUpdateInput(BaseModel):
+    display_name: Optional[str] = Field(default=None, alias="displayName")
+    model_config = {"populate_by_name": True}
+
+
+def _require_user(request: Request = None) -> str:
+    """Return the session user id, or 401 for local-token/no-token callers."""
+    user_id = getattr(request.state, "user_id", None)
+    if not user_id:
+        raise HTTPException(401, "a user session is required")
+    return user_id
+
+
+def _caller_user_id(request: Request = None) -> Optional[str]:
+    """The authenticated user id for this request, or None for the
+    local-token operator. Identity comes from the session only — never
+    from a request body."""
+    if request is None:
+        return None
+    return getattr(request.state, "user_id", None)
+
+
+def _can_access(request: Request, owner_id: Optional[str]) -> bool:
+    """May the caller access a row owned by owner_id? The operator
+    (user_id None) may access everything. A session user may access
+    only rows they own; legacy NULL-owned rows are operator-owned."""
+    uid = _caller_user_id(request)
+    return uid is None or (owner_id is not None and owner_id == uid)
+
+
+def _require_owner(request: Request, owner_id: Optional[str]) -> None:
+    """404 (not 403 — do not confirm existence) when the caller may
+    not access a row owned by owner_id."""
+    if not _can_access(request, owner_id):
+        raise HTTPException(404, "not found")
+
+
+@app.post("/api/auth/signup", status_code=201)
+def auth_signup(body: AuthSignupInput) -> dict[str, Any]:
+    from .auth_users import AuthError, signup
+
+    try:
+        user, session_token = signup(body.email, body.password, body.display_name)
+    except AuthError as exc:
+        raise HTTPException(exc.status, exc.detail) from None
+    return {"user": user, "session_token": session_token}
+
+
+@app.post("/api/auth/login")
+def auth_login(body: AuthLoginInput) -> dict[str, Any]:
+    from .auth_users import AuthError, login
+
+    try:
+        user, session_token = login(body.email, body.password)
+    except AuthError as exc:
+        raise HTTPException(exc.status, exc.detail) from None
+    return {"user": user, "session_token": session_token}
+
+
+@app.post("/api/auth/logout")
+def auth_logout(request: Request = None) -> dict[str, bool]:
+    from .auth_users import revoke_session
+
+    _require_user(request)
+    auth_header = request.headers.get("authorization", "")
+    token = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else None
+    revoke_session(token)
+    return {"ok": True}
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request = None) -> dict[str, Any]:
+    from .auth_users import get_profile
+
+    user_id = _require_user(request)
+    profile = get_profile(user_id)
+    if profile is None:
+        raise HTTPException(401, "a user session is required")
+    return profile
+
+
+@app.get("/api/profile")
+def get_user_profile(request: Request = None) -> dict[str, Any]:
+    from .auth_users import get_profile
+    from .connectors.oauth import oauth_manager
+
+    user_id = _require_user(request)
+    profile = get_profile(user_id)
+    if profile is None:
+        raise HTTPException(401, "a user session is required")
+    # The user's own connections — never the operator's legacy globals.
+    profile["connected_providers"] = oauth_manager.status(user_id)
+    return profile
+
+
+@app.patch("/api/profile")
+def update_user_profile(request: Request, body: ProfileUpdateInput) -> dict[str, Any]:
+    from .auth_users import AuthError, update_profile
+    from .connectors.oauth import oauth_manager
+
+    user_id = _require_user(request)
+    try:
+        profile = update_profile(user_id, display_name=body.display_name)
+    except AuthError as exc:
+        raise HTTPException(exc.status, exc.detail) from None
+    if profile is None:
+        raise HTTPException(401, "a user session is required")
+    profile["connected_providers"] = oauth_manager.status(user_id)
+    return profile
 
 
 @app.post("/api/connectors/{provider}/start")
-async def start_connector(provider: str) -> dict[str, str]:
+async def start_connector(provider: str, request: Request = None) -> dict[str, str]:
     from .connectors.oauth import oauth_manager
+    # A user session starts the per-user DB-backed flow; the local-token
+    # operator keeps exactly today's behaviour (legacy in-memory state).
+    # This is a deliberate deviation from the per-user-only spec: the
+    # operator path is the machine owner's own trust domain.
     try:
-        return {"authorizationUrl": oauth_manager.start(provider)}
+        return {"authorizationUrl": oauth_manager.start(provider, user_id=getattr(request.state, "user_id", None))}
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
 
 
 class ConnectorConfigureInput(BaseModel):
+    # Client credentials ONLY. The old access-token/refresh-token paste
+    # path is gone: manual config stays only where genuinely required,
+    # and all four OAuth providers support the real authorization flow.
     client_id: Optional[str] = Field(default=None, alias="clientId")
     client_secret: Optional[str] = Field(default=None, alias="clientSecret")
-    access_token: Optional[str] = Field(default=None, alias="accessToken")
-    refresh_token: Optional[str] = Field(default=None, alias="refreshToken")
+    model_config = {"populate_by_name": True}
+
+
+def _web_origin() -> str:
+    """Workspace origin for OAuth callback redirects.
+
+    ``PRIVAGENT_WEB_ORIGIN`` (default http://localhost:5173, the Vite dev
+    server) — pinned to localhost so a misconfigured env cannot bounce
+    users to an arbitrary host after authorization. Only scheme + host
+    are kept; any path in the env value is dropped.
+    """
+    origin = os.environ.get("PRIVAGENT_WEB_ORIGIN", "http://localhost:5173").rstrip("/")
+    parsed = urlparse(origin)
+    if parsed.scheme not in ("http", "https") or parsed.hostname not in ("localhost", "127.0.0.1"):
+        return "http://localhost:5173"
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _attach_email_mission(provider: str, user_id: Optional[str]) -> None:
+    """After a Google/Microsoft connection, attach the primary email mission.
+
+    Moved here from the old token-paste configure path: it now runs when
+    the real OAuth flow completes. Best-effort — a failure must never
+    break the callback redirect.
+
+    Ownership: the mission is scoped to the connecting user only. It
+    never rebinds another user's mission (the old code took
+    ``missions[0]`` — the first mission in the whole DB, whoever owned
+    it — and paused the rest), and it never pauses another user's
+    missions. A duplicate mission for the same mailbox of the same user
+    is reactivated instead of creating a competing sync loop.
+    """
+    try:
+        from .connectors.oauth import oauth_manager
+        conn = oauth_manager.connector("gmail" if provider == "google" else "outlook", user_id=user_id)
+        if not getattr(conn, "configured", False):
+            return
+        prof = conn.get_profile()
+        email_addr = prof.get("emailAddress") or prof.get("mail")
+        if not email_addr:
+            return
+        logger.info("Live OAuth connected for %s: %s", provider, email_addr)
+        from .email_intelligence.sync_engine import run_email_mission_tick
+        # The connection id of the account just connected, so the
+        # mission's ticks resolve this exact connection rather than
+        # whichever row is primary later.
+        connection_id = oauth_manager.find_connection_id(user_id, provider, email_addr) if user_id else None
+        missions = db.list_email_missions(user_id=user_id)
+        same_account = [m for m in missions if (m.get("account_email") or "").lower() == email_addr.lower()]
+        if same_account:
+            primary = same_account[0]
+            db.update_email_mission(primary["id"], {"account_email": email_addr, "sync_cursor": "", "status": "active"})
+            for m in same_account[1:]:
+                db.update_email_mission(m["id"], {"status": "paused"})
+            asyncio.create_task(run_email_mission_tick(primary["id"]))
+        else:
+            new_m = db.create_email_mission(
+                account_email=email_addr,
+                provider="gmail" if provider == "google" else "outlook",
+                user_id=user_id,
+                connection_id=connection_id,
+            )
+            asyncio.create_task(run_email_mission_tick(new_m["id"]))
+    except Exception as exc:
+        logger.warning("Could not sync email profile for %s: %s", provider, exc)
+
+
+# The four OAuth providers. Used for the provider-exists check so a
+# configure/disconnect call does not trigger a live verification of
+# all four providers just to check a static name.
+_OAUTH_PROVIDERS = {"google", "microsoft", "slack", "github"}
+
+
+class ConnectorMigrateInput(BaseModel):
+    # Claiming the operator's legacy tokens requires the user to name
+    # the account and confirm explicitly — never a silent transfer.
+    account_email: Optional[str] = Field(default=None, alias="accountEmail")
+    confirm: bool = False
     model_config = {"populate_by_name": True}
 
 
 @app.post("/api/connectors/{provider}/configure")
-async def configure_connector(provider: str, body: ConnectorConfigureInput) -> dict[str, Any]:
+async def configure_connector(provider: str, body: ConnectorConfigureInput, request: Request = None) -> dict[str, Any]:
     from .connectors.oauth import oauth_manager
-    if provider not in {item["provider"] for item in oauth_manager.status()}:
+    if provider not in _OAUTH_PROVIDERS:
         raise HTTPException(404, "unknown connector")
     auth_url = None
-    if body.access_token or body.refresh_token:
-        oauth_manager.set_tokens(provider, access_token=body.access_token, refresh_token=body.refresh_token)
-        # Automatically update active email mission account email
-        try:
-            conn = oauth_manager.connector("gmail" if provider == "google" else "outlook")
-            if getattr(conn, "configured", False):
-                prof = conn.get_profile()
-                email_addr = prof.get("emailAddress") or prof.get("mail")
-                if email_addr:
-                    logger.info("Live OAuth connected for %s: %s", provider, email_addr)
-                    from .email_intelligence.sync_engine import run_email_mission_tick
-                    missions = db.list_email_missions()
-                    if missions:
-                        primary = missions[0]
-                        db.update_email_mission(primary["id"], {"account_email": email_addr, "sync_cursor": "", "status": "active"})
-                        # Deactivate or clean up any redundant missions to avoid competing sync loops
-                        for m in missions[1:]:
-                            db.update_email_mission(m["id"], {"status": "paused"})
-                        asyncio.create_task(run_email_mission_tick(primary["id"]))
-                    else:
-                        new_m = db.create_email_mission(account_email=email_addr, provider="gmail" if provider == "google" else "outlook")
-                        asyncio.create_task(run_email_mission_tick(new_m["id"]))
-        except Exception as exc:
-            logger.warning("Could not sync email profile for %s: %s", provider, exc)
-    elif body.client_id and body.client_secret:
+    if body.client_id and body.client_secret:
         oauth_manager.set_credentials(provider, body.client_id, body.client_secret)
         try:
-            auth_url = oauth_manager.start(provider)
+            auth_url = oauth_manager.start(provider, user_id=getattr(request.state, "user_id", None))
         except Exception:
             pass
     else:
-        raise HTTPException(400, "Must provide accessToken, refreshToken, or (clientId and clientSecret)")
+        raise HTTPException(400, "Must provide clientId and clientSecret")
     return {
         "ok": True,
         "authorizationUrl": auth_url,
-        "status": [item for item in oauth_manager.status() if item["provider"] == provider][0],
+        "status": [item for item in oauth_manager.status(getattr(request.state, "user_id", None)) if item["provider"] == provider][0],
     }
 
 
 @app.get("/api/connectors/{provider}/callback")
-async def connector_callback(provider: str, code: str = "", state: str = ""):
+async def connector_callback(provider: str, code: str = "", state: str = "", error: str = ""):
     from .connectors.oauth import oauth_manager
+    origin = _web_origin()
+    # The provider reports a denial (user clicked Deny) as ?error=...:
+    # land back in the workspace with an error the UI can show, not a
+    # bare 400 page. The error value is sanitized before it is reflected
+    # into the redirect — it is a short code, never free text.
+    if error:
+        if error == "access_denied":
+            err_code = "denied"
+        elif re.fullmatch(r"[a-z0-9_-]{1,64}", error):
+            err_code = error
+        else:
+            err_code = "failed"
+        return RedirectResponse(f"{origin}/agent.html?oauth_error={err_code}#connectors", status_code=303)
     try:
-        oauth_manager.complete(provider, code, state)
-    except (PermissionError, RuntimeError, KeyError, ValueError) as exc:
-        raise HTTPException(400, "OAuth authorization failed or expired") from None
-    return RedirectResponse("http://localhost:5173/agent.html#connectors", status_code=303)
+        user_id = oauth_manager.complete(provider, code, state)
+    except PermissionError:
+        return RedirectResponse(f"{origin}/agent.html?oauth_error=invalid_state#connectors", status_code=303)
+    except (RuntimeError, KeyError, ValueError):
+        return RedirectResponse(f"{origin}/agent.html?oauth_error=exchange_failed#connectors", status_code=303)
+    if provider in ("google", "microsoft"):
+        _attach_email_mission(provider, user_id)
+    return RedirectResponse(f"{origin}/agent.html#connectors", status_code=303)
 
 
 @app.delete("/api/connectors/{provider}")
-async def disconnect_connector(provider: str) -> dict[str, bool]:
+async def disconnect_connector(provider: str, request: Request, connection_id: str = "") -> dict[str, Any]:
     from .connectors.oauth import oauth_manager
-    if provider not in {item["provider"] for item in oauth_manager.status()}:
+    if provider not in _OAUTH_PROVIDERS:
         raise HTTPException(404, "unknown connector")
-    oauth_manager.disconnect(provider)
+    # Revokes at the provider, then deletes locally; the result says
+    # whether the provider revoke succeeded. With no connection_id the
+    # primary connection is disconnected.
+    try:
+        return oauth_manager.disconnect(
+            provider, user_id=getattr(request.state, "user_id", None),
+            connection_id=connection_id or None,
+        )
+    except PermissionError as exc:
+        raise HTTPException(404, "connection not found") from exc
+
+
+@app.post("/api/connectors/{provider}/connections/{connection_id}/primary")
+async def set_primary_connection(provider: str, connection_id: str, request: Request = None) -> dict[str, Any]:
+    from .connectors.oauth import oauth_manager
+    if provider not in _OAUTH_PROVIDERS:
+        raise HTTPException(404, "unknown connector")
+    user_id = _require_user(request)
+    try:
+        oauth_manager.set_primary(user_id, provider, connection_id)
+    except PermissionError as exc:
+        raise HTTPException(404, "connection not found") from exc
     return {"ok": True}
+
+
+@app.post("/api/connectors/{provider}/migrate")
+async def migrate_legacy_connection(provider: str, body: ConnectorMigrateInput, request: Request = None) -> dict[str, Any]:
+    from .connectors.oauth import oauth_manager
+    if provider not in _OAUTH_PROVIDERS:
+        raise HTTPException(404, "unknown connector")
+    user_id = _require_user(request)
+    if not body.confirm or not body.account_email:
+        raise HTTPException(400, "migration requires accountEmail and confirm=true")
+    try:
+        return oauth_manager.migrate_legacy(provider, user_id, body.account_email)
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
 
 
 @app.post("/api/attachments")
@@ -451,14 +715,14 @@ async def discover_llm_models() -> dict[str, Any]:
 
 
 @app.get("/api/chats")
-async def get_chats() -> list[dict[str, Any]]:
-    return db.list_chats()
+async def get_chats(request: Request = None) -> list[dict[str, Any]]:
+    return db.list_chats(user_id=_caller_user_id(request))
 
 
 @app.post("/api/chat")
-async def create_chat_session(body: Optional[ChatCreateInput] = None) -> dict[str, Any]:
+async def create_chat_session(body: Optional[ChatCreateInput] = None, request: Request = None) -> dict[str, Any]:
     title = body.title if body else None
-    chat = db.create_chat(title=title)
+    chat = db.create_chat(title=title, user_id=_caller_user_id(request))
     return {
         "chatId": chat["id"],
         "chat_id": chat["id"],
@@ -468,10 +732,11 @@ async def create_chat_session(body: Optional[ChatCreateInput] = None) -> dict[st
 
 
 @app.get("/api/chat/{chat_id}")
-async def get_chat_session(chat_id: str) -> dict[str, Any]:
+async def get_chat_session(chat_id: str, request: Request = None) -> dict[str, Any]:
     chat = db.get_chat(chat_id)
     if not chat:
         raise HTTPException(status_code=404, detail="chat not found")
+    _require_owner(request, chat.get("user_id"))
     from .hub import TERMINAL_STATES
     active_task = None
     for t in hub.tasks.values():
@@ -501,10 +766,11 @@ async def get_chat_session(chat_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/chat/{chat_id}/message")
-async def post_chat_message(chat_id: str, body: ChatMessageInput) -> dict[str, Any]:
+async def post_chat_message(chat_id: str, body: ChatMessageInput, request: Request = None) -> dict[str, Any]:
     chat = db.get_chat(chat_id)
     if not chat:
         raise HTTPException(status_code=404, detail="chat not found")
+    _require_owner(request, chat.get("user_id"))
     if body.file_token and not file_uploads.get(body.file_token):
         raise HTTPException(status_code=422, detail="attachment expired")
     # Task 3: chat messages inherit the global allow-list (no per-task
@@ -513,6 +779,7 @@ async def post_chat_message(chat_id: str, body: ChatMessageInput) -> dict[str, A
         body.text,
         chat_id=chat_id,
         allowed_domains=list(config.ALLOWED_DOMAINS) if config.ALLOWED_DOMAINS else None,
+        user_id=_caller_user_id(request),
     )
     task.file_token = body.file_token
     task.state = "planning"
@@ -527,7 +794,11 @@ async def post_chat_message(chat_id: str, body: ChatMessageInput) -> dict[str, A
 
 
 @app.delete("/api/chat/{chat_id}")
-async def delete_chat_session(chat_id: str) -> dict[str, bool]:
+async def delete_chat_session(chat_id: str, request: Request = None) -> dict[str, bool]:
+    chat = db.get_chat(chat_id)
+    if not chat:
+        raise HTTPException(status_code=404, detail="chat not found")
+    _require_owner(request, chat.get("user_id"))
     ok = db.delete_chat(chat_id)
     if not ok:
         raise HTTPException(status_code=404, detail="chat not found")
@@ -557,11 +828,16 @@ async def delete_preference(key: str) -> dict[str, bool]:
 
 
 @app.post("/api/task", response_model=TaskCreated)
-async def create_task(body: TaskInput) -> TaskCreated:
+async def create_task(body: TaskInput, request: Request = None) -> TaskCreated:
     chat_id = body.chat_id
     if not chat_id:
-        chat = db.create_chat(title=body.instruction[:48].strip() or "New Mission")
+        chat = db.create_chat(title=body.instruction[:48].strip() or "New Mission", user_id=_caller_user_id(request))
         chat_id = chat["id"]
+    else:
+        # A task may only be attached to a chat the caller owns.
+        chat = db.get_chat(chat_id)
+        if chat is not None:
+            _require_owner(request, chat.get("user_id"))
     if body.file_token and not file_uploads.get(body.file_token):
         raise HTTPException(status_code=422, detail="attachment expired")
     # Task 3: per-task allow-list wins; otherwise the global
@@ -576,7 +852,7 @@ async def create_task(body: TaskInput) -> TaskCreated:
             "no domain allow-list configured for task (set PRIVAGENT_ALLOWED_DOMAINS "
             "or pass allowedDomains); navigation is unrestricted for this task"
         )
-    task = hub.new_task(body.instruction, chat_id=chat_id, allowed_domains=effective, long_horizon=body.long_horizon, background=body.background)
+    task = hub.new_task(body.instruction, chat_id=chat_id, allowed_domains=effective, long_horizon=body.long_horizon, background=body.background, user_id=_caller_user_id(request))
     task.file_token = body.file_token
     task.state = "planning"
     _spawn(hub.broadcast_progress(task))
@@ -634,8 +910,8 @@ async def _run_task_later(task_id: str) -> None:
 
 
 @app.get("/api/task/{task_id}")
-async def get_task(task_id: str) -> dict[str, Any]:
-    task = _require(task_id)
+async def get_task(task_id: str, request: Request = None) -> dict[str, Any]:
+    task = _require(task_id, user_id=_caller_user_id(request))
     from .privacy import scrub_persistent
     cp = db.get_task_checkpoint(task_id)
     steps = []
@@ -686,8 +962,8 @@ async def get_task(task_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/task/{task_id}/cancel")
-async def cancel_task(task_id: str) -> dict[str, str]:
-    task = _require(task_id)
+async def cancel_task(task_id: str, request: Request = None) -> dict[str, str]:
+    task = _require(task_id, user_id=_caller_user_id(request))
     if task.state in TERMINAL_STATES:
         return {"taskState": task.state}
 
@@ -704,7 +980,8 @@ async def cancel_task(task_id: str) -> dict[str, str]:
             last_url = str(obs.get("url") or "")
         elif obs is not None:
             last_url = str(getattr(obs, "url", "") or "")
-        save_cancel_checkpoint(task_id, task.instruction, task.steps_done, last_url)
+        save_cancel_checkpoint(task_id, task.instruction, task.steps_done, last_url,
+                               user_id=task.user_id, conversation_id=task.chat_id)
     except Exception:
         pass
 
@@ -753,8 +1030,8 @@ async def cancel_task(task_id: str) -> dict[str, str]:
 
 
 @app.post("/api/task/{task_id}/pause")
-async def pause_task(task_id: str) -> dict[str, str]:
-    task = _require(task_id)
+async def pause_task(task_id: str, request: Request = None) -> dict[str, str]:
+    task = _require(task_id, user_id=_caller_user_id(request))
     if task.state not in {"running", "planning"}:
         raise HTTPException(409, f"task is {task.state}, cannot pause")
     from .agentLoop import request_pause
@@ -766,8 +1043,8 @@ async def pause_task(task_id: str) -> dict[str, str]:
 
 
 @app.post("/api/task/{task_id}/resume")
-async def resume_task(task_id: str) -> dict[str, str]:
-    task = _require(task_id)
+async def resume_task(task_id: str, request: Request = None) -> dict[str, str]:
+    task = _require(task_id, user_id=_caller_user_id(request))
     if task.state not in ("paused", "interrupted"):
         raise HTTPException(409, f"task is {task.state}, cannot resume")
     from .agentLoop import request_resume, _pause_events
@@ -782,8 +1059,8 @@ async def resume_task(task_id: str) -> dict[str, str]:
 
 
 @app.post("/api/task/{task_id}/confirm")
-async def confirm_task(task_id: str, body: ConfirmInput) -> dict[str, str]:
-    task = _require(task_id)
+async def confirm_task(task_id: str, body: ConfirmInput, request: Request = None) -> dict[str, str]:
+    task = _require(task_id, user_id=_caller_user_id(request))
     if task.state != "awaiting_confirmation":
         raise HTTPException(409, f"task is {task.state}, not awaiting_confirmation")
     task.confirm_decision = body.decision in ("approve", "approve_step")
@@ -814,14 +1091,14 @@ async def confirm_task(task_id: str, body: ConfirmInput) -> dict[str, str]:
 # "I finished it, resume", or cancel the task. All routes are behind the
 # security_guard bearer auth (see the middleware above).
 @app.get("/api/task/{task_id}/takeover")
-async def get_takeover(task_id: str) -> dict[str, Any]:
-    task = _require(task_id)
+async def get_takeover(task_id: str, request: Request = None) -> dict[str, Any]:
+    task = _require(task_id, user_id=_caller_user_id(request))
     return {"taskId": task.task_id, "taskState": task.state, "takeover": task.takeover}
 
 
 @app.post("/api/task/{task_id}/takeover/resume")
-async def resume_takeover(task_id: str) -> dict[str, str]:
-    task = _require(task_id)
+async def resume_takeover(task_id: str, request: Request = None) -> dict[str, str]:
+    task = _require(task_id, user_id=_caller_user_id(request))
     if task.state != "awaiting_takeover":
         raise HTTPException(409, f"task is {task.state}, not awaiting_takeover")
     # The operator completed the manual step (login / OTP / payment) in
@@ -838,8 +1115,8 @@ async def resume_takeover(task_id: str) -> dict[str, str]:
 
 
 @app.post("/api/task/{task_id}/takeover/cancel")
-async def cancel_takeover(task_id: str) -> dict[str, str]:
-    task = _require(task_id)
+async def cancel_takeover(task_id: str, request: Request = None) -> dict[str, str]:
+    task = _require(task_id, user_id=_caller_user_id(request))
     if task.state != "awaiting_takeover":
         raise HTTPException(409, f"task is {task.state}, not awaiting_takeover")
     task.takeover_decision = False
@@ -970,7 +1247,7 @@ class ScheduledJobInput(BaseModel):
 
 
 @app.post("/api/scheduled", status_code=201)
-async def create_scheduled_job(body: ScheduledJobInput) -> dict[str, Any]:
+async def create_scheduled_job(body: ScheduledJobInput, request: Request = None) -> dict[str, Any]:
     from .scheduler import create_job
 
     try:
@@ -978,34 +1255,40 @@ async def create_scheduled_job(body: ScheduledJobInput) -> dict[str, Any]:
             body.instruction, body.schedule,
             allowed_domains=body.allowed_domains,
             long_horizon=body.long_horizon,
+            user_id=_caller_user_id(request),
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.get("/api/scheduled")
-async def list_scheduled_jobs() -> dict[str, Any]:
+async def list_scheduled_jobs(request: Request = None) -> dict[str, Any]:
     from .scheduler import list_jobs
 
-    return {"jobs": list_jobs()}
+    return {"jobs": list_jobs(user_id=_caller_user_id(request))}
 
 
 @app.delete("/api/scheduled/{job_id}")
-async def delete_scheduled_job(job_id: str) -> dict[str, bool]:
-    from .scheduler import delete_job
+async def delete_scheduled_job(job_id: str, request: Request = None) -> dict[str, bool]:
+    from .scheduler import delete_job, get_job
 
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="scheduled job not found")
+    _require_owner(request, job.get("user_id"))
     if not delete_job(job_id):
         raise HTTPException(status_code=404, detail="scheduled job not found")
     return {"deleted": True}
 
 
 @app.post("/api/scheduled/{job_id}/run-now")
-async def run_scheduled_job_now(job_id: str) -> dict[str, Any]:
+async def run_scheduled_job_now(job_id: str, request: Request = None) -> dict[str, Any]:
     from .scheduler import get_job, start_job
 
     job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="scheduled job not found")
+    _require_owner(request, job.get("user_id"))
     task_id, _task = start_job(job)
     record = hub.tasks.get(task_id)
     if record is not None:
@@ -1013,9 +1296,16 @@ async def run_scheduled_job_now(job_id: str) -> dict[str, Any]:
     return {"taskId": task_id}
 
 
-def _require(task_id: str):
+def _require(task_id: str, user_id: Optional[str] = None):
+    """Resolve a task by id, enforcing ownership for session users
+    (404 for another user's task — never confirm existence). The
+    operator (user_id=None) may access any task. A task restored from
+    a checkpoint inherits its owner from the chat (or from the
+    user_id the loop checkpointed in working_memory)."""
     task = hub.tasks.get(task_id)
     if task is not None:
+        if user_id is not None and task.user_id != user_id:
+            raise HTTPException(404, "task not found")
         return task
     # Restore from SQLite task_checkpoints if task was saved but pruned from memory
     try:
@@ -1089,7 +1379,12 @@ def _require(task_id: str):
                 long_horizon=bool(wm.get("long_horizon")),
                 background=bool(wm.get("background")),
                 tabs=[dict(t) for t in (wm.get("tabs") or []) if isinstance(t, dict)],
+                # Owner: the checkpointed user_id first (set by the
+                # loop for tasks that carry one), else the chat owner.
+                user_id=wm.get("user_id") or (chat or {}).get("user_id"),
             )
+            if user_id is not None and restored.user_id != user_id:
+                raise HTTPException(404, "task not found")
             hub.tasks[task_id] = restored
             return restored
     except Exception:
@@ -1106,28 +1401,70 @@ ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 @app.get("/api/tasks/{task_id}/artifacts")
-async def get_task_artifacts(task_id: str) -> list[dict[str, Any]]:
-    return db.list_task_artifacts(task_id)
+async def get_task_artifacts(task_id: str, request: Request = None) -> list[dict[str, Any]]:
+    # The task may be pruned from the hub (or never have been one):
+    # artifacts are the authority here. Ownership is checked against
+    # the first artifact's owner; an empty list leaks nothing.
+    arts = db.list_task_artifacts(task_id)
+    if arts:
+        _require_owner(request, _artifact_owner(arts[0]["artifact_id"]))
+    return arts
 
 
 @app.get("/api/chats/{chat_id}/artifacts")
-async def get_chat_artifacts(chat_id: str) -> list[dict[str, Any]]:
-    return db.list_conversation_artifacts(chat_id)
+async def get_chat_artifacts(chat_id: str, request: Request = None) -> list[dict[str, Any]]:
+    chat = db.get_chat(chat_id)
+    if chat is not None:
+        _require_owner(request, chat.get("user_id"))
+        return db.list_conversation_artifacts(chat_id)
+    # The chat row may never have been saved; fall back to the
+    # artifacts' own owner instead of 404ing the listing.
+    arts = db.list_conversation_artifacts(chat_id)
+    if arts:
+        _require_owner(request, _artifact_owner(arts[0]["artifact_id"]))
+    return arts
+
+
+def _artifact_owner(artifact_id: str) -> Optional[str]:
+    """Owner user_id of an artifact, via its chat (or its task's
+    checkpoint when the chat is gone). None = operator-owned."""
+    art = db.get_artifact(artifact_id)
+    if not art:
+        return None
+    conv = art.get("conversation_id")
+    if conv:
+        chat = db.get_chat(conv)
+        if chat is not None:
+            return chat.get("user_id")
+    task_id = art.get("task_id")
+    if task_id:
+        cp = db.get_task_checkpoint(task_id)
+        if cp:
+            wm = cp.get("working_memory") or {}
+            if wm.get("user_id"):
+                return wm["user_id"]
+            if cp.get("conversation_id"):
+                chat = db.get_chat(cp["conversation_id"])
+                if chat is not None:
+                    return chat.get("user_id")
+    return None
 
 
 @app.get("/api/artifacts/{artifact_id}")
-async def get_artifact_metadata(artifact_id: str) -> dict[str, Any]:
+async def get_artifact_metadata(artifact_id: str, request: Request = None) -> dict[str, Any]:
     art = db.get_artifact(artifact_id)
     if not art:
         raise HTTPException(status_code=404, detail="Artifact not found")
+    _require_owner(request, _artifact_owner(artifact_id))
     return art
 
 
 @app.get("/api/artifacts/{artifact_id}/download")
-async def download_artifact(artifact_id: str) -> FileResponse:
+async def download_artifact(request: Request, artifact_id: str) -> FileResponse:
     art = db.get_artifact(artifact_id)
     if not art:
         raise HTTPException(status_code=404, detail="Artifact not found")
+    _require_owner(request, _artifact_owner(artifact_id))
 
     file_path = Path(art.get("filepath", "")).resolve()
 
@@ -1149,10 +1486,11 @@ async def download_artifact(artifact_id: str) -> FileResponse:
 
 
 @app.get("/api/artifacts/{artifact_id}/preview")
-async def preview_artifact(artifact_id: str) -> FileResponse:
+async def preview_artifact(request: Request, artifact_id: str) -> FileResponse:
     art = db.get_artifact(artifact_id)
     if not art:
         raise HTTPException(status_code=404, detail="Artifact not found")
+    _require_owner(request, _artifact_owner(artifact_id))
 
     file_path = Path(art.get("filepath", "")).resolve()
 

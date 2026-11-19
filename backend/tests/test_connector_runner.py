@@ -68,7 +68,7 @@ class FakeOAuth:
     def __init__(self, connectors):
         self._connectors = connectors
 
-    def connector(self, name):
+    def connector(self, name, user_id=None, connection_id=None):
         return self._connectors[name]
 
 
@@ -278,10 +278,10 @@ class FakeCalendarOAuth:
     def __init__(self, connector):
         self._connector = connector
 
-    def verify_connection(self, provider):
+    def verify_connection(self, provider, user_id=None, connection_id=None):
         return {"connected": True, "account": "op@example.com"}
 
-    def connector(self, name):
+    def connector(self, name, user_id=None, connection_id=None):
         return self._connector
 
 

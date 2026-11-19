@@ -72,6 +72,11 @@ SAFE_IDENTIFIERS: dict[str, set[str]] = {
         # value is a boolean-derived constant ('Configured' /
         # 'Not connected') — no user or API data reaches it.
         "connectorsCard",
+        # Profile view provider rows: every dynamic value passes through
+        # safe() (provider/account/error) or is a compile-time constant
+        # ('Connected' / 'Not connected' / 'Token expired /
+        # disconnected'); tag() escapes its input too.
+        "providers",
     },
     "src/taskconsole.ts": set(),
     "extension/src/companion/companionDrawer.ts": set(),

@@ -174,7 +174,7 @@ def test_native_capability_http_gate_uses_connected_adapter(tmp_path, monkeypatc
             return {"id": "draft-1"}
     registry = CapabilityRegistry({"EmailCapability": [Fake()]})
     registry._policy = capabilities_api._policy
-    monkeypatch.setattr(capabilities_api, "_registry", lambda: registry)
+    monkeypatch.setattr(capabilities_api, "_registry", lambda user_id=None: registry)
     client = TestClient(app)
     assert any(row["operation"] == "search_threads" and row["available"]
                for row in client.get("/api/capabilities").json())

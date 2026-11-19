@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+import uuid
 
 from fastapi.testclient import TestClient
 import pytest
@@ -97,6 +98,127 @@ def test_cron_webhook_and_alert_delivery(database, monkeypatch):
             assert conn.execute("SELECT notification_sent FROM monitoring_events WHERE id=?", (event["id"],)).fetchone()[0] == 1
     finally:
         hub.client_sockets.remove(ws)
+
+
+def _insert_mission_with_chat(database, chat_id, condition="below_price", params=None, user_id=None):
+    """Insert a mission row directly (bypassing create_mission's URL
+    gate, which rejects every host in this sandbox: DNS answers
+    198.18.0.0/15 for all names — see test_live_monitoring's
+    _insert_mission, same pattern)."""
+    mission_id = str(uuid.uuid4())
+    with db.get_connection(database) as conn:
+        conn.execute(
+            """INSERT INTO monitoring_missions
+               (id, conversation_id, user_id, title, target_url, trigger_type, schedule_cron, interval_seconds,
+                condition_type, condition_params, status, created_at, next_run_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (mission_id, chat_id, user_id, "Helio Strap", "https://example.org/product", "interval", None, 60,
+             condition, json.dumps(params or {}), "active", time.time(), time.time() - 1))
+    return mission_id
+
+
+def test_broadcast_persists_alert_to_chat_without_websocket(database):
+    """Fix 2: a triggered price-watch alert is persisted into its
+    mission's conversation (add_message + touch_chat) even when no
+    WebSocket client is connected, notification_sent is marked, and a
+    repeated broadcast of the SAME event never writes a second row."""
+    chat = db.create_chat("Price watch chat", db_path=database)
+    chat_id = chat["id"]
+    with db.get_connection(database) as conn:
+        conn.execute("UPDATE chats SET updated_at='2000-01-01 00:00:00' WHERE id=?", (chat_id,))
+    mission_id = _insert_mission_with_chat(database, chat_id, "below_price", {"threshold": 5000})
+
+    saved_sockets = list(hub.client_sockets)
+    hub.client_sockets.clear()
+    try:
+        event = evaluate_observation(mission_id, {"text": "Helio strap ₹4,500"}, observed_at=100, db_path=database)
+        assert event is not None
+        asyncio.run(broadcast_event(event))
+        messages = db.get_messages(chat_id, db_path=database)
+        assert len(messages) == 1
+        assert messages[0]["role"] == "agent"
+        assert "Helio Strap" in messages[0]["content"]
+        assert "4500" in messages[0]["content"]
+        assert messages[0]["evidence"] == "monitoring_event"
+        with db.get_connection(database) as conn:
+            assert conn.execute("SELECT notification_sent FROM monitoring_events WHERE id=?",
+                                (event["id"],)).fetchone()[0] == 1
+            updated = conn.execute("SELECT updated_at FROM chats WHERE id=?", (chat_id,)).fetchone()[0]
+        assert updated != "2000-01-01 00:00:00"
+
+        # A repeated broadcast of the SAME event must not spam the
+        # chat — but a live socket still gets the envelope, now
+        # carrying the conversation id the frontend refreshes on.
+        class WS:
+            async def send_json(self, value):
+                self.value = value
+        ws = WS()
+        hub.client_sockets.append(ws)
+        asyncio.run(broadcast_event(event))
+        assert ws.value["type"] == "MISSION_EVENT_TRIGGERED"
+        assert ws.value["conversationId"] == chat_id
+        assert len(db.get_messages(chat_id, db_path=database)) == 1
+    finally:
+        hub.client_sockets.clear()
+        hub.client_sockets.extend(saved_sockets)
+
+
+def test_broadcast_without_conversation_persists_nothing(database):
+    """Fix 2: a mission with no conversation_id still broadcasts over
+    the socket but writes no chat message anywhere."""
+    mission_id = _insert_mission_with_chat(database, None, "below_price", {"threshold": 5000})
+    event = evaluate_observation(mission_id, {"text": "₹4,500"}, observed_at=100, db_path=database)
+    assert event is not None
+    with db.get_connection(database) as conn:
+        before = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    class WS:
+        async def send_json(self, value):
+            self.value = value
+    ws = WS()
+    hub.client_sockets.append(ws)
+    try:
+        asyncio.run(broadcast_event(event))
+        assert ws.value["type"] == "MISSION_EVENT_TRIGGERED"
+        assert ws.value["conversationId"] is None
+    finally:
+        hub.client_sockets.remove(ws)
+    with db.get_connection(database) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == before
+
+
+def test_broadcast_to_deleted_conversation_does_not_raise(database):
+    """Review D1: a mission whose conversation was deleted must not
+    fail the broadcast or kill the watch: no raise, no message, and
+    notification_sent stays 0 (nowhere to deliver to)."""
+    chat = db.create_chat("Doomed chat", db_path=database)
+    assert db.delete_chat(chat["id"], db_path=database) is True
+    mission_id = _insert_mission_with_chat(database, chat["id"], "below_price", {"threshold": 5000})
+    event = evaluate_observation(mission_id, {"text": "₹4,500"}, observed_at=100, db_path=database)
+    assert event is not None
+    asyncio.run(broadcast_event(event))  # must not raise
+    with db.get_connection(database) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
+        assert conn.execute("SELECT notification_sent FROM monitoring_events WHERE id=?",
+                            (event["id"],)).fetchone()[0] == 0
+
+
+def test_broadcast_never_writes_into_another_users_chat(database):
+    """Review D2: a mission owned by user A must not persist into
+    user B's chat; the same owner's own chat still gets the alert."""
+    chat_a = db.create_chat("A chat", db_path=database, user_id="user-a")
+    chat_b = db.create_chat("B chat", db_path=database, user_id="user-b")
+    mission_b = _insert_mission_with_chat(database, chat_b["id"], "below_price",
+                                          {"threshold": 5000}, user_id="user-a")
+    event = evaluate_observation(mission_b, {"text": "₹4,500"}, observed_at=100, db_path=database)
+    assert event is not None
+    asyncio.run(broadcast_event(event))
+    assert db.get_messages(chat_b["id"], db_path=database) == []
+    mission_a = _insert_mission_with_chat(database, chat_a["id"], "below_price",
+                                          {"threshold": 5000}, user_id="user-a")
+    event_a = evaluate_observation(mission_a, {"text": "₹4,500"}, observed_at=100, db_path=database)
+    assert event_a is not None
+    asyncio.run(broadcast_event(event_a))
+    assert len(db.get_messages(chat_a["id"], db_path=database)) == 1
 
 
 def test_scheduler_dispatches_task_record_then_detects_change(database, monkeypatch):

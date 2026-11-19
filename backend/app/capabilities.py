@@ -157,18 +157,23 @@ class CapabilityRegistry:
         "CodeRepoCapability": {"query_issues": False, "inspect_prs": False, "inspect_commit_diff": False},
     }
 
-    def __init__(self, adapters: dict[str, list[Any]] | None = None, *, browser_available: bool = False):
+    def __init__(self, adapters: dict[str, list[Any]] | None = None, *, browser_available: bool = False, user_id: str | None = None):
+        """Build adapters for one caller. ``user_id`` is the task
+        owner's id: a session user's adapters resolve that user's own
+        connections and are unconfigured when they have none — never
+        the operator's. ``None`` is the operator (legacy globals)."""
         self.browser_available = browser_available
+        self.user_id = user_id
         from .mcp.policy import ApprovalPolicy
         self._policy = ApprovalPolicy()
         from .connectors.oauth import oauth_manager
         from pathlib import Path
         self.adapters = adapters or {
-            "EmailCapability": [oauth_manager.connector("gmail"), oauth_manager.connector("outlook"), BrowserAdapter("BrowserEmailAdapter", "https://mail.google.com")],
-            "CalendarCapability": [oauth_manager.connector("google_calendar"), BrowserAdapter("BrowserCalendarAdapter", "https://calendar.google.com")],
-            "DocumentCapability": [oauth_manager.connector("google_drive"), LocalFileSystemAdapter(Path(__file__).resolve().parents[1] / "data" / "artifacts"), BrowserAdapter("BrowserDriveAdapter", "https://drive.google.com")],
-            "TeamChatCapability": [oauth_manager.connector("slack"), BrowserAdapter("BrowserChatAdapter", "https://app.slack.com/client")],
-            "CodeRepoCapability": [oauth_manager.connector("github")],
+            "EmailCapability": [oauth_manager.connector("gmail", user_id=user_id), oauth_manager.connector("outlook", user_id=user_id), BrowserAdapter("BrowserEmailAdapter", "https://mail.google.com")],
+            "CalendarCapability": [oauth_manager.connector("google_calendar", user_id=user_id), BrowserAdapter("BrowserCalendarAdapter", "https://calendar.google.com")],
+            "DocumentCapability": [oauth_manager.connector("google_drive", user_id=user_id), LocalFileSystemAdapter(Path(__file__).resolve().parents[1] / "data" / "artifacts"), BrowserAdapter("BrowserDriveAdapter", "https://drive.google.com")],
+            "TeamChatCapability": [oauth_manager.connector("slack", user_id=user_id), BrowserAdapter("BrowserChatAdapter", "https://app.slack.com/client")],
+            "CodeRepoCapability": [oauth_manager.connector("github", user_id=user_id)],
         }
 
     def resolve(self, capability: str, operation: str) -> CapabilityRoute:

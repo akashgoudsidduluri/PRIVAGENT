@@ -715,6 +715,7 @@ def _create_new_listings_watch(
     listing_url: str,
     chat_id: Optional[str],
     db_path: Optional[str],
+    user_id: Optional[str] = None,
 ) -> str:
     """Insert a new_listings mission (hourly) and return its confirmation.
     The watch's checks run through the same egress gate as browsing: if
@@ -736,12 +737,13 @@ def _create_new_listings_watch(
     with db.get_connection(db_path) as conn:
         conn.execute(
             """INSERT INTO monitoring_missions
-            (id, conversation_id, title, target_url, trigger_type, schedule_cron, interval_seconds,
+            (id, conversation_id, user_id, title, target_url, trigger_type, schedule_cron, interval_seconds,
              condition_type, condition_params, status, created_at, next_run_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
             (
                 mission_id,
                 chat_id or "default",
+                user_id,
                 f"New listings: {listing_title}",
                 listing_url,
                 "interval",
@@ -793,6 +795,7 @@ async def handle_continuous_monitoring_instruction(
     chat_id: Optional[str] = None,
     history: Optional[list[dict[str, Any]]] = None,
     db_path: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> str:
     """Register a persistent continuous monitoring mission and return natural departure handoff."""
     db.init_db(db_path)
@@ -825,7 +828,7 @@ async def handle_continuous_monitoring_instruction(
                 "Paste the search results URL (for example, the Internshala search page), "
                 "or ask me to search for the listings first and I'll offer the watch after."
             )
-        return _create_new_listings_watch(listing_title, listing_url, chat_id, db_path)
+        return _create_new_listings_watch(listing_title, listing_url, chat_id, db_path, user_id=user_id)
     product_title, target_url = _extract_monitored_product(instruction, history=history)
     if not product_title:
         # Bare "yes" answering the alert offer after a listing search
@@ -839,7 +842,7 @@ async def handle_continuous_monitoring_instruction(
         if _is_bare_affirmative(instruction) and daily is None and below is None:
             listing_title, listing_url = _extract_tracked_listing(instruction, history=history)
             if listing_title and listing_url:
-                return _create_new_listings_watch(listing_title, listing_url, chat_id, db_path)
+                return _create_new_listings_watch(listing_title, listing_url, chat_id, db_path, user_id=user_id)
         # No product and no store URL anywhere: do NOT create a watch
         # for "your last suggestion" on a store homepage. Ask which
         # product to watch instead.
@@ -994,12 +997,13 @@ async def handle_continuous_monitoring_instruction(
     with db.get_connection(db_path) as conn:
         conn.execute(
             """INSERT INTO monitoring_missions
-            (id, conversation_id, title, target_url, trigger_type, schedule_cron, interval_seconds,
+            (id, conversation_id, user_id, title, target_url, trigger_type, schedule_cron, interval_seconds,
              condition_type, condition_params, status, created_at, next_run_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
             (
                 mission_id,
                 chat_id or "default",
+                user_id,
                 f"Price Watch: {product_title}",
                 target_url,
                 trigger_type,

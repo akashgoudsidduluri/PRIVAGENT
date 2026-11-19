@@ -7,6 +7,8 @@ from typing import Any, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from fastapi import Request
+
 from app import db
 from .email_intelligence import (
     CleanupPolicy,
@@ -21,6 +23,23 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/email", tags=["Email Intelligence"])
 
 
+def _caller_user_id(request: Request) -> Optional[str]:
+    """The authenticated user id, or None for the local operator."""
+    return getattr(request.state, "user_id", None)
+
+
+def _require_mission_owner(request: Request, mission: Optional[dict]) -> dict:
+    """404 (never confirm existence) when the caller may not access
+    this mission. The operator may access any mission; a session user
+    only their own. Legacy missions with no owner are operator-owned."""
+    if not mission:
+        raise HTTPException(404, "Email mission not found")
+    uid = _caller_user_id(request)
+    if uid is not None and mission.get("user_id") != uid:
+        raise HTTPException(404, "Email mission not found")
+    return mission
+
+
 class PolicyAuthorizeInput(BaseModel):
     authorized: bool = True
     cleanup_policy: Optional[dict[str, Any]] = None
@@ -32,22 +51,28 @@ class CompanionQueryInput(BaseModel):
 
 
 @router.get("/missions")
-def list_missions():
-    """List all email monitoring missions."""
+def list_missions(request: Request):
+    """List email monitoring missions owned by the caller (all, for
+    the operator)."""
     db.init_db()
-    return db.list_email_missions()
+    return db.list_email_missions(user_id=_caller_user_id(request))
 
 
 @router.post("/missions", status_code=201)
-async def create_mission(body: EmailMissionSetupInput):
-    """Register and start an email monitoring mission."""
+async def create_mission(request: Request, body: EmailMissionSetupInput):
+    """Register and start an email monitoring mission owned by the caller."""
     db.init_db()
-    existing_missions = [m for m in db.list_email_missions() if m.get("account_email") == body.account_email and m.get("status") == "active"]
+    user_id = _caller_user_id(request)
+    existing_missions = [m for m in db.list_email_missions(user_id=user_id) if m.get("account_email") == body.account_email and m.get("status") == "active"]
     if existing_missions:
         mission = existing_missions[0]
         await run_email_mission_tick(mission["id"])
         return mission
 
+    connection_id = None
+    if user_id:
+        from .connectors.oauth import oauth_manager
+        connection_id = oauth_manager.find_connection_id(user_id, body.provider, body.account_email)
     mission = db.create_email_mission(
         account_email=body.account_email,
         provider=body.provider,
@@ -55,6 +80,8 @@ async def create_mission(body: EmailMissionSetupInput):
         cleanup_policy=body.cleanup_policy.model_dump(),
         notification_policy=body.notification_policy.model_dump(),
         conversation_id=body.conversation_id,
+        user_id=user_id,
+        connection_id=connection_id,
     )
     # Trigger first tick in background or inline
     await run_email_mission_tick(mission["id"])
@@ -62,22 +89,18 @@ async def create_mission(body: EmailMissionSetupInput):
 
 
 @router.get("/missions/{mission_id}")
-def get_mission(mission_id: str):
+def get_mission(request: Request, mission_id: str):
     """Get mission details."""
     db.init_db()
-    m = db.get_email_mission(mission_id)
-    if not m:
-        raise HTTPException(404, "Email mission not found")
+    m = _require_mission_owner(request, db.get_email_mission(mission_id))
     return m
 
 
 @router.post("/missions/{mission_id}/authorize")
-async def authorize_cleanup_policy(mission_id: str, body: PolicyAuthorizeInput):
+async def authorize_cleanup_policy(request: Request, mission_id: str, body: PolicyAuthorizeInput):
     """Explicitly authorize autonomous email cleanup within approved policy."""
     db.init_db()
-    m = db.get_email_mission(mission_id)
-    if not m:
-        raise HTTPException(404, "Email mission not found")
+    m = _require_mission_owner(request, db.get_email_mission(mission_id))
 
     updates: dict[str, Any] = {
         "policy_authorized": 1 if body.authorized else 0,
@@ -97,9 +120,10 @@ async def authorize_cleanup_policy(mission_id: str, body: PolicyAuthorizeInput):
 
 
 @router.post("/missions/{mission_id}/pause")
-def pause_mission(mission_id: str):
+def pause_mission(request: Request, mission_id: str):
     """Pause continuous email monitoring."""
     db.init_db()
+    _require_mission_owner(request, db.get_email_mission(mission_id))
     updated = db.update_email_mission(mission_id, {"status": "paused"})
     if not updated:
         raise HTTPException(404, "Email mission not found")
@@ -108,9 +132,10 @@ def pause_mission(mission_id: str):
 
 
 @router.post("/missions/{mission_id}/resume")
-async def resume_mission(mission_id: str):
+async def resume_mission(request: Request, mission_id: str):
     """Resume continuous email monitoring and trigger an immediate tick."""
     db.init_db()
+    _require_mission_owner(request, db.get_email_mission(mission_id))
     now = time.time()
     updated = db.update_email_mission(mission_id, {"status": "active", "next_run_at": now})
     if not updated:
@@ -121,9 +146,10 @@ async def resume_mission(mission_id: str):
 
 
 @router.delete("/missions/{mission_id}")
-def cancel_mission(mission_id: str):
+def cancel_mission(request: Request, mission_id: str):
     """Cancel / stop continuous email monitoring."""
     db.init_db()
+    _require_mission_owner(request, db.get_email_mission(mission_id))
     updated = db.update_email_mission(mission_id, {"status": "stopped"})
     if not updated:
         raise HTTPException(404, "Email mission not found")
@@ -132,34 +158,23 @@ def cancel_mission(mission_id: str):
 
 
 @router.post("/missions/{mission_id}/sync")
-async def force_sync_tick(mission_id: str):
-    """Trigger an immediate sync tick for the email mission."""
+async def force_sync_tick(request: Request, mission_id: str):
+    """Trigger an immediate sync tick for the email mission. The tick
+    resolves the mission owner's own connection; this route never
+    rebinds the mission's account to whatever profile the global
+    token returns (that let any holder of the globals re-own a
+    mission by syncing it)."""
     db.init_db()
-    mission = db.get_email_mission(mission_id)
-    if mission:
-        from .connectors.oauth import oauth_manager
-        prov = mission.get("provider", "gmail")
-        conn_key = "gmail" if prov == "gmail" else "outlook"
-        try:
-            conn = oauth_manager.connector(conn_key)
-            if getattr(conn, "configured", False):
-                prof = conn.get_profile()
-                email_addr = prof.get("emailAddress") or prof.get("mail")
-                if email_addr and mission.get("account_email") != email_addr:
-                    db.update_email_mission(mission_id, {"account_email": email_addr, "sync_cursor": ""})
-        except Exception:
-            pass
+    _require_mission_owner(request, db.get_email_mission(mission_id))
     result = await run_email_mission_tick(mission_id)
     return result
 
 
 @router.get("/missions/{mission_id}/dashboard")
-def get_dashboard_payload(mission_id: str):
+def get_dashboard_payload(request: Request, mission_id: str):
     """Return aggregated stats and categorized lists for the frontend dashboard."""
     db.init_db()
-    mission = db.get_email_mission(mission_id)
-    if not mission:
-        raise HTTPException(404, "Email mission not found")
+    mission = _require_mission_owner(request, db.get_email_mission(mission_id))
 
     stats = db.get_email_dashboard_stats(mission_id)
     all_classifications = db.get_email_classifications(mission_id, limit=200)
@@ -216,12 +231,10 @@ def get_dashboard_payload(mission_id: str):
 
 
 @router.post("/missions/{mission_id}/restore/{message_id}")
-def restore_email(mission_id: str, message_id: str):
+def restore_email(request: Request, mission_id: str, message_id: str):
     """Restore an email back to the inbox from Trash."""
     db.init_db()
-    mission = db.get_email_mission(mission_id)
-    if not mission:
-        raise HTTPException(404, "Email mission not found")
+    mission = _require_mission_owner(request, db.get_email_mission(mission_id))
 
     from .email_intelligence.sync_engine import _get_connector_for_mission
     try:
@@ -235,9 +248,13 @@ def restore_email(mission_id: str, message_id: str):
 
 
 @router.post("/notifications/{notification_id}/dismiss")
-def dismiss_notification(notification_id: str):
-    """Dismiss a neglected email notification."""
+def dismiss_notification(request: Request, notification_id: str):
+    """Dismiss a neglected email notification (only the mission owner's)."""
     db.init_db()
+    notif = db.get_email_notification(notification_id)
+    if not notif:
+        raise HTTPException(404, "Notification not found")
+    _require_mission_owner(request, db.get_email_mission(notif.get("mission_id") or ""))
     ok = db.update_email_notification_status(notification_id, "dismissed")
     if not ok:
         raise HTTPException(404, "Notification not found")
@@ -245,8 +262,8 @@ def dismiss_notification(notification_id: str):
 
 
 @router.post("/companion/ask")
-def ask_companion(body: CompanionQueryInput):
+def ask_companion(request: Request, body: CompanionQueryInput):
     """Ask the companion bot an email question based on actual SQLite mission data."""
     db.init_db()
-    return answer_email_companion_query(body.query, mission_id=body.mission_id)
+    return answer_email_companion_query(body.query, mission_id=body.mission_id, user_id=_caller_user_id(request))
 

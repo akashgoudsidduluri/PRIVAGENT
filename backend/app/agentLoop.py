@@ -2785,6 +2785,12 @@ async def run_task(task_id: str) -> None:
     # flag so a task restored after a restart (main._require) keeps it.
     initial_memory["background"] = record.background
 
+    # Identity propagation: the checkpoint must also carry the task
+    # owner, so a task restored after a restart (main._require) keeps
+    # its user_id and the restored loop still resolves that user's own
+    # connections — never the legacy globals.
+    initial_memory["user_id"] = record.user_id
+
     # Task 9: resume from a checkpoint. A task restored from SQLite
     # (main._require) was interrupted by a restart; its checkpoint
     # carries the history and working memory, so the loop continues
@@ -2889,6 +2895,10 @@ async def run_task(task_id: str) -> None:
                     parent_task_id=task_id,
                     allowed_domains=record.allowed_domains,
                     background=record.background,
+                    # A part runs as the parent task's owner — without
+                    # this a connector call inside a part would resolve
+                    # through the legacy globals.
+                    user_id=record.user_id,
                 )
                 real_hub.tasks[_sub_id] = _sub
                 try:
@@ -2981,7 +2991,8 @@ async def run_task(task_id: str) -> None:
             record.message = f"Routing {_route.label}…"
             await real_hub.broadcast_progress(record)
             _outcome = await run_connector_route(
-                _route, task_id=task_id, instruction=record.instruction, record=record
+                _route, task_id=task_id, instruction=record.instruction, record=record,
+                user_id=record.user_id,
             )
             # The runner's ok flag IS the outcome — no completion
             # verifier here. The verifier's navigation rule requires a
@@ -3357,12 +3368,12 @@ async def run_task(task_id: str) -> None:
             # watch, so it must fall through to the monitoring
             # directive instead of silently changing the email
             # interval.
-            if is_email_interval_change_instruction(record.instruction) and get_active_email_mission(chat_id):
-                answer = await handle_email_interval_change(record.instruction, chat_id=chat_id)
+            if is_email_interval_change_instruction(record.instruction) and get_active_email_mission(chat_id, user_id=record.user_id):
+                answer = await handle_email_interval_change(record.instruction, chat_id=chat_id, user_id=record.user_id)
             elif is_email_mission_control_instruction(record.instruction):
-                answer = await handle_email_mission_control(record.instruction, chat_id=chat_id)
+                answer = await handle_email_mission_control(record.instruction, chat_id=chat_id, user_id=record.user_id)
             elif is_email_mission_setup_instruction(record.instruction) or is_email_companion_query(record.instruction):
-                answer = await handle_email_intelligence_instruction(record.instruction, chat_id=chat_id)
+                answer = await handle_email_intelligence_instruction(record.instruction, chat_id=chat_id, user_id=record.user_id)
                 # Compound: the same instruction may also ask for a
                 # calendar event ("...find the Microsoft interview
                 # invitation, and create a calendar event for it...").
@@ -3371,11 +3382,11 @@ async def run_task(task_id: str) -> None:
                 # no event, no message, nothing. Only for a mission
                 # setup, not a pure companion query.
                 if is_email_mission_setup_instruction(record.instruction):
-                    cal_section = await handle_compound_calendar(record.instruction, chat_id=chat_id)
+                    cal_section = await handle_compound_calendar(record.instruction, chat_id=chat_id, user_id=record.user_id)
                     if cal_section:
                         answer = f"{answer}\n\n---\n\n{cal_section}"
             elif is_calendar_query(record.instruction):
-                answer = await handle_calendar_instruction(record.instruction, chat_id=chat_id)
+                answer = await handle_calendar_instruction(record.instruction, chat_id=chat_id, user_id=record.user_id)
             elif is_continuous_monitoring_directive(
                 record.instruction,
                 history=initial_memory.get("conversation_history", []),
@@ -3384,6 +3395,7 @@ async def run_task(task_id: str) -> None:
                     record.instruction,
                     chat_id=chat_id,
                     history=initial_memory.get("conversation_history", []),
+                    user_id=record.user_id,
                 )
             elif is_remember_directive(record.instruction):
                 # Chat-only memory entry (2026-11-18): "remember ..." in
@@ -3396,6 +3408,7 @@ async def run_task(task_id: str) -> None:
                     recipient=dispatch_recip,
                     chat_id=chat_id,
                     history=initial_memory.get("conversation_history", []),
+                    user_id=record.user_id,
                 )
             elif is_capability_query(record.instruction):
                 answer = format_capability_overview()

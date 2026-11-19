@@ -100,6 +100,7 @@ def create_job(
     allowed_domains: Optional[list[str]] = None,
     long_horizon: bool = False,
     db_path: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> dict[str, Any]:
     instruction = (instruction or "").strip()
     if not instruction or len(instruction) > config.MAX_INSTRUCTION_CHARS:
@@ -119,11 +120,11 @@ def create_job(
     db.init_db(db_path)
     with db.get_connection(db_path) as conn:
         conn.execute(
-            "INSERT INTO scheduled_jobs(id, instruction, schedule, schedule_kind, cron, interval_seconds,"
+            "INSERT INTO scheduled_jobs(id, instruction, user_id, schedule, schedule_kind, cron, interval_seconds,"
             " status, next_run_at, created_at, updated_at, allowed_domains, long_horizon)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
-                job_id, instruction, schedule.strip(), parsed["schedule_kind"], parsed["cron"],
+                job_id, instruction, user_id, schedule.strip(), parsed["schedule_kind"], parsed["cron"],
                 parsed["interval_seconds"], "active", _next_run(parsed, now), now, now,
                 json.dumps(list(allowed_domains) if allowed_domains is not None else list(config.ALLOWED_DOMAINS)),
                 1 if long_horizon else 0,
@@ -140,10 +141,18 @@ def get_job(job_id: str, *, db_path: Optional[str] = None) -> Optional[dict[str,
     return _row_to_job(row) if row else None
 
 
-def list_jobs(*, db_path: Optional[str] = None) -> list[dict[str, Any]]:
+def list_jobs(*, db_path: Optional[str] = None, user_id: Optional[str] = None) -> list[dict[str, Any]]:
+    """List scheduled jobs. A session user sees only their own rows;
+    the operator (user_id=None) sees all."""
     db.init_db(db_path)
     with db.get_connection(db_path) as conn:
-        rows = conn.execute("SELECT * FROM scheduled_jobs ORDER BY created_at DESC").fetchall()
+        if user_id is None:
+            rows = conn.execute("SELECT * FROM scheduled_jobs ORDER BY created_at DESC").fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM scheduled_jobs WHERE user_id = ? ORDER BY created_at DESC",
+                (user_id,),
+            ).fetchall()
     return [_row_to_job(row) for row in rows]
 
 
@@ -255,6 +264,7 @@ def start_job(job: dict[str, Any], *, db_path: Optional[str] = None) -> tuple[st
         allowed_domains=effective,
         long_horizon=bool(job.get("long_horizon")),
         background=True,
+        user_id=job.get("user_id"),
     )
     record.state = "planning"
     db.init_db(db_path)

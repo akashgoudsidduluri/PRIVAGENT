@@ -1,5 +1,5 @@
 import { escapeHtml, safeImageSrc } from './sanitize';
-import { apiFetch, artifactUrl } from './auth';
+import { apiFetch, artifactUrl, clearSessionToken, getSessionToken } from './auth';
 
 const API = 'http://localhost:8000';
 const safe = (value: unknown) => escapeHtml(String(value ?? ''));
@@ -57,8 +57,48 @@ export async function mountControlView(index: number, content: HTMLElement, isCu
       await mountEmailIntelligence(content, isCurrent);
     }
     if (index === 4) {
+      // While the providers fetch is in flight the view is in the
+      // 'Connecting' state.
+      content.innerHTML = tag('Connecting') + '<p class="cc-note">Loading your connected services…</p>';
       const providers = await request('/api/connectors');
       if (!isCurrent()) return;
+      // Six connection states, derived per provider from its connections:
+      // Not Configured / Not Connected / Connecting (while fetching) /
+      // Connected / Expired / Connection Error.
+      const connectionState = (c: any): string => {
+        if (c.connected) return 'Connected';
+        if (c.error && /expired/i.test(c.error)) return 'Expired';
+        if (c.error) return 'Connection Error';
+        return 'Not Connected';
+      };
+      const providerState = (p: any): string => {
+        const conns = p.connections || [];
+        if (!p.configured && conns.length === 0) return 'Not Configured';
+        if (conns.length === 0) return 'Not Connected';
+        if (conns.some((c: any) => c.connected)) return 'Connected';
+        if (conns.some((c: any) => c.error && /expired/i.test(c.error))) return 'Expired';
+        if (conns.some((c: any) => c.error)) return 'Connection Error';
+        return 'Not Connected';
+      };
+      const scopeLabels: Record<string, string> = {
+        'https://www.googleapis.com/auth/gmail.modify': 'Gmail (read, send, delete)',
+        'https://www.googleapis.com/auth/calendar.events': 'Calendar (read, write)',
+        'https://www.googleapis.com/auth/drive.readonly': 'Drive (read)',
+        'https://www.googleapis.com/auth/drive.file': 'Drive (create files)',
+        'User.Read': 'Profile (read)',
+        'offline_access': 'Offline access',
+        'Mail.ReadWrite': 'Mail (read, delete)',
+        'Calendars.ReadWrite': 'Calendar (read, write)',
+        'channels:read': 'Channels (list)',
+        'channels:history': 'Channel history',
+        'groups:history': 'Private channel history',
+        'chat:write': 'Post messages',
+        'repo': 'Repositories (full access)',
+      };
+      const friendlyScopes = (scopes: string | null | undefined): string => {
+        if (!scopes) return '—';
+        return scopes.split(/[\s,]+/).filter(Boolean).map(s => scopeLabels[s] || s).join(' · ');
+      };
       const names: Record<string, string> = {
         google: 'Google · Gmail / Calendar / Drive',
         microsoft: 'Microsoft · Outlook / Calendar',
@@ -78,14 +118,14 @@ export async function mountControlView(index: number, content: HTMLElement, isCu
           link: 'https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade',
           linkText: 'Azure Portal (App Registrations)',
           redirect: 'http://localhost:8000/api/connectors/microsoft/callback',
-          scopes: 'Mail.ReadWrite, Calendars.ReadWrite',
+          scopes: 'User.Read, Mail.ReadWrite, Calendars.ReadWrite',
         },
         slack: {
           title: 'Slack App Setup Guide',
           link: 'https://api.slack.com/apps',
           linkText: 'Slack API Console',
           redirect: 'http://localhost:8000/api/connectors/slack/callback',
-          scopes: 'channels:read, chat:write',
+          scopes: 'channels:read, channels:history, groups:history, chat:write',
         },
         github: {
           title: 'GitHub OAuth Setup Guide',
@@ -98,17 +138,51 @@ export async function mountControlView(index: number, content: HTMLElement, isCu
 
       content.innerHTML = '<div class="cc-grid cc-provider-grid">' + providers.map((p: any) => {
         const guide = guides[p.provider] || guides.google;
+        const connections = p.connections || [];
+        const connRows = connections.map((c: any) => {
+          const cstate = connectionState(c);
+          return '<div style="margin:8px 0;padding:10px;border:1px solid #2e2e2e;border-radius:8px;background:#101010">' +
+            '<p style="font-size:12px;color:#8cf2ac;margin:0 0 4px">✓ Account: <strong>' + safe(c.account || 'Unknown account') + '</strong>' +
+            (c.is_primary ? ' <span style="color:#aaa;font-size:11px">(primary)</span>' : '') + '</p>' +
+            '<p style="font-size:11px;color:#aaa;margin:0 0 6px">Permissions: ' + safe(friendlyScopes(c.scopes)) + '</p>' +
+            (c.error && !c.connected ? '<p style="font-size:11px;color:var(--danger);margin:0 0 6px">⚠️ ' + safe(c.error) + '</p>' : '') +
+            '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">' +
+            tag(cstate) +
+            (connections.length > 1 && !c.is_primary ? '<button class="cc-button cc-button--outline" data-make-primary="' + safe(p.provider) + ':' + safe(c.id) + '">Make primary</button>' : '') +
+            '<button class="cc-button cc-button--outline" data-disconnect-conn="' + safe(p.provider) + ':' + safe(c.id) + '">Disconnect</button>' +
+            '</div></div>';
+        }).join('');
+        // The claim identifier is provider-specific: an email for
+        // Google/Microsoft, a username for GitHub, and for Slack the
+        // bot user ID or workspace name (auth.test returns those, not
+        // an email — asking for an email would be unanswerable).
+        const claimLabels: Record<string, { label: string; placeholder: string }> = {
+          google: { label: 'Account email:', placeholder: 'the account email of the existing connection' },
+          microsoft: { label: 'Account email:', placeholder: 'the account email of the existing connection' },
+          github: { label: 'GitHub username:', placeholder: 'the GitHub username of the existing connection' },
+          slack: { label: 'Slack user ID or workspace name:', placeholder: 'the bot user ID or workspace name of the existing connection' },
+        };
+        const claimLabel = claimLabels[p.provider] || claimLabels.google;
+        const claimBlock = (!connections.length && p.legacy_available)
+          ? '<div style="margin-top:10px;padding:10px;border:1px dashed #3a3a3a;border-radius:8px">' +
+            '<p style="font-size:12px;color:#ccc;margin:0 0 8px">An earlier connection from this browser exists. Claim it into your account by confirming the account.</p>' +
+            '<button class="cc-button cc-button--outline" data-claim-legacy="' + safe(p.provider) + '">Claim existing connection</button>' +
+            '<div id="claim-' + safe(p.provider) + '" style="display:none;margin-top:8px">' +
+            '<label style="display:block;font-size:11px;color:#ccc">' + safe(claimLabel.label) +
+            '<input type="text" class="cc-input" style="width:100%;margin-top:2px;padding:6px;background:#1e1e1e;border:1px solid #444;color:#fff;border-radius:4px" placeholder="' + safe(claimLabel.placeholder) + '" data-claim-email="' + safe(p.provider) + '">' +
+            '</label>' +
+            '<button class="cc-button" style="margin-top:8px" data-claim-confirm="' + safe(p.provider) + '">Confirm &amp; claim</button>' +
+            '</div></div>'
+          : '';
         return card(names[p.provider] || safe(p.provider),
           '<div class="cc-provider-mark">' + safe(p.provider.slice(0, 1).toUpperCase()) + '</div>' +
-          '<p>Native account adapter · in-memory session</p>' +
-          (p.account ? '<p style="font-size:12px;color:#8cf2ac;margin:4px 0">✓ Account: <strong>' + safe(p.account) + '</strong></p>' : '') +
-          (p.error && !p.connected ? '<p style="font-size:11px;color:var(--danger);margin:4px 0">⚠️ ' + safe(p.error) + '</p>' : '') +
+          '<p>Native account adapter · tokens tied to your signed-in account</p>' +
+          connRows +
+          claimBlock +
           '<div class="cc-provider-actions">' +
-          tag(p.connected ? 'Connected' : p.configured ? 'Token Expired / Disconnected' : 'Setup Required') +
-          (p.connected
-            ? '<button class="cc-button cc-button--outline" disabled style="color:#8cf2ac;border-color:#357a53">✓ Connected</button>'
-            : '<button class="cc-button" data-toggle-guide="' + safe(p.provider) + '">Setup / Reconnect ⚙</button>') +
-          (p.connected ? button('Disconnect', 'disconnect', p.provider) : '') +
+          tag(providerState(p)) +
+          (p.configured ? '<button class="cc-button" data-connect="' + safe(p.provider) + '">Connect ↗</button>' : '') +
+          '<button class="cc-button cc-button--outline" data-toggle-guide="' + safe(p.provider) + '">Setup ⚙</button>' +
           (p.connected && (p.provider === 'google' || p.provider === 'microsoft') ? '<a class="cc-button" href="#email-intelligence">Monitor Inbox ✉</a>' : '') +
           '</div>' +
           '<div class="cc-provider-form" id="form-' + safe(p.provider) + '" style="display:' + (!p.configured && !p.connected ? 'none' : 'none') + ';margin-top:14px;padding:14px;border:1px solid #3a3a3a;border-radius:8px;background:#141414;">' +
@@ -129,19 +203,22 @@ export async function mountControlView(index: number, content: HTMLElement, isCu
           '<label style="display:block;font-size:11px;margin-bottom:8px;color:#ccc">Client Secret:' +
           '<input type="password" class="cc-input" style="width:100%;margin-top:2px;padding:6px;background:#1e1e1e;border:1px solid #444;color:#fff;border-radius:4px" placeholder="OAuth Client Secret" data-client-secret="' + safe(p.provider) + '">' +
           '</label>' +
-          '<div style="text-align:center;font-size:10px;color:#666;margin:8px 0">— OR QUICK TEST WITH ACCESS TOKEN —</div>' +
-          '<label style="display:block;font-size:11px;margin-bottom:4px;color:#ccc">Direct Access Token (from OAuth Playground or CLI):' +
-          '<input type="password" class="cc-input" style="width:100%;margin-top:2px;padding:6px;background:#1e1e1e;border:1px solid #444;color:#fff;border-radius:4px" placeholder="Paste access token (e.g. ya29...)" data-token-input="' + safe(p.provider) + '">' +
-          '</label>' +
-          '<label style="display:block;font-size:11px;margin-bottom:8px;color:#ccc">Refresh Token (optional, enables permanent auto-refresh):' +
-          '<input type="password" class="cc-input" style="width:100%;margin-top:2px;padding:6px;background:#1e1e1e;border:1px solid #444;color:#fff;border-radius:4px" placeholder="Paste refresh token (from Step 3 of OAuth Playground)" data-refresh-token-input="' + safe(p.provider) + '">' +
-          '</label>' +
           '<div style="margin-top:10px;display:flex;gap:8px">' +
           '<button class="cc-button" data-save-config="' + safe(p.provider) + '">Save & Authorize ↗</button>' +
           '<button class="cc-button cc-button--outline" data-toggle-guide="' + safe(p.provider) + '">Cancel</button>' +
           '</div></div>', 'NATIVE CONNECTION');
       }).join('') +
-      '</div><p class="cc-note">Credentials are saved locally in your backend .env file and never transmitted to external servers.</p>';
+      '</div><p class="cc-note">Client secrets are stored encrypted on the backend and never sent to the frontend. Tokens are tied to your signed-in account.</p>';
+
+      // A denied or failed authorization lands back here with ?oauth_error=...
+      // Show it once, then clear it so a refresh does not re-show it.
+      const oauthErr = new URLSearchParams(window.location.search).get('oauth_error');
+      if (oauthErr) {
+        showError(content, new Error(oauthErr === 'denied' ? 'Authorization was denied at the provider.' : oauthErr === 'exchange_failed' ? 'The provider could not exchange the authorization code. Try connecting again.' : 'OAuth authorization failed or expired.'));
+        const clean = new URL(window.location.href);
+        clean.searchParams.delete('oauth_error');
+        window.history.replaceState(null, '', clean.pathname + clean.hash);
+      }
 
       content.querySelectorAll<HTMLButtonElement>('[data-toggle-guide]').forEach(b => b.onclick = () => {
         const prov = b.dataset.toggleGuide;
@@ -162,29 +239,19 @@ export async function mountControlView(index: number, content: HTMLElement, isCu
 
       content.querySelectorAll<HTMLButtonElement>('[data-save-config]').forEach(b => b.onclick = async () => {
         const prov = b.dataset.saveConfig;
-        const tokenInput = content.querySelector<HTMLInputElement>('[data-token-input="' + prov + '"]')?.value.trim();
-        const refreshInput = content.querySelector<HTMLInputElement>('[data-refresh-token-input="' + prov + '"]')?.value.trim();
         const cidInput = content.querySelector<HTMLInputElement>('[data-client-id="' + prov + '"]')?.value.trim();
         const csecInput = content.querySelector<HTMLInputElement>('[data-client-secret="' + prov + '"]')?.value.trim();
         b.disabled = true;
         try {
-          let res: any;
-          if (tokenInput || refreshInput) {
-            res = await request('/api/connectors/' + encodeURIComponent(prov || '') + '/configure', jsonOptions('POST', {
-              accessToken: tokenInput || undefined,
-              refreshToken: refreshInput || undefined,
-              clientId: cidInput || undefined,
-              clientSecret: csecInput || undefined,
-            }));
-          } else if (cidInput && csecInput) {
-            res = await request('/api/connectors/' + encodeURIComponent(prov || '') + '/configure', jsonOptions('POST', { clientId: cidInput, clientSecret: csecInput }));
+          if (cidInput && csecInput) {
+            const res: any = await request('/api/connectors/' + encodeURIComponent(prov || '') + '/configure', jsonOptions('POST', { clientId: cidInput, clientSecret: csecInput }));
+            if (res?.authorizationUrl) {
+              window.location.assign(res.authorizationUrl);
+            } else {
+              rerender();
+            }
           } else {
-            throw Error('Please provide an Access Token, Refresh Token, or Client ID & Client Secret');
-          }
-          if (res?.authorizationUrl) {
-            window.location.assign(res.authorizationUrl);
-          } else {
-            rerender();
+            throw Error('Please provide a Client ID & Client Secret');
           }
         } catch (err) {
           showError(b.closest('.cc-card') || content, err);
@@ -199,9 +266,32 @@ export async function mountControlView(index: number, content: HTMLElement, isCu
         } catch (error) { showError(b.closest('.cc-card') || content, error); }
       });
 
-      content.querySelectorAll<HTMLButtonElement>('[data-disconnect]').forEach(b => b.onclick = async () => {
-        try { await request('/api/connectors/' + encodeURIComponent(b.dataset.disconnect || ''), { method: 'DELETE' }); rerender(); }
+      content.querySelectorAll<HTMLButtonElement>('[data-disconnect-conn]').forEach(b => b.onclick = async () => {
+        const [prov, connId] = (b.dataset.disconnectConn || '').split(':');
+        try { await request('/api/connectors/' + encodeURIComponent(prov || '') + '?connection_id=' + encodeURIComponent(connId || ''), { method: 'DELETE' }); rerender(); }
         catch (error) { showError(b.closest('.cc-card') || content, error); }
+      });
+
+      content.querySelectorAll<HTMLButtonElement>('[data-make-primary]').forEach(b => b.onclick = async () => {
+        const [prov, connId] = (b.dataset.makePrimary || '').split(':');
+        try { await request('/api/connectors/' + encodeURIComponent(prov || '') + '/connections/' + encodeURIComponent(connId || '') + '/primary', { method: 'POST' }); rerender(); }
+        catch (error) { showError(b.closest('.cc-card') || content, error); }
+      });
+
+      content.querySelectorAll<HTMLButtonElement>('[data-claim-legacy]').forEach(b => b.onclick = () => {
+        const form = content.querySelector<HTMLElement>('#claim-' + b.dataset.claimLegacy);
+        if (form) form.style.display = form.style.display === 'none' ? 'block' : 'none';
+      });
+
+      content.querySelectorAll<HTMLButtonElement>('[data-claim-confirm]').forEach(b => b.onclick = async () => {
+        const prov = b.dataset.claimConfirm;
+        const email = content.querySelector<HTMLInputElement>('[data-claim-email="' + prov + '"]')?.value.trim();
+        b.disabled = true;
+        try {
+          if (!email) throw Error('Enter the account for the existing connection');
+          await request('/api/connectors/' + encodeURIComponent(prov || '') + '/migrate', jsonOptions('POST', { accountEmail: email, confirm: true }));
+          rerender();
+        } catch (err) { showError(b.closest('.cc-card') || content, err); b.disabled = false; }
       });
     }
     if (index === 5) await mountMcp(content, isCurrent);
@@ -300,9 +390,61 @@ export async function mountControlView(index: number, content: HTMLElement, isCu
         catch (error) { showError(form, error); }
       };
     }
+    if (index === 11) await mountProfile(content, isCurrent);
   } catch (error) {
     if (isCurrent()) content.innerHTML = empty('Runtime unavailable', safe(error) + '. Start the local backend to load live data.');
   }
+}
+
+async function mountProfile(content: HTMLElement, isCurrent: () => boolean): Promise<void> {
+  // Plain fetch, not apiFetch: a local-token-only operator gets a 401
+  // from /api/profile by design (a profile needs a user session), and
+  // that must render as "sign in" — never as the operator-token prompt.
+  const session = getSessionToken();
+  const signedOut = () => {
+    content.innerHTML = card('Your profile', '<p>Sign in to see your profile — your display name, member since, and connected providers.</p><a class="cc-button" href="/#account">Sign in or create an account ↗</a>', 'ACCOUNT') +
+      card('Operator mode', '<p>You are using the workspace with the local operator token. Signing in adds a personal profile on top of it; the operator token keeps working either way.</p>', 'LOCAL RUNTIME');
+  };
+  if (!session) { signedOut(); return; }
+  let profile: any;
+  try {
+    const res = await fetch(API + '/api/profile', { headers: { Authorization: 'Bearer ' + session }, signal: AbortSignal.timeout(15000) });
+    if (res.status === 401) { clearSessionToken(); if (isCurrent()) signedOut(); return; }
+    if (!res.ok) throw Error('Backend returned ' + res.status);
+    profile = await res.json();
+  } catch (error) {
+    if (isCurrent()) content.innerHTML = empty('Profile unavailable', safe(error) + '. Start the local backend to load live data.');
+    return;
+  }
+  if (!isCurrent()) return;
+  const memberSince = profile.created_at ? new Date(profile.created_at * 1000).toLocaleDateString() : '—';
+  const lastLogin = profile.last_login_at ? new Date(profile.last_login_at * 1000).toLocaleString() : '—';
+  const providers = (profile.connected_providers || []).map((p: any) =>
+    '<article class="cc-row"><div><h3>' + safe(p.provider) + '</h3><p>' +
+    (p.connected ? 'Connected' + (p.account ? ' · ' + safe(p.account) : '') : p.configured ? 'Token expired / disconnected' : 'Not connected') +
+    (p.error && !p.connected ? ' · ' + safe(p.error) : '') + '</p></div>' + tag(p.connected ? 'Connected' : 'Not connected') + '</article>').join('') ||
+    empty('No providers', 'Connect a provider to see it here.');
+  content.innerHTML = card('Your profile',
+    '<div style="display:flex;gap:14px;align-items:center;margin-bottom:14px"><span style="display:inline-flex;align-items:center;justify-content:center;width:48px;height:48px;border-radius:50%;background:#1a1918;color:#fff;font-weight:700;font-size:18px">' + safe(profile.avatar_initials || '?') + '</span><div><h3 style="margin:0">' + safe(profile.display_name) + '</h3><p style="margin:2px 0 0">' + safe(profile.email) + '</p><p style="margin:2px 0 0">Member since ' + safe(memberSince) + ' · Last sign-in ' + safe(lastLogin) + '</p></div></div>' +
+    '<form class="cc-form" id="profileNameForm"><label>Display name<input name="displayName" value="' + safe(profile.display_name) + '" required></label><button class="cc-button">Save name</button></form>' +
+    '<button class="cc-button cc-button--outline" id="profileSignOut">Sign out</button>',
+    'ACCOUNT') +
+    card('Connected providers', providers, 'CONNECTORS');
+  content.querySelector<HTMLFormElement>('#profileNameForm')!.onsubmit = async event => {
+    event.preventDefault();
+    const form = event.currentTarget as HTMLFormElement;
+    const values = Object.fromEntries(new FormData(form));
+    try {
+      const res = await fetch(API + '/api/profile', { method: 'PATCH', headers: { Authorization: 'Bearer ' + session, 'Content-Type': 'application/json' }, body: JSON.stringify({ displayName: String(values.displayName || '') }) });
+      if (!res.ok) throw Error('Backend returned ' + res.status);
+      rerender();
+    } catch (error) { showError(form, error); }
+  };
+  content.querySelector<HTMLButtonElement>('#profileSignOut')!.onclick = async () => {
+    try { await fetch(API + '/api/auth/logout', { method: 'POST', headers: { Authorization: 'Bearer ' + session } }); } catch { /* local state clears regardless */ }
+    clearSessionToken();
+    rerender();
+  };
 }
 
 async function mountMcp(content: HTMLElement, isCurrent: () => boolean): Promise<void> {

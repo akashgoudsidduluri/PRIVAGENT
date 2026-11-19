@@ -3,13 +3,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
+import sqlite3
 import time
 import uuid
 from typing import Any
 
 from . import db
-from .privacy import _redact_text
+from .privacy import _redact_text, scrub_persistent
 
 _PRICE = re.compile(r"(?:₹|\b(?:Rs\.?|INR|USD)\s*|\$)\s*([\d,]+(?:\.\d{1,2})?)", re.I)
 
@@ -191,10 +193,98 @@ def evaluate_observation(mission_id: str, observation: dict[str, Any], *,
     return event
 
 
-async def broadcast_event(event: dict[str, Any]) -> None:
+def _alert_text(event: dict[str, Any]) -> str:
+    """Human-readable chat text for a monitoring event."""
+    title = str(event.get("title") or "Monitoring alert").strip()
+    summary = str(event.get("summary") or "").strip()
+    diff = event.get("diff_data") or {}
+    old_price = diff.get("old_price")
+    new_price = diff.get("new_price")
+    lines = [f"🔔 **Monitoring alert — {title}**"]
+    if summary:
+        lines.append(f"• {summary}")
+    if isinstance(old_price, (int, float)) and isinstance(new_price, (int, float)):
+        lines.append(f"• Price: ₹{old_price:g} → ₹{new_price:g}")
+    elif isinstance(new_price, (int, float)):
+        lines.append(f"• Price now: ₹{new_price:g}")
+    return "\n".join(lines)
+
+
+def _persist_event_to_chat(event: dict[str, Any], db_path: str | None = None) -> str | None:
+    """Persist one monitoring event into its mission's conversation.
+
+    Mirrors the email-alert pattern (email_intelligence/sync_engine:
+    add_message + touch_chat). Returns the conversation_id, or None
+    when there is nothing to persist (no mission row, no conversation,
+    or already persisted).
+
+    Dedupe: an event is persisted at most once. Once its
+    monitoring_events row has notification_sent=1 the row is never
+    written again, so a repeated broadcast of the same event cannot
+    spam the chat — while a NEW event for the same mission (its own
+    row, flag 0) still persists. Persisting happens before the
+    WebSocket send, so the alert is never lost when no client is
+    connected at trigger time.
+
+    Guards (review pass): the conversation may have been deleted
+    (delete_chat removes only the chat row; the mission survives),
+    and a mission stamped with an owner may only write into that
+    owner's chat — a notification-write failure must never fail the
+    tick or kill the watch.
+    """
+    event_id = event.get("id")
+    mission_id = event.get("mission_id")
+    if not event_id or not mission_id:
+        return None
+    with db.get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT conversation_id, user_id FROM monitoring_missions WHERE id=?", (mission_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        conv_id = row["conversation_id"]
+        if not conv_id:
+            return None
+        chat_row = conn.execute(
+            "SELECT user_id FROM chats WHERE id=?", (conv_id,)
+        ).fetchone()
+        if chat_row is None:
+            return None
+        mission_user = row["user_id"]
+        if mission_user is not None and chat_row["user_id"] != mission_user:
+            return None
+        sent = conn.execute(
+            "SELECT notification_sent FROM monitoring_events WHERE id=?", (event_id,)
+        ).fetchone()
+        if sent is not None and int(sent[0]) == 1:
+            return conv_id
+    text = str(scrub_persistent(_alert_text(event)))
+    try:
+        db.add_message(conv_id, "agent", text, evidence="monitoring_event",
+                       task_id=event.get("task_id"), db_path=db_path)
+    except sqlite3.IntegrityError:
+        # TOCTOU: the chat was deleted between the check above and
+        # the insert. Losing one alert beats killing the watch, and
+        # the flag stays 0 so a later broadcast retries instead of
+        # silently dropping the event.
+        logging.getLogger(__name__).warning(
+            "monitor %s: alert could not be persisted to chat %s", mission_id, conv_id)
+        return None
+    db.touch_chat(conv_id, db_path=db_path)
+    with db.get_connection(db_path) as conn:
+        conn.execute("UPDATE monitoring_events SET notification_sent=1 WHERE id=?", (event_id,))
+    return conv_id
+
+
+async def broadcast_event(event: dict[str, Any], db_path: str | None = None) -> None:
     from starlette.websockets import WebSocketDisconnect, WebSocketState
     from .hub import hub
-    envelope = {"type": "MISSION_EVENT_TRIGGERED", "taskId": event.get("task_id"), "payload": event}
+    # Persist first: the chat copy is the durable delivery channel.
+    # A live socket is only the fast path — an alert must survive a
+    # trigger that fires while nobody is connected.
+    conversation_id = _persist_event_to_chat(event, db_path=db_path)
+    envelope = {"type": "MISSION_EVENT_TRIGGERED", "taskId": event.get("task_id"),
+                "conversationId": conversation_id, "payload": event}
     delivered = False
     for ws in list(hub.client_sockets):
         if getattr(ws, "client_state", None) == WebSocketState.DISCONNECTED or getattr(ws, "application_state", None) == WebSocketState.DISCONNECTED:
@@ -208,5 +298,5 @@ async def broadcast_event(event: dict[str, Any]) -> None:
         except Exception:
             hub.client_sockets.remove(ws) if ws in hub.client_sockets else None
     if delivered:
-        with db.get_connection() as conn:
-            conn.execute("UPDATE monitoring_events SET notification_sent=1 WHERE id=?", (event["id"],))
+        with db.get_connection(db_path) as conn:
+            conn.execute("UPDATE monitoring_events SET notification_sent=1 WHERE id=?", (event.get("id"),))

@@ -29,6 +29,7 @@
       <li><a href="#use-cases">Use Cases</a></li>
       <li><a href="#tech">Tech</a></li>
       <li><a href="#team">Team</a></li>
+      <li><a href="#account">Sign in</a></li>
     </ul>
     <a class="btn btn--sm btn--primary nav__cta" href="/agent.html" target="_blank">Open Workspace ↗</a>
   </nav>
@@ -263,6 +264,42 @@
             <div class="console__confirm-actions">
               <button id="confirmApprove" class="btn btn--primary">Approve</button>
               <button id="confirmReject" class="btn btn--ghost">Reject</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ ACCOUNT ============ -->
+    <section class="section section--alt" id="account">
+      <div class="container">
+        <p class="section__kicker reveal">08 · Your account</p>
+        <h2 class="section__title reveal">Sign in to your workspace.</h2>
+        <p class="section__sub reveal">One account for the workspace. Your password is hashed on your own backend — it never leaves your machine, and there is no cloud account behind it.</p>
+        <div class="auth-card reveal">
+          <div class="auth-tabs" id="authTabs" role="tablist" aria-label="Account">
+            <button class="auth-tab is-active" id="authTabSignup" type="button" role="tab" aria-selected="true">Create account</button>
+            <button class="auth-tab" id="authTabLogin" type="button" role="tab" aria-selected="false">Sign in</button>
+          </div>
+          <form class="auth-form" id="authForm" novalidate>
+            <label class="auth-field">Email
+              <input id="authEmail" type="email" required autocomplete="email" placeholder="you@example.com" />
+            </label>
+            <label class="auth-field" id="authNameRow">Display name
+              <input id="authDisplayName" type="text" autocomplete="name" placeholder="Akash" />
+            </label>
+            <label class="auth-field">Password
+              <input id="authPassword" type="password" required minlength="8" autocomplete="current-password" placeholder="At least 8 characters" />
+            </label>
+            <p class="auth-error" id="authError" hidden></p>
+            <button class="btn btn--primary btn--lg auth-submit" id="authSubmit" type="submit">Create account</button>
+            <p class="auth-note">No email verification yet — the backend has no mailer. Password reset comes with it.</p>
+          </form>
+          <div class="auth-signedin" id="authSignedIn" hidden>
+            <p>Signed in as <b id="authSignedInAs"></b></p>
+            <div class="auth-signedin__actions">
+              <a class="btn btn--primary" href="/agent.html">Open Workspace</a>
+              <button class="btn btn--ghost" id="authSignOut" type="button">Sign out</button>
             </div>
           </div>
         </div>

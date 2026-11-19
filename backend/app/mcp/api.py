@@ -6,7 +6,7 @@ import json
 import time
 from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 from jsonschema import validate, ValidationError
 
@@ -19,7 +19,10 @@ from .sanitizer import sanitize_tool_output
 router = APIRouter(prefix="/api/mcp")
 registry = Registry()
 discovery = MCPDiscovery(registry)
-_pending: dict[str, tuple[float, str, dict, str]] = {}
+# Gate tuple: (expiry, tool name, args, binding, owner user_id).
+# The owner is checked on /execute: a gate prepared by one user
+# cannot be spent by another, even if the gate task id leaks.
+_pending: dict[str, tuple[float, str, dict, str, str | None]] = {}
 _expiry_tasks: set[asyncio.Task] = set()
 
 
@@ -85,7 +88,8 @@ def tools():
 
 
 @router.post("/prepare")
-async def prepare(body: ToolInput):
+async def prepare(request: Request, body: ToolInput):
+    user_id = getattr(request.state, "user_id", None)
     tool = registry.tools.get(body.name)
     if not tool:
         raise HTTPException(404, "unknown tool")
@@ -95,13 +99,13 @@ async def prepare(body: ToolInput):
         validate(body.args, tool.schema)
     except ValidationError:
         raise HTTPException(422, "invalid tool arguments") from None
-    task = hub.new_task(f"Approve MCP tool {body.name}")
+    task = hub.new_task(f"Approve MCP tool {body.name}", user_id=user_id)
     task.state = "awaiting_confirmation"
     safe = sanitize_tool_output(body.args, 1000)["content"]
     task.pending_confirmation = {"message": f"Approve {body.name} with these arguments? {safe}",
                                  "action": {"type": "mcp_tool", "name": body.name}}
-    binding = hashlib.sha256(json.dumps([body.name, body.args], sort_keys=True, default=str).encode()).hexdigest()
-    _pending[task.task_id] = (time.monotonic() + 120, body.name, body.args, binding)
+    binding = hashlib.sha256(json.dumps([user_id, body.name, body.args], sort_keys=True, default=str).encode()).hexdigest()
+    _pending[task.task_id] = (time.monotonic() + 120, body.name, body.args, binding, user_id)
     expiry = asyncio.create_task(_expire_gate(task.task_id))
     _expiry_tasks.add(expiry)
     expiry.add_done_callback(_expiry_tasks.discard)
@@ -110,7 +114,8 @@ async def prepare(body: ToolInput):
 
 
 @router.post("/execute")
-async def execute(body: ToolInput):
+async def execute(request: Request, body: ToolInput):
+    user_id = getattr(request.state, "user_id", None)
     tool = registry.tools.get(body.name)
     if not tool:
         raise HTTPException(404, "unknown tool")
@@ -118,14 +123,21 @@ async def execute(body: ToolInput):
     if tool.mutating:
         pending = _pending.pop(body.gate_task_id or "", None)
         task = hub.tasks.get(body.gate_task_id or "")
-        binding = hashlib.sha256(json.dumps([body.name, body.args], sort_keys=True, default=str).encode()).hexdigest()
-        if not pending or not task or pending[0] < time.monotonic() or pending[1] != body.name or pending[3] != binding or task.confirm_decision is not True:
+        binding = hashlib.sha256(json.dumps([user_id, body.name, body.args], sort_keys=True, default=str).encode()).hexdigest()
+        gate_owner = pending[4] if pending and len(pending) > 4 else None
+        # Gate-owner mismatch is a not-found, not a forbidden: the
+        # caller must not learn another user's gate exists.
+        if pending is not None and user_id is not None and gate_owner != user_id:
+            raise HTTPException(404, "gate not found")
+        if (not pending or not task or pending[0] < time.monotonic() or pending[1] != body.name or
+            pending[3] != binding or task.confirm_decision is not True or
+            (user_id is not None and gate_owner != user_id)):
             raise HTTPException(403, "fresh approved tool gate required")
         approval = registry.approve(body.name, body.args, task.task_id)
         task.state = "running"
         await hub.broadcast_progress(task)
     try:
-        result = await registry.execute_async(body.name, body.args, approval, task_id=body.gate_task_id or "")
+        result = await registry.execute_async(body.name, body.args, approval, task_id=body.gate_task_id or "", user_id=user_id)
     except (PermissionError, ValidationError, ValueError):
         raise HTTPException(422, "tool execution rejected") from None
     except Exception:
@@ -142,6 +154,16 @@ async def execute(body: ToolInput):
 
 
 @router.get("/audit")
-def audit():
+def audit(request: Request):
+    """Hash-only receipts. A session user sees only their own calls;
+    the operator sees all."""
+    user_id = getattr(request.state, "user_id", None)
     with db.get_connection() as conn:
-        return [dict(r) for r in conn.execute("SELECT * FROM mcp_audit ORDER BY created_at DESC LIMIT 100")]
+        if user_id is None:
+            rows = conn.execute("SELECT * FROM mcp_audit ORDER BY created_at DESC LIMIT 100").fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM mcp_audit WHERE user_id = ? ORDER BY created_at DESC LIMIT 100",
+                (user_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]

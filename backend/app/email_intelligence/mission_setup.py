@@ -316,9 +316,13 @@ def is_email_interval_change_instruction(text: str) -> bool:
     return bool(_INTERVAL_VERB_RE.search(t))
 
 
-def get_active_email_mission(chat_id: Optional[str] = None, db_path: Optional[str] = None) -> Optional[dict[str, Any]]:
-    """The active email mission for this chat, or the single active one."""
-    missions = [m for m in db.list_email_missions(db_path=db_path) if m.get("status") == "active"]
+def get_active_email_mission(chat_id: Optional[str] = None, db_path: Optional[str] = None, user_id: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """The active email mission for this chat, or the single active one.
+
+    ``user_id`` scopes the search to the caller's missions: the
+    single-mission fallback must never return another user's mission.
+    """
+    missions = [m for m in db.list_email_missions(db_path=db_path, user_id=user_id) if m.get("status") == "active"]
     if not missions:
         return None
     if chat_id:
@@ -333,6 +337,7 @@ def get_active_email_mission(chat_id: Optional[str] = None, db_path: Optional[st
 async def handle_email_interval_change(
     instruction: str,
     chat_id: Optional[str] = None,
+    user_id: Optional[str] = None,
     db_path: Optional[str] = None,
 ) -> str:
     """Change the active email mission's check interval. The reply
@@ -341,7 +346,7 @@ async def handle_email_interval_change(
     secs = parse_frequency_seconds(instruction)
     if secs is None:
         return "I couldn't tell what interval you want. Say it like 'check every 5 minutes'."
-    mission = get_active_email_mission(chat_id, db_path=db_path)
+    mission = get_active_email_mission(chat_id, db_path=db_path, user_id=user_id)
     if not mission:
         return "There's no active email monitoring mission in this chat to change. Set one up first (for example: 'scan my mails and notify me for important mails')."
     prev = mission.get("frequency_seconds")
@@ -399,10 +404,11 @@ async def handle_delete_receipt_instruction(
     instruction: str,
     chat_id: Optional[str] = None,
     db_path: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> str:
     """Record the user's deletion-receipt preference on the active
     email mission, so the background tick posts it on every trash."""
-    mission = get_active_email_mission(chat_id, db_path=db_path)
+    mission = get_active_email_mission(chat_id, db_path=db_path, user_id=user_id)
     if not mission:
         return "There's no active email monitoring mission in this chat to attach that receipt to. Set one up first."
     receipt = _receipt_text_for(instruction)
@@ -533,6 +539,7 @@ def is_email_mission_control_instruction(text: str) -> bool:
 async def handle_email_mission_control(
     instruction: str,
     chat_id: Optional[str] = None,
+    user_id: Optional[str] = None,
     db_path: Optional[str] = None,
 ) -> str:
     """Handle a mission-control instruction deterministically. Always
@@ -542,15 +549,15 @@ async def handle_email_mission_control(
     watch is never hijacked into an email interval change."""
     t = instruction or ""
     if is_delete_receipt_instruction(t):
-        return await handle_delete_receipt_instruction(t, chat_id=chat_id, db_path=db_path)
+        return await handle_delete_receipt_instruction(t, chat_id=chat_id, db_path=db_path, user_id=user_id)
 
-    mission = get_active_email_mission(chat_id, db_path=db_path)
+    mission = get_active_email_mission(chat_id, db_path=db_path, user_id=user_id)
     # A paused mission is not "active". When a control command finds
     # no active mission but one exists paused in this chat, say so —
     # "no active mission" would be misleading.
     paused_mission = None
     if mission is None:
-        paused = [m for m in db.list_email_missions(db_path=db_path) if m.get("status") == "paused"]
+        paused = [m for m in db.list_email_missions(db_path=db_path, user_id=user_id) if m.get("status") == "paused"]
         if chat_id:
             paused = [m for m in paused if m.get("conversation_id") == chat_id]
         paused_mission = paused[0] if paused else None
@@ -675,13 +682,18 @@ async def handle_email_intelligence_instruction(
     instruction: str,
     chat_id: Optional[str] = None,
     db_path: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> str:
-    """Handle either mission setup or companion query for email intelligence."""
+    """Handle either mission setup or companion query for email intelligence.
+
+    ``user_id`` is the task owner's id: the account resolved here is
+    that user's own, and any mission created is stamped with it.
+    """
     db.init_db(db_path)
 
     # 1. If it's a specific companion question (e.g. "What did you delete today?")
     if is_email_companion_query(instruction) and not is_email_mission_setup_instruction(instruction):
-        ans = answer_email_companion_query(instruction, db_path=db_path)
+        ans = answer_email_companion_query(instruction, db_path=db_path, user_id=user_id)
         return ans.get("text", "Processed your email query.")
 
     # 2. Mission Setup Instruction
@@ -701,8 +713,8 @@ async def handle_email_intelligence_instruction(
         mode_label = "[Controlled Test Mailbox (Sandbox)]"
     else:
         from app.connectors.oauth import oauth_manager
-        google_status = oauth_manager.verify_connection("google")
-        ms_status = oauth_manager.verify_connection("microsoft")
+        google_status = oauth_manager.verify_connection("google", user_id=user_id)
+        ms_status = oauth_manager.verify_connection("microsoft", user_id=user_id)
 
         # The provider named in the instruction wins: "monitor my
         # Outlook inbox" must use Outlook even when Gmail is also
@@ -787,8 +799,10 @@ async def handle_email_intelligence_instruction(
         "custom_keywords": custom_topics,
     }
 
-    # Check for existing mission to re-bind or update
-    existing_missions = db.list_email_missions(db_path=db_path)
+    # Check for existing mission to re-bind or update — scoped to the
+    # caller. An unscoped dedupe would re-bind another user's mission
+    # row (same mailbox, different PrivAgent user) into this chat.
+    existing_missions = db.list_email_missions(db_path=db_path, user_id=user_id)
     existing_mission = next((m for m in existing_missions if m.get("account_email") == account_email), None)
 
     if existing_mission:
@@ -833,6 +847,8 @@ async def handle_email_intelligence_instruction(
             conversation_id=chat_id,
             policy_authorized=delete_authorized,
             dry_run=not delete_authorized,
+            user_id=user_id,
+            connection_id=oauth_manager.find_connection_id(user_id, provider, account_email) if user_id else None,
             cleanup_policy={
                 "allow_promotions": True,
                 "allow_newsletters": True,

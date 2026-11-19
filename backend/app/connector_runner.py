@@ -184,6 +184,7 @@ async def run_connector_route(
     record: Any = None,
     confirm_fn: Optional[Callable[[str, dict[str, Any]], Awaitable[bool]]] = None,
     oauth_manager: Any = None,
+    user_id: Optional[str] = None,
 ) -> ConnectorOutcome:
     """Execute one routed connector operation.
 
@@ -192,7 +193,11 @@ async def run_connector_route(
     awaited for mutating operations; when omitted, the production
     confirmation gate on ``record`` is used (``record`` is then
     required). ``oauth_manager`` is injectable for tests; the
-    process-wide manager is the default.
+    process-wide manager is the default. ``user_id`` is the task
+    owner's id (from the task record): a session user's call resolves
+    that user's own connection and fails honestly when they have none
+    — it never falls back to the legacy globals. ``None`` is the
+    operator, which keeps the legacy path by design.
     """
     label = CONNECTOR_LABELS.get(route.connector, route.connector)
 
@@ -201,8 +206,15 @@ async def run_connector_route(
 
         oauth_manager = _manager
 
+    # The task record is the trusted in-memory context: when the
+    # caller did not pass user_id, fall back to the record's owner so
+    # a caller that forgets the kwarg cannot silently drop a session
+    # user onto the legacy globals. An explicit kwarg wins.
+    if user_id is None and record is not None:
+        user_id = getattr(record, "user_id", None)
+
     try:
-        connector = oauth_manager.connector(route.connector)
+        connector = oauth_manager.connector(route.connector, user_id=user_id)
     except Exception:
         _audit(route.connector, route.operation, "unknown_connector", task_id)
         return ConnectorOutcome(False, not_connected_message(route.connector), route)
@@ -352,7 +364,7 @@ async def run_connector_route(
             try:
                 from .connectors.calendar_companion import handle_calendar_instruction
 
-                answer = await handle_calendar_instruction(instruction, chat_id=None)
+                answer = await handle_calendar_instruction(instruction, chat_id=None, user_id=user_id)
             except Exception as exc:
                 _audit(route.connector, route.operation, "failed", task_id)
                 return ConnectorOutcome(False, f"Creating the calendar event failed: {exc}", route)
@@ -372,7 +384,7 @@ async def run_connector_route(
         elif route.connector == "google_calendar":
             from .connectors.calendar_companion import handle_calendar_instruction
 
-            answer = await handle_calendar_instruction(instruction, chat_id=None)
+            answer = await handle_calendar_instruction(instruction, chat_id=None, user_id=user_id)
         elif route.connector == "google_drive":
             answer = _drive_search_answer(connector, route.query)
         else:

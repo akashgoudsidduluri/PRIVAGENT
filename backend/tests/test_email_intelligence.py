@@ -1114,7 +1114,7 @@ async def test_outlook_requested_but_not_connected_is_honest(email_db, monkeypat
     Outlook is not connected — not silently set up Gmail."""
     from app.connectors.oauth import oauth_manager
 
-    def fake_verify(provider):
+    def fake_verify(provider, user_id=None, connection_id=None):
         if provider == "google":
             return {"connected": True, "account": "user@gmail.com"}
         return {"connected": False, "account": None, "error": "not connected"}
@@ -1137,7 +1137,7 @@ async def test_outlook_requested_and_connected_uses_outlook(email_db, monkeypatc
     Outlook even when Gmail is also connected."""
     from app.connectors.oauth import oauth_manager
 
-    def fake_verify(provider):
+    def fake_verify(provider, user_id=None, connection_id=None):
         if provider == "microsoft":
             return {"connected": True, "account": "user@outlook.com"}
         return {"connected": True, "account": "user@gmail.com"}

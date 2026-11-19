@@ -1864,6 +1864,7 @@ function connectWebSocket(): void {
       const env = JSON.parse(ev.data) as {
         type: string;
         taskId: string;
+        conversationId?: string | null;
         payload: {
           chatId?: string | null;
           taskState: string;
@@ -1882,6 +1883,25 @@ function connectWebSocket(): void {
           takeover?: { kind?: string; reason?: string; url?: string } | null;
         };
       };
+      if (env.type === "MISSION_EVENT_TRIGGERED") {
+        // The alert text was already persisted to this conversation
+        // by the backend (change_detector.broadcast_event); the
+        // socket event is only a refresh trigger. Re-render from the
+        // server so the alert appears exactly once — never append the
+        // payload as a second message.
+        const convId = env.conversationId ?? null;
+        if (convId && convId === activeChatId) {
+          // A task in flight owns this chat's UI: re-rendering now
+          // would wipe the user's typed draft, hide an open
+          // confirmation/takeover gate and clear the live timeline.
+          // The alert is already persisted; it renders on next
+          // navigation.
+          if (!currentTaskId || !isWorking) {
+            void selectChat(activeChatId);
+          }
+        }
+        return;
+      }
       if (env.type !== "PROGRESS") return;
       if (!currentTaskId || env.taskId !== currentTaskId) {
         if (activeChatId && env.payload.chatId === activeChatId) {

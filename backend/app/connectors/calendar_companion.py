@@ -367,12 +367,16 @@ def parse_calendar_create(instruction: str, account_email: str | None = None) ->
     }
 
 
-async def handle_calendar_instruction(instruction: str, chat_id: Optional[str] = None) -> str:
-    """Handle calendar listing or event creation requests via connected Google OAuth."""
+async def handle_calendar_instruction(instruction: str, chat_id: Optional[str] = None, user_id: Optional[str] = None) -> str:
+    """Handle calendar listing or event creation requests via connected Google OAuth.
+
+    ``user_id`` is the task owner's id: a session user's call verifies
+    and uses that user's own Google connection, never the legacy globals.
+    """
     t = instruction.lower()
 
     # 1. Verify Google Connection
-    google_status = oauth_manager.verify_connection("google")
+    google_status = oauth_manager.verify_connection("google", user_id=user_id)
     if not google_status.get("connected") or not google_status.get("account"):
         err = google_status.get("error") or "No active Google connection detected."
         return (
@@ -385,7 +389,7 @@ async def handle_calendar_instruction(instruction: str, chat_id: Optional[str] =
         )
 
     account_email = google_status["account"]
-    connector = oauth_manager.connector("google_calendar")
+    connector = oauth_manager.connector("google_calendar", user_id=user_id)
 
     # 2. Check for Event Creation
     parsed = parse_calendar_create(instruction, account_email)
@@ -544,7 +548,7 @@ def resolve_calendar_event_pronoun(clause: str, instruction: str) -> str:
     )
 
 
-async def handle_compound_calendar(instruction: str, chat_id: Optional[str] = None) -> str | None:
+async def handle_compound_calendar(instruction: str, chat_id: Optional[str] = None, user_id: Optional[str] = None) -> str | None:
     """Handle the calendar half of a compound instruction.
 
     The dispatcher routes a compound instruction to the first matching
@@ -580,4 +584,4 @@ async def handle_compound_calendar(instruction: str, chat_id: Optional[str] = No
             "put on your calendar. Please name it, e.g. *'Create a calendar "
             "event tomorrow at 10am for Microsoft interview'*."
         )
-    return await handle_calendar_instruction(resolved, chat_id=chat_id)
+    return await handle_calendar_instruction(resolved, chat_id=chat_id, user_id=user_id)

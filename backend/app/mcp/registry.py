@@ -62,7 +62,7 @@ class Registry:
         if tool.mutating:
             self._policy.authorize(tool.name, args, approval, task_id)
 
-    def execute(self, name: str, args: dict, approval: str | None = None, *, task_id: str = "") -> dict:
+    def execute(self, name: str, args: dict, approval: str | None = None, *, task_id: str = "", user_id: str | None = None) -> dict:
         tool = self.tools[name]
         self._authorize(tool, args, approval, task_id)
         started = time.monotonic()
@@ -72,13 +72,13 @@ class Registry:
                 if inspect.iscoroutine(result): result.close()
                 raise RuntimeError("async MCP tool requires execute_async")
             clean = sanitize_tool_output(result)
-            record_receipt(name, args, int((time.monotonic() - started) * 1000), "ok", clean["output_hash"])
+            record_receipt(name, args, int((time.monotonic() - started) * 1000), "ok", clean["output_hash"], user_id=user_id)
             return clean
         except Exception:
-            record_receipt(name, args, int((time.monotonic() - started) * 1000), "failed")
+            record_receipt(name, args, int((time.monotonic() - started) * 1000), "failed", user_id=user_id)
             raise
 
-    async def execute_async(self, name: str, args: dict, approval: str | None = None, *, task_id: str = "") -> dict:
+    async def execute_async(self, name: str, args: dict, approval: str | None = None, *, task_id: str = "", user_id: str | None = None) -> dict:
         tool = self.tools[name]
         self._authorize(tool, args, approval, task_id)
         started = time.monotonic()
@@ -86,8 +86,8 @@ class Registry:
             result = tool.execute(args)
             if inspect.isawaitable(result): result = await result
             clean = sanitize_tool_output(result)
-            record_receipt(name, args, int((time.monotonic() - started) * 1000), "ok", clean["output_hash"])
+            record_receipt(name, args, int((time.monotonic() - started) * 1000), "ok", clean["output_hash"], user_id=user_id)
             return clean
         except Exception:
-            record_receipt(name, args, int((time.monotonic() - started) * 1000), "failed")
+            record_receipt(name, args, int((time.monotonic() - started) * 1000), "failed", user_id=user_id)
             raise
