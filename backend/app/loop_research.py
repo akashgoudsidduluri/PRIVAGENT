@@ -75,7 +75,12 @@ def build_comparison_package(
         ),
     )
     if summary_msg:
-        pkg.topic.findings_summary = summary_msg.strip()[:2000]
+        # Strip LLM meta-talk ("I cannot render a binary PDF...",
+        # "Format note: ...") at the source so it never reaches a
+        # rendered report. The plan also strips it (defence in depth).
+        from .research.text_utils import strip_llm_meta_disclaimers
+
+        pkg.topic.findings_summary = strip_llm_meta_disclaimers(summary_msg.strip())[:2000]
 
     rows: list[list[Any]] = []
     for idx, (site, data) in enumerate(completed, start=1):
@@ -139,6 +144,11 @@ def _finalize_research_artifacts(
         # Enrich package with planner synthesis if available
         if summary_msg:
             clean_summary = re.sub(r"📄\s*\*\*Deliverable Ready:\*\*.*$", "", summary_msg, flags=re.DOTALL).strip()
+            # Drop LLM meta-apologies / format notes before the summary
+            # is stored as the report's findings synthesis.
+            from .research.text_utils import strip_llm_meta_disclaimers
+
+            clean_summary = strip_llm_meta_disclaimers(clean_summary)
             if not pkg.topic.findings_summary and clean_summary:
                 pkg.topic.findings_summary = clean_summary
 
@@ -308,7 +318,13 @@ def _finalize_research_artifacts(
             from .research.visuals.image_pipeline import ensure_local_image_asset
             for vis in pkg.visuals:
                 if vis.url_or_path and vis.url_or_path.startswith(("http://", "https://")):
-                    ensure_local_image_asset(vis, cache_dir=artifacts_dir / "images")
+                    # Blank / icon web figures are rejected here so they
+                    # never reach the renderers; generated diagrams pass.
+                    ensure_local_image_asset(
+                        vis,
+                        cache_dir=artifacts_dir / "images",
+                        reject_blank=not vis.is_generated,
+                    )
         except Exception:
             pass
 

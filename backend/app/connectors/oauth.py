@@ -40,6 +40,7 @@ Provider notes (verified against official docs 2026-11-19):
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import hashlib
 import os
 import secrets
@@ -682,54 +683,134 @@ class OAuthManager:
             return None
         return None
 
-    def status(self, user_id: Optional[str] = None, force_check: bool = False) -> list[dict]:
-        results = []
-        for name in _PROVIDER:
-            if user_id is None:
-                info = self.verify_connection(name, force_check=force_check, user_id=None)
-                results.append({
+    # Wall-clock budget for one provider's live verification inside
+    # status(). The old code verified providers sequentially with a
+    # 12s HTTP client timeout (plus refresh retries), so a dead token
+    # or missing egress made GET /api/connectors take 2-4 minutes.
+    # Providers now verify concurrently and each is capped here; a
+    # provider that overruns reports "verification timed out" instead
+    # of holding the whole status response hostage.
+    STATUS_PROVIDER_TIMEOUT_S = 4.0
+
+    def _status_for_provider(
+        self, name: str, user_id: Optional[str] = None, force_check: bool = False
+    ) -> dict:
+        """Status of one provider (no network when nothing is configured).
+
+        A provider with no connection rows, no OAuth client credentials
+        and no legacy tokens cannot be connected — answer from local
+        state only, without a live verification call.
+        """
+        has_creds = bool(_oauth_credential(name, "CLIENT_ID") and _oauth_credential(name, "CLIENT_SECRET"))
+        legacy_available = name in self._tokens or name in self._refresh_tokens
+        if user_id is None:
+            if not has_creds and not legacy_available:
+                return {
                     "provider": name,
-                    "configured": info["configured"],
-                    "connected": info["connected"],
-                    "account": info["account"],
-                    "error": info["error"],
+                    "configured": False,
+                    "connected": False,
+                    "account": None,
+                    "error": f"{name.capitalize()} is not connected",
                     "connections": [],
-                })
-                continue
-            with db_module.get_connection() as conn:
-                rows = conn.execute(
-                    "SELECT id, account_email, scopes, is_primary FROM oauth_connections"
-                    " WHERE user_id = ? AND provider = ? ORDER BY is_primary DESC, created_at ASC",
-                    (user_id, name),
-                ).fetchall()
-            connections = []
-            for row in rows:
-                info = self.verify_connection(
-                    name, force_check=force_check, user_id=user_id, connection_id=row["id"]
-                )
-                connections.append({
-                    "id": row["id"],
-                    "account": info["account"] or row["account_email"],
-                    "connected": info["connected"],
-                    "error": info["error"],
-                    "is_primary": bool(row["is_primary"]),
-                    "scopes": row["scopes"],
-                })
-            primary = next((c for c in connections if c["is_primary"]), connections[0] if connections else None)
-            has_creds = bool(_oauth_credential(name, "CLIENT_ID") and _oauth_credential(name, "CLIENT_SECRET"))
-            results.append({
+                }
+            info = self.verify_connection(name, force_check=force_check, user_id=None)
+            return {
                 "provider": name,
-                "configured": has_creds or bool(connections),
-                "connected": any(c["connected"] for c in connections),
-                "account": primary["account"] if primary else None,
-                "error": primary["error"] if primary else None,
-                "connections": connections,
-                # Whether operator-global (legacy) tokens exist for this
-                # provider — the UI offers to claim them. Existence only;
-                # the account is never revealed.
-                "legacy_available": name in self._tokens or name in self._refresh_tokens,
+                "configured": info["configured"],
+                "connected": info["connected"],
+                "account": info["account"],
+                "error": info["error"],
+                "connections": [],
+            }
+        with db_module.get_connection() as conn:
+            rows = conn.execute(
+                "SELECT id, account_email, scopes, is_primary FROM oauth_connections"
+                " WHERE user_id = ? AND provider = ? ORDER BY is_primary DESC, created_at ASC",
+                (user_id, name),
+            ).fetchall()
+        if not rows and not has_creds and not legacy_available:
+            return {
+                "provider": name,
+                "configured": False,
+                "connected": False,
+                "account": None,
+                "error": None,
+                "connections": [],
+                "legacy_available": False,
+            }
+        connections = []
+        for row in rows:
+            info = self.verify_connection(
+                name, force_check=force_check, user_id=user_id, connection_id=row["id"]
+            )
+            connections.append({
+                "id": row["id"],
+                "account": info["account"] or row["account_email"],
+                "connected": info["connected"],
+                "error": info["error"],
+                "is_primary": bool(row["is_primary"]),
+                "scopes": row["scopes"],
             })
-        return results
+        primary = next((c for c in connections if c["is_primary"]), connections[0] if connections else None)
+        return {
+            "provider": name,
+            "configured": has_creds or bool(connections),
+            "connected": any(c["connected"] for c in connections),
+            "account": primary["account"] if primary else None,
+            "error": primary["error"] if primary else None,
+            "connections": connections,
+            # Whether operator-global (legacy) tokens exist for this
+            # provider — the UI offers to claim them. Existence only;
+            # the account is never revealed.
+            "legacy_available": legacy_available,
+        }
+
+    def status(self, user_id: Optional[str] = None, force_check: bool = False) -> list[dict]:
+        """Per-provider connection status, verified concurrently.
+
+        Unconfigured providers answer from local state with no network
+        call. Configured providers verify in parallel, each capped at
+        STATUS_PROVIDER_TIMEOUT_S, so a slow/dead provider cannot make
+        GET /api/connectors take minutes. Results keep _PROVIDER order.
+        """
+        providers = list(_PROVIDER)
+        results: list[Optional[dict]] = [None] * len(providers)
+        # No `with` block: its shutdown(wait=True) would wait out a hung
+        # verification (up to the 12s HTTP timeout) and defeat the cap.
+        # shutdown(wait=False) lets the response return on budget while a
+        # stray verification finishes in the background (its result still
+        # lands in the 15s verification cache for the next call).
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(providers))
+        try:
+            futures = {
+                pool.submit(self._status_for_provider, name, user_id, force_check): idx
+                for idx, name in enumerate(providers)
+            }
+            for fut, idx in futures.items():
+                name = providers[idx]
+                try:
+                    results[idx] = fut.result(timeout=self.STATUS_PROVIDER_TIMEOUT_S)
+                except concurrent.futures.TimeoutError:
+                    results[idx] = {
+                        "provider": name,
+                        "configured": True,
+                        "connected": False,
+                        "account": None,
+                        "error": "Verification timed out — connection status could not be checked quickly",
+                        "connections": [],
+                    }
+                except Exception as exc:
+                    results[idx] = {
+                        "provider": name,
+                        "configured": True,
+                        "connected": False,
+                        "account": None,
+                        "error": f"Verification failed: {exc}",
+                        "connections": [],
+                    }
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+        return [r for r in results if r is not None]
 
     def _redirect(self, provider: str) -> str:
         origin = os.environ.get("PRIVAGENT_OAUTH_REDIRECT_ORIGIN", "http://localhost:8000").rstrip("/")

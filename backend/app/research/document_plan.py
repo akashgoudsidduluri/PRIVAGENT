@@ -50,6 +50,11 @@ from .models import (
     VisualAsset,
 )
 from .adaptive_planner import PageConstraint, PageConstraintType, PageSpec, reconcile_page_count
+from .text_utils import (
+    markdown_inline_to_reportlab,
+    smart_title_case,
+    strip_llm_meta_disclaimers,
+)
 
 
 class BlockType(str, Enum):
@@ -203,7 +208,11 @@ def _format_citation(source_ids: list[str], cit_map: dict[str, int]) -> str:
 
 
 def _clean_title(raw_title: str) -> str:
-    """Normalize raw title, stripping command verbs and excess prompt length."""
+    """Normalize raw title, stripping command verbs and excess prompt length.
+
+    Title-casing preserves acronyms (AI, LLM, API, PDF) instead of
+    mangling them to Ai / Llm / Api / Pdf.
+    """
     if not raw_title:
         return "Autonomous Research Deliverable"
     clean = raw_title.strip()
@@ -214,7 +223,7 @@ def _clean_title(raw_title: str) -> str:
         clean = clauses[0].strip()
         if len(clean) < 15 and len(clauses) > 1:
             clean = f"{clauses[0].strip()}: {clauses[1].strip()}"
-    return clean[:80].title() if not clean.isupper() else clean[:80]
+    return smart_title_case(clean[:80])
 
 
 def _clean_subtopic_title(raw_title: str, parent_title: str = "", idx: int = 1) -> str:
@@ -233,7 +242,135 @@ def _clean_subtopic_title(raw_title: str, parent_title: str = "", idx: int = 1) 
             clean = clauses[0].strip()
         if len(clean) > 60:
             clean = clean[:57].strip() + "..."
-    return clean.title() if not clean.isupper() else clean
+    return smart_title_case(clean)
+
+
+# ---------------------------------------------------------------------------
+# Markdown synthesis -> structured blocks
+# ---------------------------------------------------------------------------
+
+# Harvested (non-generated) web figures embedded per report. Generated
+# diagrams/charts are created for the report and are not capped.
+MAX_WEB_FIGURES_PER_REPORT = 4
+
+_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?[\s:|\-]+\|?\s*$")
+_HEADING_RE = re.compile(r"^#{1,4}\s+(.*)")
+_BULLET_RE = re.compile(r"^(?:[-*+]\s+|\d+[.)]\s+)(.*)")
+_MD_TABLE_COUNTER = [0]
+
+
+def _norm_text(text: str) -> str:
+    """Whitespace/punctuation-insensitive form, for duplicate detection."""
+    return re.sub(r"\W+", " ", (text or "").lower()).strip()
+
+
+def _is_duplicate_summary(candidate: str, seen_normalized: set[str]) -> bool:
+    """True if ``candidate`` was already rendered (identical, or a
+    substring of / superstring of an already-rendered summary)."""
+    norm = _norm_text(candidate)
+    if not norm:
+        return True
+    for seen in seen_normalized:
+        if norm == seen:
+            return True
+        if len(norm) > 40 and (norm in seen or seen in norm):
+            return True
+    return False
+
+
+def _table_from_markdown_lines(lines: list[str], title: Optional[str]) -> Optional[DataTable]:
+    """Parse ``| a | b |`` rows into a DataTable; None if not a table."""
+    rows: list[list[str]] = []
+    for ln in lines:
+        cells = [c.strip() for c in ln.strip().strip("|").split("|")]
+        # Separator rows (|---|---|) carry no data.
+        if all(re.fullmatch(r"[:\- ]*", c or "") for c in cells):
+            continue
+        rows.append([markdown_inline_to_reportlab(c) for c in cells])
+    if len(rows) < 2:
+        return None
+    _MD_TABLE_COUNTER[0] += 1
+    return DataTable(
+        table_id=f"tbl_md_{_MD_TABLE_COUNTER[0]:02d}",
+        title=title or "Data Table",
+        headers=rows[0],
+        rows=rows[1:],
+    )
+
+
+def _add_markdown_text(section: DocumentSection, text: str, first_title: Optional[str] = None) -> None:
+    """Add LLM/extracted Markdown text to a section as styled blocks.
+
+    - Meta-disclaimers ("I cannot render a binary PDF...", "Format
+      note: ...") are stripped before anything is rendered.
+    - ``## Heading`` lines become the title of the following block.
+    - ``| a | b |`` runs become structured TABLE blocks.
+    - ``-`` / ``1.`` runs become BULLET_LIST blocks.
+    - Inline ``**bold**`` / ``*italic*`` / code become ReportLab
+      markup, so no raw ``##``, ``**`` or ``|`` reaches the PDF/DOCX.
+    """
+    clean = strip_llm_meta_disclaimers(text or "")
+    if not clean:
+        return
+    lines = clean.splitlines()
+    para_buf: list[str] = []
+    pending_title = first_title
+
+    def flush_para() -> None:
+        nonlocal para_buf, pending_title
+        if para_buf:
+            body = markdown_inline_to_reportlab(" ".join(para_buf))
+            section.add_text(body, title=pending_title)
+            para_buf = []
+            pending_title = None
+
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line:
+            flush_para()
+            i += 1
+            continue
+        heading = _HEADING_RE.match(line)
+        if heading:
+            flush_para()
+            pending_title = markdown_inline_to_reportlab(heading.group(1).strip())
+            i += 1
+            continue
+        if line.startswith("|"):
+            tbl_lines: list[str] = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                tbl_lines.append(lines[i].strip())
+                i += 1
+            flush_para()
+            table = _table_from_markdown_lines(tbl_lines, pending_title)
+            pending_title = None
+            if table is not None:
+                section.add_table(table)
+            else:
+                # Not a real table — keep the words, drop the pipes.
+                para_buf.extend(
+                    " ".join(c.strip() for c in ln.strip().strip("|").split("|") if c.strip())
+                    for ln in tbl_lines
+                )
+            continue
+        bullet = _BULLET_RE.match(line)
+        if bullet:
+            flush_para()
+            items = [markdown_inline_to_reportlab(bullet.group(1).strip())]
+            i += 1
+            while i < len(lines):
+                nxt = _BULLET_RE.match(lines[i].strip())
+                if not nxt:
+                    break
+                items.append(markdown_inline_to_reportlab(nxt.group(1).strip()))
+                i += 1
+            section.add_bullets(items, title=pending_title)
+            pending_title = None
+            continue
+        para_buf.append(line)
+        i += 1
+    flush_para()
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +511,17 @@ def build_per_page_plan(
                 best_page, best_score = idx, score
         if best_page >= 0:
             visuals_by_page[best_page].append((best_score, visual))
+    # Cap harvested web figures per report at MAX_WEB_FIGURES_PER_REPORT
+    # (best-scoring first); generated diagrams/charts are not capped.
+    _ranked_web = sorted(
+        ((score, v) for lst in visuals_by_page.values() for score, v in lst if not v.is_generated),
+        key=lambda sv: -sv[0],
+    )
+    _keep_web_ids = {id(v) for _, v in _ranked_web[:MAX_WEB_FIGURES_PER_REPORT]}
+    visuals_by_page = {
+        idx: [(sc, v) for sc, v in lst if v.is_generated or id(v) in _keep_web_ids]
+        for idx, lst in visuals_by_page.items()
+    }
 
     sections: list[DocumentSection] = []
     for idx, spec in enumerate(page_specs):
@@ -541,6 +689,19 @@ def build_structured_document_plan(
             seen_vis_keys.add(dedup_key)
             valid_visuals.append(v)
 
+    # Cap harvested web figures per report: at most
+    # MAX_WEB_FIGURES_PER_REPORT non-generated figures are embedded,
+    # however many pages were harvested. Generated diagrams/charts are
+    # created for the report and are not capped.
+    _web_kept = 0
+    _capped_visuals: list[VisualAsset] = []
+    for v in valid_visuals:
+        if v.is_generated or _web_kept < MAX_WEB_FIGURES_PER_REPORT:
+            _capped_visuals.append(v)
+            if not v.is_generated:
+                _web_kept += 1
+    valid_visuals = _capped_visuals
+
     sections: list[DocumentSection] = []
 
     # -----------------------------------------------------------------------
@@ -560,6 +721,13 @@ def build_structured_document_plan(
     # boilerplate, which would present an empty report as researched.
     has_verified_material = bool(pkg.claims or pkg.evidence or pkg.sources)
 
+    # Summaries already rendered, normalised — the topic synthesis is
+    # rendered exactly once (here), never again in Section 2 or in a
+    # subtopic that merely repeats it.
+    seen_summaries: set[str] = set()
+    if pkg.topic.findings_summary:
+        seen_summaries.add(_norm_text(pkg.topic.findings_summary))
+
     if pkg.topic.scope:
         s1.add_text(f"<b>Research Scope:</b> {pkg.topic.scope}")
     if not has_verified_material:
@@ -573,11 +741,13 @@ def build_structured_document_plan(
             # A synthesized package carries the prior chat text as its
             # summary — show it, but labelled unverified, never as an
             # "Executive Synthesis" of researched material.
-            s1.add_text(
-                f"<b>Unverified summary (from the conversation; no external sources were consulted):</b> {pkg.topic.findings_summary}"
+            _add_markdown_text(
+                s1,
+                pkg.topic.findings_summary,
+                first_title="Unverified summary (from the conversation; no external sources were consulted)",
             )
     elif pkg.topic.findings_summary:
-        s1.add_text(f"<b>Executive Synthesis:</b> {pkg.topic.findings_summary}")
+        _add_markdown_text(s1, pkg.topic.findings_summary, first_title="Executive Synthesis")
     else:
         s1.add_text(
             f"This autonomous technical dossier delivers an authoritative investigation into {clean_doc_title}. "
@@ -594,7 +764,7 @@ def build_structured_document_plan(
             cit = _format_citation(src_ids, cit_map)
             cit_str = f" <b><font color='#1E3A8A'>{cit}</font></b>" if cit else ""
             badge = f"<b><font color='#1E3A8A'>[{c.claim_type.upper()}]</font></b> "
-            bullets.append(f"{badge}{c.statement}{cit_str}")
+            bullets.append(f"{badge}{markdown_inline_to_reportlab(c.statement)}{cit_str}")
         s1.add_bullets(bullets, title="Key Synthesized Findings:")
 
     sections.append(s1)
@@ -612,12 +782,13 @@ def build_structured_document_plan(
             f"No literature was visited and no evidence was collected for {clean_doc_title}, "
             f"so there are no detailed findings to report."
         )
-    elif pkg.topic.findings_summary:
-        s2.add_text(f"<b>Core Findings Synthesis:</b> {pkg.topic.findings_summary}")
     else:
+        # The synthesis is rendered once, in Section 1. Repeating it
+        # here as "Core Findings Synthesis" duplicated the same text
+        # verbatim in every report.
         s2.add_text(
-            f"In-depth analysis of visited literature and technical specifications reveals key functional "
-            f"characteristics, architectural choices, and empirical benchmarks governing {clean_doc_title}."
+            "The subsections below present the detailed findings, grouped "
+            "by subtopic, with citations to the sources each finding rests on."
         )
     sections.append(s2)
 
@@ -643,10 +814,17 @@ def build_structured_document_plan(
             level=2,
         )
 
-        if sub.findings_summary:
-            s_sub.add_text(sub.findings_summary)
-        elif sub.description:
-            s_sub.add_text(sub.description)
+        # A subtopic summary that merely repeats the topic synthesis
+        # (or an earlier subtopic) is skipped, not rendered again.
+        summary_text: Optional[str] = None
+        if sub.findings_summary and not _is_duplicate_summary(sub.findings_summary, seen_summaries):
+            summary_text = sub.findings_summary
+        if summary_text:
+            _add_markdown_text(s_sub, summary_text)
+            seen_summaries.add(_norm_text(summary_text))
+        elif sub.description and not _is_duplicate_summary(sub.description, seen_summaries):
+            _add_markdown_text(s_sub, sub.description)
+            seen_summaries.add(_norm_text(sub.description))
 
         # Claims for this subtopic
         sub_claims = [
@@ -662,7 +840,7 @@ def build_structured_document_plan(
                 src_ids = ([c.primary_source_id] if c.primary_source_id else []) + c.supporting_source_ids
                 cit = _format_citation(src_ids, cit_map)
                 cit_str = f" <b><font color='#1E3A8A'>{cit}</font></b>" if cit else ""
-                bullets.append(f"<b>{c.claim_type.title()}:</b> {c.statement}{cit_str}")
+                bullets.append(f"<b>{c.claim_type.title()}:</b> {markdown_inline_to_reportlab(c.statement)}{cit_str}")
             s_sub.add_bullets(bullets)
 
         # Correlate and place matching Formulas inline
@@ -682,35 +860,29 @@ def build_structured_document_plan(
                     s_sub.add_visual(v)
                     placed_visual_ids.add(v.asset_id)
 
-        sections.append(s_sub)
+        # Omit empty subsections: a subtopic with no summary, claims,
+        # visuals or formulas contributes no section at all.
+        if s_sub.blocks:
+            sections.append(s_sub)
 
     # -----------------------------------------------------------------------
-    # Section 3: Algorithmic & Mathematical Foundations (if formulas exist)
+    # Section 3: Methods & Formal Analysis (if formulas exist)
     # -----------------------------------------------------------------------
     remaining_formulas = [f for f in pkg.formulas if f.formula_id not in placed_formula_ids]
     if remaining_formulas or (pkg.formulas and target_pages == 5):
         s3 = DocumentSection(
             section_id="sec_03",
-            title="3. Algorithmic & Mathematical Foundations",
+            title="3. Methods & Formal Analysis",
             level=1,
         )
         s3.add_text(
-            "Quantitative modeling and formal algorithmic analysis establish theoretical boundaries, "
-            "computational resource scaling, and performance guarantees for the underlying system. "
-            "The mathematical formulations below characterize critical operational functions derived "
-            "from rigorous empirical benchmarks and peer-reviewed literature."
+            "The models and equations below formalize the key relationships "
+            "discussed in this report."
         )
         formulas_to_add = remaining_formulas if remaining_formulas else pkg.formulas
         for f in formulas_to_add:
             s3.add_formula(f)
             placed_formula_ids.add(f.formula_id)
-        s3.add_text(
-            "<b>Analytical Parameter Sensitivity & Scaling Dynamics:</b> Empirical evaluation indicates "
-            "that parameter sensitivity plays a decisive role in real-world deployment viability. In high-throughput "
-            "regimes, asymptotic scaling bounds dictate memory overhead and latency profiles. Optimizing operational "
-            "efficiency requires fine-tuning hyperparameter values against workload constraints to prevent computational "
-            "degradation."
-        )
         sections.append(s3)
 
     # -----------------------------------------------------------------------
@@ -723,9 +895,8 @@ def build_structured_document_plan(
             level=1,
         )
         s4.add_text(
-            "Empirical evaluation across leading architectural implementations demonstrates significant divergences "
-            "in throughput, cost-efficiency, and operational reliability. The structured comparative ledger below "
-            "synthesizes verified quantitative metrics collected across production environments and official documentation."
+            "The tables below collect the quantitative comparisons found "
+            "in the sources, with captions and citations."
         )
         # In a strict 5-page document budget, include up to 2 comprehensive comparative tables in Section 4
         # to ensure elegant layout geometry without accidental page overflow
@@ -733,11 +904,6 @@ def build_structured_document_plan(
         for tbl in tables_to_add:
             s4.add_table(tbl)
             placed_table_ids.add(tbl.table_id)
-        s4.add_text(
-            "<b>Architectural Trade-off Synthesis:</b> Trade-off analysis reveals that optimizing for peak burst throughput "
-            "frequently incurs higher baseline standing cost, whereas architectures tuned for predictable baseline load "
-            "provide superior unit economics."
-        )
         sections.append(s4)
 
     # -----------------------------------------------------------------------
@@ -751,17 +917,15 @@ def build_structured_document_plan(
             level=1,
         )
         s5.add_text(
-            "System visual schematics illustrate the operational flow, service boundaries, and state transition pipelines "
-            "across distributed components. The harvested figures and architectural diagrams below detail end-to-end "
-            "data processing mechanics and component topologies."
+            "The figures below illustrate the key structures, flows and "
+            "relationships discussed in this report."
         )
         for v in unplaced_visuals:
             s5.add_visual(v)
             placed_visual_ids.add(v.asset_id)
         s5.add_text(
-            "<b>Structural Flow & Invariant Integrity:</b> The component interactions diagrammed above enforce modular "
-            "isolation and deterministic state propagation. By decoupling ingress ingestion from backend persistence, "
-            "the system maintains fault tolerance and prevents cascading degradation under heavy operational concurrency."
+            "Each figure is captioned with its source; full attribution "
+            "is in the provenance ledger."
         )
         sections.append(s5)
 
@@ -841,22 +1005,22 @@ def build_structured_document_plan(
         while len(major_secs) < 5:
             idx = len(major_secs) + 1
             if idx == 3:
-                s_title = "3. Algorithmic, Mathematical & System Formulations"
+                s_title = "3. Methods & Formal Analysis"
                 s_text = (
-                    "Algorithmic formulation and formal modeling define operational bounds, data structures, "
-                    "and performance characteristics. This section details algorithmic mechanics and asymptotic complexity."
+                    "The methods and formal models behind the findings in "
+                    "this report, as far as the collected evidence supports them."
                 )
             elif idx == 4:
                 s_title = "4. Comparative Evaluation, Benchmarks & Metrics"
                 s_text = (
-                    "Empirical benchmarking provides quantitative validation of architectural components. "
-                    "This section evaluates latency, throughput, resource consumption, and reliability across operating regimes."
+                    "Quantitative comparisons found in the sources, with "
+                    "their captions and citations."
                 )
             else:
-                s_title = f"{idx}. Production Considerations & Architectural Implementation"
+                s_title = f"{idx}. Implementation & Practical Considerations"
                 s_text = (
-                    "Real-world deployment mandates careful analysis of scalability bottlenecks, security boundaries, "
-                    "and operational trade-offs to ensure continuous availability and performance integrity."
+                    "Practical considerations: the scope of the evidence, "
+                    "its limits, and what would be needed to apply it."
                 )
             new_sec = DocumentSection(
                 section_id=f"sec_{idx:02d}",
@@ -869,9 +1033,8 @@ def build_structured_document_plan(
             )
             new_sec.add_text(s_text)
             new_sec.add_text(
-                "<b>Implementation Analysis & Guidelines:</b> Architectural best practices emphasize decoupling critical "
-                "subsystems, enforcing strict telemetry monitoring, and validating operational failure modes through continuous "
-                "benchmarking."
+                "No further evidence was collected for this section; it "
+                "exists only to hold the requested page budget."
             )
             sections.insert(-1, new_sec)
             major_secs.insert(-1, new_sec)

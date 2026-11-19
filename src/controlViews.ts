@@ -27,6 +27,37 @@ async function request(path: string, options?: RequestInit, timeoutMs = 15000): 
   throw lastError;
 }
 const jsonOptions = (method: string, value: unknown): RequestInit => ({ method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) });
+
+// Deduplicated /api/connectors reads: the Connectors view and the
+// Email Intelligence view both need provider status, and every
+// Control Center action re-mounts the view (rerender -> hashchange).
+// Without this, overlapping mounts fired concurrent GET
+// /api/connectors bursts — each one slow on the backend — and the
+// re-mounts stacked. Concurrent callers share one in-flight request
+// and rapid re-mounts reuse a fresh result for 10s. Mutations
+// (configure / disconnect / make-primary / migrate) invalidate the
+// cache so the next mount reads fresh state.
+let connectorsInFlight: Promise<any> | null = null;
+let connectorsCache: { at: number; data: any } | null = null;
+const CONNECTORS_CACHE_MS = 10000;
+async function getConnectors(force = false): Promise<any> {
+  const now = Date.now();
+  if (!force && connectorsCache && now - connectorsCache.at < CONNECTORS_CACHE_MS) {
+    return connectorsCache.data;
+  }
+  if (!force && connectorsInFlight) return connectorsInFlight;
+  const p = request('/api/connectors').then(data => {
+    connectorsCache = { at: Date.now(), data };
+    return data;
+  }).finally(() => {
+    if (connectorsInFlight === p) connectorsInFlight = null;
+  });
+  connectorsInFlight = p;
+  return p;
+}
+function invalidateConnectorsCache(): void {
+  connectorsCache = null;
+}
 const showError = (scope: Element, error: unknown) => {
   let note = scope.querySelector<HTMLElement>('.cc-error');
   if (!note) { note = document.createElement('p'); note.className = 'cc-error'; scope.append(note); }
@@ -60,7 +91,7 @@ export async function mountControlView(index: number, content: HTMLElement, isCu
       // While the providers fetch is in flight the view is in the
       // 'Connecting' state.
       content.innerHTML = tag('Connecting') + '<p class="cc-note">Loading your connected services…</p>';
-      const providers = await request('/api/connectors');
+      const providers = await getConnectors();
       if (!isCurrent()) return;
       // Six connection states, derived per provider from its connections:
       // Not Configured / Not Connected / Connecting (while fetching) /
@@ -248,6 +279,7 @@ export async function mountControlView(index: number, content: HTMLElement, isCu
             if (res?.authorizationUrl) {
               window.location.assign(res.authorizationUrl);
             } else {
+              invalidateConnectorsCache();
               rerender();
             }
           } else {
@@ -268,13 +300,13 @@ export async function mountControlView(index: number, content: HTMLElement, isCu
 
       content.querySelectorAll<HTMLButtonElement>('[data-disconnect-conn]').forEach(b => b.onclick = async () => {
         const [prov, connId] = (b.dataset.disconnectConn || '').split(':');
-        try { await request('/api/connectors/' + encodeURIComponent(prov || '') + '?connection_id=' + encodeURIComponent(connId || ''), { method: 'DELETE' }); rerender(); }
+        try { await request('/api/connectors/' + encodeURIComponent(prov || '') + '?connection_id=' + encodeURIComponent(connId || ''), { method: 'DELETE' }); invalidateConnectorsCache(); rerender(); }
         catch (error) { showError(b.closest('.cc-card') || content, error); }
       });
 
       content.querySelectorAll<HTMLButtonElement>('[data-make-primary]').forEach(b => b.onclick = async () => {
         const [prov, connId] = (b.dataset.makePrimary || '').split(':');
-        try { await request('/api/connectors/' + encodeURIComponent(prov || '') + '/connections/' + encodeURIComponent(connId || '') + '/primary', { method: 'POST' }); rerender(); }
+        try { await request('/api/connectors/' + encodeURIComponent(prov || '') + '/connections/' + encodeURIComponent(connId || '') + '/primary', { method: 'POST' }); invalidateConnectorsCache(); rerender(); }
         catch (error) { showError(b.closest('.cc-card') || content, error); }
       });
 
@@ -290,6 +322,7 @@ export async function mountControlView(index: number, content: HTMLElement, isCu
         try {
           if (!email) throw Error('Enter the account for the existing connection');
           await request('/api/connectors/' + encodeURIComponent(prov || '') + '/migrate', jsonOptions('POST', { accountEmail: email, confirm: true }));
+          invalidateConnectorsCache();
           rerender();
         } catch (err) { showError(b.closest('.cc-card') || content, err); b.disabled = false; }
       });
@@ -530,7 +563,7 @@ async function mountEmailIntelligence(content: HTMLElement, isCurrent: () => boo
   if (!isCurrent()) return;
 
   if (!missions || !missions.length) {
-    const connectors = await request('/api/connectors');
+    const connectors = await getConnectors();
     const connectedAcc = connectors?.find((c: any) => c.connected && c.account);
     const targetAccount = connectedAcc ? connectedAcc.account : 'demo.privagent@gmail.com';
     const targetProvider = connectedAcc ? (connectedAcc.provider === 'microsoft' ? 'outlook' : 'gmail') : 'gmail';

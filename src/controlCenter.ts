@@ -28,7 +28,33 @@ function ensureLiveNodes(): WorkspaceNodes | null {
 nav.innerHTML = `<div class="control-nav-label">WORKSPACE</div>` + views.map((v,i)=>`<button data-view="${i}" title="${v}"><span>${icons[i]}</span><b>${v}</b>${i===1?'<small>LIVE</small>':''}</button>`).join('') + '<div class="nav-foot"><span class="orbit-dot"></span>LOCAL BY DESIGN</div>';
 let generation = 0;
 let inspectorRefresh: number | undefined;
+// Coalescing render guard: hashchange fires on every Control Center
+// action (rerender() dispatches it), and a slow view mount —
+// Connectors used to take minutes — lets a second render start while
+// the first is still fetching, so the same endpoints get hit twice
+// (or more) concurrently. Only one render runs at a time; a render
+// requested while one is in flight is remembered and runs once,
+// for the latest index, when the current one finishes.
+let renderInFlight = false;
+let pendingRenderIndex: number | null = null;
 async function render(index: number) {
+ if (renderInFlight) {
+   pendingRenderIndex = index;
+   return;
+ }
+ renderInFlight = true;
+ try {
+   await renderNow(index);
+ } finally {
+   renderInFlight = false;
+   if (pendingRenderIndex !== null) {
+     const next = pendingRenderIndex;
+     pendingRenderIndex = null;
+     void render(next);
+   }
+ }
+}
+async function renderNow(index: number) {
  const version = ++generation;
  if (inspectorRefresh !== undefined) { window.clearInterval(inspectorRefresh); inspectorRefresh = undefined; }
  // Only the views that move live workspace nodes mount the template:

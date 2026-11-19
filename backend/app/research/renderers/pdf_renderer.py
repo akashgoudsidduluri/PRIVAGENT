@@ -53,6 +53,7 @@ from ..models import (
     EvidenceClassification,
     ResearchKnowledgePackage,
 )
+from ..text_utils import markdown_inline_to_reportlab
 from ..visuals.image_pipeline import ensure_local_image_asset
 from .base import BaseRenderer
 
@@ -285,6 +286,9 @@ class PdfRenderer(BaseRenderer):
 
             # 4. Render Sections and Generic Content Blocks from Document Plan
             images_emitted = 0
+            # Resolved local image paths already embedded in this
+            # document — the same image must never appear twice.
+            embedded_image_paths: set[str] = set()
             for sec_idx, sec in enumerate(doc_plan.sections):
                 if sec.page_break_before and story:
                     story.append(PageBreak())
@@ -353,14 +357,14 @@ class PdfRenderer(BaseRenderer):
                         continue
                     if block.block_type == BlockType.TEXT and block.text:
                         if block.title:
-                            story.append(Paragraph(f"<b>{block.title}</b>", h2_style))
-                        story.append(Paragraph(block.text, body_style))
+                            story.append(Paragraph(f"<b>{markdown_inline_to_reportlab(block.title)}</b>", h2_style))
+                        story.append(Paragraph(markdown_inline_to_reportlab(block.text), body_style))
 
                     elif block.block_type == BlockType.BULLET_LIST and block.items:
                         if block.title:
-                            story.append(Paragraph(f"<b>{block.title}</b>", body_style))
+                            story.append(Paragraph(f"<b>{markdown_inline_to_reportlab(block.title)}</b>", body_style))
                         for item in block.items:
-                            story.append(Paragraph(f"• {item}", bullet_style))
+                            story.append(Paragraph(f"• {markdown_inline_to_reportlab(item)}", bullet_style))
                         story.append(Spacer(1, 4))
 
                     elif block.block_type == BlockType.CALLOUT:
@@ -378,9 +382,9 @@ class PdfRenderer(BaseRenderer):
                             callout_items.append(Paragraph("<b><font color='#059669'>📌 Strategic Takeaway & Architectural Synthesis</font></b>", body_style))
 
                         if block.text:
-                            callout_items.append(Paragraph(block.text, body_style))
+                            callout_items.append(Paragraph(markdown_inline_to_reportlab(block.text), body_style))
                         for itm in block.items:
-                            callout_items.append(Paragraph(f"• {itm}", bullet_style))
+                            callout_items.append(Paragraph(f"• {markdown_inline_to_reportlab(itm)}", bullet_style))
 
                         callout_tbl = Table([[callout_items]], colWidths=[504])
                         callout_tbl.setStyle(
@@ -396,9 +400,21 @@ class PdfRenderer(BaseRenderer):
                         story.append(Spacer(1, 8))
 
                     elif block.block_type == BlockType.IMAGE and block.visual_asset:
-                        images_emitted += 1
                         v = block.visual_asset
-                        local_img_path = ensure_local_image_asset(v, cache_dir=out_file.parent / "images")
+                        # Resolve first: reject blank / icon web figures,
+                        # and skip entirely when this image was already
+                        # embedded in this document (content-hash dedup).
+                        local_img_path = ensure_local_image_asset(
+                            v,
+                            cache_dir=out_file.parent / "images",
+                            reject_blank=not v.is_generated,
+                        )
+                        if local_img_path and Path(local_img_path).exists():
+                            _resolved = str(Path(local_img_path).resolve())
+                            if _resolved in embedded_image_paths:
+                                continue
+                            embedded_image_paths.add(_resolved)
+                        images_emitted += 1
                         if local_img_path and Path(local_img_path).exists():
                             story.append(Paragraph(f"<b>{v.title}</b>", h2_style))
                             try:
