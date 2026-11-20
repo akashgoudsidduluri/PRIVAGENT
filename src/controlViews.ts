@@ -27,6 +27,33 @@ async function request(path: string, options?: RequestInit, timeoutMs = 15000): 
   throw lastError;
 }
 const jsonOptions = (method: string, value: unknown): RequestInit => ({ method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) });
+
+// Deduplicated /api/connectors reads: the Connectors view and the
+// Email Intelligence view both need provider status, and every
+// Control Center action re-mounts the view (rerender -> hashchange).
+// Without this, overlapping mounts fired concurrent GET
+// /api/connectors bursts — each one slow on the backend — and the
+// re-mounts stacked. Concurrent callers share one in-flight request
+// and rapid re-mounts reuse a fresh result for 10s; the cache expires
+// on its own after that window.
+let connectorsInFlight: Promise<any> | null = null;
+let connectorsCache: { at: number; data: any } | null = null;
+const CONNECTORS_CACHE_MS = 10000;
+async function getConnectors(force = false): Promise<any> {
+  const now = Date.now();
+  if (!force && connectorsCache && now - connectorsCache.at < CONNECTORS_CACHE_MS) {
+    return connectorsCache.data;
+  }
+  if (!force && connectorsInFlight) return connectorsInFlight;
+  const p = request('/api/connectors').then(data => {
+    connectorsCache = { at: Date.now(), data };
+    return data;
+  }).finally(() => {
+    if (connectorsInFlight === p) connectorsInFlight = null;
+  });
+  connectorsInFlight = p;
+  return p;
+}
 const showError = (scope: Element, error: unknown) => {
   let note = scope.querySelector<HTMLElement>('.cc-error');
   if (!note) { note = document.createElement('p'); note.className = 'cc-error'; scope.append(note); }
@@ -57,7 +84,10 @@ export async function mountControlView(index: number, content: HTMLElement, isCu
       await mountEmailIntelligence(content, isCurrent);
     }
     if (index === 4) {
-      const providers = await request('/api/connectors');
+      // While the providers fetch is in flight the view is in the
+      // 'Connecting' state.
+      content.innerHTML = tag('Connecting') + '<p class="cc-note">Loading your connected services…</p>';
+      const providers = await getConnectors();
       if (!isCurrent()) return;
       const names: Record<string, string> = {
         google: 'Google · Gmail / Calendar / Drive',
@@ -388,7 +418,7 @@ async function mountEmailIntelligence(content: HTMLElement, isCurrent: () => boo
   if (!isCurrent()) return;
 
   if (!missions || !missions.length) {
-    const connectors = await request('/api/connectors');
+    const connectors = await getConnectors();
     const connectedAcc = connectors?.find((c: any) => c.connected && c.account);
     const targetAccount = connectedAcc ? connectedAcc.account : 'demo.privagent@gmail.com';
     const targetProvider = connectedAcc ? (connectedAcc.provider === 'microsoft' ? 'outlook' : 'gmail') : 'gmail';

@@ -260,6 +260,9 @@ class DocxRenderer(BaseRenderer):
         # -------------------------------------------------------------------
         # Render Sections from Structured Document Plan
         # -------------------------------------------------------------------
+        # Resolved local image paths already embedded in this document —
+        # the same image (deduped by content hash) must never appear twice.
+        embedded_image_paths: set[str] = set()
         for sec in doc_plan.sections:
             if sec.page_break_before:
                 doc.add_page_break()
@@ -332,6 +335,20 @@ class DocxRenderer(BaseRenderer):
                 elif block.block_type == BlockType.IMAGE:
                     vis = block.visual_asset
                     if vis:
+                        # Resolve the image first: reject blank / icon web
+                        # figures, and skip entirely when this image was
+                        # already embedded (content-hash dedup).
+                        local_path = ensure_local_image_asset(
+                            vis,
+                            cache_dir=out_file.parent / "images",
+                            reject_blank=not vis.is_generated,
+                        )
+                        if local_path and Path(local_path).exists():
+                            _resolved = str(Path(local_path).resolve())
+                            if _resolved in embedded_image_paths:
+                                continue
+                            embedded_image_paths.add(_resolved)
+
                         p_fig_head = doc.add_paragraph()
                         p_fig_head.paragraph_format.space_before = Pt(6)
                         p_fig_head.paragraph_format.space_after = Pt(2)
@@ -341,7 +358,6 @@ class DocxRenderer(BaseRenderer):
                         r_fig.font.color.rgb = SLATE
 
                         # Embed image: check local or safely fetch remote URL
-                        local_path = ensure_local_image_asset(vis, cache_dir=out_file.parent / "images")
                         has_img = False
                         if local_path and Path(local_path).exists():
                             try:

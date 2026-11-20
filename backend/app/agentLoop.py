@@ -3323,10 +3323,15 @@ async def run_task(task_id: str) -> None:
                 get_active_email_mission,
             )
             from .email_intelligence.companion_queries import is_email_companion_query
+            from .connector_router import (
+                connector_status_reply,
+                is_connector_status_query,
+            )
             from .connectors.calendar_companion import (
                 is_calendar_query,
                 handle_calendar_instruction,
                 handle_compound_calendar,
+                merge_calendar_followup,
             )
 
             from .continuous_monitoring_companion import (
@@ -3374,8 +3379,25 @@ async def run_task(task_id: str) -> None:
                     cal_section = await handle_compound_calendar(record.instruction, chat_id=chat_id)
                     if cal_section:
                         answer = f"{answer}\n\n---\n\n{cal_section}"
+            elif (_status_connector := is_connector_status_query(
+                record.instruction,
+                history=initial_memory.get("conversation_history", []),
+            )):
+                # "check if calendar connected" / "is it connected"
+                # after a calendar turn: answer from the verified
+                # oauth status, never from the LLM (it invents states).
+                answer = connector_status_reply(_status_connector)
             elif is_calendar_query(record.instruction):
-                answer = await handle_calendar_instruction(record.instruction, chat_id=chat_id)
+                # Multi-turn follow-up: "create it" / "go ahead" /
+                # "create a google calendar event as said on 21th"
+                # carry no details of their own — merge the recent
+                # calendar discussion in before dispatch, so the
+                # handler sees the title and time.
+                _cal_instruction = merge_calendar_followup(
+                    record.instruction,
+                    initial_memory.get("conversation_history", []),
+                )
+                answer = await handle_calendar_instruction(_cal_instruction, chat_id=chat_id)
             elif is_continuous_monitoring_directive(
                 record.instruction,
                 history=initial_memory.get("conversation_history", []),
@@ -3411,7 +3433,21 @@ async def run_task(task_id: str) -> None:
                 # preferences) to the system prompt; the model is told
                 # to say it does not remember when the fact is absent,
                 # never to invent one.
-                sys_prompt = None
+                from .capabilities import SYSTEM_CAPABILITY_PROMPT
+
+                # Live date/time: the model must know today's real date
+                # when it interprets relative dates ("tomorrow", "on
+                # 21st", "next Monday") instead of guessing from its
+                # training data.
+                import datetime as _datetime_mod
+
+                _now_live = _datetime_mod.datetime.now().astimezone()
+                _date_line = (
+                    f"Today's live date and time is {_now_live.strftime('%A, %B %d, %Y at %I:%M %p %Z')} "
+                    f"({_now_live.isoformat()}). Use this as today's real date when interpreting "
+                    "relative dates like 'tomorrow', 'on 21st' or 'next Monday' — never guess the date."
+                )
+                sys_prompt = SYSTEM_CAPABILITY_PROMPT + "\n\n" + _date_line
                 mem_lines: list[str] = []
                 prefs = initial_memory.get("user_preferences") or {}
                 if prefs:
@@ -3424,10 +3460,8 @@ async def run_task(task_id: str) -> None:
                             f"- {f.get('category', '')}: {f.get('key', '')} = {f.get('value', '')}"
                         )
                 if mem_lines:
-                    from .capabilities import SYSTEM_CAPABILITY_PROMPT
-
                     sys_prompt = (
-                        SYSTEM_CAPABILITY_PROMPT
+                        sys_prompt
                         + "\n\n<remembered-facts (operator-stated, trusted)>\n"
                         + "\n".join(mem_lines)
                         + "\nAnswer recall questions from these facts. If the fact is not listed, say you do not remember it — do not invent one.\n</remembered-facts>"
@@ -3457,6 +3491,15 @@ async def run_task(task_id: str) -> None:
                             f"({', '.join(_stripped_tools)}) that isn't available, "
                             "so no file was created from it."
                         )
+                # If stripping left nothing (the reply WAS a tool call),
+                # say so honestly instead of completing with an empty
+                # or whitespace-only message.
+                if not (answer or "").strip():
+                    answer = (
+                        "I tried to answer, but the reply only contained a tool call "
+                        "I can't run, so I don't have a plain answer for that yet. "
+                        "Could you rephrase it, or say what you'd like me to do?"
+                    )
                 # Fix 5: a conversational product suggestion states
                 # prices no browsing ever verified (live case: the
                 # fitness-band suggestion answered from LLM knowledge

@@ -28,6 +28,7 @@ from .models import (
     SourceReference,
     VisualAsset,
 )
+from .text_utils import smart_title_case
 
 
 class PageConstraintType(str, Enum):
@@ -669,7 +670,7 @@ def decompose_subtopics(
         ))
         subtopics.append(SubtopicPlan(
             subtopic_id="sub_02",
-            title="Core Technical Mechanics & Methodologies",
+            title="Core Analysis & Methods",
             search_query=f"{topic} technical mechanics implementation methods",
             priority=1,
             min_evidence_needed=1,
@@ -826,7 +827,7 @@ def create_section_allocations(
     allocations = []
     allocations.append(SectionAllocation(
         section_id="sec_01",
-        title="1. Executive Summary & Core Architectural Mechanics",
+        title="1. Executive Summary & Key Findings",
         page_budget=1.0,
         word_budget=350,
         subtopic_ids=[s.subtopic_id for s in subtopics[:1]],
@@ -834,7 +835,7 @@ def create_section_allocations(
     if visual_plan.need_formulas:
         allocations.append(SectionAllocation(
             section_id="sec_02",
-            title="2. Algorithmic & Mathematical Formulations",
+            title="2. Methods & Formal Analysis",
             page_budget=1.0,
             word_budget=400,
             subtopic_ids=[s.subtopic_id for s in subtopics[1:2]],
@@ -885,7 +886,7 @@ def generate_adaptive_research_plan(
     if len(topic_title) > 80:
         clean_title = re.sub(r"^(?:research|generate|create|build|write|investigate)\s+", "", topic_title, flags=re.IGNORECASE).strip()
         first_clause = clean_title.split(",")[0].split(".")[0].strip()
-        topic_title = first_clause.title() if len(first_clause) < 60 else first_clause[:60].title()
+        topic_title = smart_title_case(first_clause) if len(first_clause) < 60 else smart_title_case(first_clause[:60])
 
     deliverable_type = ctx.get("deliverable_type")
     format_hint = ctx.get("requested_format")

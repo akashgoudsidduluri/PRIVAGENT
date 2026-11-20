@@ -26,6 +26,105 @@ MAGIC_SIGNATURES = {
 }
 
 
+def image_content_stats(raw_bytes: bytes) -> Optional[dict[str, Any]]:
+    """Pixel-variance statistics for blank / solid-colour detection.
+
+    Downsamples to 32x32 greyscale and returns the standard deviation
+    and distinct-colour count. Returns None when the bytes cannot be
+    decoded as an image (callers must not reject on that basis).
+    """
+    try:
+        with Image.open(io.BytesIO(raw_bytes)) as img:
+            grey = img.convert("L")
+            small = grey.resize((32, 32))
+            pixels = list(small.get_flattened_data())
+        n = len(pixels)
+        mean = sum(pixels) / n
+        var = sum((p - mean) ** 2 for p in pixels) / n
+        return {
+            "stddev": var ** 0.5,
+            "distinct_colors": len(set(pixels)),
+            "mean": mean,
+        }
+    except Exception:
+        return None
+
+
+def is_blank_or_solid_image(
+    raw_bytes: bytes,
+    max_stddev: float = 3.0,
+    max_distinct_colors: int = 2,
+) -> bool:
+    """True for solid-colour / blank images (near-zero pixel variance
+    or at most two distinct colours in the downsampled image).
+
+    Deliberately NOT wired into :func:`validate_image_bytes`: the
+    generic validator must keep accepting solid test fixtures and
+    generated diagrams. Report embedding calls this explicitly for
+    harvested web figures, via ``ensure_local_image_asset(...,
+    reject_blank=True)``.
+    """
+    stats = image_content_stats(raw_bytes)
+    if stats is None:
+        return False
+    return stats["stddev"] <= max_stddev or stats["distinct_colors"] <= max_distinct_colors
+
+
+def content_sha256(raw_bytes: bytes) -> str:
+    """SHA-256 hex digest of the exact image bytes."""
+    return hashlib.sha256(raw_bytes).hexdigest()
+
+
+def average_hash(raw_bytes: bytes) -> Optional[int]:
+    """64-bit perceptual (average) hash of the image.
+
+    8x8 greyscale downsample; each bit is 1 when the pixel is at or
+    above the mean. Near-identical images (re-encodes, resizes) hash
+    to values a few bits apart; identical bytes hash identically.
+    Returns None when the bytes cannot be decoded.
+    """
+    try:
+        with Image.open(io.BytesIO(raw_bytes)) as img:
+            grey = img.convert("L")
+            small = grey.resize((8, 8))
+            pixels = list(small.get_flattened_data())
+        mean = sum(pixels) / len(pixels)
+        bits = 0
+        for p in pixels:
+            bits = (bits << 1) | (1 if p >= mean else 0)
+        return bits
+    except Exception:
+        return None
+
+
+def hamming_distance(hash_a: Optional[int], hash_b: Optional[int]) -> Optional[int]:
+    """Bit distance between two perceptual hashes (None if either is None)."""
+    if hash_a is None or hash_b is None:
+        return None
+    return bin(hash_a ^ hash_b).count("1")
+
+
+def _find_duplicate_cached_image(cache_dir: Path, sha256_hex: str, exclude: Path) -> Optional[Path]:
+    """Find another cached file in ``cache_dir`` with identical bytes.
+
+    Same image, different URL (CDN variants, resized copies) must be
+    cached — and embedded — once. Only exact SHA-256 matches count
+    here; near-duplicates are handled by :func:`average_hash`.
+    """
+    try:
+        for candidate in cache_dir.glob("*.png"):
+            if candidate.resolve() == exclude.resolve():
+                continue
+            try:
+                if hashlib.sha256(candidate.read_bytes()).hexdigest() == sha256_hex:
+                    return candidate
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
 def validate_image_bytes(raw_bytes: bytes, max_size_mb: float = 15.0) -> tuple[bool, Optional[str], Optional[dict[str, Any]]]:
     """Validate image bytes for authentic format, reasonable dimensions, and absence of corruption."""
     if not raw_bytes:
@@ -218,6 +317,8 @@ def ensure_local_image_asset(
     visual: Any,
     cache_dir: Optional[Path | str] = None,
     timeout: float = 6.0,
+    reject_blank: bool = False,
+    min_report_dimension: int = 100,
 ) -> Optional[str]:
     """Ensure that a VisualAsset has a valid, validated local disk file path.
 
@@ -230,6 +331,17 @@ def ensure_local_image_asset(
       caches it to disk, updates visual.url_or_path with the local path, and returns it.
 
     If validation or download fails, returns None.
+
+    ``reject_blank`` (for harvested web figures in reports): after a
+    remote download, rejects solid-colour / blank images (near-zero
+    pixel variance) and images smaller than ``min_report_dimension``
+    on either side — small icons and UI placeholders must never be
+    embedded. Local files are never rejected this way (generated
+    diagrams and existing fixtures stay valid).
+
+    Content-hash deduplication: a freshly downloaded image whose exact
+    bytes are already cached under another URL resolves to the existing
+    cached file instead, so the same image is never embedded twice.
     """
     if not visual:
         return None
@@ -276,6 +388,44 @@ def ensure_local_image_asset(
         timeout=timeout,
     )
     if ok and cached_path.exists() and cached_path.stat().st_size > 0:
+        # Report-figure quality gate (remote web images only): reject
+        # blank / solid-colour images and tiny icons.
+        if reject_blank:
+            try:
+                raw = cached_path.read_bytes()
+            except Exception:
+                raw = b""
+            too_small = bool(meta) and (
+                (meta.get("width") or 0) < min_report_dimension
+                or (meta.get("height") or 0) < min_report_dimension
+            )
+            if too_small or (raw and is_blank_or_solid_image(raw)):
+                try:
+                    cached_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return None
+        # Content-hash dedup (always on for remote downloads): the same
+        # image under another URL reuses the existing cache file instead
+        # of being cached — and embedded — twice.
+        try:
+            raw = cached_path.read_bytes()
+        except Exception:
+            raw = b""
+        if raw:
+            duplicate = _find_duplicate_cached_image(
+                target_dir, content_sha256(raw), cached_path
+            )
+            if duplicate is not None:
+                try:
+                    cached_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                visual.url_or_path = str(duplicate)
+                if meta and hasattr(visual, "metadata") and isinstance(visual.metadata, dict):
+                    visual.metadata["local_cached_path"] = str(duplicate)
+                    visual.metadata["deduplicated_to"] = str(duplicate)
+                return str(duplicate)
         visual.url_or_path = str(cached_path)
         if meta and hasattr(visual, "metadata") and isinstance(visual.metadata, dict):
             visual.metadata["local_cached_path"] = str(cached_path)
