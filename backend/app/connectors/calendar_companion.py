@@ -8,20 +8,9 @@ from typing import Any, Optional
 from app.connectors.oauth import oauth_manager
 
 
-def _normalise_calendar_text(text: str) -> str:
-    """Lowercased instruction with common spelling variants folded so
-    the detectors below see one spelling: "calender" -> "calendar",
-    "remainder" -> "reminder" (the user's spelling for a reminder
-    event)."""
-    t = (text or "").lower()
-    t = re.sub(r"\bcalender\b", "calendar", t)
-    t = re.sub(r"\bremainder(s)?\b", r"reminder\1", t)
-    return t
-
-
 def is_calendar_query(text: str) -> bool:
     """Return True if the instruction is asking to inspect or manage the user's calendar."""
-    t = _normalise_calendar_text(text)
+    t = (text or "").lower()
     patterns = [
         r"\b(?:check|show|view|list|get|what\s+is\s+on|what'?s\s+on)\s+(?:my\s+)?(?:calendar|schedule|agenda|meetings?|events?)\b",
         r"\b(?:do\s+i\s+have|are\s+there)\s+any\s+(?:meetings?|events?|appointments?|calls?)\b",
@@ -33,38 +22,8 @@ def is_calendar_query(text: str) -> bool:
         # keeps a bare "add to my calendar" (a question, no object) out.
         r"\b(?:add|put)\s+\S+[^.]{0,50}?\b(?:to|on|onto)\s+(?:my\s+)?calendar\b",
         r"\bgoogle\s+calendar\b",
-        # Keep / name events: "keep events for OA1 and OA2", "name the
-        # events as OA reminder 1 and 2".
-        r"\bkeep\s+(?:an?\s+)?events?\b",
-        r"\bname\s+(?:the\s+)?events?\s+as\b",
-        r"\bnamed\s+[a-z0-9][a-z0-9 _-]*(?:,\s*[a-z0-9][a-z0-9 _-]*)+\b",
-        # Date-bound reminders: "remind me on 21st nov at 5:30 pm",
-        # "remind me at 5 30 pm on 21st nov 2026". A bare "remind me
-        # to ..." (no date/time) is not a calendar event.
-        r"\bremind(?:er|ers)?\s+me\s+(?:on|at)\b",
-        r"\bremind(?:er|ers)?\s+me\b.{0,80}?\b(?:on|at)\s+\d",
-        r"\bremind(?:er|ers)?\s+me\b.{0,80}?\b(?:tomorrow|today|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
     ]
     return any(re.search(p, t) for p in patterns)
-
-
-def _is_create_intent(text: str) -> bool:
-    """True when the instruction asks to CREATE (not list) an event.
-
-    Used by the handler so an explicit create that fails to parse
-    asks a clarification question instead of silently falling back
-    to a listing ("No upcoming events found")."""
-    t = _normalise_calendar_text(text)
-    return bool(
-        re.search(
-            r"\b(?:schedule|create|add|book)\s+(?:an?\s+)?(?:google\s+)?(?:calendar\s+)?(?:\w+\s+)?(?:event|meeting|invite|appointment|call)\b"
-            r"|\bkeep\s+(?:an?\s+)?events?\b"
-            r"|\bremind(?:er|ers)?\s+me\s+(?:on|at)\b"
-            r"|\bremind(?:er|ers)?\s+me\b.{0,80}?\b(?:on|at)\s+\d"
-            r"|\bname\s+(?:the\s+)?events?\s+as\b",
-            t,
-        )
-    )
 
 
 _CREATE_RE = re.compile(
@@ -90,33 +49,16 @@ _MONTHS = {
     "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
 }
 _MONTH_NAMES = "|".join(sorted(_MONTHS, key=len, reverse=True))
-# "5 30 pm": a space-separated clock time (no colon). Matched before
-# the general time pattern, which would otherwise read "5" as 5:00.
-_SPACE_TIME_RE = re.compile(r"\b(\d{1,2})\s+(\d{2})\s*(am|pm)\b", re.IGNORECASE)
 _TIME_RE = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", re.IGNORECASE)
 _ISO_DATE_RE = re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b")
-# Ordinal suffix ("21st nov 2026"): without it the day number never
-# matches and the date silently fell back to tomorrow.
-_DMY_DATE_RE = re.compile(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({_MONTH_NAMES})\b(?:\s+(\d{{4}}))?", re.IGNORECASE)
+_DMY_DATE_RE = re.compile(rf"\b(\d{{1,2}})\s+({_MONTH_NAMES})\b(?:\s+(\d{{4}}))?", re.IGNORECASE)
 _MDY_DATE_RE = re.compile(rf"\b({_MONTH_NAMES})\s+(\d{{1,2}})(?:st|nd|rd|th)?\b(?:\s*,?\s*(\d{{4}}))?", re.IGNORECASE)
-
-
-def _live_now() -> datetime.datetime:
-    """Current live date/time, timezone-aware in the machine's local
-    zone. Relative days ("tomorrow", "on 21st") resolve against this,
-    so the assistant knows today's real date instead of a stale or
-    UTC-only "now"."""
-    return datetime.datetime.now().astimezone()
 
 
 def _parse_time_of_day(text: str) -> tuple[int, int] | None:
     """Parse the first clock time in the text ("10:00 AM", "10am",
-    "14:00", "at 10", "5 30 pm"). A time with minutes or an am/pm
-    marker wins over a bare number, so "for 2 people at 10am" reads
-    10am, not 2."""
-    m = _SPACE_TIME_RE.search(text or "")
-    if m:
-        return _normalise_hour(int(m.group(1)), int(m.group(2)), m.group(3))
+    "14:00", "at 10"). A time with minutes or an am/pm marker wins
+    over a bare number, so "for 2 people at 10am" reads 10am, not 2."""
     matches = list(_TIME_RE.finditer(text))
     for m in matches:
         hour, minute, marker = int(m.group(1)), m.group(2), m.group(3)
@@ -126,35 +68,6 @@ def _parse_time_of_day(text: str) -> tuple[int, int] | None:
         hour, minute, marker = int(m.group(1)), m.group(2), m.group(3)
         return _normalise_hour(hour, int(minute) if minute else 0, marker)
     return None
-
-
-def _extract_all_times(text: str) -> list[tuple[int, int]]:
-    """Every clock time in the text, in order, deduplicated.
-
-    Space-separated times ("5 30 pm") are consumed first so their
-    digits are not also read as bare hours ("5", "30")."""
-    found: list[tuple[int, int]] = []
-    consumed: list[tuple[int, int]] = []
-    for m in _SPACE_TIME_RE.finditer(text or ""):
-        t = _normalise_hour(int(m.group(1)), int(m.group(2)), m.group(3))
-        if t is not None:
-            found.append(t)
-            consumed.append((m.start(), m.end()))
-    for m in _TIME_RE.finditer(text or ""):
-        if any(s <= m.start() < e for s, e in consumed):
-            continue
-        hour, minute, marker = int(m.group(1)), m.group(2), m.group(3)
-        if minute is None and not marker:
-            continue
-        t = _normalise_hour(hour, int(minute) if minute else 0, marker)
-        if t is not None:
-            found.append(t)
-    # Drop exact duplicates ("5:30 pm ... 5:30 pm" names one time).
-    deduped: list[tuple[int, int]] = []
-    for t in found:
-        if t not in deduped:
-            deduped.append(t)
-    return deduped
 
 
 def _normalise_hour(hour: int, minute: int, marker: str | None) -> tuple[int, int] | None:
@@ -414,7 +327,7 @@ def parse_calendar_create(instruction: str, account_email: str | None = None) ->
                 a for a in re.findall(r"[\w\.-]+@[\w\.-]+\.\w+", instruction or "")
                 if a != account_email
             ]
-            now = _live_now()
+            now = datetime.datetime.now(datetime.timezone.utc)
             start_dt, end_dt = _interpret_time_text(time_text, now)
             return {
                 "title": title,
@@ -442,7 +355,7 @@ def parse_calendar_create(instruction: str, account_email: str | None = None) ->
         a for a in re.findall(r"[\w\.-]+@[\w\.-]+\.\w+", instruction or "")
         if a != account_email
     ]
-    now = _live_now()
+    now = datetime.datetime.now(datetime.timezone.utc)
     start_dt, end_dt = _interpret_time_text(time_text, now)
     return {
         "title": title,
@@ -452,238 +365,6 @@ def parse_calendar_create(instruction: str, account_email: str | None = None) ->
         "start": start_dt,
         "end": end_dt,
     }
-
-
-# ---------------------------------------------------------------------------
-# Multiple events from one instruction
-# ---------------------------------------------------------------------------
-
-_NAMED_EVENTS_RE = re.compile(
-    r"\bname\s+(?:the\s+)?events?\s+as\s+(?P<names>.+?)\s*$"
-    r"|\bnamed\s+(?P<named>.+?)\s*$",
-    re.IGNORECASE,
-)
-_HOURLY_BLOCK_RE = re.compile(
-    r"\bfrom\s+(?P<start>.+?)\s+to\s+(?P<end>.+?)\s+every\s+(?P<n>\d+)\s*(?P<unit>hours?|hrs?|minutes?|mins?)\b",
-    re.IGNORECASE,
-)
-_MAX_MULTI_EVENTS = 12
-
-
-def _expand_numbered_names(segments: list[str]) -> list[str]:
-    """Expand bare-number segments: "OA remainder 1 and 2" names the
-    events "OA remainder 1" and "OA remainder 2", not "OA remainder 1"
-    and "2"."""
-    out: list[str] = []
-    for seg in segments:
-        seg = seg.strip().strip(" .,;:!?\"'").strip()
-        if not seg:
-            continue
-        if re.fullmatch(r"(?:no\.?\s*)?\d+", seg, re.IGNORECASE) and out:
-            base = re.sub(r"\s*\d+\s*$", "", out[-1]).strip()
-            num = re.search(r"(\d+)", seg).group(1)
-            out.append(f"{base} {num}" if base else seg)
-        else:
-            out.append(seg)
-    return out
-
-
-def _extract_named_events(text: str) -> list[str] | None:
-    """Event names from "name the events as OA remainder 1 and 2" /
-    "named OA1, OA2, OA3", or None when the instruction names none."""
-    m = _NAMED_EVENTS_RE.search(text or "")
-    if not m:
-        return None
-    raw = m.group("names") or m.group("named") or ""
-    # Stop at a sentence boundary or a trailing time/date clause that
-    # belongs to the schedule, not the name ("named OA1 at 5pm").
-    raw = re.split(r"\s+(?:at|on|for)\s+(?=\d)", raw)[0]
-    segments = re.split(r"\s*,\s*|\s+and\s+", raw)
-    names = _expand_numbered_names(segments)
-    return names or None
-
-
-def _extract_day(text: str, now: datetime.datetime) -> datetime.date | None:
-    """The calendar day named in the text (explicit date, today /
-    tomorrow / weekday), or None. Mirrors the day half of
-    _interpret_time_text without the clock."""
-    norm = _normalise_calendar_text(text)
-    for rex, groups in ((_ISO_DATE_RE, (1, 2, 3)), (_DMY_DATE_RE, (3, 2, 1)), (_MDY_DATE_RE, (3, 1, 2))):
-        m = rex.search(norm)
-        if not m:
-            continue
-        try:
-            if rex is _ISO_DATE_RE:
-                return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-            year = int(m.group(groups[0])) if m.group(groups[0]) else now.year
-            return datetime.date(year, _MONTHS[m.group(groups[1]).lower()], int(m.group(groups[2])))
-        except (ValueError, KeyError, IndexError):
-            continue
-    low = norm.lower()
-    if re.search(r"\btomorrow\b", low):
-        return (now + datetime.timedelta(days=1)).date()
-    if re.search(r"\btoday\b", low):
-        return now.date()
-    m = re.search(r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", low)
-    if m:
-        target = _WEEKDAYS[m.group(1)]
-        days_ahead = (target - now.weekday()) % 7
-        return (now.date() + datetime.timedelta(days=days_ahead))
-    return None
-
-
-def parse_calendar_creates(instruction: str, account_email: str | None = None) -> list[dict[str, Any]] | None:
-    """Parse a multi-event instruction into a list of event dicts
-    (same shape as parse_calendar_create), or None.
-
-    Shapes:
-    * "remind me at 5 30 pm and 6 10 pm on 21st nov 2026. name the
-      events as OA remainder 1 and 2" -> two events, paired in order.
-    * "from 9 am to 6 pm every 1 hour named OA1, OA2, ..." -> hourly
-      slots, capped at 12 events, names continued past the list.
-    * "remind me at 5 30 pm on 21st nov 2026, name the event as OA
-      remainder 1" -> one event (the reminder phrasing has no create
-      verb, so the single-event parser cannot see it).
-    Returns None when the instruction is not a multi-event shape
-    (single creates, reads, and unparseable text fall through to the
-    single parser / clarification path).
-    """
-    text = instruction or ""
-    # Strip the reminder clause up front (same as the single parser):
-    # "with a reminder 3 days before" must not pollute the names or
-    # the time extraction below.
-    text, reminder_minutes = _extract_reminder(text)
-    norm = _normalise_calendar_text(text)
-    now = _live_now()
-    tz = _IST
-    if re.search(r"\butc\b|\bgmt\b", norm):
-        tz = datetime.timezone.utc
-    now_tz = now.astimezone(tz)
-    attendees = [
-        a for a in re.findall(r"[\w\.-]+@[\w\.-]+\.\w+", text)
-        if a != account_email
-    ]
-    day = _extract_day(norm, now_tz) or (now_tz + datetime.timedelta(days=1)).date()
-
-    def _event(title: str, hour: int, minute: int) -> dict[str, Any]:
-        start_dt = datetime.datetime.combine(day, datetime.time(hour, minute), tzinfo=tz)
-        return {
-            "title": title,
-            "time_text": start_dt.strftime("%d %b %Y %I:%M %p"),
-            "attendees": attendees,
-            "reminder_minutes": reminder_minutes,
-            "start": start_dt,
-            "end": start_dt + datetime.timedelta(hours=1),
-        }
-
-    # Hourly block first: it carries its own times.
-    block = _HOURLY_BLOCK_RE.search(norm)
-    if block:
-        start_t = _parse_time_of_day(block.group("start"))
-        end_t = _parse_time_of_day(block.group("end"))
-        if start_t is not None and end_t is not None:
-            step_min = int(block.group("n")) * (60 if block.group("unit").lower().startswith(("hour", "hr")) else 1)
-            if step_min <= 0:
-                step_min = 60
-            names = _extract_named_events(text) or []
-            slots: list[dict[str, Any]] = []
-            cur_min = start_t[0] * 60 + start_t[1]
-            end_min = end_t[0] * 60 + end_t[1]
-            if end_min <= cur_min:
-                end_min += 24 * 60
-            idx = 0
-            while cur_min <= end_min and len(slots) < _MAX_MULTI_EVENTS:
-                if idx < len(names):
-                    title = names[idx]
-                elif names and re.search(r"\d+\s*$", names[-1]):
-                    base = re.sub(r"\s*\d+\s*$", "", names[-1]).strip()
-                    last_num = int(re.search(r"(\d+)\s*$", names[-1]).group(1))
-                    title = f"{base} {last_num + (idx - len(names)) + 1}" if base else f"Event {idx + 1}"
-                elif names:
-                    title = f"{names[-1]} {idx + 1}"
-                else:
-                    title = f"Event {idx + 1}"
-                slots.append(_event(title, cur_min // 60 % 24, cur_min % 60))
-                cur_min += step_min
-                idx += 1
-            if slots:
-                return slots
-
-    # Named events paired with times, in order.
-    names = _extract_named_events(text)
-    times = _extract_all_times(norm)
-    if names and times:
-        pairs = list(zip(names, times))
-        # Every named event needs its own time; a shortfall means the
-        # instruction is ambiguous — let the clarification path ask.
-        if len(pairs) >= 1 and len(names) == len(times):
-            return [_event(title, h, m) for title, (h, m) in pairs]
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Multi-turn follow-ups
-# ---------------------------------------------------------------------------
-
-_CONFIRM_RE = re.compile(
-    r"^\s*(?:create\s+it|you\s+create\s+it|create(?:\s*,?\s*(?:it'?s|its)\s+perfect)?"
-    r"|go\s+ahead|yes|yeah|yep|do\s+it|confirm|ok(?:ay)?|sounds\s+good|please\s+create\s+it)\s*[.!]?\s*$",
-    re.IGNORECASE,
-)
-_PARTIAL_REF_RE = re.compile(
-    r"\b(?:as\s+said|as\s+discussed|as\s+mentioned|as\s+we\s+discussed|as\s+before|as\s+per\s+the\s+(?:chat|discussion))\b",
-    re.IGNORECASE,
-)
-
-
-def merge_calendar_followup(instruction: str, history: list[dict[str, Any]] | None) -> str:
-    """Merge a bare calendar follow-up with the recent conversation.
-
-    "create it" / "go ahead" / "create a google calendar event as
-    said on 21th" carry no title or time of their own — the details
-    live in the previous turns. When the current instruction is such
-    a confirmation or partial reference AND the recent history holds
-    a calendar event/reminder discussion, the merged instruction is
-    the most recent calendar user turn (plus any genuinely new
-    time/date fragment from the current turn). A self-contained
-    instruction is returned unchanged: history must never pollute a
-    create that already parses.
-    """
-    text = (instruction or "").strip()
-    if not text or not history:
-        return text
-    # Self-contained already: do not merge.
-    if parse_calendar_create(text) is not None or parse_calendar_creates(text):
-        return text
-    low = text.lower()
-    is_confirm = bool(_CONFIRM_RE.match(low))
-    is_partial = bool(_PARTIAL_REF_RE.search(low)) or bool(
-        re.search(r"\b(?:create|add|schedule|book)\b", low)
-        and re.search(r"\b(?:said|discussed|mentioned|before|earlier)\b", low)
-    )
-    if not (is_confirm or is_partial):
-        return text
-    for turn in reversed(history):
-        content = (turn or {}).get("content") or ""
-        if (turn or {}).get("role") != "user" or not content.strip():
-            continue
-        if not (is_calendar_query(content) or "reminder" in _normalise_calendar_text(content)):
-            continue
-        # New time/date fragments in the current turn that the prior
-        # turn lacks (e.g. "on 21th" when the prior turn said "21st
-        # nov") are appended; the confirmation words are dropped.
-        extra = ""
-        for m in list(_TIME_RE.finditer(text)) + list(_SPACE_TIME_RE.finditer(text)):
-            frag = m.group(0)
-            if frag not in content and frag not in extra:
-                extra += f" {frag}"
-        for rex in (_ISO_DATE_RE, _DMY_DATE_RE, _MDY_DATE_RE):
-            m = rex.search(text)
-            if m and m.group(0) not in content:
-                extra += f" {m.group(0)}"
-        merged = content.strip() + extra
-        return merged.strip()
-    return text
 
 
 async def handle_calendar_instruction(instruction: str, chat_id: Optional[str] = None) -> str:
@@ -706,112 +387,52 @@ async def handle_calendar_instruction(instruction: str, chat_id: Optional[str] =
     account_email = google_status["account"]
     connector = oauth_manager.connector("google_calendar")
 
-    def _reminder_line(minutes: int | None) -> str:
-        if minutes is None:
-            return ""
-        if minutes % 1440 == 0:
-            return f"\n• **Reminder:** {minutes // 1440} day{'s' if minutes // 1440 != 1 else ''} before (popup)"
-        if minutes % 60 == 0:
-            return f"\n• **Reminder:** {minutes // 60} hour{'s' if minutes // 60 != 1 else ''} before (popup)"
-        return f"\n• **Reminder:** {minutes} minute{'s' if minutes != 1 else ''} before (popup)"
-
-    def _create_one(parsed: dict[str, Any]) -> str:
-        """Create one parsed event; returns its summary line."""
+    # 2. Check for Event Creation
+    parsed = parse_calendar_create(instruction, account_email)
+    if parsed is not None:
         title = parsed["title"]
         start_dt = parsed["start"]
         end_dt = parsed["end"]
         attendees = parsed["attendees"]
         reminder_minutes = parsed.get("reminder_minutes")
-        reminders = None
-        if reminder_minutes is not None:
-            # Google Calendar reminders.overrides: popup N minutes
-            # before the event (create_invite translates the list
-            # into {useDefault: false, overrides: [...]}).
-            reminders = [{"method": "popup", "minutes": reminder_minutes}]
-        invite = connector.create_invite(
-            calendar_id="primary",
-            title=title or "New Meeting",
-            start=start_dt.isoformat(),
-            end=end_dt.isoformat(),
-            attendees=attendees,
-            reminders=reminders,
-        )
-        html_link = invite.get("htmlLink", "")
-        link_md = f" — [Open in Google Calendar]({html_link})" if html_link else ""
-        att_text = f" — Attendees: {', '.join(attendees)}" if attendees else ""
-        return (
-            f"• **{title}** — {start_dt.strftime('%A, %B %d, %Y at %I:%M %p %Z')}"
-            f"{_reminder_line(reminder_minutes)}{att_text}{link_md}"
-        )
 
-    # 2. Multiple events from one instruction ("name the events as OA
-    # remainder 1 and 2", hourly blocks). Tried first: the single
-    # parser cannot see reminder phrasing at all.
-    multi = parse_calendar_creates(instruction, account_email)
-    if multi:
-        created_lines: list[str] = []
         try:
-            for parsed in multi:
-                created_lines.append(_create_one(parsed))
-        except Exception as exc:
-            done = ""
-            if created_lines:
-                done = (
-                    f"\n\nCreated {len(created_lines)} before the failure:\n"
-                    + "\n".join(created_lines)
-                )
-            return (
-                "### ⚠️ Failed to Create Calendar Event\n\n"
-                f"An error occurred while contacting the Google Calendar API: `{exc}`{done}"
+            reminders = None
+            if reminder_minutes is not None:
+                reminders = [{"method": "popup", "minutes": reminder_minutes}]
+            invite = connector.create_invite(
+                calendar_id="primary",
+                title=title or "New Meeting",
+                start=start_dt.isoformat(),
+                end=end_dt.isoformat(),
+                attendees=attendees,
+                reminders=reminders,
             )
-        return (
-            f"### ✓ Google Calendar Invites Created ({len(created_lines)})\n\n"
-            + "\n".join(created_lines)
-            + f"\n\nThe events have been placed on your calendar (`{account_email}`) and invites dispatched."
-        )
+            html_link = invite.get("htmlLink", "")
+            link_md = f"\n• **Calendar Link:** [Open in Google Calendar]({html_link})" if html_link else ""
+            att_text = f"\n• **Attendees:** {', '.join(attendees)}" if attendees else ""
+            if reminder_minutes is not None:
+                if reminder_minutes % 1440 == 0:
+                    rem_text = f"\n• **Reminder:** {reminder_minutes // 1440} day{'s' if reminder_minutes // 1440 != 1 else ''} before (popup)"
+                elif reminder_minutes % 60 == 0:
+                    rem_text = f"\n• **Reminder:** {reminder_minutes // 60} hour{'s' if reminder_minutes // 60 != 1 else ''} before (popup)"
+                else:
+                    rem_text = f"\n• **Reminder:** {reminder_minutes} minute{'s' if reminder_minutes != 1 else ''} before (popup)"
+            else:
+                rem_text = ""
 
-    # 3. Single event creation
-    parsed = parse_calendar_create(instruction, account_email)
-    if parsed is not None:
-        try:
-            line = _create_one(parsed)
+            return (
+                f"### ✓ Google Calendar Invite Created\n\n"
+                f"• **Event:** **{title}**\n"
+                f"• **When:** {start_dt.strftime('%A, %B %d, %Y at %I:%M %p %Z')}\n"
+                f"• **Calendar:** `{account_email}`{att_text}{rem_text}{link_md}\n\n"
+                f"The event has been placed on your calendar and invites dispatched."
+            )
         except Exception as exc:
             return f"### ⚠️ Failed to Create Calendar Event\n\nAn error occurred while contacting the Google Calendar API: `{exc}`"
-        return (
-            f"### ✓ Google Calendar Invite Created\n\n"
-            f"{line}\n"
-            f"• **Calendar:** `{account_email}`\n\n"
-            f"The event has been placed on your calendar and invites dispatched."
-        )
 
-    # 4. An explicit create that did not parse must NEVER silently
-    # fall back to a listing ("No upcoming events found" reads as if
-    # the create succeeded or was never asked). Ask a crisp
-    # clarification question naming what is missing instead.
-    if _is_create_intent(instruction):
-        # (The caller merges multi-turn follow-ups from history before
-        # dispatch; here there is no history to merge from.)
-        missing: list[str] = []
-        norm = _normalise_calendar_text(instruction)
-        if not _extract_all_times(norm) and not re.search(
-            r"\b(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", norm
-        ) and _extract_day(norm, _live_now()) is None:
-            missing.append("when it should happen (a date and time, e.g. '21st Nov 2026 at 5:30 PM')")
-        if _extract_named_events(instruction) is None and not re.search(
-            r"\b(?:called|titled|for|about)\s+\S", norm
-        ):
-            missing.append("what to call it (e.g. 'OA remainder 1')")
-        missing_text = " and ".join(missing) if missing else "the title and time"
-        return (
-            f"### 📅 Calendar — Need a Detail\n\n"
-            f"I want to create that event, but I couldn't work out {missing_text} from "
-            f"\"{instruction.strip()}\".\n\n"
-            f"Could you say it again with both, e.g. *'Create a calendar event tomorrow at "
-            f"10am for Microsoft interview'*? Nothing was created and nothing was listed."
-        )
-
-    # 5. Schedule / Events Listing
-    now = _live_now()
+    # 3. Schedule / Events Listing
+    now = datetime.datetime.now(datetime.timezone.utc)
     is_today = "today" in t
     if is_today:
         start_dt = now.replace(hour=0, minute=0, second=0, microsecond=0)
