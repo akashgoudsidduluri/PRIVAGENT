@@ -11,6 +11,7 @@ is only the address of the workspace web UI, never the monitoring channel.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 import uuid
@@ -19,6 +20,8 @@ from urllib.parse import urlsplit
 
 from . import db
 from .hub import hub
+
+logger = logging.getLogger(__name__)
 
 
 # Track-new-items alternatives, shared by the directive pattern and
@@ -38,7 +41,12 @@ _TRACK_NEW_RE = re.compile(_TRACK_NEW_ALT, re.IGNORECASE)
 
 
 MONITORING_DIRECTIVE_PATTERN = re.compile(
-    r"\b(?:continuously\s+monitor|monitor\s+this|monitor\s+(?:the\s+)?(?:product|price|page|site|webpage|item|deal)|track\s+(?:the\s+)?price|alert\s+me\s+if\s+(?:the\s+)?price\s+drops|price\s+drop\s+alert|keep\s+an\s+eye\s+on\s+(?:the\s+)?price)\b|"
+    # A bare price drop ("alert me when the price drops", "notify me
+    # when the price drops"): "if" and "when" are the same ask. The
+    # product may sit between "when" and "price" ("alert me when
+    # the Apple iPhone 17 price drops"), so a short window is
+    # allowed there.
+    r"\b(?:continuously\s+monitor|monitor\s+this|monitor\s+(?:the\s+)?(?:product|price|page|site|webpage|item|deal)|track\s+(?:the\s+)?price|(?:alert|notify|tell)\s+me\s+(?:if|when)\s+(?:the\s+)?[^.\n]{0,40}?\bprice\s+drops?|price\s+drop\s+alert|keep\s+an\s+eye\s+on\s+(?:the\s+)?price)\b|"
     r"\b(?:monitor|track)\s+.*?\b(?:price|drops?|stock|availability|changes?)\b|"
     # Daily price report ("yes every day at 9am just notify me the
     # prices"): a notify + price(s) ask, or a price(s) ask with a daily
@@ -65,6 +73,20 @@ MONITORING_DIRECTIVE_PATTERN = re.compile(
     # falls through to a browser task that only looks once.
     r"\b(?:alert|notify|tell|let|check)\b[^.\n]{0,60}?(?:reaches?|drops?|falls?|goes?|gets?|dips?)\s+(?:below|under|to)\s*(?:₹|Rs\.?|INR|\$)?\s*[\d,]+(?:\.\d{1,2})?\b|"
     r"\b(?:alert|notify|tell|let|check|watch|monitor|track)\b[^.\n]{0,60}?<\s*(?:₹|Rs\.?|INR|\$)?\s*[\d,]+(?:\.\d{1,2})?\b|"
+    # Percent-drop watch ("live monitor iPhone 17 when it 10% off",
+    # "alert me when it drops by 10%"): a directive verb + a percent
+    # drop, in either word order — the number first ("10% off") or
+    # the drop word first ("drops by 10%"). The number may be a word
+    # ("ten percent off"). Without this a bare %-drop ask (no word
+    # "price", no "below", no interval) fell through to a one-shot
+    # browser task instead of a watch. The drop word is required so
+    # a plain statement ("the iPhone 17 is 10% off today") does not
+    # route. "drops?" (not "dropped") keeps past-tense statements
+    # ("it dropped 10% yesterday") from routing. No word boundary
+    # after the %: "%" is a non-word character, so \b never matches
+    # after it ("drops by 10%" at the end would not route).
+    r"\b(?:monitor|track|watch|alert|notify|tell|let|check)\b[^.\n]{0,60}?\b(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty)\s*(?:%|percent|per\s*cent)\s*(?:off|drops?|down|discount|less|cheaper)\b|"
+    r"\b(?:monitor|track|watch|alert|notify|tell|let|check)\b[^.\n]{0,60}?\b(?:drops?|falls?|goes?\s+down|discounts?|cuts?)\s+(?:by\s+)?(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty)\s*(?:%|percent|per\s*cent)|"
     # An interval cadence on its own ("alert me every 5 minutes",
     # "check its price and just alert me every 5 minutes"): the
     # directive verb + a per-N-minutes/hours cadence. Without this a
@@ -218,6 +240,162 @@ def parse_below_price(instruction: str) -> float | None:
     return value if value > 0 else None
 
 
+_PERCENT_WORD_NUMBERS = "|".join(sorted(_WORD_NUMBERS, key=len, reverse=True))
+
+# A %-drop needs a drop construction ADJACENT to the number — a drop
+# word before it ("drops by 10%", "down 10%") or after it ("10% off",
+# "10 percent discount"). A bare number + % ("100% sure", "50%
+# chance") is not a threshold: it used to parse as min_percent 100
+# / 50, and a 100% watch can never fire. Two patterns because the
+# number is in a different group in each order.
+_PERCENT_DROP_BEFORE_RE = re.compile(
+    r"(?:drops?|falls?|down|discount(?:ed)?|cut)\s+(?:by\s+)?"
+    rf"(\d+(?:\.\d{{1,2}})?|{_PERCENT_WORD_NUMBERS})\s*(?:%|percent|per\s*cent)",
+    re.IGNORECASE,
+)
+_PERCENT_DROP_AFTER_RE = re.compile(
+    rf"(\d+(?:\.\d{{1,2}})?|{_PERCENT_WORD_NUMBERS})\s*(?:%|percent|per\s*cent)"
+    r"\s*(?:off|drops?|down|discount|less|cheaper)",
+    re.IGNORECASE,
+)
+
+
+def parse_percent_drop(instruction: str) -> float | None:
+    """Parse 'live monitor iPhone 17 when it 10% off' into 10.0.
+
+    Accepts the forms users actually type: '10% off', 'drops by
+    10%', '10 percent discount', 'ten percent off', 'a 12.5% drop'.
+    Returns None when no percent is named, when the number is
+    meaningless as a drop (0% or over 100%), or when the % is not
+    part of a drop construction ('100% sure', '50% chance'). The
+    caller (a monitoring directive) has already established the
+    intent, so this only extracts the number.
+
+    Residual limit, by design: '15% off right now' IS a drop
+    construction used as a statement of the CURRENT discount, which
+    no regex can distinguish from a threshold — it parses as 15.
+    """
+    for pattern in (_PERCENT_DROP_BEFORE_RE, _PERCENT_DROP_AFTER_RE):
+        m = pattern.search(instruction or "")
+        if not m:
+            continue
+        raw = m.group(1)
+        if raw is None:
+            continue
+        lowered = raw.lower()
+        if lowered in _WORD_NUMBERS:
+            value = float(_WORD_NUMBERS[lowered])
+        else:
+            try:
+                value = float(raw.replace(",", ""))
+            except ValueError:
+                continue
+        if 0 < value <= 100:
+            return value
+    return None
+
+
+def _percent_from_history(history: Optional[list[dict[str, Any]]]) -> float | None:
+    """Most recent %-drop in the last few history turns.
+
+    Mirrors _threshold_from_history: a follow-up that only changes
+    the cadence ("check every 5 minutes") names no percent — the one
+    from the ask it follows ("when it 10% off") still applies, or
+    the watch would be rebuilt with min_percent 0 and the threshold
+    silently wiped. Only the last few turns are scanned, so an old
+    percent for a different product in the same chat cannot leak in.
+    """
+    for entry in reversed((history or [])[-4:]):
+        if not isinstance(entry, dict):
+            continue
+        content = str(entry.get("content") or entry.get("message") or "")
+        value = parse_percent_drop(content)
+        if value is not None:
+            return value
+    return None
+
+
+def _normalised_product_title(title: str) -> str:
+    """Product titles compare ignoring case and a leading brand:
+    'Apple iPhone 17' is the same product as 'iPhone 17'. Only a
+    LEADING brand is stripped, so 'Smart Band 10' and 'Smart Band'
+    stay different products, and 'iPhone 17 Pro' stays different
+    from 'iPhone 17'."""
+    t = (title or "").strip().lower()
+    t = t.removeprefix("price watch:").strip()
+    m = re.match(rf"(?:{_MONITORED_BRANDS})\b\s*", t)
+    if m:
+        t = t[m.end():].strip()
+    return re.sub(r"\s+", " ", t)
+
+
+def _find_active_watch(product_title: str, chat_id: Optional[str], db_path: Optional[str]):
+    """Most recent active watch for this product in this chat,
+    matched on the normalised title — a re-ask that adds or drops
+    the brand ('Apple iPhone 17' after 'iPhone 17') is the same
+    watch, not a second one."""
+    try:
+        with db.get_connection(db_path) as conn:
+            rows = conn.execute(
+                """SELECT * FROM monitoring_missions
+                   WHERE conversation_id = ? AND status = 'active'
+                   ORDER BY created_at DESC""",
+                (chat_id or "default",),
+            ).fetchall()
+    except Exception:
+        logger.warning("active-watch lookup failed for %r", product_title, exc_info=True)
+        return None
+    wanted = _normalised_product_title(f"Price Watch: {product_title}")
+    for row in rows:
+        if _normalised_product_title(row["title"]) == wanted:
+            return row
+    return None
+
+
+def _thresholds_from_existing_watch(
+    product_title: str, chat_id: Optional[str], db_path: Optional[str]
+) -> tuple[float | None, float | None]:
+    """(below, percent) of the active watch for this product, if any.
+
+    Covers the case _threshold_from_history / _percent_from_history
+    cannot: a cadence follow-up that NAMES the product again ("live
+    monitor Apple iPhone 17, check every 5 minutes") — the history
+    guards only run when no product is named, so without this the
+    watch would be rebuilt with min_percent 0, silently wiping a
+    ₹ threshold (below_price) or a % threshold (price_drop). The
+    lookup is keyed by the same normalised title the duplicate
+    check uses, so a different product never inherits. Returns
+    (None, None) when there is no active threshold watch for this
+    product, or the stored value is not valid.
+    """
+    row = _find_active_watch(product_title, chat_id, db_path)
+    if row is None:
+        return None, None
+    try:
+        params = json.loads(row["condition_params"] or "{}")
+    except Exception:
+        return None, None
+    if row["condition_type"] == "below_price":
+        value = params.get("threshold")
+        if isinstance(value, (int, float)) and value > 0:
+            return float(value), None
+    elif row["condition_type"] == "price_drop":
+        value = params.get("min_percent")
+        if isinstance(value, (int, float)) and 0 <= value <= 100:
+            return None, float(value)
+    return None, None
+
+
+def _percent_threshold_text(percent: float | None) -> str:
+    """Reply fragment for a %-drop threshold: 0 means any drop, not
+    the nonsense 'drops 0% or more' a bare-drop watch used to show."""
+    if percent is None:
+        return ""
+    if percent == 0:
+        return ", alerting on any price drop"
+    return f", alerting when the price drops {percent:g}% or more"
+
+
 # Brands a monitored product can belong to. The extractor matches
 # "<brand> <model...>" in the instruction first, then in the recent
 # history — so a fitness band, a phone or a laptop all work, and the
@@ -230,8 +408,11 @@ _MONITORED_BRANDS = (
 # Brand + up to three model tokens ("Galaxy Fit3", "Smart Band 10",
 # "Band 7"). Trailing stop-words are stripped after the match so a
 # sentence like "Samsung Galaxy Fit3 is the best" yields just the model.
+# A model token that is a bare number followed by "%" is a percent
+# ("Apple iPhone 17 10% off"), not part of the model — the lookahead
+# refuses it, or the title becomes "Apple iPhone 17 10".
 _PRODUCT_RE = re.compile(
-    rf"\b(?:{_MONITORED_BRANDS})((?:\s+[A-Za-z0-9][\w\-]*){{1,3}})",
+    rf"\b(?:{_MONITORED_BRANDS})((?:\s+(?![\d,]+(?:\.\d{{1,2}})?%)[A-Za-z0-9][\w\-]*){{1,3}})",
     re.IGNORECASE,
 )
 _PRODUCT_STOPWORDS = {
@@ -328,9 +509,15 @@ def _product_phrase_from_text(text: str) -> str:
         # after "every" may be a word ("every five minutes"). A daily
         # / morning cadence cuts the title too ("watch the stand every
         # day" must not become a product called "Stand Every Day").
+        # A percent token cuts it too — no product name contains "%",
+        # so "iphone 17 10% off" must stay "iphone 17", not become
+        # "Iphone 17 10% Off" in the watch card and every alert.
+        # No word boundary after the %: "%" is a non-word character,
+        # so \b never matches after it ("10% off" would not cut).
         r",\s*(?:alert|notify|tell)\b"
         r"|\s+if\s+the\s+price\b|\s+if\s+it\b|\s+when\b|\s+and\s+(?:alert|notify|tell)\b"
-        r"|\s+every\s+(?:(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty)\s*)?(?:minutes?|mins?|hours?|days?|mornings?|evenings?|nights?)\b",
+        r"|\s+every\s+(?:(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty)\s*)?(?:minutes?|mins?|hours?|days?|mornings?|evenings?|nights?)\b"
+        r"|\s+(?:\d+(?:\.\d{1,2})?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty)\s*(?:%|percent|per\s*cent)",
         phrase,
         flags=re.IGNORECASE,
     )[0]
@@ -797,10 +984,17 @@ async def handle_continuous_monitoring_instruction(
     """Register a persistent continuous monitoring mission and return natural departure handoff."""
     db.init_db(db_path)
     # Price signals are read first: a price ask must never become a
-    # listing watch. Dispatch order is daily -> below -> new_listings
-    # -> price_drop, so the handler body matches the documented order.
+    # listing watch. Dispatch order is daily -> below -> percent ->
+    # new_listings -> price_drop, so the handler body matches the
+    # documented order.
     daily = parse_daily_time(instruction)
     below = parse_below_price(instruction)
+    percent = parse_percent_drop(instruction)
+    # Whether THIS instruction names a percent. Inheritance (history
+    # / existing watch) may fill percent in below, but only a percent
+    # named here counts for the percent+below note — an inherited
+    # one was not mentioned by the user in this ask.
+    percent_named = percent is not None
     # A follow-up that only changes the cadence ("check its price and
     # just alert me every 5 minutes") names no threshold — the one from
     # the ask it follows ("if the price is below 1000") still applies.
@@ -813,6 +1007,16 @@ async def handle_continuous_monitoring_instruction(
         and not _product_phrase_from_text(instruction or "")
     ):
         below = _threshold_from_history(history)
+    # Same inheritance for a %-drop: a bare cadence follow-up names
+    # no percent — the one from the ask it follows ("when it 10%
+    # off") still applies, or the watch would be rebuilt with
+    # min_percent 0 and the threshold silently wiped.
+    if (
+        percent is None
+        and not _PRODUCT_RE.search(instruction or "")
+        and not _product_phrase_from_text(instruction or "")
+    ):
+        percent = _percent_from_history(history)
     # Track-new-items ("track SDE internships and alert me when a
     # new one appears"): a new_listings mission, not a price watch.
     # Hourly interval — listing pages change slowly; a 5-minute tick
@@ -850,6 +1054,16 @@ async def handle_continuous_monitoring_instruction(
             "set up the watch."
         )
 
+    # A product-named cadence follow-up ("live monitor Apple iPhone
+    # 17, check every 5 minutes") names no threshold — the threshold
+    # from the watch already running for this product still applies,
+    # or the watch would be rebuilt with min_percent 0 and a ₹ or %
+    # threshold silently wiped. The history inheritance above only
+    # covers pronoun follow-ups (no product named), so this covers
+    # the same-product case; a different product never inherits.
+    if percent is None and below is None:
+        below, percent = _thresholds_from_existing_watch(product_title, chat_id, db_path)
+
     mission_id = str(uuid.uuid4())
     now = time.time()
     # A daily cadence and a threshold COMPOSE: "below ₹5000, notify
@@ -868,6 +1082,19 @@ async def handle_continuous_monitoring_instruction(
         alert_line = (
             f"• **Alert Condition:** Alert when the price falls below ₹{below:g} "
             f"(if it is already below, I'll alert you on the first check)\n"
+        )
+    elif daily and percent is not None:
+        # A %-drop and a daily cadence COMPOSE, like daily+below: a
+        # price_drop mission on a daily cron — the check runs once a
+        # morning and alerts only when the price has dropped the
+        # asked percent since the previous check.
+        cron, display = daily
+        trigger_type, schedule_cron, interval_sec = "cron", cron, 86400
+        condition_type, condition_params = "price_drop", {"target": product_title, "min_percent": percent}
+        cadence_line = f"• **Check Schedule:** Every day at **{display}**\n"
+        alert_line = (
+            f"• **Alert Condition:** Alert when the price drops {percent:g}% or more "
+            f"from the price on the previous check (the first check records today's price)\n"
         )
     elif daily:
         # A daily time ("every day at 9am", "every morning at 9")
@@ -897,12 +1124,40 @@ async def handle_continuous_monitoring_instruction(
             f"• **Alert Condition:** Alert the moment the price falls below ₹{below:g} "
             f"(if it is already below, I'll alert you on the first check)\n"
         )
+    elif percent is not None:
+        # Percent drop ("live monitor iPhone 17 when it 10% off"):
+        # a price_drop mission carrying the asked percent — before
+        # this the percent was never parsed, so every %-drop ask
+        # became a min_percent 0 watch that fired on ANY drop. The
+        # cadence is the one the user asked for ("every 10 minutes"
+        # is 10 minutes, not 5); no cadence -> 300s default. The
+        # first check records today's price, so the alert can fire
+        # from the second check on.
+        interval_sec = _parse_interval_seconds(instruction)
+        trigger_type, schedule_cron = "interval", None
+        condition_type, condition_params = "price_drop", {"target": product_title, "min_percent": percent}
+        cadence_line = f"• **Check Frequency:** {_describe_interval(interval_sec).capitalize()} (interval scheduler tick)\n"
+        alert_line = (
+            f"• **Alert Condition:** Alert the moment the price drops {percent:g}% or more "
+            f"from the price on the previous check — the first check records today's price, "
+            f"so the alert can fire from the second check on\n"
+        )
     else:
         interval_sec = _parse_interval_seconds(instruction)
         trigger_type, schedule_cron = "interval", None
         condition_type, condition_params = "price_drop", {"target": product_title, "min_percent": 0}
         cadence_line = f"• **Check Frequency:** {_describe_interval(interval_sec).capitalize()} (interval scheduler tick)\n"
         alert_line = "• **Alert Condition:** Instant notification whenever the price drops or special discount offers are detected\n"
+
+    # Percent + below together: a watch stores ONE condition, and
+    # below wins — so say so, or the user believes both are watched.
+    # Only when THIS instruction named the percent; an inherited one
+    # was not mentioned in this ask.
+    if below is not None and percent_named:
+        alert_line += (
+            f"• **Note:** You also mentioned a {percent:g}% drop — this watch tracks only "
+            f"the below-₹{below:g} condition, not the percent drop.\n"
+        )
 
     # A follow-up that only changes the cadence ("check its price and
     # just alert me every 5 minutes") must not create a SECOND watch
@@ -923,12 +1178,22 @@ async def handle_continuous_monitoring_instruction(
                ORDER BY created_at DESC LIMIT 1""",
             (chat_id or "default", f"Price Watch: {product_title}"),
         ).fetchone()
+    # A re-ask that adds or drops the brand ("Apple iPhone 17"
+    # after "iPhone 17") is the same watch — fall back to the
+    # normalised-title match, or it becomes a duplicate watch.
+    if existing is None:
+        existing = _find_active_watch(product_title, chat_id, db_path)
     if existing:
         try:
             stored_params = json.loads(existing["condition_params"] or "{}")
         except Exception:
             stored_params = {}
         stored_threshold = stored_params.get("threshold")
+        stored_percent = stored_params.get("min_percent")
+        # A bare price_drop watch stores min_percent 0 while a bare
+        # re-ask parses percent None — compare them normalized (None
+        # -> 0) or the re-ask never matches and the user gets a false
+        # "Updated" instead of "already running".
         same_settings = (
             existing["trigger_type"] == trigger_type
             and existing["interval_seconds"] == interval_sec
@@ -936,14 +1201,19 @@ async def handle_continuous_monitoring_instruction(
             and existing["condition_type"] == condition_type
             and (stored_threshold if condition_type == "below_price" else None)
             == (below if condition_type == "below_price" else None)
+            and ((stored_percent or 0) if condition_type == "price_drop" else None)
+            == ((percent or 0) if condition_type == "price_drop" else None)
         )
         if same_settings:
             cadence = _describe_interval(interval_sec) if trigger_type == "interval" else "daily"
-            threshold_line = (
-                f", alerting when the price falls below ₹{below:g}"
-                if below is not None
-                else ""
-            )
+            if below is not None:
+                threshold_line = f", alerting when the price falls below ₹{below:g}"
+            elif condition_type == "price_drop":
+                threshold_line = _percent_threshold_text(
+                    percent if percent is not None else stored_percent
+                )
+            else:
+                threshold_line = ""
             return (
                 f"That watch is already running — **{product_title}** is being checked "
                 f"{cadence}{threshold_line}."
@@ -957,12 +1227,20 @@ async def handle_continuous_monitoring_instruction(
         old_threshold = (
             f", alerting below ₹{stored_threshold:g}"
             if stored_threshold is not None
-            else ""
+            else (
+                _percent_threshold_text(stored_percent)
+                if existing["condition_type"] == "price_drop"
+                else ""
+            )
         )
         new_threshold = (
             f", alerting when the price falls below ₹{below:g}"
             if below is not None
-            else ""
+            else (
+                _percent_threshold_text(percent)
+                if condition_type == "price_drop"
+                else ""
+            )
         )
         with db.get_connection(db_path) as conn:
             conn.execute(
