@@ -217,16 +217,18 @@ def _is_composer_target(target: Any) -> bool:
 
 
 def strip_tool_call_blocks(text: str) -> tuple[str, list[str]]:
-    """Remove hallucinated `<tool_call>...</tool_call>` blocks from a direct answer.
+    """Remove hallucinated `<tool_call>...</tool_call>` and
+    `<function=...>...</function>` blocks from a direct answer.
 
     The NON_BROWSER direct-answer path calls the LLM with NO tools, but the
     model can still emit a tool-call block as text (live 2026-11-19: the PPT
     request was answered directly and the model emitted a
     `createpresentation` tool call with a 10-slide outline; the mission then
-    "completed" with an outline and no file). A tool call the backend never
-    registered must never reach the user as if it ran. Returns the cleaned
-    text and the tool names that were stripped, so the caller can say
-    honestly that no file was created.
+    "completed" with an outline and no file — and a later model emitted
+    `<function=calltool>...</function>` the same way). A tool call the
+    backend never registered must never reach the user as if it ran.
+    Returns the cleaned text and the tool names that were stripped, so
+    the caller can say honestly that no file was created.
     """
     if not text:
         return text, []
@@ -251,6 +253,30 @@ def strip_tool_call_blocks(text: str) -> tuple[str, list[str]]:
         name_m = re.search(r'"name"\s*:\s*"([^"]+)"', body)
         names.append(name_m.group(1) if name_m else "unknown")
         cleaned = cleaned[: _trunc.start()]
+    # `<function=NAME>...</function>` — the same hallucination in
+    # XML-function-call form (live: `<function=calltool>...</function>`
+    # in a conversational reply). Paired blocks first, then
+    # self-closing `<function=NAME/>`, then a truncated unclosed tag.
+    func_pattern = re.compile(
+        r"<function\s*=\s*([A-Za-z0-9_.-]+)[^>]*>(.*?)</function\s*>",
+        re.IGNORECASE | re.DOTALL,
+    )
+    def _collect_func(m: re.Match[str]) -> str:
+        names.append(m.group(1) or "unknown")
+        return ""
+    cleaned = func_pattern.sub(_collect_func, cleaned)
+    cleaned = re.sub(
+        r"<function\s*=\s*([A-Za-z0-9_.-]+)[^>]*/>",
+        lambda m: names.append(m.group(1) or "unknown") or "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    _trunc_fn = re.search(
+        r"<function\s*=\s*([A-Za-z0-9_.-]+)[^>]*>(.*)$", cleaned, re.IGNORECASE | re.DOTALL
+    )
+    if _trunc_fn:
+        names.append(_trunc_fn.group(1) or "unknown")
+        cleaned = cleaned[: _trunc_fn.start()]
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return cleaned, names
 

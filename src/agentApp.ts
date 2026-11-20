@@ -1306,6 +1306,17 @@ function renderTaskTimeline(t: {
   taskTimelineCard.hidden = false;
 }
 
+// Clear the TASK TIMELINE panel: step rows belong to the chat/task
+// that produced them, so starting a new mission or switching to a
+// chat with no task must never leave a previous chat's rows visible
+// on a fresh screen. renderTaskTimeline() re-shows the card when a
+// task with steps is rendered again.
+function clearTaskTimeline(): void {
+  if (taskTimelineList) taskTimelineList.replaceChildren();
+  if (timelineSummaryEl) timelineSummaryEl.textContent = "";
+  if (taskTimelineCard) taskTimelineCard.hidden = true;
+}
+
 // ----------------------------------------------------
 // Takeover (Task 4)
 // ----------------------------------------------------
@@ -1445,6 +1456,9 @@ async function selectChat(chatId: string): Promise<void> {
 
   // Clear feed and load history
   if (stepsList) stepsList.innerHTML = "";
+  // A chat with no task must not keep the previous chat's timeline
+  // rows: they are re-rendered below only when this chat has a task.
+  clearTaskTimeline();
   if (resultCard) resultCard.hidden = true;
   if (artifactsCard) artifactsCard.hidden = true;
   // Switching chats must not leave the previous chat's screenshot in
@@ -1641,6 +1655,8 @@ function createNewChat(): void {
   if (stepsList) {
     stepsList.innerHTML = '<li class="agent-step-placeholder">Submit a mission directive to begin autonomous browser execution.</li>';
   }
+  // A fresh mission screen must not show the previous chat's timeline.
+  clearTaskTimeline();
   if (resultCard) resultCard.hidden = true;
   // A new chat must not keep the previous chat's deliverables: the
   // artifacts card is only re-populated by loadArtifacts() for the chat
@@ -1849,8 +1865,25 @@ document.addEventListener("click", event => {
 // WebSocket Client
 // ----------------------------------------------------
 
+// Single-socket guard: connectWebSocket() must never run twice while
+// a socket is open or still connecting, and only one reconnect may be
+// pending. Without this, a reconnect racing a fresh connect (or a
+// module re-evaluation) opened several /ws/client sockets at once;
+// the backend then raised `socket.send() raised exception` writing
+// progress frames to the dead ones.
+let activeSocket: WebSocket | null = null;
+let wsReconnectTimer: number | undefined;
+
 function connectWebSocket(): void {
+  if (activeSocket && (activeSocket.readyState === WebSocket.OPEN || activeSocket.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+  if (wsReconnectTimer !== undefined) {
+    window.clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = undefined;
+  }
   const ws = new WebSocket(wsUrl(`ws://localhost:8000/ws/client`));
+  activeSocket = ws;
 
   ws.onopen = () => {
     setConnectionStatus(true, "Online");
@@ -1956,8 +1989,16 @@ function connectWebSocket(): void {
   };
 
   ws.onclose = () => {
+    if (activeSocket === ws) activeSocket = null;
     setConnectionStatus(false, "Reconnecting...");
-    setTimeout(connectWebSocket, 2500);
+    // Exactly one pending reconnect: a second onclose (or a manual
+    // connectWebSocket call) must not schedule another one.
+    if (wsReconnectTimer === undefined) {
+      wsReconnectTimer = window.setTimeout(() => {
+        wsReconnectTimer = undefined;
+        connectWebSocket();
+      }, 2500);
+    }
   };
 
   ws.onerror = () => {
