@@ -560,3 +560,374 @@ def test_truncate_title_cuts_at_word_boundary():
     assert len(_truncate_title(long_title)) <= 80
     assert _truncate_title("Short title") == "Short title"
     assert _truncate_title("x" * 100) == "x" * 80  # no space: hard cut
+
+
+# ---------------------------------------------------------------------------
+# Percent-drop live monitor ("live monitor iPhone 17 when it 10% off")
+# ---------------------------------------------------------------------------
+
+def test_directive_routes_percent_drop_phrasing():
+    """A bare %-drop ask must ROUTE to the monitoring handler. Before
+    the fix, MONITORING_DIRECTIVE_PATTERN only knew below-price,
+    daily and interval cadences — "live monitor iPhone 17 when it
+    10% off then remind" (no word "price", no "below", no interval)
+    fell through to a one-shot browser task, so no watch was ever
+    made."""
+    from app.continuous_monitoring_companion import is_continuous_monitoring_directive
+
+    assert is_continuous_monitoring_directive(
+        "live monitor iphone 17 when it 10% off then remind"
+    ) is True
+    assert is_continuous_monitoring_directive(
+        "monitor iphone 17, remind me when it drops by 10%"
+    ) is True
+    assert is_continuous_monitoring_directive(
+        "alert me when the iphone 17 gets a 10 percent discount"
+    ) is True
+    assert is_continuous_monitoring_directive(
+        "watch iphone 17 for 10% off, check every 10 minutes"
+    ) is True
+    # Drop word BEFORE the number ("drops by 10%", "falls 10%") must
+    # route too — the first percent branch only knew the number
+    # first ("10% off"), so these fell through to a one-shot task.
+    assert is_continuous_monitoring_directive("alert me when it drops by 10%") is True
+    assert is_continuous_monitoring_directive("alert me when the price drops 10%") is True
+    assert is_continuous_monitoring_directive("tell me when the price drops 10%") is True
+    assert is_continuous_monitoring_directive("notify me if iphone 17 falls 10%") is True
+    assert is_continuous_monitoring_directive("monitor iphone 17 when it goes down 10%") is True
+    assert is_continuous_monitoring_directive("watch iphone 17 price drop 10%") is True
+    # Word numbers, both orders — the parser reads them, so the
+    # router must too.
+    assert is_continuous_monitoring_directive("alert me when it is ten percent off") is True
+    assert is_continuous_monitoring_directive("monitor iphone 17 when it is ten percent off") is True
+    assert is_continuous_monitoring_directive("alert me when it drops by ten percent") is True
+    assert is_continuous_monitoring_directive("watch iphone 17 for ten percent off") is True
+    # Controls: a plain statement about a discount is not a watch.
+    assert is_continuous_monitoring_directive("the iphone 17 is 10% off today") is False
+    assert is_continuous_monitoring_directive("iphone 17 10% off") is False
+
+
+def test_parse_percent_drop_user_phrasings():
+    """parse_percent_drop reads the %-drop the user asked for, in the
+    phrasings they actually type. Before the fix there was no parser
+    at all — the handler always stored min_percent 0, so the 10%
+    was silently lost and ANY drop alerted."""
+    from app.continuous_monitoring_companion import parse_percent_drop
+
+    assert parse_percent_drop("live monitor iphone 17 when it 10% off then remind") == 10.0
+    assert parse_percent_drop("remind me when it drops by 10%") == 10.0
+    assert parse_percent_drop("alert me when the iphone 17 gets a 10 percent discount") == 10.0
+    assert parse_percent_drop("iphone 17 10% discount, check every 10 minutes") == 10.0
+    assert parse_percent_drop("tell me when it is ten percent off") == 10.0
+    assert parse_percent_drop("watch for a 12.5% drop") == 12.5
+    assert parse_percent_drop("buy it if the price drops by 10% of today's price") == 10.0
+    # No percent, or a meaningless one, parses to None.
+    assert parse_percent_drop("alert me when the price falls below 5000") is None
+    assert parse_percent_drop("check the price every day") is None
+    assert parse_percent_drop("0% off") is None
+    assert parse_percent_drop("150% off") is None
+    # A "%" that is NOT a drop threshold must not parse: a bare
+    # number + % ("100% sure", "50% chance") used to become a
+    # min_percent the watch could never fire on.
+    assert parse_percent_drop("there's a 50% chance it drops") is None
+    assert parse_percent_drop("I'm 100% sure it'll drop") is None
+    assert parse_percent_drop("live monitor iphone 17, check every 5 minutes, I'm 100% sure it'll drop") is None
+
+
+def test_percent_drop_does_not_leak_into_product_title():
+    """The "10% off" must not become part of the product name: the
+    watch card and every alert would read "Iphone 17 10% Off". A
+    percent token cuts the product phrase, and the brand+model match
+    refuses a bare number followed by "%"."""
+    from app.continuous_monitoring_companion import _extract_monitored_product
+
+    title, _ = _extract_monitored_product("live monitor iphone 17 10% off, notify me every day at 9am")
+    assert title == "Iphone 17"
+    title, _ = _extract_monitored_product("live monitor Apple iPhone 17 when it 10% off then remind")
+    assert title == "Apple Iphone 17"
+    # Model numbers that are NOT percents still belong to the title.
+    title, _ = _extract_monitored_product("monitor the Samsung Galaxy Fit3")
+    assert title == "Samsung Galaxy Fit3"
+
+
+def test_handler_percent_drop_creates_watch_with_interval(database):
+    """The user's example, end to end: a price_drop watch with the
+    10% the user asked for, checked every 10 minutes — not a
+    min_percent 0 watch that fires on any drop."""
+    from app.continuous_monitoring_companion import handle_continuous_monitoring_instruction
+
+    reply = asyncio.run(handle_continuous_monitoring_instruction(
+        "live monitor iphone 17 when it 10% off then remind, check every 10 minutes",
+        chat_id="t-pct1", db_path=database,
+    ))
+    assert "10%" in reply
+    with db.get_connection(database) as conn:
+        row = conn.execute("SELECT * FROM monitoring_missions WHERE conversation_id='t-pct1'").fetchone()
+    assert row is not None
+    assert row["title"] == "Price Watch: Iphone 17"
+    assert row["condition_type"] == "price_drop"
+    assert json.loads(row["condition_params"]) == {"target": "Iphone 17", "min_percent": 10.0}
+    assert row["trigger_type"] == "interval"
+    assert row["interval_seconds"] == 600
+    assert row["schedule_cron"] is None
+    assert row["status"] == "active"
+
+
+def test_handler_percent_drop_bare_no_interval_defaults_5min(database):
+    """A %-drop ask with no cadence becomes a 5-minute interval
+    watch — the same default as below-price — instead of falling
+    through to a one-shot task."""
+    from app.continuous_monitoring_companion import handle_continuous_monitoring_instruction
+
+    reply = asyncio.run(handle_continuous_monitoring_instruction(
+        "live monitor iphone 17 when it 10% off then remind",
+        chat_id="t-pct2", db_path=database,
+    ))
+    assert "10%" in reply
+    with db.get_connection(database) as conn:
+        row = conn.execute("SELECT * FROM monitoring_missions WHERE conversation_id='t-pct2'").fetchone()
+    assert row["condition_type"] == "price_drop"
+    assert json.loads(row["condition_params"])["min_percent"] == 10.0
+    assert row["trigger_type"] == "interval"
+    assert row["interval_seconds"] == 300
+
+
+def test_handler_daily_percent_drop_composes_cron(database):
+    """A %-drop plus a daily cadence composes like daily+below: a
+    price_drop condition on a daily cron, not a daily report and
+    not a 5-minute interval watch."""
+    from app.continuous_monitoring_companion import handle_continuous_monitoring_instruction
+
+    reply = asyncio.run(handle_continuous_monitoring_instruction(
+        "live monitor iphone 17 10% off, notify me every day at 9am",
+        chat_id="t-pct3", db_path=database,
+    ))
+    assert "10%" in reply
+    with db.get_connection(database) as conn:
+        row = conn.execute("SELECT * FROM monitoring_missions WHERE conversation_id='t-pct3'").fetchone()
+    assert row["condition_type"] == "price_drop"
+    assert json.loads(row["condition_params"]) == {"target": "Iphone 17", "min_percent": 10.0}
+    assert row["trigger_type"] == "cron"
+    assert row["schedule_cron"] == "30 3 * * *"
+    assert row["interval_seconds"] == 86400
+
+
+def test_handler_percent_change_updates_existing_watch(database):
+    """Changing the percent (10% -> 20%) updates the watch in place
+    instead of answering "already running" — the old duplicate
+    check compared only the below-price threshold, so a price_drop
+    watch could never change its percent."""
+    from app.continuous_monitoring_companion import handle_continuous_monitoring_instruction
+
+    first = asyncio.run(handle_continuous_monitoring_instruction(
+        "live monitor iphone 17 when it 10% off then remind, check every 10 minutes",
+        chat_id="t-pct4", db_path=database,
+    ))
+    assert "10%" in first
+    with db.get_connection(database) as conn:
+        row = conn.execute("SELECT * FROM monitoring_missions WHERE conversation_id='t-pct4'").fetchone()
+    mission_id = row["id"]
+    assert json.loads(row["condition_params"])["min_percent"] == 10.0
+
+    updated = asyncio.run(handle_continuous_monitoring_instruction(
+        "live monitor iphone 17 when it 20% off then remind, check every 10 minutes",
+        chat_id="t-pct4", db_path=database,
+    ))
+    assert "20%" in updated
+    with db.get_connection(database) as conn:
+        rows = conn.execute("SELECT * FROM monitoring_missions WHERE conversation_id='t-pct4'").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["id"] == mission_id
+    assert json.loads(rows[0]["condition_params"])["min_percent"] == 20.0
+
+    # Same settings again: no duplicate, and the reply names the 20%.
+    again = asyncio.run(handle_continuous_monitoring_instruction(
+        "live monitor iphone 17 when it 20% off then remind, check every 10 minutes",
+        chat_id="t-pct4", db_path=database,
+    ))
+    assert "already running" in again.lower()
+    assert "20%" in again
+
+
+def test_percent_drop_detector_boundaries():
+    """The detector fires a 10% watch at exactly a 10% drop, not at
+    9% — the boundary is the contract the handler promises."""
+    from app.change_detector import _triggered
+
+    before = {"price": 100000.0}
+    assert _triggered("price_drop", {"min_percent": 10}, before, {"price": 90000.0})[0] is True
+    assert _triggered("price_drop", {"min_percent": 10}, before, {"price": 91000.0})[0] is False
+    assert _triggered("price_drop", {"min_percent": 10}, before, {"price": 89000.0})[0] is True
+    # No baseline yet: the first check records today's price and
+    # never alerts, whatever the price is.
+    assert _triggered("price_drop", {"min_percent": 10}, {}, {"price": 90000.0})[0] is False
+
+
+def test_bare_cadence_follow_up_keeps_percent(database):
+    """A follow-up that only changes the cadence ("check every 5
+    minutes") must keep the 10% from the ask it follows — the old
+    code rebuilt the watch with min_percent 0, silently wiping the
+    threshold the user asked for."""
+    from app.continuous_monitoring_companion import handle_continuous_monitoring_instruction
+
+    asyncio.run(handle_continuous_monitoring_instruction(
+        "live monitor iphone 17 when it 10% off then remind, check every 10 minutes",
+        chat_id="t-pct5", db_path=database,
+    ))
+    history = [
+        {"role": "user", "content": "live monitor iphone 17 when it 10% off then remind, check every 10 minutes"},
+        {"role": "agent", "content": "Watch running for Iphone 17, drops 10% or more, every 10 minutes."},
+    ]
+    reply = asyncio.run(handle_continuous_monitoring_instruction(
+        "check every 5 minutes", chat_id="t-pct5", history=history, db_path=database,
+    ))
+    assert "5 minutes" in reply
+    with db.get_connection(database) as conn:
+        rows = conn.execute("SELECT * FROM monitoring_missions WHERE conversation_id='t-pct5'").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["interval_seconds"] == 300
+    assert json.loads(rows[0]["condition_params"])["min_percent"] == 10.0
+
+
+def test_stray_percent_in_instruction_is_not_a_threshold(database):
+    """A "%" that is not a drop threshold ("I'm 100% sure") must not
+    become min_percent 100 — a 100% drop means the price reaching
+    zero, so that watch could never fire."""
+    from app.continuous_monitoring_companion import handle_continuous_monitoring_instruction
+
+    reply = asyncio.run(handle_continuous_monitoring_instruction(
+        "live monitor iphone 17, check every 5 minutes, I'm 100% sure it'll drop",
+        chat_id="t-pct6", db_path=database,
+    ))
+    assert "100%" not in reply
+    with db.get_connection(database) as conn:
+        row = conn.execute("SELECT * FROM monitoring_missions WHERE conversation_id='t-pct6'").fetchone()
+    assert row["condition_type"] == "price_drop"
+    assert json.loads(row["condition_params"])["min_percent"] == 0
+
+
+def test_bare_drop_reask_reports_already_running(database):
+    """Re-asking a bare price-drop watch ("alert me when the price
+    drops") must say "already running" — the duplicate check used
+    to compare stored 0 with parsed None, so it never matched and
+    the user got a false "Updated" that exposed "drops 0% or more"."""
+    from app.continuous_monitoring_companion import handle_continuous_monitoring_instruction
+
+    first = asyncio.run(handle_continuous_monitoring_instruction(
+        "alert me when the Apple iPhone 17 price drops",
+        chat_id="t-pct7", db_path=database,
+    ))
+    with db.get_connection(database) as conn:
+        row = conn.execute("SELECT * FROM monitoring_missions WHERE conversation_id='t-pct7'").fetchone()
+    assert json.loads(row["condition_params"])["min_percent"] == 0
+    again = asyncio.run(handle_continuous_monitoring_instruction(
+        "alert me when the Apple iPhone 17 price drops",
+        chat_id="t-pct7", db_path=database,
+    ))
+    assert "already running" in again.lower()
+    assert "0%" not in again
+    with db.get_connection(database) as conn:
+        rows = conn.execute("SELECT * FROM monitoring_missions WHERE conversation_id='t-pct7'").fetchall()
+    assert len(rows) == 1
+
+
+def test_product_named_cadence_follow_up_keeps_percent(database):
+    """A cadence follow-up that NAMES the product again ("live
+    monitor Apple iPhone 17, check every 5 minutes") must keep the
+    10% — the history inheritance only covered pronoun follow-ups,
+    so this silently rebuilt the watch with min_percent 0 and the
+    reply never said the threshold was wiped."""
+    from app.continuous_monitoring_companion import handle_continuous_monitoring_instruction
+
+    asyncio.run(handle_continuous_monitoring_instruction(
+        "live monitor iphone 17 when it 10% off then remind, check every 10 minutes",
+        chat_id="t-pct8", db_path=database,
+    ))
+    reply = asyncio.run(handle_continuous_monitoring_instruction(
+        "live monitor Apple iPhone 17, check every 5 minutes",
+        chat_id="t-pct8", db_path=database,
+    ))
+    assert "5 minutes" in reply
+    with db.get_connection(database) as conn:
+        rows = conn.execute("SELECT * FROM monitoring_missions WHERE conversation_id='t-pct8'").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["interval_seconds"] == 300
+    assert json.loads(rows[0]["condition_params"])["min_percent"] == 10.0
+
+
+def test_percent_and_below_names_dropped_condition(database):
+    """Percent + below together: a watch stores ONE condition and
+    below wins — so the reply must name the dropped percent, or the
+    user believes both are watched."""
+    from app.continuous_monitoring_companion import handle_continuous_monitoring_instruction
+
+    reply = asyncio.run(handle_continuous_monitoring_instruction(
+        "live monitor iphone 17, alert me when it drops below 80000 or 10% off",
+        chat_id="t-pct9", db_path=database,
+    ))
+    assert "10%" in reply
+    assert "only" in reply.lower()
+    with db.get_connection(database) as conn:
+        row = conn.execute("SELECT * FROM monitoring_missions WHERE conversation_id='t-pct9'").fetchone()
+    assert row["condition_type"] == "below_price"
+    assert json.loads(row["condition_params"])["threshold"] == 80000.0
+
+
+def test_directive_routes_bare_price_drop_when():
+    """A bare "alert me when the price drops" must route to the
+    monitoring handler — the first directive alternative only knew
+    "alert me IF the price drops", so the "when" phrasing fell
+    through to a one-shot browser task and no watch was ever made."""
+    from app.continuous_monitoring_companion import is_continuous_monitoring_directive
+
+    assert is_continuous_monitoring_directive("alert me when the Apple iPhone 17 price drops") is True
+    assert is_continuous_monitoring_directive("notify me when the price drops") is True
+    assert is_continuous_monitoring_directive("tell me when the price drops") is True
+    # Past tense is a statement about the past, not a watch.
+    assert is_continuous_monitoring_directive("alert me when the price dropped") is False
+
+
+def test_product_named_cadence_follow_up_keeps_below_threshold(database):
+    """Mirror of the percent follow-up test, for a ₹ threshold: a
+    cadence follow-up naming the product again must keep the below
+    price. The percent inheritance fixed the same wipe for %-drop
+    watches, but a below watch was still rebuilt as a min_percent 0
+    price_drop watch — losing the ₹80000 (and, for a daily watch,
+    the cron it was on)."""
+    from app.continuous_monitoring_companion import handle_continuous_monitoring_instruction
+
+    # Interval variant: below ₹80000, every 10 minutes.
+    asyncio.run(handle_continuous_monitoring_instruction(
+        "live monitor Apple iPhone 17, alert me when the price falls below 80000, check every 10 minutes",
+        chat_id="t-pct10", db_path=database,
+    ))
+    reply = asyncio.run(handle_continuous_monitoring_instruction(
+        "live monitor Apple iPhone 17, check every 5 minutes",
+        chat_id="t-pct10", db_path=database,
+    ))
+    assert "80000" in reply
+    with db.get_connection(database) as conn:
+        rows = conn.execute("SELECT * FROM monitoring_missions WHERE conversation_id='t-pct10'").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["condition_type"] == "below_price"
+    assert json.loads(rows[0]["condition_params"])["threshold"] == 80000.0
+    assert rows[0]["interval_seconds"] == 300
+
+    # Daily variant: below ₹80000, every day at 9am. The threshold
+    # is what must survive; the cadence changes as asked (the
+    # follow-up explicitly asks for every 5 minutes).
+    asyncio.run(handle_continuous_monitoring_instruction(
+        "live monitor Apple iPhone 17, alert me when the price falls below 80000, notify me every day at 9am",
+        chat_id="t-pct11", db_path=database,
+    ))
+    reply = asyncio.run(handle_continuous_monitoring_instruction(
+        "live monitor Apple iPhone 17, check every 5 minutes",
+        chat_id="t-pct11", db_path=database,
+    ))
+    assert "80000" in reply
+    with db.get_connection(database) as conn:
+        rows = conn.execute("SELECT * FROM monitoring_missions WHERE conversation_id='t-pct11'").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["condition_type"] == "below_price"
+    assert json.loads(rows[0]["condition_params"])["threshold"] == 80000.0
+    assert rows[0]["interval_seconds"] == 300
