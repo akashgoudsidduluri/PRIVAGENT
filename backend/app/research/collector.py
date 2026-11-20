@@ -243,6 +243,61 @@ def normalize_url(raw_url: str) -> str:
         return raw_url.strip()
 
 
+# Two-label public suffixes (country-code second levels) — the site key
+# is what remains after stripping the suffix, so bbc.co.uk and bbc.com
+# (and en.wikipedia.org vs de.wikipedia.org) compare correctly.
+_TWO_LABEL_SUFFIXES = {
+    "co.uk", "org.uk", "ac.uk", "gov.uk",
+    "com.au", "org.au", "net.au",
+    "co.jp", "ne.jp", "or.jp",
+    "co.nz", "org.nz",
+    "com.br", "org.br",
+    "co.in", "org.in", "ac.in",
+    "com.mx", "org.mx",
+    "co.za", "org.za",
+    "com.cn", "org.cn",
+    "co.kr", "or.kr",
+}
+
+
+def canonical_source_key(raw_url: str) -> str:
+    """Deduplication key for a source across mirror domains.
+
+    ``https://www.bbc.co.uk/news/articles/c123`` and
+    ``https://bbc.com/news/articles/c123`` are the same article on two
+    mirror domains, so they share a key: the site name (host minus
+    www and minus its public suffix) plus the normalized path and
+    significant query. Different paths, languages (en vs de
+    wikipedia) and subdomains keep distinct keys.
+    """
+    if not raw_url:
+        return ""
+    try:
+        parts = urllib.parse.urlsplit(raw_url)
+        host = parts.netloc.lower()
+        host = re.sub(r":\d+$", "", host)
+        if host.startswith("www."):
+            host = host[4:]
+        labels = host.split(".")
+        if len(labels) >= 3 and ".".join(labels[-2:]) in _TWO_LABEL_SUFFIXES:
+            site = ".".join(labels[:-2])
+        elif len(labels) >= 2:
+            site = ".".join(labels[:-1])
+        else:
+            site = host
+        path = parts.path.rstrip("/") or "/"
+        clean_query = []
+        if parts.query:
+            for pair in parts.query.split("&"):
+                k = pair.split("=")[0].lower()
+                if not (k.startswith("utm_") or k in ("ref", "fbclid", "gclid", "source", "feature")):
+                    clean_query.append(pair)
+        q_str = "&".join(clean_query)
+        return f"{site}{path}" + (f"?{q_str}" if q_str else "")
+    except Exception:
+        return normalize_url(raw_url)
+
+
 def extract_domain(url: str) -> str:
     """Extract clean domain name without www or port."""
     try:
@@ -401,6 +456,31 @@ BOILERPLATE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Wikipedia maintenance templates and article-quality banners. These are
+# editorial notices about the page itself, not evidence about the topic —
+# they leaked into reports as "findings" (e.g. "Please help improve it",
+# "citation needed" attached to a real metric).
+WIKI_MAINTENANCE_PATTERNS = [
+    re.compile(r"please\s+help\s+improve\s+it", re.IGNORECASE),
+    re.compile(r"learn\s+how\s+and\s+when\s+to\s+remove\s+this\s+message", re.IGNORECASE),
+    re.compile(r"citation\s+needed", re.IGNORECASE),
+    re.compile(r"may\s+require\s+cleanup", re.IGNORECASE),
+    re.compile(r"needs\s+additional\s+citations", re.IGNORECASE),
+    re.compile(r"this\s+article\s+needs", re.IGNORECASE),
+    re.compile(r"this\s+section\s+needs", re.IGNORECASE),
+    re.compile(r"relies\s+(?:largely\s+)?on\s+a\s+single\s+source", re.IGNORECASE),
+    re.compile(r"to\s+meet\s+wikipedia'?s\s+quality\s+standards", re.IGNORECASE),
+    re.compile(r"this\s+article\s+may\s+require\s+cleanup", re.IGNORECASE),
+]
+
+
+def is_wiki_maintenance_text(text: str) -> bool:
+    """True if a sentence/line is (or carries) a Wikipedia maintenance
+    banner rather than substantive evidence about the topic."""
+    if not text:
+        return False
+    return any(p.search(text) for p in WIKI_MAINTENANCE_PATTERNS)
+
 
 def extract_evidence_snippets(text: str, max_snippets: int = 8) -> list[dict[str, Any]]:
     """Extract substantive, factual evidence sentences from page text.
@@ -430,6 +510,11 @@ def extract_evidence_snippets(text: str, max_snippets: int = 8) -> list[dict[str
             if s_len < 30 or s_len > 400:
                 continue
 
+            # Drop Wikipedia maintenance banners / junk template text,
+            # even when the sentence also carries a factual signal.
+            if is_wiki_maintenance_text(s_clean):
+                continue
+
             # Check for factual or metric indicators
             if not FACTUAL_SIGNALS_RE.search(s_clean):
                 continue
@@ -441,9 +526,17 @@ def extract_evidence_snippets(text: str, max_snippets: int = 8) -> list[dict[str
             seen_hashes.add(sh)
 
             confidence = 0.9 if any(sym in s_clean for sym in ("%", "₹", "$", "±", "=")) else 0.8
+            # Context is the surrounding line with banner sentences
+            # stripped, so maintenance text never rides along with a
+            # real finding into the evidence record.
+            clean_context = " ".join(
+                s2.strip()
+                for s2 in sentences
+                if s2.strip() and not is_wiki_maintenance_text(s2.strip())
+            )[:250]
             candidates.append({
                 "quote": s_clean,
-                "context": line[:250],
+                "context": clean_context,
                 "confidence": confidence,
             })
             if len(candidates) >= max_snippets:
@@ -456,6 +549,31 @@ def extract_evidence_snippets(text: str, max_snippets: int = 8) -> list[dict[str
 # Contradiction and Discrepancy Detection
 # ---------------------------------------------------------------------------
 
+# Common words that must never count as "shared subject" tokens when
+# deciding whether two statements are about the same thing. The old
+# ``\b[a-z]{4,}\b`` tokeniser counted "from", "that", "with" and "this"
+# (all four letters) as subject overlap, so unrelated statements that
+# merely shared stopwords were flagged as contradictions.
+CONTRADICTION_STOPWORDS = {
+    "from", "that", "with", "this", "have", "been", "were", "which",
+    "there", "their", "about", "would", "could", "should", "these",
+    "those", "when", "where", "than", "then", "them", "they", "also",
+    "into", "over", "under", "such", "more", "most", "only", "other",
+    "some", "very", "just", "like", "after", "before", "between",
+    "during", "while", "within", "without", "through", "because",
+    "however", "therefore", "being", "does", "doing", "said", "says",
+}
+
+
+def _content_words(text: str) -> set[str]:
+    """Subject-bearing tokens: lowercase words of 4+ letters, minus
+    stopwords. Used for contradiction / corroboration overlap."""
+    return {
+        w for w in re.findall(r"\b[a-z]{4,}\b", text.lower())
+        if w not in CONTRADICTION_STOPWORDS
+    }
+
+
 def detect_contradiction_between_claims(statement_a: str, statement_b: str) -> tuple[bool, Optional[str]]:
     """Detect whether two statements provide contradictory numbers, dates, or assertions."""
     if not statement_a or not statement_b:
@@ -464,13 +582,17 @@ def detect_contradiction_between_claims(statement_a: str, statement_b: str) -> t
     sa = statement_a.lower()
     sb = statement_b.lower()
 
+    # The same statement cannot contradict itself.
+    if re.sub(r"\W+", " ", sa).strip() == re.sub(r"\W+", " ", sb).strip():
+        return False, None
+
     # 1. Divergent years for the same milestone
     years_a = set(re.findall(r"\b(202\d|203\d)\b", sa))
     years_b = set(re.findall(r"\b(202\d|203\d)\b", sb))
     if years_a and years_b and not (years_a & years_b):
         # Shared subject words?
-        words_a = set(re.findall(r"\b[a-z]{4,}\b", sa))
-        words_b = set(re.findall(r"\b[a-z]{4,}\b", sb))
+        words_a = _content_words(sa)
+        words_b = _content_words(sb)
         milestone_keywords = {"commercial", "production", "deployment", "launch", "release", "market", "delivery", "vehicle", "automotive", "scale", "manufacturing"}
         has_milestone_overlap = bool((words_a & milestone_keywords) and (words_b & milestone_keywords))
         if len(words_a & words_b) >= 2 or (has_milestone_overlap and len(words_a & words_b) >= 1):
@@ -483,8 +605,8 @@ def detect_contradiction_between_claims(statement_a: str, statement_b: str) -> t
         val_a = float(pcts_a[0])
         val_b = float(pcts_b[0])
         if abs(val_a - val_b) > 0.05 and abs(val_a - val_b) / max(val_a, val_b, 0.001) > 0.3:
-            words_a = set(re.findall(r"\b[a-z]{4,}\b", sa))
-            words_b = set(re.findall(r"\b[a-z]{4,}\b", sb))
+            words_a = _content_words(sa)
+            words_b = _content_words(sb)
             if len(words_a & words_b) >= 2:
                 return True, f"Conflicting percentage metrics: {val_a}% vs {val_b}%"
 
@@ -493,8 +615,8 @@ def detect_contradiction_between_claims(statement_a: str, statement_b: str) -> t
     has_neg_a = any(n in sa.split() for n in negations)
     has_neg_b = any(n in sb.split() for n in negations)
     if has_neg_a != has_neg_b:
-        words_a = set(re.findall(r"\b[a-z]{4,}\b", sa)) - negations
-        words_b = set(re.findall(r"\b[a-z]{4,}\b", sb)) - negations
+        words_a = _content_words(sa) - negations
+        words_b = _content_words(sb) - negations
         overlap = words_a & words_b
         if len(overlap) >= 3:
             return True, f"Direct assertion conflict (affirmation vs negation regarding {', '.join(list(overlap)[:3])})"
@@ -539,13 +661,37 @@ def classify_claim_type(statement: str) -> str:
 # Website Image Extraction & Visual Provenance
 # ---------------------------------------------------------------------------
 
+# Tracker / ad images. The "ad" alternative needs a word boundary:
+# without it, "ad/" inside "download/" or "head/" falsely rejects
+# legitimate figures served from those paths.
 TRACKER_AD_PATTERNS = re.compile(
-    r"(?i)(?:tracker|pixel|analytics|doubleclick|googleads|ad[s_\-/]|advertisement|beacon|telemetry|stat[s\._]|spacer\.gif|blank\.gif|1x1|dot\.gif|badge|spinner|loader|wp-includes|avatar|user[-_]profile|author[-_]image|favicon)"
+    r"(?i)(?:tracker|pixel|analytics|doubleclick|googleads|\bad[s_\-/]|advertisement|beacon|telemetry|stat[s\._]|spacer\.gif|blank\.gif|1x1|dot\.gif|badge|spinner|loader|wp-includes|avatar|user[-_]profile|author[-_]image|favicon)"
 )
 
 LOGO_ICON_PATTERNS = re.compile(
     r"(?i)(?:header[-_]logo|footer[-_]logo|site[-_]logo|brand[-_]logo|icon[-_]|/icons?/|nav[-_]icon|social[-_]share|share[-_]btn)"
 )
+
+# Junk web images: site promo banners / ads, UI skeleton placeholders,
+# generic share images and generated social cards. These are page chrome,
+# not evidence figures, and they were embedded into reports as if they
+# illustrated the topic.
+JUNK_IMAGE_PATTERNS = re.compile(
+    r"(?i)(?:promo|advert|sponsor|banner[-_]?ad|\bads?[-_/]|skeleton|shimmer|"
+    r"placeholder|loading[-_]?spinner|empty[-_]?state|"
+    r"opengraph\.githubassets|default[-_]?og|og[-_]?default)"
+)
+
+# Generic og:image / social-image filenames: the site's default share
+# image (usually its logo), not a figure about the article. Matched on
+# the exact filename stem, so a real article hero like "og_hero.jpg"
+# still passes.
+GENERIC_OG_STEMS = {
+    "og", "og-image", "og_image", "default", "default-og", "default_og",
+    "social", "social-preview", "social_preview", "share", "share-image",
+    "share_image", "logo", "site-logo", "site_logo", "preview", "meta",
+    "meta-image", "meta_image", "thumbnail",
+}
 
 VALID_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".svg", ".avif", ".gif"}
 
@@ -701,7 +847,7 @@ def extract_page_images(
             continue
 
         # Skip tiny thumbnail icons (e.g. Wikipedia 16px, 20px, 32px icons)
-        if re.search(r"/(?:[1-4]\d|50)px-", canon_img_url):
+        if re.search(r"/(?:[1-9]\d)px-", canon_img_url):
             continue
 
         # Check tracking and advertisement patterns
@@ -713,6 +859,21 @@ def extract_page_images(
             continue
         if LOGO_ICON_PATTERNS.search(combined_text):
             continue
+
+        # Reject promo banners / ads, UI skeleton placeholders and
+        # generic share-image cards — page chrome, not evidence.
+        if JUNK_IMAGE_PATTERNS.search(combined_text):
+            continue
+
+        # A generic og:image is the site's default share image (usually
+        # its logo), not a figure about the article. og:image candidates
+        # carry the page title as alt text, so they slip past the logo
+        # filters unless the filename itself is generic.
+        if (cand.get("context") or "") == "og:image":
+            _og_stem = urllib.parse.urlparse(canon_img_url).path.rsplit("/", 1)[-1]
+            _og_stem = re.sub(r"\.[a-z0-9]+$", "", _og_stem.lower())
+            if _og_stem in GENERIC_OG_STEMS or "opengraph.githubassets.com" in canon_img_url:
+                continue
 
         # Specific logo or site branding checks
         if alt_str.lower() in {"logo", "site logo", "company logo", "brand", "icon", "arrow", "spacer", "pixel"}:
@@ -818,9 +979,13 @@ def harvest_page_evidence(
             notes="Invalid URL or missing domain.",
         )
 
-    # 1. Check for Duplicate Source in Package
+    # 1. Check for Duplicate Source in Package (exact URL, or the same
+    # article on a mirror domain — bbc.co.uk vs bbc.com, same path).
+    _new_source_key = canonical_source_key(canon_url)
     for existing_src in pkg.sources.values():
-        if existing_src.url == canon_url:
+        if existing_src.url == canon_url or (
+            _new_source_key and canonical_source_key(existing_src.url) == _new_source_key
+        ):
             return HarvestResult(
                 source_id=existing_src.source_id, url=canon_url, domain=domain, status="duplicate",
                 evidence_count=0, claims_added=0, claims_corroborated=0, claims_conflicted=0,
@@ -905,9 +1070,21 @@ def harvest_page_evidence(
         has_conflict = False
         conflict_reason: Optional[str] = None
 
-        words_statement = set(re.findall(r"\b[a-z]{4,}\b", statement.lower()))
+        words_statement = _content_words(statement)
 
         for existing_clm in pkg.claims.values():
+            # A source can never contradict (or corroborate) itself:
+            # skip claims this very source already owns, claims it
+            # already supports, and claims from a canonical-URL
+            # duplicate of this source (mirror domain, same article).
+            if existing_clm.primary_source_id == src_id:
+                continue
+            if src_id in (existing_clm.supporting_source_ids or []):
+                continue
+            _primary_src = pkg.sources.get(existing_clm.primary_source_id or "")
+            if _primary_src and _new_source_key and canonical_source_key(_primary_src.url) == _new_source_key:
+                continue
+
             # Check for direct contradiction first
             is_conflict, reason = detect_contradiction_between_claims(existing_clm.statement, statement)
             if is_conflict:
@@ -917,7 +1094,7 @@ def harvest_page_evidence(
                 break
 
             # Check for semantic overlap / corroboration
-            words_existing = set(re.findall(r"\b[a-z]{4,}\b", existing_clm.statement.lower()))
+            words_existing = _content_words(existing_clm.statement)
             overlap = words_statement & words_existing
             # Substantial subject token overlap indicates discussion of the same factual point
             if len(overlap) >= 3 and len(overlap) / max(len(words_statement), 1) >= 0.4:
@@ -951,6 +1128,9 @@ def harvest_page_evidence(
                     is_independent = False
             # Same domain or common publisher subdomains cannot independently corroborate itself
             if primary_src and (primary_src.domain == domain or primary_src.domain.endswith(f".{domain}") or domain.endswith(f".{primary_src.domain}")):
+                is_independent = False
+            # Same article on a mirror domain is not independent either.
+            if primary_src and _new_source_key and canonical_source_key(primary_src.url) == _new_source_key:
                 is_independent = False
 
             if src_id not in matched_claim.supporting_source_ids:
