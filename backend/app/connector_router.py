@@ -38,13 +38,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-__all__ = [
-    "ConnectorRoute",
-    "route_instruction",
-    "CONNECTOR_LABELS",
-    "is_connector_status_query",
-    "connector_status_reply",
-]
+__all__ = ["ConnectorRoute", "route_instruction", "CONNECTOR_LABELS"]
 
 CONNECTOR_LABELS = {
     "gmail": "Gmail",
@@ -153,47 +147,10 @@ _DRIVE_PATTERNS = [
 # Calendar create (mutating). Reads are detected by the existing
 # calendar companion detector, reused here rather than duplicated.
 # "create a calendar event" has "calendar" between the verb and the
-# noun — the optional middle group covers it. "keep event(s)" and
-# date-bound "remind me on/at ..." are creates too (they book an
-# event, they do not list one).
+# noun — the optional middle group covers it.
 _CALENDAR_CREATE_RE = re.compile(
     r"\b(?:schedule|create|add|book)\s+(?:an?\s+)?(?:calendar\s+)?"
-    r"(?:event|meeting|invite|appointment|call)\b"
-    r"|\bkeep\s+(?:an?\s+)?events?\b"
-    r"|\bremind(?:er|ers)?\s+me\s+(?:on|at)\b",
-    re.IGNORECASE,
-)
-
-# Connector status questions ("check if calendar connected", "is
-# gmail connected", "is it connected" after a calendar turn). These
-# are answered from oauth_manager.status(), never by the LLM — the
-# model would otherwise invent a connection state.
-_STATUS_CONNECTOR_WORDS: dict[str, str] = {
-    "calendar": "google_calendar",
-    "calender": "google_calendar",
-    "gmail": "gmail",
-    "mail": "gmail",
-    "inbox": "gmail",
-    "drive": "google_drive",
-    "outlook": "microsoft",
-    "slack": "slack",
-    "github": "github",
-}
-_STATUS_QUESTION_RE = re.compile(
-    r"\b(?:is|are|check|verify|confirm|how\s+do\s+i\s+know)\b"
-    r"[^.]{0,60}?\b(?:calendar|calender|gmail|mail|inbox|drive|outlook|slack|github)\b"
-    r"[^.]{0,40}?\b(?:connected|active|working|set\s+up|configured|linked|signed\s+in)\b"
-    r"|\b(?:is|are)\s+(?:my\s+|the\s+)?(?:calendar|calender|gmail|mail|inbox|drive|outlook|slack|github)\s+(?:connected|active|working|set\s+up|configured|linked)\b"
-    r"|\bcheck\s+(?:if|whether)\s+(?:my\s+|the\s+)?(?:calendar|calender|gmail|mail|inbox|drive|outlook|slack|github)\s+(?:is\s+)?(?:connected|active|working|set\s+up|configured)\b",
-    re.IGNORECASE,
-)
-_BARE_STATUS_RE = re.compile(
-    r"^\s*(?:is|are)\s+it\s+(?:connected|active|working|set\s+up|configured)\b"
-    r"|\bcheck\s+(?:if|whether)\s+it(?:'s|\s+is)?\s+connected\b",
-    re.IGNORECASE,
-)
-_HISTORY_CONNECTOR_WORDS = re.compile(
-    r"\b(calendar|calender|gmail|mail|inbox|drive|outlook|slack|github)\b",
+    r"(?:event|meeting|invite|appointment|call)\b",
     re.IGNORECASE,
 )
 
@@ -214,109 +171,6 @@ def _clean_query(raw: Optional[str]) -> str:
     q = raw.strip().strip("\"'").strip()
     q = re.sub(r"\s+", " ", q)
     return q[:300]
-
-
-def is_connector_status_query(
-    text: str, history: list[dict[str, Any]] | None = None
-) -> Optional[str]:
-    """Detect a connector-status question, returning the connector key
-    ("google_calendar" | "gmail" | "google_drive" | "microsoft" |
-    "slack" | "github") or None.
-
-    "check if calendar connected" names its connector. A bare "is it
-    connected" resolves from the recent conversation: the last turn
-    that names a connector decides which one "it" is. A plain read
-    ("what is on my calendar tomorrow") is not a status question.
-    """
-    t = (text or "").strip()
-    if not t:
-        return None
-    m = _STATUS_QUESTION_RE.search(t)
-    if m:
-        word = _HISTORY_CONNECTOR_WORDS.search(t)
-        if word:
-            return _STATUS_CONNECTOR_WORDS.get(word.group(1).lower())
-        return None
-    if _BARE_STATUS_RE.search(t) and history:
-        for turn in reversed(history):
-            content = (turn or {}).get("content") or ""
-            word = _HISTORY_CONNECTOR_WORDS.search(content)
-            if word:
-                return _STATUS_CONNECTOR_WORDS.get(word.group(1).lower())
-    return None
-
-
-def connector_status_reply(connector: str) -> str:
-    """Verified connector status, from oauth_manager.status().
-
-    The reply states the real connection state (account) and, when
-    not connected, how to connect — never a model-invented status.
-    This branch's status payload carries no per-connection scope
-    data, so the reply makes no claim about scopes: a connected
-    Google account is reported connected, not scope-missing.
-    """
-    from .connectors.oauth import oauth_manager
-
-    try:
-        providers = oauth_manager.status()
-    except Exception as exc:
-        return (
-            "### ⚠️ Couldn't Check Connection Status\n\n"
-            f"The connection check itself failed: `{exc}`\n\n"
-            "Open the **Connectors** tab in the Control Center to see the live state."
-        )
-    by_provider = {p.get("provider"): p for p in providers}
-    # Calendar / Gmail / Drive all live under the Google provider;
-    # Slack / GitHub / Microsoft are their own providers.
-    provider_key = {
-        "google_calendar": "google",
-        "gmail": "google",
-        "google_drive": "google",
-        "microsoft": "microsoft",
-        "slack": "slack",
-        "github": "github",
-    }.get(connector, connector)
-    label = CONNECTOR_LABELS.get(connector, connector)
-    entry = by_provider.get(provider_key) or {}
-
-    if connector == "google_calendar":
-        if entry.get("connected") and entry.get("account"):
-            return (
-                "### ✓ Google Calendar Connected & Verified\n\n"
-                f"• **Connected Account:** `{entry.get('account')}` (Google)\n\n"
-                "Your Google Calendar is connected — ask me to create an event or check your schedule."
-            )
-    elif connector == "gmail":
-        if entry.get("connected") and entry.get("account"):
-            return (
-                "### ✓ Gmail Connected & Verified\n\n"
-                f"• **Connected Account:** `{entry.get('account')}` (Google)\n\n"
-                "Your Gmail account is connected — ask me to check your inbox or find an email."
-            )
-    elif connector == "google_drive":
-        if entry.get("connected") and entry.get("account"):
-            return (
-                "### ✓ Google Drive Connected & Verified\n\n"
-                f"• **Connected Account:** `{entry.get('account')}` (Google)\n\n"
-                "Your Google Drive is connected — ask me to find a file."
-            )
-    else:
-        if entry.get("connected") and entry.get("account"):
-            return (
-                f"### ✓ {label} Connected & Verified\n\n"
-                f"• **Connected Account:** `{entry.get('account')}`\n\n"
-                f"Your {label} account is connected."
-            )
-
-    err = entry.get("error") or f"No active {label} connection was detected."
-    return (
-        f"### ⚠️ {label} Not Connected\n\n"
-        f"{err}\n\n"
-        "To connect it:\n"
-        "1. Open the **Connectors** tab in the Control Center.\n"
-        "2. Sign in or enter your OAuth credentials.\n"
-        "3. Return here and prompt me again."
-    )
 
 
 @dataclass(frozen=True)
